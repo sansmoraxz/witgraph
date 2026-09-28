@@ -1,0 +1,16 @@
+package demo:graph@0.1.0;
+
+/// Integrates deltas into a running total carried across iterations.
+world accumulator {
+    export node: interface {
+        record inputs {
+            delta: option<f64>,
+            /// Previous iteration's total, delivered over a feedback edge.
+            state-in: option<f64>,
+        }
+
+        record outputs {
+            state-out: f64,
+        }
+    }
+}

@@ -1,0 +1,71 @@
+package demo:graph@0.1.0;
+
+/// Smooths a stream of readings.
+world filter {
+    import demo:caps/log@0.1.0;
+
+    export node: interface {
+        record reading {
+            value: f64,
+            timestamp: u64,
+        }
+
+        record inputs {
+            raw: stream<reading>,
+        }
+
+        record outputs {
+            filtered: stream<reading>,
+            /// Resolves with a summary when the input stream closes.
+            done: future<string>,
+        }
+    }
+}
+
+/// Renders the filtered stream.
+world display {
+    export node: interface {
+        record reading {
+            value: f64,
+            timestamp: u64,
+        }
+
+        record inputs {
+            view: stream<reading>,
+            done: future<string>,
+        }
+    }
+}
+
+/// Sums an entire stream of readings once it closes: the stream is a drained
+/// input, so the node runs synchronously with the latched total.
+world collector {
+    export node: interface {
+        record reading {
+            value: f64,
+            timestamp: u64,
+        }
+
+        record drained-inputs {
+            samples: stream<reading>,
+        }
+
+        record inputs {
+            /// Latched scale factor, sampled when the drained batch fires.
+            scale: option<f64>,
+        }
+
+        record outputs {
+            total: f64,
+        }
+    }
+}
+
+/// Reacts to threshold events.
+world alarm {
+    export node: interface {
+        record input-events {
+            trigger: f64,
+        }
+    }
+}

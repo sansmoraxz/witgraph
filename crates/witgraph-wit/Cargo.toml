@@ -1,0 +1,21 @@
+[package]
+name = "witgraph-wit"
+description = "WIT ingestion and component contract generation for witgraph"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+witgraph-ir = { workspace = true }
+wit-parser = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true, features = ["std"] }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
