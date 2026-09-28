@@ -1,0 +1,28 @@
+[package]
+name = "witgraph-ir"
+description = "Typed graph IR and component model for witgraph"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+semver = { workspace = true }
+thiserror = { workspace = true }
+miette = { workspace = true }
+nutype = { workspace = true }
+petgraph = { workspace = true }
+strum = { workspace = true }
+serde = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[features]
+default = ["serde"]
+serde = ["dep:serde", "semver/serde", "nutype/serde"]

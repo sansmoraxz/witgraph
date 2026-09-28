@@ -1,0 +1,41 @@
+[workspace]
+resolver = "3"
+members = ["crates/witgraph-ir", "crates/witgraph-wit"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license = "BSD-3-Clause"
+repository = "https://github.com/sansmoraxz/witgraph"
+readme = "README.md"
+
+[workspace.lints.rust]
+missing_docs = "deny"
+
+[workspace.lints.rustdoc]
+broken_intra_doc_links = "deny"
+private_intra_doc_links = "deny"
+
+# Diagnostics are data, never panics (see witgraph-ir::diagnostics). Test
+# code is exempted via clippy.toml's allow-*-in-tests.
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+
+[workspace.dependencies]
+witgraph-ir = { path = "crates/witgraph-ir" }
+semver = { version = "1.0", default-features = false }
+thiserror = { version = "2.0", default-features = false }
+miette = "7.6"
+nutype = "0.8"
+petgraph = { version = "0.8", default-features = false }
+strum = { version = "0.27", default-features = false, features = ["derive"] }
+hex = "0.4"
+serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
+serde_json = "1.0"
+wit-parser = "0.259"
+sha2 = "0.10"

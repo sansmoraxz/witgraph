@@ -1,0 +1,31 @@
+package demo:graph@0.1.0;
+
+/// Periodically samples a sensor and publishes readings.
+world sensor {
+    import demo:caps/clock@0.1.0;
+
+    export node: interface {
+        /// A single timestamped sensor reading.
+        record reading {
+            value: f64,
+            timestamp: u64,
+        }
+
+        record inputs {
+            /// Samples per second; the component picks a default when absent.
+            sample-rate: option<u32>,
+        }
+
+        record outputs {
+            /// Latched most recent reading.
+            latest: reading,
+            /// Ordered stream of all readings.
+            samples: stream<reading>,
+        }
+
+        record output-events {
+            /// Fires when a reading crosses the configured threshold.
+            threshold-crossed: f64,
+        }
+    }
+}

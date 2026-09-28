@@ -1,0 +1,11 @@
+package demo:caps@0.1.0;
+
+/// Monotonic time source.
+interface clock {
+    now: func() -> u64;
+}
+
+/// Structured logging sink.
+interface log {
+    emit: func(msg: string);
+}
