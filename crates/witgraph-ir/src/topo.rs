@@ -112,6 +112,41 @@ pub(crate) fn useful_feedback_edges(
         .collect()
 }
 
+/// Longest-path depth from sources over non-feedback edges.
+///
+/// Nodes with no predecessors (through non-feedback resolved edges) get
+/// depth 0. Every other node gets `max(depth of predecessors) + 1`.
+/// The result is deterministic given a deterministic `order`.
+pub(crate) fn depth_map(
+    graph: &Graph,
+    order: &[NodeId],
+    resolved: &HashSet<&ConnectionId>,
+) -> HashMap<NodeId, usize> {
+    let mut preds: HashMap<&NodeId, Vec<&NodeId>> = HashMap::new();
+    for conn in &graph.connections {
+        if conn.feedback || !resolved.contains(&conn.id) {
+            continue;
+        }
+        preds.entry(&conn.to.node).or_default().push(&conn.from.node);
+    }
+
+    let mut depth: HashMap<NodeId, usize> = HashMap::with_capacity(order.len());
+    for node_id in order {
+        let d = preds
+            .get(node_id)
+            .map(|pred_nodes| {
+                pred_nodes
+                    .iter()
+                    .filter_map(|p| depth.get(*p))
+                    .max()
+                    .map_or(0, |max_d| max_d + 1)
+            })
+            .unwrap_or(0);
+        depth.insert(node_id.clone(), d);
+    }
+    depth
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

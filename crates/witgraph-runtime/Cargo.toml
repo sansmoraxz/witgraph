@@ -1,0 +1,34 @@
+[package]
+name = "witgraph-runtime"
+description = "Event-driven WASM graph runtime for witgraph"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+compact-encoding = ["dep:postcard"]
+
+[dependencies]
+witgraph-ir = { workspace = true }
+thiserror = { workspace = true }
+miette = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+postcard = { version = "1", default-features = false, features = ["alloc"], optional = true }
+wasmtime = { version = "47", default-features = false, features = [
+    "runtime", "cranelift", "component-model", "component-model-async", "async", "std"
+] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }
+test-components = { path = "../test-components" }
+wasmtime = { version = "47", default-features = false, features = ["component-model"] }
+rumqttd = "0.20"
+rumqttc = "0.25"

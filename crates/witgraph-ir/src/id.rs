@@ -46,6 +46,11 @@ string_id! {
     ConnectionId
 }
 
+string_id! {
+    /// Identifies a named resource pool for scheduling budgets.
+    ResourceId
+}
+
 /// A reference to one port on one node.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
