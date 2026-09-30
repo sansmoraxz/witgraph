@@ -1,0 +1,78 @@
+package witgraph:runtime@0.1.0;
+
+/// Shared types used by the runtime-host and node interfaces.
+interface types {
+    /// Reason the runtime is activating a node.
+    variant activation-kind {
+        /// Sync activation: all inputs are latched Values.
+        sync,
+        /// A drained input received an item during drain phase.
+        drain-item(drain-item-info),
+        /// A stream item arrived on a port.
+        stream-item(port-item-info),
+        /// An event arrived on a port.
+        event(port-item-info),
+        /// A future resolved on a port.
+        future-resolved(port-item-info),
+        /// A stream closed on a port.
+        stream-closed(string),
+    }
+
+    record drain-item-info {
+        port: string,
+        data: list<u8>,
+    }
+
+    record port-item-info {
+        port: string,
+        data: list<u8>,
+    }
+
+    /// What the node wants after activation.
+    enum activation-result {
+        /// Node wants more activations.
+        %continue,
+        /// Node is done, outputs finalized.
+        completed,
+    }
+}
+
+/// Host-provided runtime services (imported by the component).
+interface runtime-host {
+    use types.{activation-kind, activation-result, drain-item-info, port-item-info};
+
+    /// Read a latched Value input. Returns none if unconnected optional or not yet written.
+    read-value: func(port: string) -> option<list<u8>>;
+    /// Write a Value output.
+    write-value: func(port: string, value: list<u8>);
+    /// Emit a discrete Event.
+    emit-event: func(port: string, payload: list<u8>);
+    /// Push an item to a Stream output.
+    push-stream: func(port: string, item: list<u8>);
+    /// Close a Stream output (EOS).
+    close-stream: func(port: string);
+    /// Resolve a Future output.
+    resolve-future: func(port: string, value: list<u8>);
+    /// Signal a graph-fatal condition. Halts the tick.
+    fatal: func(message: string);
+    /// Check whether the host has requested cancellation.
+    is-cancelled: func() -> bool;
+}
+
+/// Node lifecycle exports (exported by the component).
+interface node {
+    use types.{activation-kind, activation-result};
+
+    /// Called once before any activations (including drain-phase).
+    init: func();
+    /// Called on each activation.
+    activate: func(reason: activation-kind) -> activation-result;
+    /// Called on completion, fault, or graph shutdown.
+    dispose: func();
+}
+
+/// The world every witgraph node component targets.
+world graph-node {
+    import runtime-host;
+    export node;
+}

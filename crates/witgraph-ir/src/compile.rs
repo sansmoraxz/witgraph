@@ -39,6 +39,7 @@ pub struct CompiledGraph {
     graph: Graph,
     node_contract: HashMap<NodeId, usize>,
     order: Vec<NodeId>,
+    depth: HashMap<NodeId, usize>,
     warnings: Diagnostics,
 }
 
@@ -61,6 +62,15 @@ impl CompiledGraph {
     /// Execution order over non-feedback edges.
     pub fn topological_order(&self) -> &[NodeId] {
         &self.order
+    }
+
+    /// Longest-path depth from source nodes over non-feedback edges.
+    ///
+    /// Nodes with no predecessors have depth 0; each other node has
+    /// `max(depth of predecessors) + 1`. Used by the runtime scheduler
+    /// to group independent nodes for concurrent execution.
+    pub fn depth_map(&self) -> &HashMap<NodeId, usize> {
+        &self.depth
     }
 
     /// The contract the given node instantiates.
@@ -446,6 +456,30 @@ fn check_feedback_into_drained_inputs(
     }
 }
 
+/// Feedback connections on Future-kind ports are rejected: Future resolves
+/// once; a feedback edge would silently drop every iteration after the first.
+fn check_feedback_on_futures(
+    graph: &Graph,
+    contracts: &HashMap<&NodeId, usize>,
+    diagnostics: &mut Diagnostics,
+) {
+    for conn in graph.connections.iter().filter(|c| c.feedback) {
+        let Some(&i) = contracts.get(&conn.from.node) else {
+            continue;
+        };
+        let is_future = graph.components[i]
+            .outputs
+            .iter()
+            .any(|output| output.kind == PortKind::Future && output.name == conn.from.port);
+        if is_future {
+            diagnostics.push(Diagnostic::FeedbackOnFuture {
+                conn: conn.id.clone(),
+                port: conn.from.clone(),
+            });
+        }
+    }
+}
+
 /// A non-feedback connection into a drained input on a cycle waits on a
 /// completion that transitively depends on the target node's own output:
 /// deadlock. Per-edge precision — a node on a cycle via a reactive port with
@@ -478,6 +512,47 @@ fn check_drained_inputs_off_cycles(
     }
 }
 
+/// Config values must target existing Value-kind input ports with matching
+/// types. Nodes whose component failed to resolve are skipped (already
+/// diagnosed by `check_nodes`).
+fn check_config_values(
+    graph: &Graph,
+    contracts: &HashMap<&NodeId, usize>,
+    diagnostics: &mut Diagnostics,
+) {
+    for node in &graph.nodes {
+        let Some(&i) = contracts.get(&node.id) else {
+            continue;
+        };
+        let contract = &graph.components[i];
+        for (port_name, val) in &node.config {
+            match contract.inputs.iter().find(|p| &p.name == port_name) {
+                None => {
+                    diagnostics.push(Diagnostic::ConfigUnknownPort {
+                        node: node.id.clone(),
+                        port: port_name.clone(),
+                    });
+                }
+                Some(port_def) if port_def.kind != PortKind::Value => {
+                    diagnostics.push(Diagnostic::ConfigNotValueInput {
+                        node: node.id.clone(),
+                        port: port_name.clone(),
+                        kind: port_def.kind,
+                    });
+                }
+                Some(port_def) if !val.matches_type(&port_def.ty) => {
+                    diagnostics.push(Diagnostic::ConfigTypeMismatch {
+                        node: node.id.clone(),
+                        port: port_name.clone(),
+                        expected: port_def.ty.to_string(),
+                    });
+                }
+                Some(_) => {}
+            }
+        }
+    }
+}
+
 impl Graph {
     /// Consuming typestate transition. On failure the graph is handed back
     /// inside [`CompilationFailure`] together with every diagnostic found.
@@ -492,7 +567,9 @@ impl Graph {
         check_connection_ids(&self, &mut diagnostics);
         let resolved = check_connection_endpoints(&self, &node_ids, &contracts, &mut diagnostics);
         check_required_inputs(&self, &node_ids, &contracts, &mut diagnostics);
+        check_config_values(&self, &contracts, &mut diagnostics);
         check_feedback_into_drained_inputs(&self, &contracts, &mut diagnostics);
+        check_feedback_on_futures(&self, &contracts, &mut diagnostics);
         // Cycle analysis keys graph vertices by node id, so it needs ids to
         // be unique; duplicates were already diagnosed as errors above.
         let order = if node_ids.len() == self.nodes.len() {
@@ -507,15 +584,19 @@ impl Graph {
         // or IllegalCycle), so the arms are exhaustive without any panic
         // path.
         match order {
-            Some(order) if !diagnostics.has_errors() => Ok(CompiledGraph {
-                node_contract: contracts
-                    .into_iter()
-                    .map(|(id, i)| (id.clone(), i))
-                    .collect(),
-                graph: self,
-                order,
-                warnings: diagnostics,
-            }),
+            Some(order) if !diagnostics.has_errors() => {
+                let depth = topo::depth_map(&self, &order, &resolved);
+                Ok(CompiledGraph {
+                    node_contract: contracts
+                        .into_iter()
+                        .map(|(id, i)| (id.clone(), i))
+                        .collect(),
+                    graph: self,
+                    order,
+                    depth,
+                    warnings: diagnostics,
+                })
+            }
             _ => Err(CompilationFailure {
                 graph: Box::new(self),
                 diagnostics,
@@ -527,9 +608,11 @@ impl Graph {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::graph::ResourceClaim;
     use crate::id::ComponentRef;
     use crate::port::PortKind;
     use crate::types::Type;
+    use crate::val::Val;
 
     fn cref(world: &str) -> ComponentRef {
         format!("demo:graph/{world}@0.1.0").parse().unwrap()
@@ -1378,5 +1461,177 @@ mod tests {
             port: PortRef::new("d", "in"),
             connections: vec!["c1".into(), "c2".into()],
         }));
+    }
+
+    #[test]
+    fn valid_config_compiles() {
+        let graph = Graph::builder("t")
+            .add_component(sink())
+            .add_component(source())
+            .add_node("s", cref("source"))
+            .add_node("d", cref("sink"))
+            .set_config("d", "in", Val::F64(42.0)).unwrap()
+            .connect("c1", PortRef::new("s", "out"), PortRef::new("d", "in"))
+            .build();
+        graph.compile().expect("valid config");
+    }
+
+    #[test]
+    fn config_unknown_port() {
+        let graph = Graph::builder("t")
+            .add_component(source())
+            .add_node("s", cref("source"))
+            .set_config("s", "nope", Val::F64(1.0)).unwrap()
+            .build();
+        assert_eq!(
+            diags(graph.compile()),
+            vec![Diagnostic::ConfigUnknownPort {
+                node: "s".into(),
+                port: "nope".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn config_not_value_input() {
+        let graph = Graph::builder("t")
+            .add_component(contract(
+                "evented",
+                vec![port("sig", PortKind::Event).optional()],
+                vec![],
+                &[],
+            ))
+            .add_node("e", cref("evented"))
+            .set_config("e", "sig", Val::F64(1.0)).unwrap()
+            .build();
+        assert_eq!(
+            diags(graph.compile()),
+            vec![Diagnostic::ConfigNotValueInput {
+                node: "e".into(),
+                port: "sig".into(),
+                kind: PortKind::Event,
+            }]
+        );
+    }
+
+    #[test]
+    fn config_type_mismatch() {
+        let graph = Graph::builder("t")
+            .add_component(sink())
+            .add_component(source())
+            .add_node("s", cref("source"))
+            .add_node("d", cref("sink"))
+            .set_config("d", "in", Val::String("wrong".into())).unwrap()
+            .connect("c1", PortRef::new("s", "out"), PortRef::new("d", "in"))
+            .build();
+        assert_eq!(
+            diags(graph.compile()),
+            vec![Diagnostic::ConfigTypeMismatch {
+                node: "d".into(),
+                port: "in".into(),
+                expected: "f64".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn config_on_optional_unconnected_port_compiles() {
+        let graph = Graph::builder("t")
+            .add_component(contract(
+                "opt-sink",
+                vec![port("in", PortKind::Value).optional()],
+                vec![],
+                &[],
+            ))
+            .add_node("d", cref("opt-sink"))
+            .set_config("d", "in", Val::F64(3.14)).unwrap()
+            .build();
+        graph
+            .compile()
+            .expect("config on unconnected optional port is valid");
+    }
+
+    #[test]
+    fn config_satisfies_required_input() {
+        let graph = Graph::builder("t")
+            .add_component(sink())
+            .add_node("d", cref("sink"))
+            .set_config("d", "in", Val::F64(1.0)).unwrap()
+            .build();
+        let diags_list = diags(graph.compile());
+        assert!(
+            diags_list.contains(&Diagnostic::RequiredInputUnconnected {
+                port: PortRef::new("d", "in"),
+            }),
+            "config does not satisfy required-input-connected: {diags_list:?}"
+        );
+    }
+
+    #[test]
+    fn feedback_on_future_rejected() {
+        let future_node = contract(
+            "future-node",
+            vec![port("trigger", PortKind::Value)],
+            vec![port("result", PortKind::Future)],
+            &[],
+        );
+        let graph = Graph::builder("t")
+            .add_component(future_node)
+            .add_node("a", cref("future-node"))
+            .connect_feedback("c1", PortRef::new("a", "result"), PortRef::new("a", "trigger"))
+            .build();
+        let diags_list = diags(graph.compile());
+        assert!(
+            diags_list.iter().any(|d| matches!(d, Diagnostic::FeedbackOnFuture { .. })),
+            "feedback on future port should be rejected: {diags_list:?}"
+        );
+    }
+
+    #[test]
+    fn resource_budget_valid() {
+        use crate::graph::Fraction;
+        assert!(Fraction::new(0.5).is_ok());
+        assert!(Fraction::new(1.0).is_ok());
+        assert!(Fraction::new(0.001).is_ok());
+    }
+
+    #[test]
+    fn resource_budget_invalid_rejected_by_fraction() {
+        use crate::graph::Fraction;
+        assert!(Fraction::new(0.0).is_err());
+        assert!(Fraction::new(-0.1).is_err());
+        assert!(Fraction::new(1.5).is_err());
+        assert!(Fraction::new(f64::NAN).is_err());
+        assert!(Fraction::new(f64::INFINITY).is_err());
+        assert!(Fraction::new(f64::NEG_INFINITY).is_err());
+    }
+
+    #[test]
+    fn resource_budget_compiles() {
+        let graph = Graph::builder("t")
+            .add_component(source())
+            .add_node("s", cref("source"))
+            .set_resource("s", "disk", ResourceClaim::new(0.5).unwrap()).unwrap()
+            .build();
+        graph.compile().expect("valid resource budget");
+    }
+
+    #[test]
+    fn resource_budget_held_compiles() {
+        let graph = Graph::builder("t")
+            .add_component(source())
+            .add_node("s", cref("source"))
+            .set_resource("s", "vram", ResourceClaim::held(0.3).unwrap()).unwrap()
+            .build();
+        graph.compile().expect("held resource budget is valid");
+    }
+
+    #[test]
+    fn resource_budget_unknown_node_rejected() {
+        let result = Graph::builder("t")
+            .add_component(source())
+            .add_node("s", cref("source"))
+            .set_resource("ghost", "disk", ResourceClaim::new(0.5).unwrap());
+        assert!(result.is_err(), "set_resource on unknown node should fail");
     }
 }

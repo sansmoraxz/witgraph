@@ -301,6 +301,53 @@ pub enum Diagnostic {
         /// The pointless feedback connection.
         conn: ConnectionId,
     },
+    /// A node config entry targets a port that does not exist on the
+    /// node's component.
+    #[error("node `{node}` config references unknown port `{port}`")]
+    #[diagnostic(code(witgraph::ir::config_unknown_port))]
+    ConfigUnknownPort {
+        /// The node carrying the bad config.
+        node: NodeId,
+        /// The port name that does not exist.
+        port: PortName,
+    },
+    /// A node config entry targets a port that is not a Value input.
+    #[error(
+        "node `{node}` config targets {kind} port `{port}`, but only value inputs accept config"
+    )]
+    #[diagnostic(code(witgraph::ir::config_not_value_input))]
+    ConfigNotValueInput {
+        /// The node carrying the bad config.
+        node: NodeId,
+        /// The mismatched port name.
+        port: PortName,
+        /// The port's actual kind.
+        kind: PortKind,
+    },
+    /// A node config value does not match the port's declared type.
+    #[error("node `{node}` config for port `{port}` has wrong type: expected {expected}")]
+    #[diagnostic(code(witgraph::ir::config_type_mismatch))]
+    ConfigTypeMismatch {
+        /// The node carrying the bad config.
+        node: NodeId,
+        /// The port whose type does not match.
+        port: PortName,
+        /// Rendered expected type.
+        expected: String,
+    },
+    /// A feedback connection carries a Future-kind port. Future is one-shot;
+    /// feedback is iterative. The second iteration's resolve is silently
+    /// rejected.
+    #[error(
+        "feedback connection `{conn}` carries a future port, which can only resolve once"
+    )]
+    #[diagnostic(code(witgraph::ir::feedback_on_future))]
+    FeedbackOnFuture {
+        /// The contradictory feedback connection.
+        conn: ConnectionId,
+        /// The future port.
+        port: PortRef,
+    },
 }
 
 impl Diagnostic {
@@ -328,6 +375,7 @@ impl Diagnostic {
             | Diagnostic::TypeMismatch { conn, .. }
             | Diagnostic::DrainedInputOnCycle { conn, .. }
             | Diagnostic::FeedbackIntoDrainedInput { conn, .. }
+            | Diagnostic::FeedbackOnFuture { conn, .. }
             | Diagnostic::UselessFeedback { conn } => Location::Connection(conn.clone()),
             Diagnostic::MultipleWriters { port, .. }
             | Diagnostic::RequiredInputUnconnected { port } => Location::Port(port.clone()),
@@ -337,6 +385,9 @@ impl Diagnostic {
             | Diagnostic::OptionalOutput { component, .. }
             | Diagnostic::DrainedOutput { component, .. } => Location::Component(component.clone()),
             Diagnostic::IllegalCycle { nodes } => Location::Cycle(nodes.clone()),
+            Diagnostic::ConfigUnknownPort { node, .. }
+            | Diagnostic::ConfigNotValueInput { node, .. }
+            | Diagnostic::ConfigTypeMismatch { node, .. } => Location::Node(node.clone()),
         }
     }
 }

@@ -15,13 +15,16 @@ pub mod id;
 pub mod port;
 mod topo;
 pub mod types;
+pub mod val;
 
 pub use compile::{CompilationFailure, CompiledGraph};
 pub use component::{Capability, ComponentContract, TypeDecl};
 pub use diagnostics::{Diagnostic, Diagnostics, Location, Severity};
-pub use graph::{Connection, Graph, GraphBuilder, GraphMetadata, Node};
+pub use graph::{Connection, Fraction, Graph, GraphBuilder, GraphMetadata, Node, ResourceClaim};
 pub use id::{
     ComponentRef, ConnectionId, NodeId, PackageRef, ParseComponentRefError, PortName, PortRef,
+    ResourceId,
 };
 pub use port::{ConsumptionMode, PortDef, PortDirection, PortKind};
 pub use types::{Case, EnumType, Field, FlagsType, Record, Type, Variant};
+pub use val::Val;
