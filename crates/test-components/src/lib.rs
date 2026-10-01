@@ -1,31 +1,53 @@
-/// Compiled echo node WASM component.
-///
-/// Ports: optional Value input `in` (f64) → Value output `out` (f64).
-/// Reads `in`, writes it to `out`. Defaults to 0.0 when absent.
-pub const ECHO: &[u8] = include_bytes!(env!("ECHO_WASM"));
+//! Guest components used by the witgraph runtime tests.
+//!
+//! Every guest is a standalone crate under `guests/` whose `wit/` directory
+//! is its contract. The build script compiles each one for
+//! `wasm32-unknown-unknown` and encodes it as a component.
 
-/// Compiled configurable node WASM component.
-///
-/// Ports: optional Value inputs `rate` (u32) + `gain` (f64) →
-/// Value output `result` (f64). Writes `rate as f64 * gain`.
-/// Defaults to 1 and 1.0 when absent.
-pub const CONFIGURABLE: &[u8] = include_bytes!(env!("CONFIGURABLE_WASM"));
+/// One test guest: its component bytes and the directory holding its WIT
+/// contract (lower it with `witgraph_wit::load_components`).
+#[derive(Debug, Clone, Copy)]
+pub struct Guest {
+    /// The encoded WASM component.
+    pub wasm: &'static [u8],
+    /// The guest's `wit/` directory.
+    pub wit: &'static str,
+}
 
-/// Compiled stream-producer WASM component.
-///
-/// Ports: optional Value input `burst-size` (u32, default 1),
-/// Stream output `items` (u32). Pushes `burst-size` items then
-/// closes the stream.
-pub const STREAM_PRODUCER: &[u8] = include_bytes!(env!("STREAM_PRODUCER_WASM"));
+macro_rules! guest {
+    ($wasm:literal, $dir:literal) => {
+        Guest {
+            wasm: include_bytes!(env!($wasm)),
+            wit: concat!(env!("CARGO_MANIFEST_DIR"), "/guests/", $dir, "/wit"),
+        }
+    };
+}
 
-/// Compiled stream-consumer WASM component.
-///
-/// Ports: Stream input `items` (u32), Value output `total` (u32).
-/// Accumulates stream items into a running sum.
-pub const STREAM_CONSUMER: &[u8] = include_bytes!(env!("STREAM_CONSUMER_WASM"));
+/// Sync. `in: option<f64>` → `out: f64`; absent input reads as 0.0.
+pub const ECHO: Guest = guest!("ECHO_WASM", "echo");
 
-/// Compiled MQTT node WASM component with custom host import.
-///
-/// Ports: Value output `count` (u32). Imports
-/// `witgraph:runtime/mqtt-source::next-message` and counts messages.
-pub const MQTT_NODE: &[u8] = include_bytes!(env!("MQTT_NODE_WASM"));
+/// Sync. `rate: option<u32>`, `gain: option<f64>` → `result: f64`
+/// (`rate * gain`, defaults 1 and 1.0).
+pub const CONFIGURABLE: Guest = guest!("CONFIGURABLE_WASM", "configurable");
+
+/// Sync. `in: u32`, `add: option<u32>` → `out: u32` (`in + add`).
+pub const RELAY: Guest = guest!("RELAY_WASM", "relay");
+
+/// Async. `burst-size: option<u32>` → `items: stream<u32>` streaming
+/// 0, 1, 2, ... (forever when `burst-size` is absent), stopping once the
+/// reader is dropped.
+pub const STREAM_PRODUCER: Guest = guest!("STREAM_PRODUCER_WASM", "stream-producer");
+
+/// Async. `items: stream<u32>`, `take: option<u32>`, `delay: option<u32>` →
+/// `total: u32`, `count: u32`. Returns once the stream ends or `take` items
+/// were read; yields `delay` times per item.
+pub const STREAM_CONSUMER: Guest = guest!("STREAM_CONSUMER_WASM", "stream-consumer");
+
+/// Async. Imports the `test:mqtt/source` capability and streams its
+/// messages on `messages: stream<u32>` until the feed is exhausted.
+pub const MQTT_NODE: Guest = guest!("MQTT_NODE_WASM", "mqtt-node");
+
+/// Async. `action: option<enum { finish, spin, trap, fatal }>` (default
+/// `finish`) → `done: u32`.
+/// Spins forever, traps, or calls `witgraph:runtime/host.fatal` on request.
+pub const BUSY_LOOP: Guest = guest!("BUSY_LOOP_WASM", "busy-loop");

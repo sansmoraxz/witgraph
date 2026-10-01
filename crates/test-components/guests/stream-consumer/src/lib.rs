@@ -1,57 +1,26 @@
-#[allow(warnings)]
-mod bindings {
-    wit_bindgen::generate!({
-        path: "../../../witgraph-runtime/wit",
-        world: "graph-node",
-    });
-}
+wit_bindgen::generate!({ path: "wit", world: "stream-consumer" });
 
-use bindings::exports::witgraph::runtime::node::Guest;
-use bindings::witgraph::runtime::runtime_host;
-use bindings::witgraph::runtime::types::{ActivationKind, ActivationResult};
+use exports::node::{Guest, Inputs, Outputs};
 
-use std::cell::Cell;
+struct Consumer;
 
-#[derive(serde::Serialize, serde::Deserialize)]
-enum Val {
-    U32(u32),
-}
-
-fn read_u32_val(bytes: &[u8]) -> u32 {
-    serde_json::from_slice::<Val>(bytes)
-        .map(|v| match v {
-            Val::U32(n) => n,
-        })
-        .unwrap_or(0)
-}
-
-thread_local! {
-    static TOTAL: Cell<u32> = const { Cell::new(0) };
-}
-
-struct StreamConsumer;
-
-impl Guest for StreamConsumer {
-    fn init() {}
-
-    fn activate(reason: ActivationKind) -> ActivationResult {
-        match reason {
-            ActivationKind::StreamItem(info) => {
-                let item = read_u32_val(&info.data);
-                TOTAL.with(|total| {
-                    let new_total = total.get() + item;
-                    total.set(new_total);
-                    let out = serde_json::to_vec(&Val::U32(new_total)).unwrap_or_default();
-                    runtime_host::write_value("total", &out);
-                });
-                ActivationResult::Continue
+impl Guest for Consumer {
+    async fn run(inputs: Inputs) -> Outputs {
+        let Inputs { mut items, take, delay } = inputs;
+        let mut total = 0u32;
+        let mut count = 0u32;
+        while take.is_none_or(|t| count < t) {
+            let Some(item) = items.next().await else { break };
+            total = total.wrapping_add(item);
+            count += 1;
+            for _ in 0..delay.unwrap_or(0) {
+                wit_bindgen::yield_async().await;
             }
-            ActivationKind::StreamClosed(_) => ActivationResult::Completed,
-            _ => ActivationResult::Continue,
         }
+        // Dropping the reader tells the producer to stop.
+        drop(items);
+        Outputs { total, count }
     }
-
-    fn dispose() {}
 }
 
-bindings::export!(StreamConsumer with_types_in bindings);
+export!(Consumer);

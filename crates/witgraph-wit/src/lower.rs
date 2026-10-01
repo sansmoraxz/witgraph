@@ -1,48 +1,89 @@
 //! Lowering resolved WIT worlds into witgraph component contracts.
 //!
 //! Convention: a witgraph component is a WIT world that exports an interface
-//! named `node` containing up to five well-known records:
+//! named `node`. The interface declares its ports as fields of up to two
+//! well-known records (at least one must be present), and exactly one
+//! function, `run`:
 //!
-//! | record           | direction | field type meaning                                   |
-//! |------------------|-----------|------------------------------------------------------|
-//! | `inputs`         | input     | `T` → Value; top-level `option<T>` → optional Value; |
-//! |                  |           | `stream<T>` → Stream; `future<T>` → Future           |
-//! | `outputs`        | output    | same mapping (no optional unwrapping)                |
-//! | `input-events`   | input     | Event, field type is the payload directly            |
-//! | `output-events`  | output    | Event, field type is the payload directly            |
-//! | `drained-inputs` | input     | `stream<T>`/`future<T>` only: consumed to completion |
-//! |                  |           | before first activation, latched as the total        |
+//! ```wit
+//! export node: interface {
+//!     record inputs  { rate: option<u32>, samples: stream<f64> }
+//!     record outputs { latest: f64, total: future<f64> }
+//!     run: async func(inputs: inputs) -> outputs;
+//! }
+//! ```
 //!
-//! Top-level `option<T>` unwraps only on inputs, where it marks the port
-//! optional (may be left unconnected); an output field of `option<T>` is a
-//! Value whose payload is the option itself. Events have no optional form —
-//! an event that never fires delivers nothing, so there is nothing for
-//! `option` to add.
+//! A field's port kind comes from its type, identically on both sides:
+//!
+//! | field type   | port kind | notes                                          |
+//! |--------------|-----------|------------------------------------------------|
+//! | `T`          | Value     | read when `run` starts / latched when it returns |
+//! | `option<T>`  | Value     | on `inputs` only: optional, may stay unconnected |
+//! | `stream<T>`  | Stream    | bare `stream` carries the unit payload         |
+//! | `future<T>`  | Future    | bare `future` carries the unit payload         |
+//!
+//! Top-level `option<T>` unwraps only on inputs; an output field of
+//! `option<T>` is a Value whose payload is the option itself. `stream` and
+//! `future` may appear only at the top level of a field.
+//!
+//! `run` must be `func` or `async func` (recorded as
+//! [`RunKind`]). It takes exactly `(inputs: inputs)`
+//! when an `inputs` record exists and no parameters otherwise, and returns
+//! `outputs` when an `outputs` record exists and nothing otherwise. No other
+//! function may appear in `node`.
+//!
+//! Payload types are resolved by wasm-wave
+//! ([`wasm_wave::value::resolve_wit_type`]), so a payload is exactly what WAVE
+//! can represent. Resources, handles, `map`, `error-context`, nested
+//! `stream`/`future`, and fixed-length lists (whose length the contract hash
+//! cannot observe) are rejected. Empty `record`/`flags`/`tuple` types parse
+//! as WIT but can never appear in a component, so any in the source fail
+//! every world.
 //!
 //! The world's imported functions and function-carrying interfaces are its
-//! capabilities; type-only imports are structural, not capabilities. Inputs
-//! may mix sync and async kinds: any undrained async input colors the node
-//! async, with Value inputs latched. A node whose async inputs are all
-//! drained is sync — it fires once with the drained totals. Values and
-//! Events have no completion semantics, so a `drained-inputs` field must
-//! lower to Stream or Future.
+//! capabilities; type-only imports are structural, and imports from the
+//! built-in `witgraph:runtime` package are provided by every witgraph host,
+//! so neither counts as a capability.
 
 use core::fmt;
 use std::collections::HashSet;
 
+use wasm_wave::value::resolve_wit_type;
+use wasm_wave::wasm::{WasmTypeKind, WasmValueError};
 use wit_parser as wp;
 use wit_parser::{Resolve, TypeId, WorldItem, WorldKey};
 use witgraph_ir::{
-    Capability, Case, ComponentContract, ComponentRef, EnumType, Field, FlagsType, PackageRef,
-    PortDef, PortDirection, PortKind, PortName, Record, Type, TypeDecl, Variant,
+    Capability, ComponentContract, ComponentRef, PackageRef, PortDef, PortDirection, PortKind,
+    PortName, RunKind, Type,
 };
 
 use crate::hash;
 use crate::load::WitSource;
 
 /// The well-known record names, rendered for error messages.
-const WELL_KNOWN_NAMES: &str =
-    "`inputs`, `outputs`, `input-events`, `output-events`, `drained-inputs`";
+const WELL_KNOWN_NAMES: &str = "`inputs`, `outputs`";
+
+/// One lowered component world: its contract plus the named WIT types its
+/// ports reference. Type names are not part of the contract (payload types
+/// are structural); they are kept for editor metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Lowered {
+    /// The component's contract.
+    pub contract: ComponentContract,
+    /// Named types reached from the ports, in first-reference order.
+    pub types: Vec<NamedType>,
+}
+
+/// A named WIT type reached from a port.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamedType {
+    /// The WIT-declared type name.
+    pub name: String,
+    /// The structural type the name resolves to.
+    pub ty: Type,
+    /// Doc comment from the WIT declaration, if any.
+    pub docs: Option<String>,
+}
 
 /// One or more worlds failed to lower; every failing world is reported.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,14 +123,23 @@ pub enum LowerErrorKind {
     /// The world exports more than one interface named `node`.
     #[error("exports more than one interface named `node`; the node contract must be unambiguous")]
     AmbiguousNodeExport,
-    /// The `node` interface declares a function.
+    /// The `node` interface declares a function other than `run`.
     #[error(
-        "the `node` interface declares a function `{function}`; a node's contract \
-         is data-only — ports are record fields"
+        "the `node` interface declares a function `{function}`; its only function \
+         is `run` — ports are record fields"
     )]
     FunctionInNodeInterface {
         /// The offending function's name.
         function: String,
+    },
+    /// The `node` interface declares no `run` function.
+    #[error("the `node` interface declares no `run` function")]
+    MissingRun,
+    /// `run` does not have the signature its records call for.
+    #[error("`run` has the wrong signature: {reason}")]
+    BadRunSignature {
+        /// What is wrong with it.
+        reason: String,
     },
     /// The `node` interface defines none of the well-known records.
     #[error(
@@ -112,14 +162,13 @@ pub enum LowerErrorKind {
         /// The duplicated port name.
         port: PortName,
     },
-    /// A type in the `node` interface that no port reaches.
-    #[error(
-        "type `{name}` in the `node` interface is neither a well-known record \
-         ({WELL_KNOWN_NAMES}) nor referenced by one"
-    )]
-    UnreferencedType {
-        /// The unreachable type's name.
-        name: String,
+    /// The WIT source declares an empty `record`, `flags` or `tuple`.
+    #[error("the WIT source declares an empty {what}{}; components cannot contain empty {what} types", name.as_ref().map(|n| format!(" `{n}`")).unwrap_or_default())]
+    EmptyType {
+        /// Which kind of type is empty.
+        what: &'static str,
+        /// The type's name, when it has one.
+        name: Option<String>,
     },
     /// A port field failed to lower.
     #[error("record `{record}`, field `{field}`: {kind}")]
@@ -137,58 +186,40 @@ pub enum LowerErrorKind {
 /// [`LowerErrorKind::Field`] adds the record and field names.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum FieldErrorKind {
-    /// An event field's payload is a `stream` or `future`.
-    #[error(
-        "event payloads cannot be `stream`/`future` — an event delivers one \
-         occurrence's payload"
-    )]
-    AsyncEventPayload,
-    /// A `drained-inputs` field lowered to a kind with no completion.
-    #[error(
-        "only `stream` and `future` fields can be drained; \
-         a {kind} has no completion to drain"
-    )]
-    NotDrainable {
-        /// The kind the field lowered to.
-        kind: PortKind,
-    },
     /// A `stream`/`future` below the top level of a port field.
     #[error(
         "nested `stream`/`future` — async types may only appear \
          at the top level of a port field"
     )]
     NestedAsync,
-    /// A resource or handle type in a payload.
-    #[error("resource types are not supported in port payloads")]
-    Resource,
-    /// A `map` type in a payload.
-    #[error("`map` types are not supported in port payloads")]
-    Map,
-    /// A fixed-length `list` type in a payload.
-    #[error("fixed-length `list` types are not supported in port payloads")]
-    FixedLengthList,
-    /// An `error-context` type in a payload.
-    #[error("`error-context` is not supported in port payloads")]
-    ErrorContext,
-    /// A type reference wit-parser could not resolve.
-    #[error("unresolved type reference")]
-    UnresolvedType,
-    /// A payload references one of the well-known records.
-    #[error("a well-known record ({WELL_KNOWN_NAMES}) cannot be used as a payload type")]
-    WellKnownPayload,
-    /// The same type name is bound to two structurally different types.
-    #[error("type name `{name}` refers to two structurally different types")]
-    ConflictingTypeName {
-        /// The conflicting name.
-        name: String,
+    /// A payload type WAVE (or the contract hash) cannot represent.
+    #[error("`{kind}` types are not supported in port payloads")]
+    Unsupported {
+        /// The offending kind, as wit-parser or wasm-wave names it.
+        kind: String,
     },
+}
+
+impl From<WasmValueError> for FieldErrorKind {
+    fn from(err: WasmValueError) -> Self {
+        match err {
+            WasmValueError::UnsupportedType(kind) if kind == "stream" || kind == "future" => {
+                Self::NestedAsync
+            }
+            WasmValueError::UnsupportedType(kind) => Self::Unsupported { kind },
+            other => Self::Unsupported {
+                kind: other.to_string(),
+            },
+        }
+    }
 }
 
 /// Lower every witgraph component world in the source's root packages.
 /// Worlds that don't export a `node` interface are skipped. Every world is
 /// attempted; the error reports all failing worlds, not just the first.
-pub fn lower(source: &WitSource) -> Result<Vec<ComponentContract>, LowerFailures> {
+pub fn lower(source: &WitSource) -> Result<Vec<Lowered>, LowerFailures> {
     let resolve = &source.resolve;
+    let empty = find_empty_type(resolve);
     let mut contracts = Vec::new();
     let mut failures: Vec<LowerError> = Vec::new();
     for &package_id in &source.packages {
@@ -200,8 +231,15 @@ pub fn lower(source: &WitSource) -> Result<Vec<ComponentContract>, LowerFailures
         };
         for &world_id in package.worlds.values() {
             let world = &resolve.worlds[world_id];
-            match lower_world(resolve, world, &package_ref) {
-                Ok(Some(contract)) => contracts.push(contract),
+            let lowered = match &empty {
+                // wasm-wave panics on these, so no world may lower past them.
+                Some(kind) if find_node_export(resolve, world).is_ok_and(|n| n.is_some()) => {
+                    Err(kind.clone())
+                }
+                _ => lower_world(resolve, world, &package_ref),
+            };
+            match lowered {
+                Ok(Some(lowered)) => contracts.push(lowered),
                 Ok(None) => {}
                 Err(kind) => failures.push(LowerError {
                     world: world.name.clone(),
@@ -246,68 +284,59 @@ fn find_node_export(
     }
 }
 
-/// How a well-known record's fields lower to ports.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum FieldRole {
-    /// `T` → Value (top-level `option<T>` optional on inputs);
-    /// `stream`/`future` → async kinds.
-    Data,
-    /// Event; the field type is the payload directly.
-    Event,
-    /// Like `Data`, but drained: must lower to Stream or Future.
-    Drained,
-}
-
-const WELL_KNOWN: [(&str, PortDirection, FieldRole); 5] = [
-    ("inputs", PortDirection::Input, FieldRole::Data),
-    ("outputs", PortDirection::Output, FieldRole::Data),
-    ("input-events", PortDirection::Input, FieldRole::Event),
-    ("output-events", PortDirection::Output, FieldRole::Event),
-    ("drained-inputs", PortDirection::Input, FieldRole::Drained),
+const WELL_KNOWN: [(&str, PortDirection); 2] = [
+    ("inputs", PortDirection::Input),
+    ("outputs", PortDirection::Output),
 ];
 
 fn lower_world(
     resolve: &Resolve,
     world: &wp::World,
     package: &PackageRef,
-) -> Result<Option<ComponentContract>, LowerErrorKind> {
+) -> Result<Option<Lowered>, LowerErrorKind> {
     let Some(node) = find_node_export(resolve, world)? else {
         return Ok(None);
     };
     let interface = &resolve.interfaces[node];
-    if let Some(function) = interface.functions.keys().next() {
+    if let Some(function) = interface.functions.keys().find(|name| *name != "run") {
         return Err(LowerErrorKind::FunctionInNodeInterface {
             function: function.clone(),
         });
     }
 
-    // Resolve the well-known records before lowering any field, so payload
-    // lowering can reject references back into them.
     let mut consumed: HashSet<TypeId> = HashSet::new();
     let mut records = Vec::new();
-    for (record_name, direction, role) in WELL_KNOWN {
+    let mut record_ids: [Option<TypeId>; 2] = [None, None];
+    for (slot, (record_name, direction)) in WELL_KNOWN.into_iter().enumerate() {
         let Some(&type_id) = interface.types.get(record_name) else {
             continue;
         };
-        let record = expect_record(resolve, type_id, record_name, &mut consumed)?;
-        records.push((record_name, direction, role, record));
+        let (record, defining) = expect_record(resolve, type_id, record_name, &mut consumed)?;
+        record_ids[slot] = Some(defining);
+        records.push((record_name, direction, record));
     }
 
     if records.is_empty() {
         return Err(LowerErrorKind::NoWellKnownRecords);
     }
 
-    let mut lowerer = Lowerer {
-        resolve,
-        well_known: &consumed,
-        type_names: Vec::new(),
-        referenced: HashSet::new(),
-    };
+    let run = interface
+        .functions
+        .get("run")
+        .ok_or(LowerErrorKind::MissingRun)?;
+    let [inputs_id, outputs_id] = record_ids;
+    let run = run_kind(resolve, run, inputs_id, outputs_id)?;
+
     let mut inputs = Vec::new();
     let mut outputs = Vec::new();
-    for (record_name, direction, role, record) in records {
+    for (record_name, direction, record) in records {
         for field in &record.fields {
-            let port = lowerer.lower_port(field, direction, role, record_name)?;
+            let port =
+                lower_field(resolve, field, direction).map_err(|kind| LowerErrorKind::Field {
+                    record: record_name,
+                    field: field.name.clone(),
+                    kind,
+                })?;
             match direction {
                 PortDirection::Input => inputs.push(port),
                 PortDirection::Output => outputs.push(port),
@@ -330,13 +359,6 @@ fn lower_world(
         }
     }
 
-    for (name, type_id) in &interface.types {
-        if consumed.contains(type_id) || lowerer.referenced.contains(type_id) {
-            continue;
-        }
-        return Err(LowerErrorKind::UnreferencedType { name: name.clone() });
-    }
-
     let mut contract = ComponentContract {
         id: ComponentRef {
             package: package.clone(),
@@ -345,25 +367,153 @@ fn lower_world(
         },
         inputs,
         outputs,
+        run,
         capabilities: capabilities(resolve, world, package),
-        type_names: lowerer.type_names,
         docs: world.docs.contents.clone(),
     };
     contract.id.content_hash = Some(hash::content_hash(&contract));
-    Ok(Some(contract))
+    Ok(Some(Lowered {
+        contract,
+        types: named_types(resolve, interface, &consumed),
+    }))
 }
 
+/// The first empty `record`, `flags` or `tuple` anywhere in the source.
+/// wit-parser accepts these, but wasm-wave cannot represent them (its
+/// resolver panics) and component validation rejects them.
+fn find_empty_type(resolve: &Resolve) -> Option<LowerErrorKind> {
+    resolve.types.iter().find_map(|(_, def)| {
+        let what = match &def.kind {
+            wp::TypeDefKind::Record(r) if r.fields.is_empty() => "record",
+            wp::TypeDefKind::Flags(f) if f.flags.is_empty() => "flags",
+            wp::TypeDefKind::Tuple(t) if t.types.is_empty() => "tuple",
+            _ => return None,
+        };
+        Some(LowerErrorKind::EmptyType {
+            what,
+            name: def.name.clone(),
+        })
+    })
+}
+
+/// Named value types declared in (or `use`d into) the `node` interface,
+/// other than the well-known records, for editor metadata. Types WAVE cannot
+/// represent are left out; ports that use them already failed to lower.
+fn named_types(
+    resolve: &Resolve,
+    interface: &wp::Interface,
+    well_known: &HashSet<TypeId>,
+) -> Vec<NamedType> {
+    interface
+        .types
+        .iter()
+        .filter(|(_, id)| !well_known.contains(id))
+        .filter_map(|(name, &id)| {
+            let ty = resolve_wit_type(resolve, id).ok()?;
+            let defining = defining_id(resolve, &wp::Type::Id(id)).unwrap_or(id);
+            Some(NamedType {
+                name: name.clone(),
+                ty,
+                docs: resolve.types[defining].docs.contents.clone(),
+            })
+        })
+        .collect()
+}
+
+/// Follow `type x = y` alias chains to the defining kind, if any.
+fn top_kind<'a>(resolve: &'a Resolve, ty: &wp::Type) -> Option<&'a wp::TypeDefKind> {
+    let id = defining_id(resolve, ty)?;
+    Some(&resolve.types[id].kind)
+}
+
+fn lower_field(
+    resolve: &Resolve,
+    field: &wp::Field,
+    direction: PortDirection,
+) -> Result<PortDef, FieldErrorKind> {
+    let (kind, optional, ty) = match top_kind(resolve, &field.ty) {
+        Some(wp::TypeDefKind::Stream(payload)) => (
+            PortKind::Stream,
+            false,
+            payload
+                .as_ref()
+                .map(|t| payload_type(resolve, t))
+                .transpose()?,
+        ),
+        Some(wp::TypeDefKind::Future(payload)) => (
+            PortKind::Future,
+            false,
+            payload
+                .as_ref()
+                .map(|t| payload_type(resolve, t))
+                .transpose()?,
+        ),
+        Some(wp::TypeDefKind::Option(inner)) if direction == PortDirection::Input => {
+            (PortKind::Value, true, Some(payload_type(resolve, inner)?))
+        }
+        _ => (
+            PortKind::Value,
+            false,
+            Some(payload_type(resolve, &field.ty)?),
+        ),
+    };
+    Ok(PortDef {
+        name: field.name.clone().into(),
+        kind,
+        ty,
+        optional,
+        docs: field.docs.contents.clone(),
+    })
+}
+
+/// A payload type, resolved by wasm-wave. wasm-wave resolves type ids only,
+/// so the primitive leaves are mapped here.
+fn payload_type(resolve: &Resolve, ty: &wp::Type) -> Result<Type, FieldErrorKind> {
+    let ty = match ty {
+        wp::Type::Id(id) => resolve_wit_type(resolve, *id)?,
+        wp::Type::Bool => Type::BOOL,
+        wp::Type::U8 => Type::U8,
+        wp::Type::U16 => Type::U16,
+        wp::Type::U32 => Type::U32,
+        wp::Type::U64 => Type::U64,
+        wp::Type::S8 => Type::S8,
+        wp::Type::S16 => Type::S16,
+        wp::Type::S32 => Type::S32,
+        wp::Type::S64 => Type::S64,
+        wp::Type::F32 => Type::F32,
+        wp::Type::F64 => Type::F64,
+        wp::Type::Char => Type::CHAR,
+        wp::Type::String => Type::STRING,
+        wp::Type::ErrorContext => {
+            return Err(FieldErrorKind::Unsupported {
+                kind: "error-context".into(),
+            });
+        }
+    };
+    match hash::unsupported_kind(&ty) {
+        Some(kind) => Err(FieldErrorKind::Unsupported {
+            kind: match kind {
+                WasmTypeKind::FixedLengthList => "fixed-length list".into(),
+                other => other.to_string(),
+            },
+        }),
+        None => Ok(ty),
+    }
+}
+
+/// The record a well-known name resolves to, plus the id of its defining
+/// type (the end of any alias chain).
 fn expect_record<'a>(
     resolve: &'a Resolve,
     mut id: TypeId,
     name: &'static str,
     consumed: &mut HashSet<TypeId>,
-) -> Result<&'a wp::Record, LowerErrorKind> {
+) -> Result<(&'a wp::Record, TypeId), LowerErrorKind> {
     loop {
         consumed.insert(id);
         match &resolve.types[id].kind {
             wp::TypeDefKind::Type(wp::Type::Id(next)) => id = *next,
-            wp::TypeDefKind::Record(record) => return Ok(record),
+            wp::TypeDefKind::Record(record) => return Ok((record, id)),
             other => {
                 return Err(LowerErrorKind::WellKnownNotARecord {
                     record: name,
@@ -374,9 +524,64 @@ fn expect_record<'a>(
     }
 }
 
+/// The defining type id of `ty`, following `type x = y` aliases.
+fn defining_id(resolve: &Resolve, ty: &wp::Type) -> Option<TypeId> {
+    let wp::Type::Id(mut id) = *ty else {
+        return None;
+    };
+    while let wp::TypeDefKind::Type(wp::Type::Id(next)) = resolve.types[id].kind {
+        id = next;
+    }
+    Some(id)
+}
+
+/// Validates `run` against the records the node declares.
+fn run_kind(
+    resolve: &Resolve,
+    run: &wp::Function,
+    inputs: Option<TypeId>,
+    outputs: Option<TypeId>,
+) -> Result<RunKind, LowerErrorKind> {
+    let bad = |reason: &str| LowerErrorKind::BadRunSignature {
+        reason: reason.into(),
+    };
+    let kind = match run.kind {
+        wp::FunctionKind::Freestanding => RunKind::Sync,
+        wp::FunctionKind::AsyncFreestanding => RunKind::Async,
+        _ => return Err(bad("`run` must be a plain `func` or `async func`")),
+    };
+    match (inputs, run.params.as_slice()) {
+        (Some(id), [param])
+            if param.name == "inputs" && defining_id(resolve, &param.ty) == Some(id) => {}
+        (Some(_), _) => {
+            return Err(bad(
+                "`run` must take exactly one parameter, `inputs: inputs`",
+            ));
+        }
+        (None, []) => {}
+        (None, _) => {
+            return Err(bad(
+                "`run` must take no parameters when the node has no `inputs` record",
+            ));
+        }
+    }
+    match (outputs, &run.result) {
+        (Some(id), Some(ty)) if defining_id(resolve, ty) == Some(id) => {}
+        (Some(_), _) => return Err(bad("`run` must return `outputs`")),
+        (None, None) => {}
+        (None, Some(_)) => {
+            return Err(bad(
+                "`run` must return nothing when the node has no `outputs` record",
+            ));
+        }
+    }
+    Ok(kind)
+}
+
 /// Imported functions and function-carrying interfaces. Type-only imports
-/// (bare types, function-less interfaces) demand nothing of the host, so
-/// they are not capabilities.
+/// (bare types, function-less interfaces) demand nothing of the host, and
+/// the built-in `witgraph:runtime` package is provided by every host, so
+/// neither is a capability.
 ///
 /// A named interface's capability is its full id
 /// (`namespace:name/interface@version`). An anonymous inline interface has
@@ -389,7 +594,8 @@ fn capabilities(resolve: &Resolve, world: &wp::World, package: &PackageRef) -> V
         .iter()
         .filter_map(|(key, item)| match item {
             WorldItem::Interface { id, .. } => {
-                if resolve.interfaces[*id].functions.is_empty() {
+                let interface = &resolve.interfaces[*id];
+                if interface.functions.is_empty() || is_witgraph_runtime(resolve, interface) {
                     return None;
                 }
                 let name = resolve.id_of(*id).unwrap_or_else(|| {
@@ -419,233 +625,39 @@ fn capabilities(resolve: &Resolve, world: &wp::World, package: &PackageRef) -> V
     capabilities
 }
 
-struct Lowerer<'a> {
-    resolve: &'a Resolve,
-    /// Type ids of the well-known records, alias chains included.
-    well_known: &'a HashSet<TypeId>,
-    type_names: Vec<TypeDecl>,
-    /// Ids of every type reached from a port field.
-    referenced: HashSet<TypeId>,
-}
-
-impl<'a> Lowerer<'a> {
-    /// Follow `type x = y` alias chains to the defining kind, if any.
-    fn top_kind(&self, ty: &wp::Type) -> Option<&'a wp::TypeDefKind> {
-        let mut current = *ty;
-        loop {
-            let wp::Type::Id(id) = current else {
-                return None;
-            };
-            match &self.resolve.types[id].kind {
-                wp::TypeDefKind::Type(inner) => current = *inner,
-                kind => return Some(kind),
-            }
-        }
-    }
-
-    /// Record every type on the alias chain from `ty` as referenced,
-    /// including chains that end in `stream`/`future`/`option` and so never
-    /// reach [`Lowerer::lower_typedef`].
-    fn mark_referenced(&mut self, ty: &wp::Type) {
-        let mut current = *ty;
-        while let wp::Type::Id(id) = current {
-            self.referenced.insert(id);
-            match &self.resolve.types[id].kind {
-                wp::TypeDefKind::Type(inner) => current = *inner,
-                _ => break,
-            }
-        }
-    }
-
-    fn lower_port(
-        &mut self,
-        field: &wp::Field,
-        direction: PortDirection,
-        role: FieldRole,
-        record_name: &'static str,
-    ) -> Result<PortDef, LowerErrorKind> {
-        self.lower_field(field, direction, role)
-            .map_err(|kind| LowerErrorKind::Field {
-                record: record_name,
-                field: field.name.clone(),
-                kind,
-            })
-    }
-
-    fn lower_field(
-        &mut self,
-        field: &wp::Field,
-        direction: PortDirection,
-        role: FieldRole,
-    ) -> Result<PortDef, FieldErrorKind> {
-        self.mark_referenced(&field.ty);
-        let (kind, optional, ty) = if role == FieldRole::Event {
-            if matches!(
-                self.top_kind(&field.ty),
-                Some(wp::TypeDefKind::Stream(_) | wp::TypeDefKind::Future(_))
-            ) {
-                return Err(FieldErrorKind::AsyncEventPayload);
-            }
-            (PortKind::Event, false, self.lower_type(&field.ty)?)
-        } else {
-            match self.top_kind(&field.ty) {
-                Some(wp::TypeDefKind::Stream(payload)) => {
-                    (PortKind::Stream, false, self.lower_payload(payload)?)
-                }
-                Some(wp::TypeDefKind::Future(payload)) => {
-                    (PortKind::Future, false, self.lower_payload(payload)?)
-                }
-                Some(wp::TypeDefKind::Option(inner)) if direction == PortDirection::Input => {
-                    let inner = *inner;
-                    (PortKind::Value, true, self.lower_type(&inner)?)
-                }
-                _ => (PortKind::Value, false, self.lower_type(&field.ty)?),
-            }
-        };
-        if role == FieldRole::Drained && !matches!(kind, PortKind::Stream | PortKind::Future) {
-            return Err(FieldErrorKind::NotDrainable { kind });
-        }
-        Ok(PortDef {
-            name: field.name.clone().into(),
-            kind,
-            ty,
-            optional,
-            drained: role == FieldRole::Drained,
-            docs: field.docs.contents.clone(),
-        })
-    }
-
-    fn lower_payload(&mut self, payload: &Option<wp::Type>) -> Result<Type, FieldErrorKind> {
-        match payload {
-            Some(ty) => {
-                let ty = *ty;
-                self.lower_type(&ty)
-            }
-            // Bare `future`/`stream`: unit payload.
-            None => Ok(Type::Tuple(vec![])),
-        }
-    }
-
-    fn lower_type(&mut self, ty: &wp::Type) -> Result<Type, FieldErrorKind> {
-        Ok(match ty {
-            wp::Type::Bool => Type::Bool,
-            wp::Type::U8 => Type::U8,
-            wp::Type::U16 => Type::U16,
-            wp::Type::U32 => Type::U32,
-            wp::Type::U64 => Type::U64,
-            wp::Type::S8 => Type::S8,
-            wp::Type::S16 => Type::S16,
-            wp::Type::S32 => Type::S32,
-            wp::Type::S64 => Type::S64,
-            wp::Type::F32 => Type::F32,
-            wp::Type::F64 => Type::F64,
-            wp::Type::Char => Type::Char,
-            wp::Type::String => Type::String,
-            wp::Type::Id(id) => return self.lower_typedef(*id),
-            wp::Type::ErrorContext => return Err(FieldErrorKind::ErrorContext),
-        })
-    }
-
-    fn lower_typedef(&mut self, id: TypeId) -> Result<Type, FieldErrorKind> {
-        if self.well_known.contains(&id) {
-            return Err(FieldErrorKind::WellKnownPayload);
-        }
-        self.referenced.insert(id);
-        let def = &self.resolve.types[id];
-        let lowered = match &def.kind {
-            wp::TypeDefKind::Type(inner) => self.lower_type(inner)?,
-            wp::TypeDefKind::Record(record) => Type::Record(Record {
-                fields: record
-                    .fields
-                    .iter()
-                    .map(|f| {
-                        Ok(Field {
-                            name: f.name.clone(),
-                            ty: self.lower_type(&f.ty)?,
-                        })
-                    })
-                    .collect::<Result<_, FieldErrorKind>>()?,
-            }),
-            wp::TypeDefKind::Variant(variant) => Type::Variant(Variant {
-                cases: variant
-                    .cases
-                    .iter()
-                    .map(|c| {
-                        Ok(Case {
-                            name: c.name.clone(),
-                            ty: c.ty.as_ref().map(|t| self.lower_type(t)).transpose()?,
-                        })
-                    })
-                    .collect::<Result<_, FieldErrorKind>>()?,
-            }),
-            wp::TypeDefKind::Enum(e) => Type::Enum(EnumType {
-                cases: e.cases.iter().map(|c| c.name.clone()).collect(),
-            }),
-            wp::TypeDefKind::Flags(f) => Type::Flags(FlagsType {
-                flags: f.flags.iter().map(|f| f.name.clone()).collect(),
-            }),
-            wp::TypeDefKind::Option(inner) => Type::Option(Box::new(self.lower_type(inner)?)),
-            wp::TypeDefKind::List(inner) => Type::List(Box::new(self.lower_type(inner)?)),
-            wp::TypeDefKind::Tuple(tuple) => Type::Tuple(
-                tuple
-                    .types
-                    .iter()
-                    .map(|t| self.lower_type(t))
-                    .collect::<Result<_, FieldErrorKind>>()?,
-            ),
-            wp::TypeDefKind::Result(result) => Type::Result {
-                ok: result
-                    .ok
-                    .as_ref()
-                    .map(|t| self.lower_type(t).map(Box::new))
-                    .transpose()?,
-                err: result
-                    .err
-                    .as_ref()
-                    .map(|t| self.lower_type(t).map(Box::new))
-                    .transpose()?,
-            },
-            wp::TypeDefKind::Future(_) | wp::TypeDefKind::Stream(_) => {
-                return Err(FieldErrorKind::NestedAsync);
-            }
-            wp::TypeDefKind::Resource | wp::TypeDefKind::Handle(_) => {
-                return Err(FieldErrorKind::Resource);
-            }
-            wp::TypeDefKind::Map(..) => return Err(FieldErrorKind::Map),
-            wp::TypeDefKind::FixedLengthList(..) => return Err(FieldErrorKind::FixedLengthList),
-            wp::TypeDefKind::Unknown => return Err(FieldErrorKind::UnresolvedType),
-        };
-        if let Some(name) = &def.name {
-            if let Some(existing) = self.type_names.iter().find(|d| d.name == *name) {
-                if existing.ty != lowered {
-                    return Err(FieldErrorKind::ConflictingTypeName { name: name.clone() });
-                }
-            } else {
-                self.type_names.push(TypeDecl {
-                    name: name.clone(),
-                    ty: lowered.clone(),
-                    docs: def.docs.contents.clone(),
-                });
-            }
-        }
-        Ok(lowered)
-    }
+fn is_witgraph_runtime(resolve: &Resolve, interface: &wp::Interface) -> bool {
+    interface.package.is_some_and(|package| {
+        let name = &resolve.packages[package].name;
+        name.namespace == "witgraph" && name.name == "runtime"
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::load::load_str;
-    use witgraph_ir::ConsumptionMode;
+    use witgraph_ir::NodeShape;
 
-    fn lower_source(wit: &str) -> Result<Vec<ComponentContract>, crate::Error> {
+    fn lower_all(wit: &str) -> Result<Vec<Lowered>, crate::Error> {
         Ok(lower(&load_str("test.wit", wit)?)?)
     }
 
+    fn lower_source(wit: &str) -> Result<Vec<ComponentContract>, crate::Error> {
+        Ok(lower_all(wit)?.into_iter().map(|l| l.contract).collect())
+    }
+
+    fn lower_lowered(wit: &str) -> Lowered {
+        let mut lowered = lower_all(wit).expect("lowering failed");
+        assert_eq!(lowered.len(), 1, "expected exactly one component world");
+        lowered.remove(0)
+    }
+
     fn lower_one(wit: &str) -> ComponentContract {
-        let mut contracts = lower_source(wit).expect("lowering failed");
-        assert_eq!(contracts.len(), 1, "expected exactly one component world");
-        contracts.remove(0)
+        lower_lowered(wit).contract
+    }
+
+    fn lower_err(wit: &str) -> String {
+        format!("{:#}", lower_source(wit).unwrap_err())
     }
 
     fn port<'a>(ports: &'a [PortDef], name: &str) -> &'a PortDef {
@@ -656,8 +668,8 @@ mod tests {
     }
 
     #[test]
-    fn sync_value_ports_lower_with_full_type_coverage() {
-        let contract = lower_one(
+    fn value_ports_lower_with_full_type_coverage() {
+        let Lowered { contract, types } = lower_lowered(
             r#"
             package demo:test@0.1.0;
 
@@ -684,6 +696,7 @@ mod tests {
                     out: point,
                     maybe: option<u64>,
                 }
+                run: func(inputs: inputs) -> outputs;
             }
 
             /// Lowers everything.
@@ -696,75 +709,33 @@ mod tests {
         assert_eq!(contract.id.to_string(), "demo:test/value-node@0.1.0");
         assert_eq!(contract.id.content_hash.as_ref().unwrap().len(), 64);
         assert_eq!(contract.docs.as_deref(), Some("Lowers everything."));
+        assert_eq!(contract.run, RunKind::Sync);
+        assert_eq!(contract.shape(), NodeShape::Reactive);
 
         assert!(contract.inputs.iter().all(|p| p.kind == PortKind::Value));
         let rate = port(&contract.inputs, "rate");
         assert!(rate.optional, "top-level option input is an optional Value");
-        assert_eq!(rate.ty, Type::U32);
+        assert_eq!(rate.ty, Some(Type::U32));
         assert_eq!(rate.docs.as_deref(), Some("Sampling rate."));
 
-        let expected_point = Type::Record(Record {
-            fields: vec![
-                Field {
-                    name: "x".into(),
-                    ty: Type::F32,
-                },
-                Field {
-                    name: "y".into(),
-                    ty: Type::F32,
-                },
-            ],
-        });
-        assert_eq!(port(&contract.inputs, "pos").ty, expected_point);
+        let ty = |name: &str| port(&contract.inputs, name).ty.clone().unwrap();
+        let expected_point = Type::record([("x", Type::F32), ("y", Type::F32)]).unwrap();
+        assert_eq!(ty("pos"), expected_point);
+        assert_eq!(ty("m"), Type::enum_ty(["fast", "slow"]).unwrap());
+        assert_eq!(ty("p"), Type::flags(["read", "write"]).unwrap());
         assert_eq!(
-            port(&contract.inputs, "m").ty,
-            Type::Enum(EnumType {
-                cases: vec!["fast".into(), "slow".into()]
-            })
+            ty("s"),
+            Type::variant([("circle", Some(Type::F32)), ("dot", None)]).unwrap()
         );
-        assert_eq!(
-            port(&contract.inputs, "p").ty,
-            Type::Flags(FlagsType {
-                flags: vec!["read".into(), "write".into()]
-            })
-        );
-        assert_eq!(
-            port(&contract.inputs, "s").ty,
-            Type::Variant(Variant {
-                cases: vec![
-                    Case {
-                        name: "circle".into(),
-                        ty: Some(Type::F32)
-                    },
-                    Case {
-                        name: "dot".into(),
-                        ty: None
-                    },
-                ],
-            })
-        );
-        assert_eq!(
-            port(&contract.inputs, "items").ty,
-            Type::List(Box::new(Type::String))
-        );
-        assert_eq!(
-            port(&contract.inputs, "pair").ty,
-            Type::Tuple(vec![Type::U8, Type::Char])
-        );
-        assert_eq!(
-            port(&contract.inputs, "res").ty,
-            Type::Result {
-                ok: Some(Box::new(Type::U32)),
-                err: Some(Box::new(Type::String)),
-            }
-        );
+        assert_eq!(ty("items"), Type::list(Type::STRING));
+        assert_eq!(ty("pair"), Type::tuple(vec![Type::U8, Type::CHAR]).unwrap());
+        assert_eq!(ty("res"), Type::result(Some(Type::U32), Some(Type::STRING)));
 
         let maybe = port(&contract.outputs, "maybe");
         assert!(!maybe.optional, "outputs get no optional unwrapping");
-        assert_eq!(maybe.ty, Type::Option(Box::new(Type::U64)));
+        assert_eq!(maybe.ty, Some(Type::option(Type::U64)));
 
-        let point_decl = contract
-            .type_names
+        let point_decl = types
             .iter()
             .find(|d| d.name == "point")
             .expect("named type recorded");
@@ -773,7 +744,7 @@ mod tests {
     }
 
     #[test]
-    fn async_ports_lower_to_stream_future_event() {
+    fn async_ports_lower_to_stream_and_future_on_both_sides() {
         let contract = lower_one(
             r#"
             package demo:test@0.1.0;
@@ -783,16 +754,14 @@ mod tests {
                     samples: stream<f64>,
                     done: future<string>,
                     tick: future,
+                    threshold: u32,
                 }
                 record outputs {
                     filtered: stream<f64>,
+                    total: future<f64>,
+                    latest: f64,
                 }
-                record input-events {
-                    trigger: f64,
-                }
-                record output-events {
-                    alert: string,
-                }
+                run: async func(inputs: inputs) -> outputs;
             }
 
             world async-node {
@@ -801,26 +770,28 @@ mod tests {
             "#,
         );
 
+        assert_eq!(contract.run, RunKind::Async);
+        assert_eq!(contract.shape(), NodeShape::Streaming);
         let samples = port(&contract.inputs, "samples");
-        assert_eq!((samples.kind, &samples.ty), (PortKind::Stream, &Type::F64));
+        assert_eq!(
+            (samples.kind, &samples.ty),
+            (PortKind::Stream, &Some(Type::F64))
+        );
         let done = port(&contract.inputs, "done");
-        assert_eq!((done.kind, &done.ty), (PortKind::Future, &Type::String));
+        assert_eq!(
+            (done.kind, &done.ty),
+            (PortKind::Future, &Some(Type::STRING))
+        );
         let tick = port(&contract.inputs, "tick");
         assert_eq!(
             (tick.kind, &tick.ty),
-            (PortKind::Future, &Type::Tuple(vec![])),
-            "bare future carries the unit payload"
+            (PortKind::Future, &None),
+            "a bare future carries no payload"
         );
-        let trigger = port(&contract.inputs, "trigger");
-        assert_eq!(
-            (trigger.kind, &trigger.ty),
-            (PortKind::Event, &Type::F64),
-            "event payload is the field type directly"
-        );
+        assert_eq!(port(&contract.inputs, "threshold").kind, PortKind::Value);
         assert_eq!(port(&contract.outputs, "filtered").kind, PortKind::Stream);
-        assert_eq!(port(&contract.outputs, "alert").kind, PortKind::Event);
-        assert!(contract.inputs.iter().all(|p| !p.drained));
-        assert_eq!(contract.consumption_mode(), ConsumptionMode::Async);
+        assert_eq!(port(&contract.outputs, "total").kind, PortKind::Future);
+        assert_eq!(port(&contract.outputs, "latest").kind, PortKind::Value);
     }
 
     #[test]
@@ -832,6 +803,7 @@ mod tests {
             interface node {
                 type samples = stream<f64>;
                 record inputs { s: samples }
+                run: async func(inputs: inputs);
             }
 
             world w { export node; }
@@ -841,129 +813,199 @@ mod tests {
     }
 
     #[test]
-    fn mixed_sync_async_inputs_lower_as_async() {
+    fn bare_stream_carries_no_payload() {
         let contract = lower_one(
             r#"
             package demo:test@0.1.0;
             interface node {
-                record inputs { v: u32, s: stream<f64> }
+                record inputs { ticks: stream }
+                run: async func(inputs: inputs);
             }
-            world mixed { export node; }
+            world w { export node; }
             "#,
         );
-        assert_eq!(port(&contract.inputs, "v").kind, PortKind::Value);
-        assert_eq!(port(&contract.inputs, "s").kind, PortKind::Stream);
-        assert_eq!(
-            contract.consumption_mode(),
-            ConsumptionMode::Async,
-            "the value input becomes a latched parameter of an async node"
-        );
-
-        let contract = lower_one(
-            r#"
-            package demo:test@0.1.0;
-            interface node {
-                record inputs { v: u32 }
-                record input-events { t: f64 }
-            }
-            world mixed2 { export node; }
-            "#,
-        );
-        assert_eq!(contract.consumption_mode(), ConsumptionMode::Async);
+        let ticks = port(&contract.inputs, "ticks");
+        assert_eq!((ticks.kind, &ticks.ty), (PortKind::Stream, &None));
     }
 
     #[test]
-    fn drained_inputs_lower_drained_and_sync() {
-        let drained = lower_one(
-            r#"
-            package demo:test@0.1.0;
-            interface node {
-                record drained-inputs { s: stream<f64> }
-                record inputs { threshold: u32 }
-                record outputs { total: f64 }
-            }
-            world collector { export node; }
-            "#,
-        );
-        let s = port(&drained.inputs, "s");
-        assert!(s.drained);
-        assert_eq!(s.kind, PortKind::Stream);
-        assert!(!port(&drained.inputs, "threshold").drained);
-        assert_eq!(
-            drained.consumption_mode(),
-            ConsumptionMode::Sync,
-            "all async inputs drained: the node fires once with the totals"
-        );
-
-        let reactive = lower_one(
-            r#"
-            package demo:test@0.1.0;
-            interface node {
-                record inputs { s: stream<f64>, threshold: u32 }
-                record outputs { total: f64 }
-            }
-            world collector { export node; }
-            "#,
-        );
+    fn run_kind_follows_the_function_kind() {
+        let wit = |run: &str| {
+            format!(
+                r#"
+                package demo:test@0.1.0;
+                interface node {{
+                    record inputs {{ x: u32 }}
+                    record outputs {{ y: u32 }}
+                    run: {run};
+                }}
+                world w {{ export node; }}
+                "#
+            )
+        };
+        let sync = lower_one(&wit("func(inputs: inputs) -> outputs"));
+        let r#async = lower_one(&wit("async func(inputs: inputs) -> outputs"));
+        assert_eq!(sync.run, RunKind::Sync);
+        assert_eq!(r#async.run, RunKind::Async);
         assert_ne!(
-            drained.id.content_hash, reactive.id.content_hash,
-            "draining an input is part of the contract identity"
+            sync.id.content_hash, r#async.id.content_hash,
+            "the run kind is part of the contract"
         );
     }
 
     #[test]
-    fn drained_input_with_reactive_event_stays_async() {
+    fn run_signature_tracks_present_records() {
+        let source = lower_one(
+            r#"
+            package demo:test@0.1.0;
+            interface node {
+                record outputs { out: stream<u32> }
+                run: async func() -> outputs;
+            }
+            world w { export node; }
+            "#,
+        );
+        assert!(source.inputs.is_empty());
+
+        let sink = lower_one(
+            r#"
+            package demo:test@0.1.0;
+            interface node {
+                record inputs { items: stream<u32> }
+                run: async func(inputs: inputs);
+            }
+            world w { export node; }
+            "#,
+        );
+        assert!(sink.outputs.is_empty());
+    }
+
+    #[test]
+    fn run_through_aliased_records_lowers() {
         let contract = lower_one(
             r#"
             package demo:test@0.1.0;
             interface node {
-                record drained-inputs { s: stream<f64> }
-                record input-events { t: f64 }
+                record io { x: u32 }
+                type inputs = io;
+                run: func(inputs: inputs);
             }
             world w { export node; }
             "#,
         );
-        assert!(port(&contract.inputs, "s").drained);
-        assert_eq!(
-            contract.consumption_mode(),
-            ConsumptionMode::Async,
-            "the reactive event keeps the node async; the drain only gates first activation"
-        );
+        assert_eq!(port(&contract.inputs, "x").kind, PortKind::Value);
     }
 
     #[test]
-    fn value_field_in_drained_inputs_rejected() {
-        let err = lower_source(
+    fn missing_run_rejected() {
+        let message = lower_err(
             r#"
             package demo:test@0.1.0;
             interface node {
-                record drained-inputs { threshold: u32 }
+                record inputs { x: u32 }
             }
             world w { export node; }
             "#,
-        )
-        .unwrap_err();
-        let message = format!("{err:#}");
-        assert!(message.contains("drained"), "{message}");
-        assert!(
-            message.contains("record `drained-inputs`, field `threshold`"),
-            "error must locate the offending field: {message}"
         );
+        assert!(message.contains("declares no `run` function"), "{message}");
+    }
+
+    #[test]
+    fn bad_run_signatures_rejected() {
+        let wit = |run: &str| {
+            format!(
+                r#"
+                package demo:test@0.1.0;
+                interface node {{
+                    record inputs {{ x: u32 }}
+                    record outputs {{ y: u32 }}
+                    run: {run};
+                }}
+                world w {{ export node; }}
+                "#
+            )
+        };
+        for (run, expected) in [
+            (
+                "func() -> outputs",
+                "exactly one parameter, `inputs: inputs`",
+            ),
+            (
+                "func(x: u32) -> outputs",
+                "exactly one parameter, `inputs: inputs`",
+            ),
+            (
+                "func(i: inputs) -> outputs",
+                "exactly one parameter, `inputs: inputs`",
+            ),
+            (
+                "func(inputs: inputs, extra: u32) -> outputs",
+                "exactly one parameter, `inputs: inputs`",
+            ),
+            ("func(inputs: inputs)", "must return `outputs`"),
+            ("func(inputs: inputs) -> u32", "must return `outputs`"),
+        ] {
+            let message = lower_err(&wit(run));
+            assert!(
+                message.contains("wrong signature") && message.contains(expected),
+                "`{run}`: {message}"
+            );
+        }
+
+        let no_outputs = lower_err(
+            r#"
+            package demo:test@0.1.0;
+            interface node {
+                record inputs { x: u32 }
+                run: func(inputs: inputs) -> u32;
+            }
+            world w { export node; }
+            "#,
+        );
+        assert!(no_outputs.contains("must return nothing"), "{no_outputs}");
+
+        let no_inputs = lower_err(
+            r#"
+            package demo:test@0.1.0;
+            interface node {
+                record outputs { y: u32 }
+                run: func(x: u32) -> outputs;
+            }
+            world w { export node; }
+            "#,
+        );
+        assert!(no_inputs.contains("must take no parameters"), "{no_inputs}");
+    }
+
+    #[test]
+    fn function_other_than_run_rejected() {
+        let message = lower_err(
+            r#"
+            package demo:test@0.1.0;
+            interface node {
+                record inputs { x: u32 }
+                run: func(inputs: inputs);
+                go: func();
+            }
+            world w { export node; }
+            "#,
+        );
+        assert!(message.contains("its only function"), "{message}");
+        assert!(message.contains("`go`"), "{message}");
     }
 
     #[test]
     fn nested_async_rejected_with_location() {
-        let err = lower_source(
+        let message = lower_err(
             r#"
             package demo:test@0.1.0;
             interface node {
                 record outputs { nested: stream<stream<u8>> }
+                run: async func() -> outputs;
             }
             world w { export node; }
             "#,
-        )
-        .unwrap_err();
-        let message = format!("{err:#}");
+        );
         assert!(message.contains("nested"), "{message}");
         assert!(
             message.contains("record `outputs`, field `nested`"),
@@ -972,18 +1014,36 @@ mod tests {
     }
 
     #[test]
+    fn option_of_stream_input_rejected() {
+        let message = lower_err(
+            r#"
+            package demo:test@0.1.0;
+            interface node {
+                record inputs { s: option<stream<f64>> }
+                run: async func(inputs: inputs);
+            }
+            world w { export node; }
+            "#,
+        );
+        assert!(
+            message.contains("nested `stream`/`future`"),
+            "an optional async input has no meaning: {message}"
+        );
+    }
+
+    #[test]
     fn world_without_well_known_records_rejected() {
-        let err = lower_source(
+        let message = lower_err(
             r#"
             package demo:test@0.1.0;
             interface node {
                 record reading { value: f64 }
+                run: func();
             }
             world w { export node; }
             "#,
-        )
-        .unwrap_err();
-        assert!(format!("{err:#}").contains("well-known"), "{err:#}");
+        );
+        assert!(message.contains("well-known"), "{message}");
     }
 
     #[test]
@@ -1009,6 +1069,7 @@ mod tests {
             interface types-only { record cfg { threshold: u32 } }
             interface node {
                 record outputs { out: u32 }
+                run: func() -> outputs;
             }
 
             world w {
@@ -1031,113 +1092,104 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_port_name_across_records_rejected() {
-        let err = lower_source(
+    fn witgraph_runtime_imports_are_not_capabilities() {
+        let contract = lower_one(
+            r#"
+            package demo:test@0.1.0;
+
+            package witgraph:runtime@0.1.0 {
+                interface host {
+                    fatal: func(message: string);
+                }
+            }
+
+            interface dep { ping: func(); }
+            interface node {
+                record outputs { out: u32 }
+                run: func() -> outputs;
+            }
+
+            world w {
+                import witgraph:runtime/host@0.1.0;
+                import dep;
+                export node;
+            }
+            "#,
+        );
+        assert_eq!(
+            contract.capabilities,
+            vec![Capability::new("demo:test/dep@0.1.0")],
+            "the built-in runtime package is provided by every host"
+        );
+    }
+
+    #[test]
+    fn duplicate_port_name_rejected() {
+        let message = lower_err(
+            r#"
+            package demo:test@0.1.0;
+            interface node {
+                record inputs { x: u32, x: f64 }
+                run: func(inputs: inputs);
+            }
+            world w { export node; }
+            "#,
+        );
+        assert!(
+            message.contains("duplicate") && message.contains("`x`"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn same_name_on_both_sides_is_legal() {
+        let contract = lower_one(
             r#"
             package demo:test@0.1.0;
             interface node {
                 record inputs { x: u32 }
-                record input-events { x: f64 }
+                record outputs { x: u32 }
+                run: func(inputs: inputs) -> outputs;
             }
             world w { export node; }
             "#,
-        )
-        .unwrap_err();
-        let message = format!("{err:#}");
-        assert!(message.contains("duplicate input port `x`"), "{message}");
-    }
-
-    #[test]
-    fn unreferenced_node_interface_type_rejected() {
-        let err = lower_source(
-            r#"
-            package demo:test@0.1.0;
-            interface node {
-                record input { rate: u32 }
-                record outputs { out: f64 }
-            }
-            world w { export node; }
-            "#,
-        )
-        .unwrap_err();
-        let message = format!("{err:#}");
-        assert!(message.contains("type `input`"), "{message}");
-        assert!(
-            message.contains("`inputs`"),
-            "error must list the well-known names: {message}"
         );
-    }
-
-    #[test]
-    fn event_stream_payload_rejected_with_location() {
-        let err = lower_source(
-            r#"
-            package demo:test@0.1.0;
-            interface node {
-                record input-events { t: stream<f64> }
-            }
-            world w { export node; }
-            "#,
-        )
-        .unwrap_err();
-        let message = format!("{err:#}");
-        assert!(message.contains("event payloads"), "{message}");
-        assert!(
-            message.contains("record `input-events`, field `t`"),
-            "error must locate the offending field: {message}"
-        );
+        assert_eq!(contract.inputs.len(), 1);
+        assert_eq!(contract.outputs.len(), 1);
     }
 
     #[test]
     fn lowering_errors_aggregate_across_worlds() {
-        let err = lower_source(
+        let message = lower_err(
             r#"
             package demo:test@0.1.0;
             world a {
-                export node: interface { record drained-inputs { x: u32 } }
+                export node: interface { record inputs { x: u32 } }
             }
             world b {
                 export node: interface {
-                    record inputs { y: u32 }
-                    record unused { z: u32 }
+                    record inputs { y: map<u32, u32> }
+                    run: func(inputs: inputs);
                 }
             }
             "#,
-        )
-        .unwrap_err();
-        let message = format!("{err:#}");
+        );
         assert!(message.contains("world `a`"), "{message}");
         assert!(message.contains("world `b`"), "{message}");
     }
 
     #[test]
-    fn aliased_well_known_record_lowers() {
-        let contract = lower_one(
-            r#"
-            package demo:test@0.1.0;
-            interface node {
-                record io { x: u32 }
-                type inputs = io;
-            }
-            world w { export node; }
-            "#,
-        );
-        assert_eq!(port(&contract.inputs, "x").kind, PortKind::Value);
-    }
-
-    #[test]
     fn non_record_well_known_rejected_with_kind() {
-        let err = lower_source(
+        let message = lower_err(
             r#"
             package demo:test@0.1.0;
             interface node {
                 enum inputs { a }
+                run: func(inputs: inputs);
             }
             world w { export node; }
             "#,
-        )
-        .unwrap_err();
-        let message = format!("{err:#}");
+        );
         assert!(
             message.contains("`inputs` must be a record, found enum"),
             "{message}"
@@ -1145,214 +1197,89 @@ mod tests {
     }
 
     #[test]
-    fn bare_stream_carries_unit_payload() {
-        let contract = lower_one(
-            r#"
-            package demo:test@0.1.0;
-            interface node {
-                record inputs { ticks: stream }
-            }
-            world w { export node; }
-            "#,
-        );
-        let ticks = port(&contract.inputs, "ticks");
-        assert_eq!(
-            (ticks.kind, &ticks.ty),
-            (PortKind::Stream, &Type::Tuple(vec![]))
-        );
-    }
-
-    #[test]
-    fn drained_future_lowers() {
-        let contract = lower_one(
-            r#"
-            package demo:test@0.1.0;
-            interface node {
-                record drained-inputs { d: future<u32> }
-            }
-            world w { export node; }
-            "#,
-        );
-        let d = port(&contract.inputs, "d");
-        assert!(d.drained);
-        assert_eq!(d.kind, PortKind::Future);
-        assert_eq!(contract.consumption_mode(), ConsumptionMode::Sync);
-    }
-
-    #[test]
-    fn option_of_stream_input_rejected() {
-        let err = lower_source(
-            r#"
-            package demo:test@0.1.0;
-            interface node {
-                record inputs { s: option<stream<f64>> }
-            }
-            world w { export node; }
-            "#,
-        )
-        .unwrap_err();
-        let message = format!("{err:#}");
-        assert!(
-            message.contains("nested `stream`/`future`"),
-            "an optional async input has no meaning — the stream itself may simply be unconnected: {message}"
-        );
-    }
-
-    #[test]
-    fn drained_option_rejected() {
-        let err = lower_source(
-            r#"
-            package demo:test@0.1.0;
-            interface node {
-                record drained-inputs { d: option<u32> }
-            }
-            world w { export node; }
-            "#,
-        )
-        .unwrap_err();
-        let message = format!("{err:#}");
-        assert!(message.contains("no completion to drain"), "{message}");
-    }
-
-    #[test]
     fn map_type_rejected() {
-        let err = lower_source(
+        let message = lower_err(
             r#"
             package demo:test@0.1.0;
             interface node {
                 record inputs { m: map<string, u32> }
+                run: func(inputs: inputs);
             }
             world w { export node; }
             "#,
-        )
-        .unwrap_err();
-        assert!(format!("{err:#}").contains("`map` types"), "{err:#}");
+        );
+        assert!(message.contains("`map` types"), "{message}");
+    }
+
+    #[test]
+    fn empty_types_fail_lowering_instead_of_panicking() {
+        for (decl, what) in [
+            ("record empty {}", "record"),
+            ("flags empty {}", "flags"),
+            ("type empty = tuple<>;", "tuple"),
+        ] {
+            let message = lower_err(&format!(
+                r#"
+                package demo:test@0.1.0;
+                interface node {{
+                    {decl}
+                    record inputs {{ x: u32 }}
+                    run: func(inputs: inputs);
+                }}
+                world w {{ export node; }}
+                "#
+            ));
+            assert!(message.contains(&format!("empty {what}")), "{message}");
+        }
+    }
+
+    #[test]
+    fn named_types_come_from_the_node_interface() {
+        let lowered = lower_lowered(
+            r#"
+            package demo:test@0.1.0;
+            interface node {
+                /// A sample.
+                record reading { value: f64 }
+                record inputs { r: reading }
+                run: func(inputs: inputs);
+            }
+            world w { export node; }
+            "#,
+        );
+        let names: Vec<&str> = lowered.types.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["reading"]);
+        assert_eq!(lowered.types[0].docs.as_deref(), Some("A sample."));
     }
 
     #[test]
     fn fixed_length_list_rejected() {
-        let err = lower_source(
+        let message = lower_err(
             r#"
             package demo:test@0.1.0;
             interface node {
                 record inputs { l: list<u8, 4> }
+                run: func(inputs: inputs);
             }
             world w { export node; }
             "#,
-        )
-        .unwrap_err();
-        assert!(
-            format!("{err:#}").contains("fixed-length `list`"),
-            "{err:#}"
         );
-    }
-
-    #[test]
-    fn aliased_event_stream_payload_rejected() {
-        let err = lower_source(
-            r#"
-            package demo:test@0.1.0;
-            interface node {
-                type s = stream<f64>;
-                record input-events { t: s }
-            }
-            world w { export node; }
-            "#,
-        )
-        .unwrap_err();
-        assert!(format!("{err:#}").contains("event payloads"), "{err:#}");
-    }
-
-    #[test]
-    fn duplicate_output_port_across_records_rejected() {
-        let err = lower_source(
-            r#"
-            package demo:test@0.1.0;
-            interface node {
-                record outputs { x: u32 }
-                record output-events { x: f64 }
-            }
-            world w { export node; }
-            "#,
-        )
-        .unwrap_err();
-        let message = format!("{err:#}");
-        assert!(message.contains("duplicate output port `x`"), "{message}");
-    }
-
-    #[test]
-    fn well_known_record_as_payload_rejected() {
-        let err = lower_source(
-            r#"
-            package demo:test@0.1.0;
-            interface node {
-                record inputs { x: u32 }
-                record outputs { o: inputs }
-            }
-            world w { export node; }
-            "#,
-        )
-        .unwrap_err();
-        let message = format!("{err:#}");
         assert!(
-            message.contains("cannot be used as a payload type"),
+            message.contains("`fixed-length list` types are not supported"),
             "{message}"
         );
-    }
-
-    #[test]
-    fn conflicting_type_names_rejected() {
-        let err = lower_source(
-            r#"
-            package demo:test@0.1.0;
-            interface d1 { record point { x: u32 } }
-            interface d2 { record point { y: f64 } }
-            interface node {
-                use d1.{point as p1};
-                use d2.{point as p2};
-                record inputs { a: p1, b: p2 }
-            }
-            world w { export node; }
-            "#,
-        )
-        .unwrap_err();
-        let message = format!("{err:#}");
-        assert!(
-            message.contains("structurally different types"),
-            "{message}"
-        );
-    }
-
-    #[test]
-    fn function_in_node_interface_rejected() {
-        let err = lower_source(
-            r#"
-            package demo:test@0.1.0;
-            interface node {
-                record inputs { x: u32 }
-                go: func();
-            }
-            world w { export node; }
-            "#,
-        )
-        .unwrap_err();
-        let message = format!("{err:#}");
-        assert!(message.contains("data-only"), "{message}");
-        assert!(message.contains("`go`"), "{message}");
     }
 
     #[test]
     fn function_export_named_node_rejected() {
-        let err = lower_source(
+        let message = lower_err(
             r#"
             package demo:test@0.1.0;
             world w {
                 export node: func();
             }
             "#,
-        )
-        .unwrap_err();
-        let message = format!("{err:#}");
+        );
         assert!(
             message.contains("exports a function named `node`"),
             "{message}"
@@ -1366,6 +1293,7 @@ mod tests {
             package demo:test@0.1.0;
             interface node {
                 record outputs { out: u32 }
+                run: func() -> outputs;
             }
             world w {
                 import config: interface { get: func() -> u32; }
@@ -1389,12 +1317,14 @@ mod tests {
             package demo:inner@0.1.0 {
                 interface node {
                     record inputs { x: u32 }
+                    run: func(inputs: inputs);
                 }
                 world inner-node { export node; }
             }
 
             interface node {
                 record outputs { y: f64 }
+                run: func() -> outputs;
             }
             world outer-node { export node; }
             "#,
@@ -1415,6 +1345,7 @@ mod tests {
             package demo:test;
             interface node {
                 record outputs { out: u32 }
+                run: func() -> outputs;
             }
             world w {
                 import config: interface { get: func() -> u32; }
@@ -1437,6 +1368,7 @@ mod tests {
             interface node {
                 record inputs { rate: u32 }
                 record outputs { out: f64 }
+                run: func(inputs: inputs) -> outputs;
             }
             world w { export node; }
         "#;
@@ -1448,6 +1380,8 @@ mod tests {
                     rate: u32,
                 }
                 record outputs { out: f64 }
+                /// Runs once.
+                run: func(inputs: inputs) -> outputs;
             }
             /// Now with docs.
             world w { export node; }

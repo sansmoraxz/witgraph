@@ -1,11 +1,15 @@
 //! Graph compilation: the `Graph → CompiledGraph` typestate transition.
 //!
-//! Compilation validates the graph, collecting ALL diagnostics (never fail-fast, never panics).
+//! Compilation resolves the graph's component table against a
+//! [`ContractSource`] (contracts are never stored in the graph) and
+//! validates the graph, collecting ALL diagnostics (never fail-fast, never
+//! panics).
 //! Checks whose preconditions failed on a connection (unresolvable endpoint)
 //! are suppressed on that connection rather than cascading noise.
 
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::hash::BuildHasher;
 use std::ops::Deref;
 
 use crate::component::{Capability, ComponentContract};
@@ -29,6 +33,53 @@ pub struct CompilationFailure {
     pub diagnostics: Diagnostics,
 }
 
+/// Supplies the contract for a component reference at compile time.
+///
+/// Contracts are re-derived from WIT rather than stored in the graph. A
+/// lookup matches on the full [`ComponentRef`], content hash included, so a
+/// graph pinned to one revision of a component never compiles against
+/// another. An unhashed reference falls back to the single contract with the
+/// same package, world and version, if exactly one exists.
+pub trait ContractSource {
+    /// The contract for `id`, if this source has one.
+    fn contract(&self, id: &ComponentRef) -> Option<&ComponentContract>;
+}
+
+fn lookup<'a, I>(contracts: I, id: &ComponentRef) -> Option<&'a ComponentContract>
+where
+    I: Iterator<Item = &'a ComponentContract> + Clone,
+{
+    if let Some(exact) = contracts.clone().find(|c| c.id == *id) {
+        return Some(exact);
+    }
+    if id.content_hash.is_some() {
+        return None;
+    }
+    let mut matching = contracts.filter(|c| c.id.matches(id));
+    match (matching.next(), matching.next()) {
+        (Some(only), None) => Some(only),
+        _ => None,
+    }
+}
+
+impl ContractSource for [ComponentContract] {
+    fn contract(&self, id: &ComponentRef) -> Option<&ComponentContract> {
+        lookup(self.iter(), id)
+    }
+}
+
+impl ContractSource for Vec<ComponentContract> {
+    fn contract(&self, id: &ComponentRef) -> Option<&ComponentContract> {
+        self.as_slice().contract(id)
+    }
+}
+
+impl<S: BuildHasher> ContractSource for HashMap<ComponentRef, ComponentContract, S> {
+    fn contract(&self, id: &ComponentRef) -> Option<&ComponentContract> {
+        self.get(id).or_else(|| lookup(self.values(), id))
+    }
+}
+
 /// A graph that compiled successfully.
 ///
 /// Sealed — no public constructor, private fields, not deserializable. The
@@ -37,9 +88,12 @@ pub struct CompilationFailure {
 #[derive(Debug, Clone)]
 pub struct CompiledGraph {
     graph: Graph,
+    contracts: Vec<ComponentContract>,
     node_contract: HashMap<NodeId, usize>,
     order: Vec<NodeId>,
     depth: HashMap<NodeId, usize>,
+    islands: Vec<Vec<NodeId>>,
+    island_of: HashMap<NodeId, usize>,
     warnings: Diagnostics,
 }
 
@@ -67,17 +121,39 @@ impl CompiledGraph {
     /// Longest-path depth from source nodes over non-feedback edges.
     ///
     /// Nodes with no predecessors have depth 0; each other node has
-    /// `max(depth of predecessors) + 1`. Used by the runtime scheduler
-    /// to group independent nodes for concurrent execution.
+    /// `max(depth of predecessors) + 1`. Nodes at the same depth have no
+    /// path between them, so a runtime may re-run them together.
     pub fn depth_map(&self) -> &HashMap<NodeId, usize> {
         &self.depth
     }
 
+    /// The graph's stream islands: the connected components of the graph
+    /// over Stream and Future connections. Nodes in one island exchange
+    /// component-model stream/future handles directly, so a runtime must
+    /// host them together; a node with no Stream or Future connection is an
+    /// island of its own.
+    ///
+    /// Deterministic: islands are ordered by the topological position of
+    /// their first member, and members are in topological order.
+    pub fn islands(&self) -> &[Vec<NodeId>] {
+        &self.islands
+    }
+
+    /// The index into [`islands`](Self::islands) of the island holding the
+    /// given node.
+    pub fn island_of(&self, node: &NodeId) -> Option<usize> {
+        self.island_of.get(node).copied()
+    }
+
     /// The contract the given node instantiates.
     pub fn contract_for(&self, node: &NodeId) -> Option<&ComponentContract> {
-        self.node_contract
-            .get(node)
-            .map(|&i| &self.graph.components[i])
+        self.node_contract.get(node).map(|&i| &self.contracts[i])
+    }
+
+    /// The resolved contract of every component table entry, in table
+    /// order.
+    pub fn contracts(&self) -> &[ComponentContract] {
+        &self.contracts
     }
 
     /// Union of the capabilities of every component instantiated by a node,
@@ -100,15 +176,14 @@ impl Deref for CompiledGraph {
     }
 }
 
-fn resolve_endpoint<'g>(
-    graph: &'g Graph,
+fn resolve_endpoint<'c>(
     node_ids: &HashSet<&NodeId>,
-    contracts: &HashMap<&NodeId, usize>,
+    contracts: &HashMap<&NodeId, &'c ComponentContract>,
     conn: &ConnectionId,
     port_ref: &PortRef,
     direction: PortDirection,
     diagnostics: &mut Diagnostics,
-) -> Option<&'g PortDef> {
+) -> Option<&'c PortDef> {
     if !node_ids.contains(&port_ref.node) {
         diagnostics.push(Diagnostic::UnknownNode {
             conn: conn.clone(),
@@ -116,9 +191,9 @@ fn resolve_endpoint<'g>(
         });
         return None;
     }
-    // A known node with an unknown component was already diagnosed
-    // (`UnknownComponent`); suppress dependent checks.
-    let contract = &graph.components[*contracts.get(&port_ref.node)?];
+    // A known node with an unknown component or a missing contract was
+    // already diagnosed; suppress dependent checks.
+    let contract = *contracts.get(&port_ref.node)?;
     let (expected, opposite) = match direction {
         PortDirection::Output => (&contract.outputs, &contract.inputs),
         PortDirection::Input => (&contract.inputs, &contract.outputs),
@@ -152,13 +227,17 @@ fn resolve_endpoint<'g>(
 /// several contracts narrows to the one with exactly that hash — hashless
 /// table entries match any hash (see [`ComponentRef::matches`]) but an exact
 /// hash is the stronger claim. Returns the known node ids and the contract
-/// index per uniquely resolvable node.
-fn check_nodes<'g>(
+/// of each uniquely resolvable node whose table entry has one.
+fn check_nodes<'g, 'c>(
     graph: &'g Graph,
+    table: &'c [Option<ComponentContract>],
     diagnostics: &mut Diagnostics,
-) -> (HashSet<&'g NodeId>, HashMap<&'g NodeId, usize>) {
+) -> (
+    HashSet<&'g NodeId>,
+    HashMap<&'g NodeId, &'c ComponentContract>,
+) {
     let mut node_ids: HashSet<&NodeId> = HashSet::new();
-    let mut contracts: HashMap<&NodeId, usize> = HashMap::new();
+    let mut contracts: HashMap<&NodeId, &ComponentContract> = HashMap::new();
     for node in &graph.nodes {
         let fresh = node_ids.insert(&node.id);
         if !fresh {
@@ -168,14 +247,14 @@ fn check_nodes<'g>(
             .components
             .iter()
             .enumerate()
-            .filter(|(_, c)| c.id.matches(&node.component))
+            .filter(|(_, c)| c.matches(&node.component))
             .map(|(i, _)| i)
             .collect();
         if matches.len() > 1 && node.component.content_hash.is_some() {
             let exact: Vec<usize> = matches
                 .iter()
                 .copied()
-                .filter(|&i| graph.components[i].id.content_hash == node.component.content_hash)
+                .filter(|&i| graph.components[i].content_hash == node.component.content_hash)
                 .collect();
             if exact.len() == 1 {
                 matches = exact;
@@ -187,17 +266,14 @@ fn check_nodes<'g>(
                 component: node.component.clone(),
             }),
             [i] => {
-                if fresh {
-                    contracts.insert(&node.id, *i);
+                if fresh && let Some(contract) = &table[*i] {
+                    contracts.insert(&node.id, contract);
                 }
             }
             many => diagnostics.push(Diagnostic::AmbiguousComponent {
                 node: node.id.clone(),
                 component: node.component.clone(),
-                matches: many
-                    .iter()
-                    .map(|&i| graph.components[i].id.clone())
-                    .collect(),
+                matches: many.iter().map(|&i| graph.components[i].clone()).collect(),
             }),
         }
     }
@@ -209,17 +285,17 @@ fn check_nodes<'g>(
 /// differ, make every reference to that identity unresolvable.
 fn check_duplicate_components(graph: &Graph, diagnostics: &mut Diagnostics) {
     let mut seen: HashSet<&ComponentRef> = HashSet::new();
-    for contract in &graph.components {
-        if !seen.insert(&contract.id) {
-            diagnostics.push(Diagnostic::DuplicateComponent(contract.id.clone()));
+    for component in &graph.components {
+        if !seen.insert(component) {
+            diagnostics.push(Diagnostic::DuplicateComponent(component.clone()));
         }
     }
 }
 
 /// Port names must be unique per contract side — connections address ports by
 /// name, so a duplicate makes the port unaddressable.
-fn check_duplicate_port_names(graph: &Graph, diagnostics: &mut Diagnostics) {
-    for contract in &graph.components {
+fn check_duplicate_port_names(table: &[Option<ComponentContract>], diagnostics: &mut Diagnostics) {
+    for contract in table.iter().flatten() {
         for (direction, ports) in [
             (PortDirection::Input, &contract.inputs),
             (PortDirection::Output, &contract.outputs),
@@ -238,39 +314,26 @@ fn check_duplicate_port_names(graph: &Graph, diagnostics: &mut Diagnostics) {
     }
 }
 
-/// Output ports carry neither input-only flag: `optional` and `drained` only
-/// make sense on the consuming side.
-fn check_output_flags(graph: &Graph, diagnostics: &mut Diagnostics) {
-    for contract in &graph.components {
-        for output in &contract.outputs {
-            if output.optional {
-                diagnostics.push(Diagnostic::OptionalOutput {
-                    component: contract.id.clone(),
-                    port: output.name.clone(),
-                });
-            }
-            if output.drained {
-                diagnostics.push(Diagnostic::DrainedOutput {
-                    component: contract.id.clone(),
-                    port: output.name.clone(),
-                });
-            }
+/// `optional` is a Value-input flag: an output is never optional, and an
+/// unconnected stream or future input has no handle to hand the node.
+fn check_port_flags(table: &[Option<ComponentContract>], diagnostics: &mut Diagnostics) {
+    for contract in table.iter().flatten() {
+        for output in contract.outputs.iter().filter(|output| output.optional) {
+            diagnostics.push(Diagnostic::OptionalOutput {
+                component: contract.id.clone(),
+                port: output.name.clone(),
+            });
         }
-    }
-}
-
-/// Only kinds with completion semantics can be drained: Stream
-/// (end-of-stream) and Future (resolution).
-fn check_drained_kinds(graph: &Graph, diagnostics: &mut Diagnostics) {
-    for contract in &graph.components {
-        for input in contract.inputs.iter().filter(|input| input.drained) {
-            if matches!(input.kind, PortKind::Value | PortKind::Event) {
-                diagnostics.push(Diagnostic::UndrainableInput {
-                    component: contract.id.clone(),
-                    port: input.name.clone(),
-                    kind: input.kind,
-                });
-            }
+        for input in contract
+            .inputs
+            .iter()
+            .filter(|input| input.optional && input.kind.is_async())
+        {
+            diagnostics.push(Diagnostic::OptionalAsyncInput {
+                component: contract.id.clone(),
+                port: input.name.clone(),
+                kind: input.kind,
+            });
         }
     }
 }
@@ -307,14 +370,13 @@ fn check_connection_ids(graph: &Graph, diagnostics: &mut Diagnostics) {
 fn check_connection_endpoints<'g>(
     graph: &'g Graph,
     node_ids: &HashSet<&NodeId>,
-    contracts: &HashMap<&NodeId, usize>,
+    contracts: &HashMap<&NodeId, &ComponentContract>,
     diagnostics: &mut Diagnostics,
 ) -> HashSet<&'g ConnectionId> {
     let mut resolved: HashSet<&ConnectionId> = HashSet::new();
     let mut writers: BTreeMap<&PortRef, Vec<&ConnectionId>> = BTreeMap::new();
     for conn in &graph.connections {
         let from = resolve_endpoint(
-            graph,
             node_ids,
             contracts,
             &conn.id,
@@ -323,7 +385,6 @@ fn check_connection_endpoints<'g>(
             diagnostics,
         );
         let to = resolve_endpoint(
-            graph,
             node_ids,
             contracts,
             &conn.id,
@@ -345,8 +406,8 @@ fn check_connection_endpoints<'g>(
             } else if from.ty != to.ty {
                 diagnostics.push(Diagnostic::TypeMismatch {
                     conn: conn.id.clone(),
-                    from: from.ty.to_string(),
-                    to: to.ty.to_string(),
+                    from: from.type_display(),
+                    to: to.type_display(),
                 });
             }
         }
@@ -369,7 +430,7 @@ fn check_connection_endpoints<'g>(
 fn check_required_inputs(
     graph: &Graph,
     node_ids: &HashSet<&NodeId>,
-    contracts: &HashMap<&NodeId, usize>,
+    contracts: &HashMap<&NodeId, &ComponentContract>,
     diagnostics: &mut Diagnostics,
 ) {
     let connected: HashSet<&PortRef> = graph
@@ -383,10 +444,10 @@ fn check_required_inputs(
         if !checked.insert(&node.id) {
             continue;
         }
-        let Some(&i) = contracts.get(&node.id) else {
+        let Some(contract) = contracts.get(&node.id) else {
             continue;
         };
-        for input in &graph.components[i].inputs {
+        for input in &contract.inputs {
             if input.optional {
                 continue;
             }
@@ -430,152 +491,153 @@ fn check_cycles(
     order
 }
 
-/// A feedback edge delivers the previous iteration's value, but a drained
-/// input completes before its node's first activation — before any iteration
-/// has run — so feedback into a drained input can never deliver, on or off a
-/// cycle.
-fn check_feedback_into_drained_inputs(
-    graph: &Graph,
-    contracts: &HashMap<&NodeId, usize>,
-    diagnostics: &mut Diagnostics,
-) {
-    for conn in graph.connections.iter().filter(|c| c.feedback) {
-        let Some(&i) = contracts.get(&conn.to.node) else {
-            continue;
-        };
-        let drained = graph.components[i]
-            .inputs
-            .iter()
-            .any(|input| input.drained && input.name == conn.to.port);
-        if drained {
-            diagnostics.push(Diagnostic::FeedbackIntoDrainedInput {
-                conn: conn.id.clone(),
-                port: conn.to.clone(),
-            });
-        }
-    }
+/// The kind of the output port a connection reads from, if it resolves.
+fn source_kind(
+    contracts: &HashMap<&NodeId, &ComponentContract>,
+    from: &PortRef,
+) -> Option<PortKind> {
+    contracts
+        .get(&from.node)?
+        .outputs
+        .iter()
+        .find(|output| output.name == from.port)
+        .map(|output| output.kind)
 }
 
-/// Feedback connections on Future-kind ports are rejected: Future resolves
-/// once; a feedback edge would silently drop every iteration after the first.
-fn check_feedback_on_futures(
+/// Feedback edges are unit-delay boundaries between generations; only a
+/// Value can cross one. A stream or future handle belongs to the run that
+/// created it.
+fn check_feedback_kinds(
     graph: &Graph,
-    contracts: &HashMap<&NodeId, usize>,
+    contracts: &HashMap<&NodeId, &ComponentContract>,
     diagnostics: &mut Diagnostics,
 ) {
     for conn in graph.connections.iter().filter(|c| c.feedback) {
-        let Some(&i) = contracts.get(&conn.from.node) else {
-            continue;
-        };
-        let is_future = graph.components[i]
-            .outputs
-            .iter()
-            .any(|output| output.kind == PortKind::Future && output.name == conn.from.port);
-        if is_future {
-            diagnostics.push(Diagnostic::FeedbackOnFuture {
+        if let Some(kind) = source_kind(contracts, &conn.from)
+            && kind.is_async()
+        {
+            diagnostics.push(Diagnostic::AsyncFeedback {
                 conn: conn.id.clone(),
                 port: conn.from.clone(),
+                kind,
             });
         }
     }
 }
 
-/// A non-feedback connection into a drained input on a cycle waits on a
-/// completion that transitively depends on the target node's own output:
-/// deadlock. Per-edge precision — a node on a cycle via a reactive port with
-/// an off-cycle drained input is fine. Feedback connections are skipped:
-/// [`check_feedback_into_drained_inputs`] rejects them unconditionally.
-fn check_drained_inputs_off_cycles(
+/// A stream or future handle moves to exactly one consumer, so an async
+/// output may feed at most one connection.
+fn check_async_fan_out(
     graph: &Graph,
-    contracts: &HashMap<&NodeId, usize>,
-    resolved: &HashSet<&ConnectionId>,
+    contracts: &HashMap<&NodeId, &ComponentContract>,
     diagnostics: &mut Diagnostics,
 ) {
-    let scc = topo::scc_membership(graph, resolved);
-    for conn in graph.connections.iter().filter(|c| !c.feedback) {
-        let Some(&i) = contracts.get(&conn.to.node) else {
-            continue;
-        };
-        let drained = graph.components[i]
-            .inputs
-            .iter()
-            .any(|input| input.drained && input.name == conn.to.port);
-        if drained
-            && let (Some(from), Some(to)) = (scc.get(&conn.from.node), scc.get(&conn.to.node))
-            && from == to
+    let mut readers: BTreeMap<&PortRef, (PortKind, Vec<ConnectionId>)> = BTreeMap::new();
+    for conn in &graph.connections {
+        if let Some(kind) = source_kind(contracts, &conn.from)
+            && kind.is_async()
         {
-            diagnostics.push(Diagnostic::DrainedInputOnCycle {
-                conn: conn.id.clone(),
-                port: conn.to.clone(),
+            readers
+                .entry(&conn.from)
+                .or_insert_with(|| (kind, Vec::new()))
+                .1
+                .push(conn.id.clone());
+        }
+    }
+    for (port, (kind, connections)) in readers {
+        if connections.len() > 1 {
+            diagnostics.push(Diagnostic::AsyncFanOut {
+                port: port.clone(),
+                kind,
+                connections,
             });
         }
     }
 }
 
-/// Config values must target existing Value-kind input ports with matching
-/// types. Nodes whose component failed to resolve are skipped (already
-/// diagnosed by `check_nodes`).
-fn check_config_values(
+/// Union-find over resolved Stream/Future connections, read off in
+/// topological order (see [`CompiledGraph::islands`]).
+fn stream_islands(
     graph: &Graph,
-    contracts: &HashMap<&NodeId, usize>,
-    diagnostics: &mut Diagnostics,
-) {
-    for node in &graph.nodes {
-        let Some(&i) = contracts.get(&node.id) else {
+    contracts: &HashMap<&NodeId, &ComponentContract>,
+    resolved: &HashSet<&ConnectionId>,
+    order: &[NodeId],
+) -> (Vec<Vec<NodeId>>, HashMap<NodeId, usize>) {
+    let index: HashMap<&NodeId, usize> = order.iter().enumerate().map(|(i, n)| (n, i)).collect();
+    let mut parent: Vec<usize> = (0..order.len()).collect();
+    fn find(parent: &mut [usize], mut x: usize) -> usize {
+        while parent[x] != x {
+            parent[x] = parent[parent[x]];
+            x = parent[x];
+        }
+        x
+    }
+    for conn in &graph.connections {
+        if !resolved.contains(&conn.id)
+            || !source_kind(contracts, &conn.from).is_some_and(PortKind::is_async)
+        {
             continue;
-        };
-        let contract = &graph.components[i];
-        for (port_name, val) in &node.config {
-            match contract.inputs.iter().find(|p| &p.name == port_name) {
-                None => {
-                    diagnostics.push(Diagnostic::ConfigUnknownPort {
-                        node: node.id.clone(),
-                        port: port_name.clone(),
-                    });
-                }
-                Some(port_def) if port_def.kind != PortKind::Value => {
-                    diagnostics.push(Diagnostic::ConfigNotValueInput {
-                        node: node.id.clone(),
-                        port: port_name.clone(),
-                        kind: port_def.kind,
-                    });
-                }
-                Some(port_def) if !val.matches_type(&port_def.ty) => {
-                    diagnostics.push(Diagnostic::ConfigTypeMismatch {
-                        node: node.id.clone(),
-                        port: port_name.clone(),
-                        expected: port_def.ty.to_string(),
-                    });
-                }
-                Some(_) => {}
-            }
+        }
+        if let (Some(&a), Some(&b)) = (index.get(&conn.from.node), index.get(&conn.to.node)) {
+            let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
+            // The earlier topological position becomes the root, so a root
+            // is always its island's first member.
+            parent[ra.max(rb)] = ra.min(rb);
         }
     }
+    let mut islands: Vec<Vec<NodeId>> = Vec::new();
+    let mut island_of: HashMap<NodeId, usize> = HashMap::new();
+    let mut root_island: HashMap<usize, usize> = HashMap::new();
+    for (i, node) in order.iter().enumerate() {
+        let root = find(&mut parent, i);
+        let island = *root_island.entry(root).or_insert_with(|| {
+            islands.push(Vec::new());
+            islands.len() - 1
+        });
+        islands[island].push(node.clone());
+        island_of.insert(node.clone(), island);
+    }
+    (islands, island_of)
 }
 
 impl Graph {
-    /// Consuming typestate transition. On failure the graph is handed back
-    /// inside [`CompilationFailure`] together with every diagnostic found.
-    pub fn compile(self) -> Result<CompiledGraph, CompilationFailure> {
+    /// Consuming typestate transition. Every component table entry is
+    /// resolved through `contracts`; an entry with no contract is diagnosed
+    /// ([`Diagnostic::ContractNotFound`]). On failure the graph is handed
+    /// back inside [`CompilationFailure`] together with every diagnostic
+    /// found.
+    pub fn compile(
+        self,
+        contracts: &(impl ContractSource + ?Sized),
+    ) -> Result<CompiledGraph, CompilationFailure> {
         let mut diagnostics = Diagnostics::default();
 
+        let table: Vec<Option<ComponentContract>> = self
+            .components
+            .iter()
+            .map(|id| {
+                let contract = contracts.contract(id).cloned();
+                if contract.is_none() {
+                    diagnostics.push(Diagnostic::ContractNotFound(id.clone()));
+                }
+                contract
+            })
+            .collect();
+
         check_duplicate_components(&self, &mut diagnostics);
-        check_duplicate_port_names(&self, &mut diagnostics);
-        let (node_ids, contracts) = check_nodes(&self, &mut diagnostics);
-        check_output_flags(&self, &mut diagnostics);
-        check_drained_kinds(&self, &mut diagnostics);
+        check_duplicate_port_names(&table, &mut diagnostics);
+        let (node_ids, node_contracts) = check_nodes(&self, &table, &mut diagnostics);
+        check_port_flags(&table, &mut diagnostics);
         check_connection_ids(&self, &mut diagnostics);
-        let resolved = check_connection_endpoints(&self, &node_ids, &contracts, &mut diagnostics);
-        check_required_inputs(&self, &node_ids, &contracts, &mut diagnostics);
-        check_config_values(&self, &contracts, &mut diagnostics);
-        check_feedback_into_drained_inputs(&self, &contracts, &mut diagnostics);
-        check_feedback_on_futures(&self, &contracts, &mut diagnostics);
+        let resolved =
+            check_connection_endpoints(&self, &node_ids, &node_contracts, &mut diagnostics);
+        check_required_inputs(&self, &node_ids, &node_contracts, &mut diagnostics);
+        check_feedback_kinds(&self, &node_contracts, &mut diagnostics);
+        check_async_fan_out(&self, &node_contracts, &mut diagnostics);
         // Cycle analysis keys graph vertices by node id, so it needs ids to
         // be unique; duplicates were already diagnosed as errors above.
         let order = if node_ids.len() == self.nodes.len() {
-            let order = check_cycles(&self, &resolved, &mut diagnostics);
-            check_drained_inputs_off_cycles(&self, &contracts, &resolved, &mut diagnostics);
-            order
+            check_cycles(&self, &resolved, &mut diagnostics)
         } else {
             None
         };
@@ -586,14 +648,32 @@ impl Graph {
         match order {
             Some(order) if !diagnostics.has_errors() => {
                 let depth = topo::depth_map(&self, &order, &resolved);
+                let (islands, island_of) =
+                    stream_islands(&self, &node_contracts, &resolved, &order);
+                // Compact the table to its resolved entries (all of them, on
+                // success) and point each node at its contract.
+                let mut compact: HashMap<&ComponentRef, usize> = HashMap::new();
+                let mut resolved_contracts: Vec<ComponentContract> = Vec::new();
+                for contract in table.iter().flatten() {
+                    compact.entry(&contract.id).or_insert_with(|| {
+                        resolved_contracts.push(contract.clone());
+                        resolved_contracts.len() - 1
+                    });
+                }
+                let node_contract: HashMap<NodeId, usize> = node_contracts
+                    .iter()
+                    .filter_map(|(node, contract)| {
+                        compact.get(&contract.id).map(|&i| ((*node).clone(), i))
+                    })
+                    .collect();
                 Ok(CompiledGraph {
-                    node_contract: contracts
-                        .into_iter()
-                        .map(|(id, i)| (id.clone(), i))
-                        .collect(),
+                    contracts: resolved_contracts,
+                    node_contract,
                     graph: self,
                     order,
                     depth,
+                    islands,
+                    island_of,
                     warnings: diagnostics,
                 })
             }
@@ -608,11 +688,75 @@ impl Graph {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::ResourceClaim;
+    use crate::Type;
+    use crate::graph::{GraphBuilder, ResourceClaim};
     use crate::id::ComponentRef;
     use crate::port::PortKind;
-    use crate::types::Type;
-    use crate::val::Val;
+
+    /// A [`GraphBuilder`] that also keeps the contracts it registers, so the
+    /// built graph can be compiled against them.
+    struct TestBuilder {
+        builder: GraphBuilder,
+        contracts: Vec<ComponentContract>,
+    }
+
+    struct TestGraph {
+        graph: Graph,
+        contracts: Vec<ComponentContract>,
+    }
+
+    fn builder(name: &str) -> TestBuilder {
+        TestBuilder {
+            builder: Graph::builder(name),
+            contracts: Vec::new(),
+        }
+    }
+
+    impl TestBuilder {
+        fn add_component(mut self, contract: ComponentContract) -> Self {
+            self.builder = self.builder.add_component(&contract);
+            self.contracts.push(contract);
+            self
+        }
+
+        fn add_node(mut self, id: &str, component: ComponentRef) -> Self {
+            self.builder = self.builder.add_node(id, component);
+            self
+        }
+
+        fn connect(mut self, id: &str, from: PortRef, to: PortRef) -> Self {
+            self.builder = self.builder.connect(id, from, to);
+            self
+        }
+
+        fn connect_feedback(mut self, id: &str, from: PortRef, to: PortRef) -> Self {
+            self.builder = self.builder.connect_feedback(id, from, to);
+            self
+        }
+
+        fn set_resource(
+            mut self,
+            node: &str,
+            resource: &str,
+            claim: ResourceClaim,
+        ) -> Result<Self, String> {
+            self.builder = self.builder.set_resource(node, resource, claim)?;
+            Ok(self)
+        }
+
+        fn build(self) -> TestGraph {
+            TestGraph {
+                graph: self.builder.build(),
+                contracts: self.contracts,
+            }
+        }
+    }
+
+    impl TestGraph {
+        fn compile(self) -> Result<CompiledGraph, CompilationFailure> {
+            self.graph.compile(&self.contracts)
+        }
+    }
 
     fn cref(world: &str) -> ComponentRef {
         format!("demo:graph/{world}@0.1.0").parse().unwrap()
@@ -628,8 +772,8 @@ mod tests {
             id: cref(world),
             inputs,
             outputs,
+            run: crate::component::RunKind::Sync,
             capabilities: capabilities.iter().map(|c| Capability::new(*c)).collect(),
-            type_names: vec![],
             docs: None,
         }
     }
@@ -674,7 +818,7 @@ mod tests {
 
     #[test]
     fn valid_graph_promotes_and_demotes() {
-        let graph = Graph::builder("valid")
+        let graph = builder("valid")
             .add_component(source())
             .add_component(sink())
             .add_node("src", cref("source"))
@@ -704,14 +848,80 @@ mod tests {
             cref("source")
         );
 
+        let contracts = compiled.contracts().to_vec();
         let demoted = compiled.into_graph();
         assert_eq!(demoted.nodes.len(), 2);
-        demoted.compile().expect("round-trip stays valid");
+        demoted.compile(&contracts).expect("round-trip stays valid");
+    }
+
+    #[test]
+    fn missing_contract_is_diagnosed() {
+        let graph = Graph::builder("t")
+            .add_component(source())
+            .add_node("s", cref("source"))
+            .build();
+        assert_eq!(
+            diags(graph.compile(&[] as &[ComponentContract])),
+            vec![Diagnostic::ContractNotFound(cref("source"))],
+            "a table entry with no contract suppresses the node's dependent checks"
+        );
+    }
+
+    #[test]
+    fn content_hash_mismatch_is_rejected() {
+        let mut pinned = cref("source");
+        pinned.content_hash = Some("bb".into());
+        let mut rebuilt = source();
+        rebuilt.id.content_hash = Some("aa".into());
+        let graph = Graph::builder("t")
+            .add_component(pinned.clone())
+            .add_node("s", cref("source"))
+            .build();
+        assert_eq!(
+            diags(graph.compile([rebuilt].as_slice())),
+            vec![Diagnostic::ContractNotFound(pinned)],
+            "a graph pinned to one revision never compiles against another"
+        );
+    }
+
+    #[test]
+    fn unhashed_entry_resolves_to_the_unique_hashed_contract() {
+        let mut hashed = source();
+        hashed.id.content_hash = Some("aa".into());
+        let graph = Graph::builder("t")
+            .add_component(cref("source"))
+            .add_node("s", cref("source"))
+            .build();
+        let compiled = graph.compile([hashed].as_slice()).expect("unique match");
+        assert_eq!(
+            compiled.contracts()[0].id.content_hash.as_deref(),
+            Some("aa")
+        );
+    }
+
+    #[test]
+    fn hash_map_is_a_contract_source() {
+        let contracts: HashMap<ComponentRef, ComponentContract> = [source(), sink()]
+            .into_iter()
+            .map(|c| (c.id.clone(), c))
+            .collect();
+        let graph = Graph::builder("t")
+            .add_component(cref("source"))
+            .add_component(cref("sink"))
+            .add_node("s", cref("source"))
+            .add_node("d", cref("sink"))
+            .connect("c1", PortRef::new("s", "out"), PortRef::new("d", "in"))
+            .build();
+        let compiled = graph.compile(&contracts).expect("valid graph");
+        assert_eq!(
+            compiled.contract_for(&NodeId::from("d")).unwrap().id,
+            cref("sink")
+        );
     }
 
     #[test]
     fn unknown_component() {
-        let graph = Graph::builder("t").add_node("n", cref("ghost")).build();
+        let graph = builder("t").add_node("n", cref("ghost")).build();
         assert_eq!(
             diags(graph.compile()),
             vec![Diagnostic::UnknownComponent {
@@ -723,7 +933,7 @@ mod tests {
 
     #[test]
     fn duplicate_node_id() {
-        let graph = Graph::builder("t")
+        let graph = builder("t")
             .add_component(source())
             .add_node("a", cref("source"))
             .add_node("a", cref("source"))
@@ -736,7 +946,7 @@ mod tests {
 
     #[test]
     fn duplicate_connection_id() {
-        let graph = Graph::builder("t")
+        let graph = builder("t")
             .add_component(source())
             .add_component(sink())
             .add_node("s", cref("source"))
@@ -753,7 +963,7 @@ mod tests {
 
     #[test]
     fn duplicate_connection_endpoints() {
-        let graph = Graph::builder("t")
+        let graph = builder("t")
             .add_component(source())
             .add_component(sink())
             .add_node("s", cref("source"))
@@ -781,7 +991,7 @@ mod tests {
 
     #[test]
     fn unknown_node_suppresses_dependent_checks() {
-        let graph = Graph::builder("t")
+        let graph = builder("t")
             .add_component(sink())
             .add_node("d", cref("sink"))
             .connect("c1", PortRef::new("ghost", "out"), PortRef::new("d", "in"))
@@ -804,7 +1014,7 @@ mod tests {
 
     #[test]
     fn unknown_port() {
-        let graph = Graph::builder("t")
+        let graph = builder("t")
             .add_component(source())
             .add_component(sink())
             .add_node("s", cref("source"))
@@ -822,7 +1032,7 @@ mod tests {
 
     #[test]
     fn not_an_output() {
-        let graph = Graph::builder("t")
+        let graph = builder("t")
             .add_component(sink())
             .add_node("d1", cref("sink"))
             .add_node("d2", cref("sink"))
@@ -840,7 +1050,7 @@ mod tests {
 
     #[test]
     fn not_an_input() {
-        let graph = Graph::builder("t")
+        let graph = builder("t")
             .add_component(source())
             .add_node("s1", cref("source"))
             .add_node("s2", cref("source"))
@@ -856,12 +1066,12 @@ mod tests {
     }
 
     #[test]
-    fn kind_mismatch_event_vs_stream() {
-        let graph = Graph::builder("t")
+    fn kind_mismatch_value_vs_stream() {
+        let graph = builder("t")
             .add_component(contract(
                 "emitter",
                 vec![],
-                vec![port("sig", PortKind::Event)],
+                vec![port("sig", PortKind::Value)],
                 &[],
             ))
             .add_component(contract(
@@ -878,7 +1088,7 @@ mod tests {
             diags(graph.compile()),
             vec![Diagnostic::KindMismatch {
                 conn: "c1".into(),
-                from: PortKind::Event,
+                from: PortKind::Value,
                 to: PortKind::Stream,
             }],
             "same payload type is not enough — kinds must match"
@@ -887,7 +1097,7 @@ mod tests {
 
     #[test]
     fn type_mismatch() {
-        let graph = Graph::builder("t")
+        let graph = builder("t")
             .add_component(source())
             .add_component(contract(
                 "int-sink",
@@ -911,7 +1121,7 @@ mod tests {
 
     #[test]
     fn multiple_writers() {
-        let graph = Graph::builder("t")
+        let graph = builder("t")
             .add_component(source())
             .add_component(sink())
             .add_node("s1", cref("source"))
@@ -931,7 +1141,7 @@ mod tests {
 
     #[test]
     fn required_input_unconnected() {
-        let graph = Graph::builder("t")
+        let graph = builder("t")
             .add_component(sink())
             .add_node("d", cref("sink"))
             .build();
@@ -945,7 +1155,7 @@ mod tests {
 
     #[test]
     fn optional_input_may_stay_unconnected() {
-        let graph = Graph::builder("t")
+        let graph = builder("t")
             .add_component(contract(
                 "opt-sink",
                 vec![port("in", PortKind::Value).optional()],
@@ -959,7 +1169,7 @@ mod tests {
 
     #[test]
     fn mixed_inputs_are_legal() {
-        let graph = Graph::builder("t")
+        let graph = builder("t")
             .add_component(contract(
                 "mixed",
                 vec![port("v", PortKind::Value), port("s", PortKind::Stream)],
@@ -969,185 +1179,230 @@ mod tests {
             .build();
         graph
             .compile()
-            .expect("mixed sync/async inputs color the node async, not invalid");
+            .expect("value and stream inputs may mix on one node");
+    }
+
+    fn stream_source() -> ComponentContract {
+        contract(
+            "stream-src",
+            vec![],
+            vec![port("out", PortKind::Stream)],
+            &[],
+        )
+    }
+
+    fn stream_sink() -> ComponentContract {
+        contract(
+            "stream-sink",
+            vec![port("in", PortKind::Stream)],
+            vec![],
+            &[],
+        )
     }
 
     #[test]
-    fn undrainable_input_rejected() {
-        let graph = Graph::builder("t")
+    fn stream_one_to_one_validates() {
+        let graph = builder("t")
+            .add_component(stream_source())
+            .add_component(stream_sink())
+            .add_node("s", cref("stream-src"))
+            .add_node("d", cref("stream-sink"))
+            .connect("c1", PortRef::new("s", "out"), PortRef::new("d", "in"))
+            .build();
+        graph.compile().expect("a stream output may feed one input");
+    }
+
+    #[test]
+    fn async_fan_out_rejected() {
+        let graph = builder("t")
+            .add_component(stream_source())
+            .add_component(stream_sink())
+            .add_node("s", cref("stream-src"))
+            .add_node("d1", cref("stream-sink"))
+            .add_node("d2", cref("stream-sink"))
+            .connect("c1", PortRef::new("s", "out"), PortRef::new("d1", "in"))
+            .connect("c2", PortRef::new("s", "out"), PortRef::new("d2", "in"))
+            .build();
+        assert_eq!(
+            diags(graph.compile()),
+            vec![Diagnostic::AsyncFanOut {
+                port: PortRef::new("s", "out"),
+                kind: PortKind::Stream,
+                connections: vec!["c1".into(), "c2".into()],
+            }],
+            "a stream handle moves to exactly one consumer"
+        );
+    }
+
+    #[test]
+    fn value_fan_out_is_legal() {
+        let graph = builder("t")
+            .add_component(source())
+            .add_component(sink())
+            .add_node("s", cref("source"))
+            .add_node("d1", cref("sink"))
+            .add_node("d2", cref("sink"))
+            .connect("c1", PortRef::new("s", "out"), PortRef::new("d1", "in"))
+            .connect("c2", PortRef::new("s", "out"), PortRef::new("d2", "in"))
+            .build();
+        graph
+            .compile()
+            .expect("values are copied, so they fan out freely");
+    }
+
+    #[test]
+    fn optional_async_input_rejected() {
+        let graph = builder("t")
             .add_component(contract(
-                "drain",
-                vec![
-                    port("t", PortKind::Event).drained(),
-                    port("v", PortKind::Value).drained(),
-                ],
+                "opt-stream",
+                vec![port("s", PortKind::Stream).optional()],
                 vec![],
                 &[],
             ))
             .build();
         assert_eq!(
             diags(graph.compile()),
-            vec![
-                Diagnostic::UndrainableInput {
-                    component: cref("drain"),
-                    port: "t".into(),
-                    kind: PortKind::Event,
-                },
-                Diagnostic::UndrainableInput {
-                    component: cref("drain"),
-                    port: "v".into(),
-                    kind: PortKind::Value,
-                },
-            ],
-            "events never complete and values have no completion — neither drains"
+            vec![Diagnostic::OptionalAsyncInput {
+                component: cref("opt-stream"),
+                port: "s".into(),
+                kind: PortKind::Stream,
+            }]
         );
     }
 
     #[test]
-    fn feedback_into_drained_input_rejected() {
-        let drain = contract(
-            "drain",
-            vec![port("in", PortKind::Stream).drained()],
-            vec![port("out", PortKind::Stream)],
-            &[],
-        );
-        let graph = Graph::builder("t")
-            .add_component(drain)
-            .add_node("a", cref("drain"))
-            .connect_feedback("c1", PortRef::new("a", "out"), PortRef::new("a", "in"))
-            .build();
-        assert_eq!(
-            diags(graph.compile()),
-            vec![Diagnostic::FeedbackIntoDrainedInput {
-                conn: "c1".into(),
-                port: PortRef::new("a", "in"),
-            }],
-            "a drain completes before any iteration, so feedback never reaches it"
-        );
-    }
-
-    #[test]
-    fn feedback_into_drained_input_rejected_even_off_cycle() {
-        let stream_src = contract(
-            "stream-src",
-            vec![],
-            vec![port("out", PortKind::Stream)],
-            &[],
-        );
-        let drain = contract(
-            "drain",
-            vec![port("in", PortKind::Stream).drained()],
-            vec![],
-            &[],
-        );
-        let graph = Graph::builder("t")
-            .add_component(stream_src)
-            .add_component(drain)
-            .add_node("s", cref("stream-src"))
-            .add_node("d", cref("drain"))
-            .connect_feedback("c1", PortRef::new("s", "out"), PortRef::new("d", "in"))
-            .build();
-        let diags = diags(graph.compile());
-        assert!(
-            diags.contains(&Diagnostic::FeedbackIntoDrainedInput {
-                conn: "c1".into(),
-                port: PortRef::new("d", "in"),
-            }),
-            "{diags:?}"
-        );
-    }
-
-    #[test]
-    fn non_feedback_into_drained_input_on_cycle_rejected() {
+    fn feedback_on_stream_rejected() {
         let pump = contract(
             "pump",
             vec![port("in", PortKind::Stream)],
             vec![port("out", PortKind::Stream)],
             &[],
         );
-        let drainer = contract(
-            "drainer",
-            vec![port("batch", PortKind::Stream).drained()],
-            vec![port("out", PortKind::Stream)],
-            &[],
-        );
-        let graph = Graph::builder("t")
+        let graph = builder("t")
             .add_component(pump)
-            .add_component(drainer)
             .add_node("p", cref("pump"))
-            .add_node("d", cref("drainer"))
-            .connect("c1", PortRef::new("p", "out"), PortRef::new("d", "batch"))
-            .connect_feedback("c2", PortRef::new("d", "out"), PortRef::new("p", "in"))
+            .connect_feedback("c1", PortRef::new("p", "out"), PortRef::new("p", "in"))
             .build();
         assert_eq!(
             diags(graph.compile()),
-            vec![Diagnostic::DrainedInputOnCycle {
+            vec![Diagnostic::AsyncFeedback {
                 conn: "c1".into(),
-                port: PortRef::new("d", "batch"),
+                port: PortRef::new("p", "out"),
+                kind: PortKind::Stream,
             }],
-            "the drain waits on a completion that depends on its own output"
+            "a stream handle cannot cross a generation boundary"
         );
     }
 
     #[test]
-    fn drained_input_off_cycle_validates() {
-        let stream_src = contract(
-            "stream-src",
-            vec![],
-            vec![port("out", PortKind::Stream)],
+    fn stream_cycle_through_value_feedback_validates() {
+        let producer = contract(
+            "producer",
+            vec![port("seed", PortKind::Value).optional()],
+            vec![port("items", PortKind::Stream)],
             &[],
         );
-        let drain = contract(
-            "drain",
-            vec![port("in", PortKind::Stream).drained()],
-            vec![],
+        let reducer = contract(
+            "reducer",
+            vec![port("items", PortKind::Stream)],
+            vec![port("total", PortKind::Value)],
             &[],
         );
-        let graph = Graph::builder("t")
-            .add_component(stream_src)
-            .add_component(drain)
-            .add_node("s", cref("stream-src"))
-            .add_node("d", cref("drain"))
-            .connect("c1", PortRef::new("s", "out"), PortRef::new("d", "in"))
+        let graph = builder("t")
+            .add_component(producer)
+            .add_component(reducer)
+            .add_node("p", cref("producer"))
+            .add_node("r", cref("reducer"))
+            .connect("c1", PortRef::new("p", "items"), PortRef::new("r", "items"))
+            .connect_feedback("c2", PortRef::new("r", "total"), PortRef::new("p", "seed"))
             .build();
-        graph
+        let compiled = graph
             .compile()
-            .expect("a drained input fed from off-cycle is legal");
+            .expect("a value feedback edge breaks the loop into generations");
+        assert_eq!(compiled.islands().len(), 1, "p and r share a stream island");
     }
 
     #[test]
-    fn drained_input_beside_on_cycle_reactive_port_validates() {
-        let stream_src = contract(
-            "stream-src",
+    fn islands_partition_over_async_edges() {
+        let value_to_stream = contract(
+            "v2s",
+            vec![port("in", PortKind::Value)],
+            vec![port("out", PortKind::Stream)],
+            &[],
+        );
+        let stream_to_value = contract(
+            "s2v",
+            vec![port("in", PortKind::Stream)],
+            vec![port("out", PortKind::Value)],
+            &[],
+        );
+        let future_src = contract(
+            "future-src",
             vec![],
-            vec![port("out", PortKind::Stream)],
+            vec![port("done", PortKind::Future)],
             &[],
         );
-        let mixed = contract(
-            "mixed-drain",
-            vec![
-                port("batch", PortKind::Stream).drained(),
-                port("live", PortKind::Stream),
-            ],
-            vec![port("out", PortKind::Stream)],
+        let future_sink = contract(
+            "future-sink",
+            vec![port("done", PortKind::Future)],
+            vec![],
             &[],
         );
-        let graph = Graph::builder("t")
-            .add_component(stream_src)
-            .add_component(mixed)
-            .add_node("s", cref("stream-src"))
-            .add_node("m", cref("mixed-drain"))
-            .connect("c1", PortRef::new("s", "out"), PortRef::new("m", "batch"))
-            .connect_feedback("c2", PortRef::new("m", "out"), PortRef::new("m", "live"))
+        let graph = builder("t")
+            .add_component(source())
+            .add_component(sink())
+            .add_component(value_to_stream)
+            .add_component(stream_to_value)
+            .add_component(future_src)
+            .add_component(future_sink)
+            .add_node("src", cref("source"))
+            .add_node("a", cref("v2s"))
+            .add_node("b", cref("s2v"))
+            .add_node("dst", cref("sink"))
+            .add_node("f", cref("future-src"))
+            .add_node("g", cref("future-sink"))
+            .connect("c1", PortRef::new("src", "out"), PortRef::new("a", "in"))
+            .connect("c2", PortRef::new("a", "out"), PortRef::new("b", "in"))
+            .connect("c3", PortRef::new("b", "out"), PortRef::new("dst", "in"))
+            .connect("c4", PortRef::new("f", "done"), PortRef::new("g", "done"))
             .build();
-        graph.compile().expect(
-            "only the drained connection must stay off-cycle; a reactive port may close the loop",
+        let compiled = graph.compile().expect("valid graph");
+        let mut islands: Vec<Vec<&str>> = compiled
+            .islands()
+            .iter()
+            .map(|island| island.iter().map(|n| n.as_str()).collect())
+            .collect();
+        islands.sort();
+        assert_eq!(
+            islands,
+            vec![vec!["a", "b"], vec!["dst"], vec!["f", "g"], vec!["src"]],
+            "value edges never join islands; stream and future edges do"
         );
+        for island in compiled.islands() {
+            let positions: Vec<usize> = island
+                .iter()
+                .map(|n| {
+                    compiled
+                        .topological_order()
+                        .iter()
+                        .position(|m| m == n)
+                        .unwrap()
+                })
+                .collect();
+            assert!(
+                positions.windows(2).all(|w| w[0] < w[1]),
+                "members in topo order"
+            );
+        }
+        let a = compiled.island_of(&NodeId::from("a")).unwrap();
+        assert_eq!(compiled.island_of(&NodeId::from("b")), Some(a));
+        assert_ne!(compiled.island_of(&NodeId::from("src")), Some(a));
+        assert_eq!(compiled.island_of(&NodeId::from("ghost")), None);
     }
 
     #[test]
     fn illegal_cycle_without_feedback() {
-        let graph = Graph::builder("t")
+        let graph = builder("t")
             .add_component(pass_through())
             .add_node("a", cref("pass"))
             .add_node("b", cref("pass"))
@@ -1164,7 +1419,7 @@ mod tests {
 
     #[test]
     fn feedback_edge_legalizes_cycle() {
-        let graph = Graph::builder("t")
+        let graph = builder("t")
             .add_component(pass_through())
             .add_node("a", cref("pass"))
             .add_node("b", cref("pass"))
@@ -1183,7 +1438,7 @@ mod tests {
 
     #[test]
     fn useless_feedback_is_a_warning() {
-        let graph = Graph::builder("t")
+        let graph = builder("t")
             .add_component(source())
             .add_component(sink())
             .add_node("s", cref("source"))
@@ -1201,7 +1456,7 @@ mod tests {
 
     #[test]
     fn collects_all_diagnostics() {
-        let graph = Graph::builder("t")
+        let graph = builder("t")
             .add_component(source())
             .add_component(sink())
             .add_node("a", cref("source"))
@@ -1228,28 +1483,28 @@ mod tests {
 
     #[test]
     fn failure_hands_the_graph_back() {
-        let graph = Graph::builder("hand-back")
-            .add_node("n", cref("ghost"))
-            .build();
+        let graph = builder("hand-back").add_node("n", cref("ghost")).build();
         let mut failure = graph.compile().unwrap_err();
         assert_eq!(failure.graph.metadata.name, "hand-back");
         assert!(failure.to_string().contains("1 error"));
 
-        failure.graph.components.push(source());
+        failure.graph.components.push(cref("source"));
         failure.graph.nodes[0].component = cref("source");
-        (*failure.graph).compile().expect("corrected graph retries");
+        (*failure.graph)
+            .compile([source()].as_slice())
+            .expect("corrected graph retries");
     }
 
     #[test]
     fn empty_graph_compiles() {
-        let compiled = Graph::builder("empty").build().compile().expect("empty");
+        let compiled = builder("empty").build().compile().expect("empty");
         assert!(compiled.topological_order().is_empty());
         assert!(compiled.warnings().is_empty());
     }
 
     #[test]
     fn duplicate_component() {
-        let graph = Graph::builder("t")
+        let graph = builder("t")
             .add_component(source())
             .add_component(source())
             .build();
@@ -1261,7 +1516,7 @@ mod tests {
 
     #[test]
     fn duplicate_port_name() {
-        let graph = Graph::builder("t")
+        let graph = builder("t")
             .add_component(contract(
                 "twice",
                 vec![port("in", PortKind::Value), port("in", PortKind::Stream)],
@@ -1281,11 +1536,11 @@ mod tests {
 
     #[test]
     fn kind_mismatch_suppresses_type_check() {
-        let graph = Graph::builder("t")
+        let graph = builder("t")
             .add_component(contract(
                 "emitter",
                 vec![],
-                vec![PortDef::new("sig", PortKind::Event, Type::F64)],
+                vec![PortDef::new("sig", PortKind::Value, Type::F64)],
                 &[],
             ))
             .add_component(contract(
@@ -1302,7 +1557,7 @@ mod tests {
             diags(graph.compile()),
             vec![Diagnostic::KindMismatch {
                 conn: "c1".into(),
-                from: PortKind::Event,
+                from: PortKind::Value,
                 to: PortKind::Stream,
             }],
             "with the wrong kind, a payload-type diagnostic would be noise"
@@ -1311,7 +1566,7 @@ mod tests {
 
     #[test]
     fn failure_carries_warnings_alongside_errors() {
-        let graph = Graph::builder("t")
+        let graph = builder("t")
             .add_component(source())
             .add_component(sink())
             .add_node("s", cref("source"))
@@ -1338,7 +1593,7 @@ mod tests {
         a.id.content_hash = Some("aa".into());
         let mut b = source();
         b.id.content_hash = Some("bb".into());
-        let graph = Graph::builder("t")
+        let graph = builder("t")
             .add_component(a.clone())
             .add_component(b.clone())
             .add_node("n", cref("source"))
@@ -1361,7 +1616,7 @@ mod tests {
         b.id.content_hash = Some("bb".into());
         let mut node_ref = cref("source");
         node_ref.content_hash = Some("bb".into());
-        let graph = Graph::builder("t")
+        let graph = builder("t")
             .add_component(a)
             .add_component(b)
             .add_node("n", node_ref)
@@ -1377,7 +1632,7 @@ mod tests {
         hashed.id.content_hash = Some("bb".into());
         let mut node_ref = cref("source");
         node_ref.content_hash = Some("bb".into());
-        let graph = Graph::builder("t")
+        let graph = builder("t")
             .add_component(source())
             .add_component(hashed)
             .add_node("n", node_ref)
@@ -1400,34 +1655,25 @@ mod tests {
         let flagged = contract(
             "flagged",
             vec![],
-            vec![
-                port("a", PortKind::Value).optional(),
-                port("b", PortKind::Stream).drained(),
-            ],
+            vec![port("a", PortKind::Value).optional()],
             &[],
         );
-        let graph = Graph::builder("t")
+        let graph = builder("t")
             .add_component(flagged)
             .add_node("n", cref("flagged"))
             .build();
         assert_eq!(
             diags(graph.compile()),
-            vec![
-                Diagnostic::OptionalOutput {
-                    component: cref("flagged"),
-                    port: "a".into(),
-                },
-                Diagnostic::DrainedOutput {
-                    component: cref("flagged"),
-                    port: "b".into(),
-                },
-            ]
+            vec![Diagnostic::OptionalOutput {
+                component: cref("flagged"),
+                port: "a".into(),
+            }]
         );
     }
 
     #[test]
     fn duplicate_node_ids_suppress_cycle_analysis() {
-        let graph = Graph::builder("t")
+        let graph = builder("t")
             .add_component(pass_through())
             .add_node("a", cref("pass"))
             .add_node("a", cref("pass"))
@@ -1442,7 +1688,7 @@ mod tests {
 
     #[test]
     fn feedback_and_forward_edges_are_distinct_connections() {
-        let graph = Graph::builder("t")
+        let graph = builder("t")
             .add_component(source())
             .add_component(sink())
             .add_node("s", cref("source"))
@@ -1464,110 +1710,6 @@ mod tests {
     }
 
     #[test]
-    fn valid_config_compiles() {
-        let graph = Graph::builder("t")
-            .add_component(sink())
-            .add_component(source())
-            .add_node("s", cref("source"))
-            .add_node("d", cref("sink"))
-            .set_config("d", "in", Val::F64(42.0)).unwrap()
-            .connect("c1", PortRef::new("s", "out"), PortRef::new("d", "in"))
-            .build();
-        graph.compile().expect("valid config");
-    }
-
-    #[test]
-    fn config_unknown_port() {
-        let graph = Graph::builder("t")
-            .add_component(source())
-            .add_node("s", cref("source"))
-            .set_config("s", "nope", Val::F64(1.0)).unwrap()
-            .build();
-        assert_eq!(
-            diags(graph.compile()),
-            vec![Diagnostic::ConfigUnknownPort {
-                node: "s".into(),
-                port: "nope".into(),
-            }]
-        );
-    }
-
-    #[test]
-    fn config_not_value_input() {
-        let graph = Graph::builder("t")
-            .add_component(contract(
-                "evented",
-                vec![port("sig", PortKind::Event).optional()],
-                vec![],
-                &[],
-            ))
-            .add_node("e", cref("evented"))
-            .set_config("e", "sig", Val::F64(1.0)).unwrap()
-            .build();
-        assert_eq!(
-            diags(graph.compile()),
-            vec![Diagnostic::ConfigNotValueInput {
-                node: "e".into(),
-                port: "sig".into(),
-                kind: PortKind::Event,
-            }]
-        );
-    }
-
-    #[test]
-    fn config_type_mismatch() {
-        let graph = Graph::builder("t")
-            .add_component(sink())
-            .add_component(source())
-            .add_node("s", cref("source"))
-            .add_node("d", cref("sink"))
-            .set_config("d", "in", Val::String("wrong".into())).unwrap()
-            .connect("c1", PortRef::new("s", "out"), PortRef::new("d", "in"))
-            .build();
-        assert_eq!(
-            diags(graph.compile()),
-            vec![Diagnostic::ConfigTypeMismatch {
-                node: "d".into(),
-                port: "in".into(),
-                expected: "f64".into(),
-            }]
-        );
-    }
-
-    #[test]
-    fn config_on_optional_unconnected_port_compiles() {
-        let graph = Graph::builder("t")
-            .add_component(contract(
-                "opt-sink",
-                vec![port("in", PortKind::Value).optional()],
-                vec![],
-                &[],
-            ))
-            .add_node("d", cref("opt-sink"))
-            .set_config("d", "in", Val::F64(3.14)).unwrap()
-            .build();
-        graph
-            .compile()
-            .expect("config on unconnected optional port is valid");
-    }
-
-    #[test]
-    fn config_satisfies_required_input() {
-        let graph = Graph::builder("t")
-            .add_component(sink())
-            .add_node("d", cref("sink"))
-            .set_config("d", "in", Val::F64(1.0)).unwrap()
-            .build();
-        let diags_list = diags(graph.compile());
-        assert!(
-            diags_list.contains(&Diagnostic::RequiredInputUnconnected {
-                port: PortRef::new("d", "in"),
-            }),
-            "config does not satisfy required-input-connected: {diags_list:?}"
-        );
-    }
-
-    #[test]
     fn feedback_on_future_rejected() {
         let future_node = contract(
             "future-node",
@@ -1575,14 +1717,22 @@ mod tests {
             vec![port("result", PortKind::Future)],
             &[],
         );
-        let graph = Graph::builder("t")
+        let graph = builder("t")
             .add_component(future_node)
             .add_node("a", cref("future-node"))
-            .connect_feedback("c1", PortRef::new("a", "result"), PortRef::new("a", "trigger"))
+            .connect_feedback(
+                "c1",
+                PortRef::new("a", "result"),
+                PortRef::new("a", "trigger"),
+            )
             .build();
         let diags_list = diags(graph.compile());
         assert!(
-            diags_list.iter().any(|d| matches!(d, Diagnostic::FeedbackOnFuture { .. })),
+            diags_list.contains(&Diagnostic::AsyncFeedback {
+                conn: "c1".into(),
+                port: PortRef::new("a", "result"),
+                kind: PortKind::Future,
+            }),
             "feedback on future port should be rejected: {diags_list:?}"
         );
     }
@@ -1608,27 +1758,18 @@ mod tests {
 
     #[test]
     fn resource_budget_compiles() {
-        let graph = Graph::builder("t")
+        let graph = builder("t")
             .add_component(source())
             .add_node("s", cref("source"))
-            .set_resource("s", "disk", ResourceClaim::new(0.5).unwrap()).unwrap()
+            .set_resource("s", "disk", ResourceClaim::new(0.5).unwrap())
+            .unwrap()
             .build();
         graph.compile().expect("valid resource budget");
     }
 
     #[test]
-    fn resource_budget_held_compiles() {
-        let graph = Graph::builder("t")
-            .add_component(source())
-            .add_node("s", cref("source"))
-            .set_resource("s", "vram", ResourceClaim::held(0.3).unwrap()).unwrap()
-            .build();
-        graph.compile().expect("held resource budget is valid");
-    }
-
-    #[test]
     fn resource_budget_unknown_node_rejected() {
-        let result = Graph::builder("t")
+        let result = builder("t")
             .add_component(source())
             .add_node("s", cref("source"))
             .set_resource("ghost", "disk", ResourceClaim::new(0.5).unwrap());

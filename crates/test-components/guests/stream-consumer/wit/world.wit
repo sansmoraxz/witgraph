@@ -1,0 +1,18 @@
+package test:stream-consumer@0.1.0;
+
+/// Sums its input stream. Stops after `take` items when given (dropping the
+/// reader), and yields `delay` times per item to act as a slow reader.
+world stream-consumer {
+    export node: interface {
+        record inputs {
+            items: stream<u32>,
+            take: option<u32>,
+            delay: option<u32>,
+        }
+        record outputs {
+            total: u32,
+            count: u32,
+        }
+        run: async func(inputs: inputs) -> outputs;
+    }
+}

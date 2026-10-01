@@ -1,259 +1,556 @@
 # witgraph
-Easy and modular flow based composer
 
-Graphs are built from WASM components whose public contracts are described in
-[WIT](https://component-model.bytecodealliance.org/design/wit.html). WIT is the
-source of truth: the typed graph IR, validation rules, and editor metadata are
-all derived from it.
+Flow graphs built from WebAssembly components.
+
+Each node in a graph is a WASM component. Its WIT world is its contract: the
+ports it exposes, their types, and how it runs. WIT is the source of truth:
+contracts are always derived from it, never written by hand or stored in
+graph files. Graphs are validated against those contracts and executed on
+wasmtime using the component model's native `stream<T>` and `future<T>`.
 
 ## Crates
 
-- `witgraph-ir` — the typed graph IR: payload types, port kinds, component
-  contracts, graph + builder, validation, topology analysis, and the runtime
-  value type (`Val`). Nodes carry compile-time `config` (initial values for
-  Value inputs) and fractional `ResourceClaim`s on named shared pools.
-  Compilation computes a longest-path `depth_map` used by the runtime
-  scheduler to group independent nodes for concurrent execution. Kept light
-  on dependencies (`serde` is an on-by-default feature) with future embedded
-  targets in mind.
-- `witgraph-wit` — loads `.wit` sources with `wit-parser`, lowers component
-  worlds into IR contracts, computes content-hash identities, and generates
+- **`witgraph-ir`** — the graph IR: port kinds, component contracts,
+  the `GraphBuilder → Graph → CompiledGraph` typestate chain, validation
+  diagnostics, topology (order, depth, stream islands). Payload types are
+  `wasm_wave::value::Type`. Light on dependencies; `serde` is an on-by-default
+  feature, and the crate builds without it.
+- **`witgraph-wit`** — loads `.wit` sources with `wit-parser`, lowers
+  component worlds into contracts, computes content hashes, and generates
   the editor-facing metadata catalog.
-- `witgraph-runtime` — event-driven WASM execution engine. Extends the
-  typestate chain with `RuntimeGraph`, which loads a `CompiledGraph` together
-  with WASM component bytes and executes it reactively via wasmtime. Nodes
-  run concurrently; channels (value, event, stream, future) carry data between
-  them. Ships with `Release` and `Debug` runtime modes (the latter emitting
-  trace events).
+- **`witgraph-runtime`** — `RuntimeGraph`, the last typestate: a compiled
+  graph loaded with component bytes and run on wasmtime.
+- **`test-components`** (not published) — guest components used by the
+  runtime tests.
 
-## The `node` component convention
+## Building and testing
 
-A witgraph component is a WIT **world** that exports an interface named
-`node`. Ports are declared structurally through up to five well-known records
-(at least one must be present); the world's **imported functions and
-function-carrying interfaces are its capabilities** (type-only imports are
-structural, not capabilities). A named interface's capability is its full id
-(`namespace:name/interface@version`); an anonymous inline interface is scoped
-to the importing world (`namespace:name/world.import-name@version`); bare
-function imports are prefixed `func:`.
+```sh
+rustup target add wasm32-unknown-unknown
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+```
 
-| Record           | Direction | Port kind | Field type meaning                          |
-|------------------|-----------|-----------|---------------------------------------------|
-| `inputs`         | input     | see below | `T` → Value; top-level `option<T>` → optional Value; `stream<T>` → Stream; `future<T>` → Future |
-| `outputs`        | output    | see below | same mapping (no optional unwrapping)       |
-| `input-events`   | input     | Event     | field type is the event payload directly    |
-| `output-events`  | output    | Event     | field type is the event payload directly    |
-| `drained-inputs` | input     | Stream/Future only | `stream<T>`/`future<T>` consumed to completion before the node's first activation, latched as the total |
+The workspace needs Rust 1.97 or newer. Building `test-components` builds
+the guests listed in the `GUESTS` array of `crates/test-components/build.rs`
+for `wasm32-unknown-unknown` (a nested `cargo build` per guest) and encodes
+each as a component. A new directory under `guests/` is not picked up until
+it is added to that list.
 
-The four port kinds:
+Toolchain pins, kept consistent with each other:
 
-- **Value** — latched, last-write-wins; read synchronously each iteration.
-- **Event** — discrete occurrences, delivered asynchronously.
-- **Stream** — ordered, back-pressured sequence.
-- **Future** — one-shot asynchronous value.
+| Dependency | Version |
+|---|---|
+| wasmtime | 49.0.1 |
+| wit-parser, wit-component, wasm-wave | 0.258 (the wasm-tools release wasmtime 49 is built on) |
+| wit-bindgen (guests) | 0.61.0, with `async-spawn` |
+
+## Components
+
+A witgraph component is a WIT world that exports an interface named `node`.
+The interface declares up to two records, `inputs` and `outputs` (at least
+one), and exactly one function, `run`:
 
 ```wit
 package demo:graph@0.1.0;
 
 world sensor {
-    import demo:caps/clock@0.1.0;      // capability
+    import demo:caps/clock@0.1.0;          // a capability
 
     export node: interface {
         record reading { value: f64, timestamp: u64 }
 
         record inputs {
-            sample-rate: option<u32>,  // optional Value input
+            sample-rate: option<u32>,      // optional Value input
         }
         record outputs {
-            latest: reading,           // Value output
-            samples: stream<reading>,  // Stream output
+            latest: reading,               // Value output
+            samples: stream<reading>,      // Stream output
+            threshold-crossed: stream<f64>,
         }
-        record output-events {
-            threshold-crossed: f64,    // Event output (payload f64)
-        }
+
+        run: async func(inputs: inputs) -> outputs;
     }
 }
 ```
 
-### Sync/async node coloring
+The example imports `demo:caps/clock`, so lowering it needs the `demo:caps`
+package alongside it (for example under `deps/`).
 
-A node's consumption mode is derived from its input ports, with one
-exception-free rule: **any undrained Stream, Event, or Future input colors the
-node async** — it fires per async activation, and its Value inputs act as
-latched parameters sampled at each firing. A node with no undrained async
-inputs is **sync**. Mixing kinds is legal. Outputs are unconstrained.
+### Ports
 
-A **drained input** (declared in the `drained-inputs` record) is consumed to
-completion — end-of-stream for a Stream, resolution for a Future — before the
-node's first activation, then delivered once as a latched total. A node whose
-async inputs are all drained is sync: it fires once with the drained totals.
-Mixed drained + reactive inputs are legal too — the node activates only after
-every drain completes, then fires per reactive activation.
+Each record field is a port. Its kind comes from the field's type, the same
+way on both sides:
 
-Draining is per-port, part of the contract (and its content hash), and carries
-two restrictions:
+| Field type | Kind | Notes |
+|---|---|---|
+| `T` | Value | An input is read when `run` starts; an output is latched when `run` returns. |
+| `option<T>` | Value | On `inputs` only: an optional port of payload `T`, which may stay unconnected. On `outputs` it is a Value whose payload is the option. |
+| `stream<T>` | Stream | Ordered and back-pressured, with end-of-stream. A bare `stream` has no payload. |
+| `future<T>` | Future | Resolves once. A bare `future` has no payload. |
 
-- **Stream and Future fields only** (enforced at lowering) — Values and Events
-  have no completion semantics, so there is nothing to drain.
-- **Drained connections stay off cycles** (enforced at graph compilation) — a
-  connection feeding a drained input from within a cycle (feedback included)
-  would deadlock waiting on its own downstream. Reactive ports on the same
-  node may still close a loop.
+`stream` and `future` may only appear at the top level of a field.
 
-### Connections, feedback, and compilation
+Payload types are resolved by wasm-wave, so a payload is anything WAVE can
+represent. Rejected:
+- resources and handles;
+- `map` and `error-context`;
+- nested `stream`/`future`;
+- fixed-length lists, because the contract hash cannot observe their
+  length.
 
-Connections are legal only when port kinds are equal and payload types are
-structurally equal — no coercion. Each input port accepts at most one writer;
-outputs fan out freely. Cycles are legal only if every cycle crosses at least
-one connection marked `feedback` (a unit-delay state boundary carrying the
-previous iteration's value).
+An empty `record`, `flags` or `tuple` anywhere in the WIT source fails every
+world in it that exports `node` (other worlds are skipped as usual).
+wit-parser accepts these types, but no component can contain them.
 
-Compilation follows a typestate chain: `GraphBuilder → Graph → CompiledGraph → RuntimeGraph`.
-Only `Graph` is serializable; `Graph::compile(self)` validates the graph,
-collecting every diagnostic rather than stopping at the first, and promotes to
-`CompiledGraph`,
-which exposes the topological order and aggregated capability requirements.
+### `run`
+
+`run` is either a `func` (sync) or an `async func`. Its signature must
+match the records the node declares:
+- it takes exactly `(inputs: inputs)` when an `inputs` record exists, and no
+  parameters otherwise;
+- it returns `outputs` when an `outputs` record exists, and nothing
+  otherwise.
+
+No other function may appear in `node`.
+
+An async `run` may await its inputs before returning. For example, a
+consumer can read a whole stream and then return a total as a Value output.
+To produce a stream, return its reader from `run` and write from a spawned
+task. The consumer's `run` cannot start until the producer's `run` has
+returned the handle, so a producer that writes before returning deadlocks.
+
+### Capabilities
+
+A world's imports are its capabilities:
+- **Named interfaces** that carry functions count, under the interface's full
+  id (`namespace:name/interface@version`).
+- **Anonymous inline interfaces** that carry functions count, scoped to the
+  importing world (`namespace:name/world.import-name@version`).
+- **Bare function imports** count, prefixed `func:`.
+- **Type-only imports** are structural and don't count.
+- **The `witgraph:runtime` package** doesn't count: any interface from it is
+  treated as built in. Hosts provide only `witgraph:runtime/host@0.1.0`
+  (below); a component importing anything else from that package fails to
+  instantiate.
+
+`CompiledGraph::required_capabilities` aggregates the capabilities of every
+component in a graph.
+
+### Guests in Rust
+
+With wit-bindgen 0.61, a sync node is a plain function from inputs to outputs:
+
+```rust
+wit_bindgen::generate!({ path: "wit", world: "echo" });
+
+use exports::node::{Guest, Inputs, Outputs};
+
+struct Echo;
+
+impl Guest for Echo {
+    fn run(inputs: Inputs) -> Outputs {
+        Outputs { out: inputs.in_.unwrap_or(0.0) }
+    }
+}
+
+export!(Echo);
+```
+
+A world that imports another package (the runtime's `host` interface, or a
+capability) keeps that package's WIT under `wit/deps/` and passes
+`generate_all` so wit-bindgen generates the imported interfaces too:
+
+```text
+wit/
+  world.wit
+  deps/witgraph-runtime/witgraph-runtime.wit
+```
+
+```rust
+wit_bindgen::generate!({ path: "wit", world: "busy-loop", generate_all });
+```
+
+An async node returns its stream reader and writes from a spawned task:
+
+```rust
+impl Guest for Producer {
+    async fn run(inputs: Inputs) -> Outputs {
+        let (mut tx, rx) = wit_stream::new::<u32>();
+        wit_bindgen::spawn_local(async move {
+            let mut i = 0u32;
+            while inputs.burst_size.is_none_or(|n| i < n) {
+                // `Some` back means the reader was dropped: stop.
+                if tx.write_one(i).await.is_some() {
+                    break;
+                }
+                i = i.wrapping_add(1);
+            }
+        });
+        Outputs { items: rx }
+    }
+}
+```
+
+## Graphs
+
+A `Graph` is plain, serializable data:
+- metadata;
+- a component table of `ComponentRef`s (`namespace:name/world@version` plus
+  a content hash);
+- nodes, each referencing a component, with optional resource claims;
+- connections from output ports to input ports.
+
+A graph never stores contracts. `Graph::compile(&contracts)` resolves the
+component table through a `ContractSource` (a slice, `Vec`, or `HashMap` of
+contracts, typically lowered from WIT by `witgraph-wit`). Compilation
+collects every diagnostic rather than stopping at the first, and returns a
+sealed `CompiledGraph` or the graph back with its diagnostics.
+
+`witgraph_wit::load_components(path)` loads a `.wit` file or directory and
+lowers every component world in it into a contract; `load_lowered(path)`
+also keeps each world's named types, for the editor catalog.
+
+A `CompiledGraph` exposes `graph()`, `contracts()`, `contract_for(node)`,
+`warnings()`, `topological_order()`, `depth_map()`, `islands()`,
+`island_of(node)` and `required_capabilities()`.
+
+### Contract resolution
+
+- A component-table entry with a content hash must match a contract exactly.
+- An entry without a hash resolves to the single contract with the same
+  package, world and version, if exactly one exists.
+- A node's reference resolves against the component table by package, world
+  and version, narrowed by content hash when it carries one. If it still
+  matches more than one entry, it is reported as ambiguous.
+
+### Connection rules
+
+- **Types match exactly.** Port kinds must be equal and payload types
+  structurally equal: no coercion, widening, or option lifting.
+- **One writer per input.** Each input port has at most one incoming
+  connection.
+- **No stream or future fan-out.** A Stream or Future output connects to at
+  most one input; use a tee node to fan out. Value outputs fan out freely.
+- **Required inputs must be connected.** Every non-optional input needs a
+  connection. Only Value inputs may be optional, and only inputs may be
+  optional.
+- **Cycles need a feedback edge.** Every cycle must cross at least one
+  connection marked `feedback`, a unit-delay boundary that delivers the
+  previous iteration's value.
+  - Feedback connections must carry Value ports.
+  - A feedback connection that is on no cycle gets a warning.
 
 ### Component identity
 
 A component is identified by `namespace:name/world@version` plus a sha-256
-content hash of its lowered contract. The hash is purely structural: it covers
-the sorted ports and capabilities only — not the package, world, version, doc
-comments, or type names — so any two contracts with the same shape hash
-identically, and drained inputs are encoded with a distinct label so undrained
-contracts keep their hashes. The canonical encoding carries its own version
-line, so a deliberate format change shifts hashes explicitly.
+content hash of its lowered contract.
+
+The hash covers the `run` kind, the sorted ports (direction, name, kind,
+optionality and payload type) and the sorted capabilities. It does not cover
+the package, world, version, doc comments or type names, so any two
+contracts with the same shape hash identically. The canonical encoding
+starts with a `witgraph-contract v2` line and uses its own type encoding,
+independent of wasm-wave's display format.
+
+### Editor catalog
+
+`witgraph_wit::metadata::generate_catalog` produces a JSON-serializable
+catalog (schema version 2) of components, ports, capabilities and named
+types, for editors.
 
 ## Runtime
 
-The `witgraph-runtime` crate extends the typestate chain with `RuntimeGraph`:
-it loads a `CompiledGraph` together with WASM component bytes and executes the
-graph reactively via wasmtime.
-
-### The `graph-node` WIT world
-
-Every node component targets the `witgraph:runtime/graph-node` world. It
-imports the `runtime-host` interface (the host-side API the node calls during
-activation) and exports the `node` interface (the lifecycle the runtime
-drives).
-
-**Host imports** (`runtime-host`):
-
-| Function         | Purpose                                        |
-|------------------|------------------------------------------------|
-| `read-value`     | Read a latched Value input (returns `option<list<u8>>`) |
-| `write-value`    | Write a Value output                           |
-| `emit-event`     | Emit a discrete Event                          |
-| `push-stream`    | Push an item to a Stream output                |
-| `close-stream`   | Close a Stream output (end-of-stream)          |
-| `resolve-future` | Resolve a Future output (one-shot)             |
-| `fatal`          | Signal a graph-fatal condition; halts the tick  |
-| `is-cancelled`   | Check whether the host has requested cancellation |
-
-Port data crosses the WASM boundary as `list<u8>` — `serde_json` by default,
-or the compact `postcard` format with the `compact-encoding` feature.
-
-**Node exports** (`node`):
-
-| Function   | When called                                          |
-|------------|------------------------------------------------------|
-| `init`     | Once before any activations (including the drain phase) |
-| `activate` | Each activation, with an `activation-kind` reason    |
-| `dispose`  | On completion, fault, cancellation, or graph shutdown |
-
-The `activation-kind` variant tells the node why it was activated: `sync`
-(Value-only inputs changed), `drain-item` (a drained stream/future delivered
-an item), `stream-item`, `event`, `future-resolved`, or `stream-closed`.
-
-### Node lifecycle
-
-Each node follows a phase state machine:
-
-```mermaid
-graph LR
-    Created -->|has drained inputs| Draining
-    Created -->|no drained inputs| Ready
-    Draining -->|all drains complete| Ready
-    Ready -->|activate| Running
-    Running -->|Continue| Ready
-    Running -->|downstream full| Suspended
-    Suspended -->|capacity freed| Running
-    Running -->|Completed| Completed:::terminal
-    Running -->|trap / error| Faulted:::terminal
-    Running -->|cancel| Cancelled
-    Cancelled -->|new input| Created
-    classDef terminal stroke-width:3px
+```rust
+let compiled = graph.compile(&contracts)?;
+let mut rt = RuntimeGraph::load(compiled, &wasm, RuntimeConfig::default(), Release).await?;
+rt.inject("sensor".into(), "sample-rate".into(), Val::U32(10))?;
+while let TickResult::Progress = rt.tick().await {}
+let latest = rt.read_output(&"sensor".into(), &"latest".into());
 ```
 
-- **Created** — allocated, not yet initialized.
-- **Draining** — consuming drained inputs to completion before the first
-  reactive activation.
-- **Ready** — waiting for an activation trigger.
-- **Running** — inside `activate()`.
-- **Suspended** — blocked on a full downstream channel (backpressure).
-- **Completed** / **Faulted** — terminal.
-- **Cancelled** — disposed by the host; restarts (fresh WASM instance, back
-  to Created) if new input arrives.
+### Loading
 
-### Scheduler
+`RuntimeGraph::load` takes the compiled graph, a map from `ComponentRef` to
+component bytes, a `RuntimeConfig` and a `RuntimeMode`. A component's key
+is the ref of its resolved contract, or a ref without a content hash, which
+matches by package (version included) and world.
 
-`RuntimeGraph::tick()` runs one scheduler round:
+For each component, loading:
+1. decodes the WIT embedded in the bytes;
+2. lowers it, which must yield exactly one `node` world;
+3. rejects bytes whose contract hash differs from the compiled contract;
+4. instantiates every node, island by island.
 
-1. **Route** pending events (external injects, channel writes) to their
-   target channels and mark affected nodes activatable.
-2. **Actor loop** — pop ready nodes in topological order:
-   - Acquire resource claims (defer if the budget is exceeded).
-   - Call `init()` on first activation.
-   - Build an `InputSnapshot` (connected channels → runtime overrides →
-     compile-time config defaults), derive the `activation-kind`, and call
-     the node's `activate()` export.
-   - Commit output writes to downstream channels; enqueue downstream nodes.
-3. **Feedback latch** — at quiescence, flush all buffered feedback-edge
-   writes into their target channels and return `Progress` so the caller
-   drives the next iteration.
+`load_with_linker` also takes a callback that adds capability imports to
+each node's wasmtime `Linker`. It runs once per node, after the built-in
+`witgraph:runtime/host` interface is added.
 
-The tick returns `Completed` when all nodes are terminal, `Idle` when no work
-was available, `StepLimitReached` when the safety limit fires, or `Aborted`
-on a fatal fault.
+Loading fails with a `RuntimeError`:
 
-### Backpressure
+| Error | Cause |
+|---|---|
+| `MissingWasm` | No bytes for a component. |
+| `BadComponent` | The bytes are not a component, or don't embed exactly one `node` world. |
+| `ContractMismatch` | The embedded contract hashes differently from the compiled one. |
+| `Instantiation` | A node failed to instantiate (for example, a missing capability import). |
+| `InvalidConfig` | A `RuntimeConfig` field is zero, or an island's summed claims on a resource exceed 1.0. |
 
-Event queues and stream channels are bounded (configurable via
-`RuntimeConfig::channel_capacity`). When a downstream channel is full, the
-producing node's uncommitted writes are saved and it transitions to
-`Suspended`. When the consumer frees capacity, the producer resumes
-automatically — the saved writes are retried without re-executing the WASM
-activation.
+`RuntimeConfig` fields and defaults:
 
-### Resource scheduling
+| Field | Default | Meaning |
+|---|---|---|
+| `max_steps_per_tick` | 10,000 | Most generations one tick may start. |
+| `yield_interval` | `Some(100_000)` | Fuel an island burns before yielding; `None` disables yielding. |
+| `fuel_per_run` | `None` | Fuel budget reset before every `run`; `None` is effectively unlimited. |
 
-Nodes declare fractional claims on named shared resource pools (e.g. GPU
-compute, VRAM). Each pool has an implicit capacity of 1.0. The scheduler
-defers activation when the sum of active claims on any pool would exceed
-capacity. Claims can be marked `hold` to retain the allocation through
-suspension (e.g. VRAM that must not be evicted), or auto-released when the
-WASM activation finishes.
+A loaded graph also exposes `node_state(node)`, `compiled()`, `config()`,
+`mode()` and `engine()`.
 
-### Runtime modes
+### Islands
 
-`RuntimeGraph<M>` is generic over a `RuntimeMode`:
+Nodes joined by stream or future connections form an **island**
+(`CompiledGraph::islands`). Every member of an island is instantiated in one
+wasmtime Store, so stream and future handles pass directly from a
+producer's `run` result into the consumer's `run` arguments. A node with no
+stream or future connection is an island of its own.
 
-- **`Release`** — all callbacks are empty, monomorphized away to zero cost.
-- **`Debug`** — records `TraceEvent`s (before/after activate, channel writes,
-  phase transitions, faults, cancellations, restarts) behind a mutex for
-  post-mortem inspection.
+The host only handles Values: it latches them and delivers them between
+islands. A stream or future output with no consumer is closed as soon as its
+`run` returns, so the guest's writes fail instead of blocking.
+
+Islands have limits, because wasmtime isolates and schedules per Store:
+- **Shared fate.** A trap in any member faults the whole island; a trap
+  poisons the Store.
+- **No interleaving within an island.** A busy member starves its siblings.
+  Separate islands do interleave, through `yield_interval`.
+- **The host never sees stream or future items.** It cannot read, trace,
+  copy or tee them.
+
+### Generations and ticks
+
+An island runs in **generations**. A generation calls each member's `run`
+once:
+- in dependency order, with independent members called concurrently;
+- it finishes when every `run` has returned **and** no guest task is left
+  in the Store (such as a stream writer spawned before returning).
+
+Value state and when an island runs:
+- **Latched values.** The host keeps one latched value per Value input port
+  (written by connections and by `inject`) and one per Value output port
+  (latched when its `run` returns). An island's Value outputs reach other
+  islands as soon as each `run` returns.
+- **Owed generations.** Each island keeps a queue of the generations it
+  owes, separate from its lifecycle phase. A newly loaded island owes one
+  run. When one of its external Value inputs changes, it owes a run on the
+  latched inputs, whatever phase it is in. Change is decided by value
+  equality, so writing an equal value is not a change, and any number of
+  changes before the next start owe a single run.
+- **When an island starts.** All of these must hold:
+  - it owes a generation and is not already running;
+  - for a run on the latched inputs, every required external Value input has
+    a value (a restored replay brings its own inputs);
+  - its resource claims fit;
+  - no ancestor island is running or could start. An ancestor is an island
+    that reaches this one over non-feedback connections; two islands that
+    reach each other are left out of each other's ancestors, so neither
+    waits on the other.
+
+  Islands are considered in order of their shallowest member's depth
+  (`CompiledGraph::depth_map`). A stopped island is rebuilt in a fresh Store
+  before it starts.
+- **No pre-emption.** A generation in flight is never pre-empted. If inputs
+  change while it runs, the island owes another run and starts again
+  afterwards, with fresh stream and future handles.
+
+`tick()` drives this until nothing is in flight and nothing can start, then
+latches every feedback connection (one loop iteration). A tick that returns
+`StepLimitReached` or `Aborted` returns before that latch, so it latches
+nothing. It returns:
+
+| Result | Meaning |
+|---|---|
+| `Progress` | Something started or finished, or a feedback value changed. Tick again. |
+| `Idle` | Quiescent: nothing ran and nothing is waiting. |
+| `StepLimitReached` | `max_steps_per_tick` generations started before quiescence. |
+| `Aborted { node, fault }` | A node called `fatal`. |
+
+In-flight generations live in the `RuntimeGraph`, not in the tick's future.
+So:
+- **Dropping a tick is safe.** Abandoning it on a timeout loses nothing; the
+  next tick resumes.
+- **An endless generation never lets the tick finish.** Examples are an
+  infinite stream, or a source that never closes. Bound the tick with a
+  timeout, or `cancel` the node.
+- **Value round trips through another island are bounded.** One island can
+  hold both ends of a Value path that runs through a second island. Such
+  paths settle only through change detection, bounded by
+  `max_steps_per_tick`.
+
+### Inputs and outputs
+
+- **`inject(node, port, val)`** writes a Value input. It checks the value's
+  type structurally against the port (for an optional port, against its
+  inner type). An unknown node (`UnknownNode`), a non-Value port
+  (`NotAValuePort`) or a wrong type (`ValueType`) is an error.
+  Required inputs fed only by a feedback connection need an initial `inject`.
+  An unconnected optional input reads as `none` until a value is injected.
+- **`read_output(node, port)`** returns a Value output's latched value.
+
+`Val` is wasmtime's component value type, re-exported.
+
+### Lifecycle
+
+The island, not the node, carries the lifecycle, because every member
+starts, finishes, faults and is cancelled together. Internally it is a
+typestate with three phases, each owning only its own data:
+- **Idle** owns the island's Store.
+- **Running** owns the generation, which owns the Store.
+- **Stopped** owns no Store, only why it stopped: a fault, a cancel, or
+  shutdown.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Idle: load (owes a run)
+    Idle --> Running: start
+    Running --> Idle: finish
+    Running --> Stopped: fault, cancel, shutdown
+    Idle --> Stopped: cancel, shutdown
+    Stopped --> Stopped: cancel (a faulted island becomes cancelled)
+    Stopped --> Idle: rebuild
+```
+
+A node's phase is a projection of its island's state. `node_state(node)`
+returns a `NodeState` view with `phase()`, `fault_cause()`, `id()` and
+`shape()`:
+
+| Island | Node phase |
+|---|---|
+| Idle, not run since it was built or rebuilt | `Pending` |
+| Running | `Running` |
+| Idle, after a finished generation | `Idle` |
+| Stopped by a fault | `Faulted` |
+| Stopped by cancel or shutdown | `Cancelled` |
+
+`Running` covers the whole generation, including guest work that continues
+after the node's own `run` returned. Each node-phase change is reported as a
+`PhaseTransition` trace event for every member.
+
+### Faults
+
+A fault stops the island and faults every member with a `NodeFault`:
+
+| Fault | Cause |
+|---|---|
+| `WasmTrap` | A trap in any member, spawned tasks included. |
+| `FuelExhausted` | The island burned its `fuel_per_run` budget. |
+| `Fatal` | A member called `fatal`; the tick returns `Aborted`. |
+| `Restart` | Rebuilding the stopped island failed. |
+
+Owed work survives a fault. If an input changed while the failing
+generation ran, the island is rebuilt and runs again; otherwise it waits for
+its next input change. A failed rebuild (`Restart`) drops the owed work, so
+a broken component is not rebuilt over and over.
+
+### Cancellation and shutdown
+
+- **`cancel(node)`** cancels the node's whole island. It drops any in-flight
+  generation and the Store, forgets the island's owed work, and marks every
+  member `Cancelled`. A faulted island becomes cancelled too; cancelling a
+  cancelled island does nothing.
+- **`shutdown().await`** does the same for every live island. A faulted
+  island keeps its fault, but its owed work is forgotten.
+
+A cancelled or shut-down island is rebuilt on its next input change.
+
+Inside an island, cancellation is native to the component model:
+- a consumer that drops its reader makes the producer's writes fail;
+- a producer that drops its writer gives the consumer end-of-stream.
+
+### `fatal`
+
+Every host provides `witgraph:runtime/host`:
+
+```wit
+interface host {
+    fatal: func(message: string);
+}
+```
+
+Calling `fatal` faults the caller's island with `NodeFault::Fatal`, and the
+current tick returns `Aborted`.
+
+### Resources
+
+Nodes may claim fractions (in `(0, 1]`) of named resources, each with
+capacity 1.0.
+- **Claims are per island.** An island's claim is the sum of its members'
+  claims.
+- **Lifetime.** A claim is held from generation start until the generation
+  finishes, faults or is cancelled.
+- **Admission.** The scheduler defers an island whose claims would exceed
+  capacity.
+- **Load check.** An island whose own claims exceed 1.0 is rejected at load.
 
 ### Sandboxing
 
-The engine supports wasmtime fuel metering and epoch-based interruption,
-configured via `RuntimeConfig`:
+Every island Store meters fuel:
+- **`yield_interval`** (default 100,000): the island yields to the executor
+  after burning this much fuel, so a busy island cannot starve other
+  islands.
+- **`fuel_per_run`** (default `None`, effectively unlimited): before every
+  `run` call, the island's fuel is reset to this budget. An island that
+  burns it before its next `run` starts faults with
+  `NodeFault::FuelExhausted`.
 
-- **`fuel_per_activation`** — optional fuel budget applied before each WASM
-  `activate()` call. The activation traps when the budget is exhausted
-  (`NodeFault::FuelExhausted`).
-- **`epoch_deadline`** — optional epoch tick deadline. The host calls
-  `WasmEngine::increment_epoch()` externally; any store whose deadline has
-  been reached traps (`NodeFault::EpochInterrupted`).
+The budget is shared by everything running in the island, spawned tasks
+included. An endless streaming generation therefore exhausts any finite
+budget eventually. Give endless islands `None`, or a budget sized for how
+long they should live.
 
-The `prepare_activation` API accepts per-activation fuel and epoch values,
-so callers that build custom schedulers can set per-node budgets.
+### Snapshots
+
+`snapshot()` captures the host-visible state at any time, mid-generation
+included. It returns a `Result`, which fails only if a latched value cannot
+be rendered as WAVE text; Value ports never hold such values. It captures:
+- latched Value inputs and outputs, and pending feedback values, as WAVE
+  text;
+- every node's phase;
+- for each island with work outstanding, the external inputs its in-flight
+  generation started with, and whether another generation is queued;
+- the component ref (id and content hash) of every node;
+- a `quiescent` flag.
+
+`Snapshot` is a serde type.
+
+`restore(&snapshot)` puts that state back:
+- **Preconditions.** No island may be running: the graph is freshly loaded,
+  shut down, or every running island was just cancelled. It must have
+  exactly the snapshot's nodes and components. Otherwise `restore` fails
+  with `NotQuiescent` or `SnapshotMismatch`.
+- **Validation.** Every value is parsed against its port type
+  (`SnapshotValue` on failure). On any error, nothing changes.
+- **Owed work.** Each island owes exactly what the snapshot recorded: a
+  replay of the generation that was in flight, then a run on the latched
+  inputs if one was queued. Islands with nothing outstanding owe nothing,
+  even on a freshly loaded graph.
+- **Replay.** A replay re-runs the generation from its start, with the
+  inputs it started with, rebuilding a stopped island first. It runs before
+  its own island's queued run, but like any start it waits for the island's
+  ancestors and resources, so other islands may start first.
+
+Snapshots do not store stream or future contents. Restoring re-runs any
+generation that was in flight, which recreates its streams from the recorded
+inputs; the result matches the original only if the guests are
+deterministic. Guest memory, including suspended tasks, cannot be read out
+of wasmtime and is not captured. A replayed source that pulls from a
+capability pulls again. Node phases are recorded for debugging but not
+restored.
+
+### Instrumentation
+
+`RuntimeGraph<M>` is generic over a `RuntimeMode`:
+- **`Release`** has empty callbacks.
+- **`Debug`** records `TraceEvent`s, read back with `Debug::trace()`:
+  `GenerationStarted`, `RunStarted`, `RunReturned`, `GenerationFinished`,
+  `PhaseTransition`, `Fault`, `Cancelled` and `Restarted`.

@@ -83,7 +83,8 @@ fn join_with_hashes(refs: &[ComponentRef]) -> String {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 pub enum Diagnostic {
-    /// A node references a component missing from the graph's contract table.
+    /// A node references a component missing from the graph's component
+    /// table.
     #[error("node `{node}` references unknown component `{component}`")]
     #[diagnostic(code(witgraph::ir::unknown_component))]
     UnknownComponent {
@@ -92,9 +93,23 @@ pub enum Diagnostic {
         /// The unresolved component reference.
         component: ComponentRef,
     },
-    /// Two contracts in the graph's component table share an identity
+    /// A component table entry for which the [`ContractSource`] supplied no
+    /// contract — the component is unknown to it, or the source only has a
+    /// revision with a different content hash.
+    ///
+    /// [`ContractSource`]: crate::ContractSource
+    #[error("no contract was supplied for component `{0}`")]
+    #[diagnostic(
+        code(witgraph::ir::contract_not_found),
+        help(
+            "looked up {}; re-derive the contract from the component's WIT, or re-pin the graph to the revision you have",
+            join_with_hashes(core::slice::from_ref(_0))
+        )
+    )]
+    ContractNotFound(ComponentRef),
+    /// Two entries in the graph's component table share an identity
     /// (package, world, version, and content hash all equal).
-    #[error("component table contains duplicate contract `{0}`")]
+    #[error("component table contains duplicate component `{0}`")]
     #[diagnostic(code(witgraph::ir::duplicate_component))]
     DuplicateComponent(ComponentRef),
     /// A contract declares two ports with the same name on the same side.
@@ -180,7 +195,7 @@ pub enum Diagnostic {
         /// The port used as a target.
         port: PortRef,
     },
-    /// A connection joins ports of different kinds (e.g. Event to Stream).
+    /// A connection joins ports of different kinds (e.g. Value to Stream).
     #[error("connection `{conn}` mixes port kinds: {from} -> {to}")]
     #[diagnostic(code(witgraph::ir::kind_mismatch))]
     KindMismatch {
@@ -223,20 +238,6 @@ pub enum Diagnostic {
         /// The unconnected input port.
         port: PortRef,
     },
-    /// A drained input whose kind has no completion semantics: only Stream
-    /// (end-of-stream) and Future (resolution) can be drained.
-    #[error(
-        "drained input `{port}` on `{component}` is a {kind}, which has no completion to drain"
-    )]
-    #[diagnostic(code(witgraph::ir::undrainable_input))]
-    UndrainableInput {
-        /// The component declaring the drained input.
-        component: ComponentRef,
-        /// The undrainable input port.
-        port: PortName,
-        /// The port's kind (Value or Event).
-        kind: PortKind,
-    },
     /// An output port marked optional: optionality only applies to inputs.
     #[error(
         "output port `{port}` on `{component}` is marked optional; only inputs may be optional"
@@ -248,42 +249,41 @@ pub enum Diagnostic {
         /// The flagged output port.
         port: PortName,
     },
-    /// An output port marked drained: draining only applies to inputs.
-    #[error("output port `{port}` on `{component}` is marked drained; only inputs may be drained")]
-    #[diagnostic(code(witgraph::ir::drained_output))]
-    DrainedOutput {
-        /// The component declaring the flagged output.
+    /// An input port marked optional whose kind is Stream or Future. Only
+    /// Value inputs can be optional: an unconnected value reads as `none`,
+    /// but there is no handle to hand a node for an unconnected stream or
+    /// future.
+    #[error(
+        "input port `{port}` on `{component}` is an optional {kind}; only value inputs may be optional"
+    )]
+    #[diagnostic(code(witgraph::ir::optional_async_input))]
+    OptionalAsyncInput {
+        /// The component declaring the flagged input.
         component: ComponentRef,
-        /// The flagged output port.
+        /// The flagged input port.
         port: PortName,
+        /// The port's kind (Stream or Future).
+        kind: PortKind,
     },
-    /// A non-feedback connection into a drained input lies on a cycle: the
-    /// drain waits on a completion that transitively depends on the node's
-    /// own output — deadlock. Feedback connections into drained inputs are
-    /// diagnosed as [`FeedbackIntoDrainedInput`](Self::FeedbackIntoDrainedInput).
+    /// A Stream or Future output with more than one outgoing connection.
+    /// Stream and future handles move to exactly one consumer; fan-out is
+    /// the job of a dedicated tee node.
     #[error(
-        "connection `{conn}` feeds drained input `{port}` from within a cycle and would deadlock"
+        "{kind} output `{port}` has {} consumers ({}); stream and future outputs connect to at most one input",
+        connections.len(),
+        join_unique(connections)
     )]
-    #[diagnostic(code(witgraph::ir::drained_input_on_cycle))]
-    DrainedInputOnCycle {
-        /// The deadlocking connection.
-        conn: ConnectionId,
-        /// The drained input port it feeds.
-        port: PortRef,
-    },
-    /// A feedback connection into a drained input. A feedback edge delivers
-    /// per-iteration values, but a drained input completes before the node's
-    /// first activation — before any iteration has produced a value — so the
-    /// combination can never deliver anything.
-    #[error(
-        "feedback connection `{conn}` feeds drained input `{port}`, which completes before any iteration runs"
+    #[diagnostic(
+        code(witgraph::ir::async_fan_out),
+        help("insert a tee node to duplicate the {kind}")
     )]
-    #[diagnostic(code(witgraph::ir::feedback_into_drained_input))]
-    FeedbackIntoDrainedInput {
-        /// The contradictory feedback connection.
-        conn: ConnectionId,
-        /// The drained input port it feeds.
+    AsyncFanOut {
+        /// The over-shared output port.
         port: PortRef,
+        /// The port's kind (Stream or Future).
+        kind: PortKind,
+        /// Every connection reading from it.
+        connections: Vec<ConnectionId>,
     },
     /// A cycle in which no edge is marked as a feedback boundary. `nodes`
     /// holds the members of the offending strongly connected component,
@@ -301,52 +301,21 @@ pub enum Diagnostic {
         /// The pointless feedback connection.
         conn: ConnectionId,
     },
-    /// A node config entry targets a port that does not exist on the
-    /// node's component.
-    #[error("node `{node}` config references unknown port `{port}`")]
-    #[diagnostic(code(witgraph::ir::config_unknown_port))]
-    ConfigUnknownPort {
-        /// The node carrying the bad config.
-        node: NodeId,
-        /// The port name that does not exist.
-        port: PortName,
-    },
-    /// A node config entry targets a port that is not a Value input.
+    /// A feedback connection carries a Stream or Future port. A feedback
+    /// edge is a unit-delay boundary between generations, which only a
+    /// Value can cross: a stream or future handle belongs to the run that
+    /// created it.
     #[error(
-        "node `{node}` config targets {kind} port `{port}`, but only value inputs accept config"
+        "feedback connection `{conn}` carries a {kind} port; feedback connections must carry values"
     )]
-    #[diagnostic(code(witgraph::ir::config_not_value_input))]
-    ConfigNotValueInput {
-        /// The node carrying the bad config.
-        node: NodeId,
-        /// The mismatched port name.
-        port: PortName,
-        /// The port's actual kind.
-        kind: PortKind,
-    },
-    /// A node config value does not match the port's declared type.
-    #[error("node `{node}` config for port `{port}` has wrong type: expected {expected}")]
-    #[diagnostic(code(witgraph::ir::config_type_mismatch))]
-    ConfigTypeMismatch {
-        /// The node carrying the bad config.
-        node: NodeId,
-        /// The port whose type does not match.
-        port: PortName,
-        /// Rendered expected type.
-        expected: String,
-    },
-    /// A feedback connection carries a Future-kind port. Future is one-shot;
-    /// feedback is iterative. The second iteration's resolve is silently
-    /// rejected.
-    #[error(
-        "feedback connection `{conn}` carries a future port, which can only resolve once"
-    )]
-    #[diagnostic(code(witgraph::ir::feedback_on_future))]
-    FeedbackOnFuture {
+    #[diagnostic(code(witgraph::ir::async_feedback))]
+    AsyncFeedback {
         /// The contradictory feedback connection.
         conn: ConnectionId,
-        /// The future port.
+        /// The source port.
         port: PortRef,
+        /// The port's kind (Stream or Future).
+        kind: PortKind,
     },
 }
 
@@ -373,21 +342,20 @@ impl Diagnostic {
             | Diagnostic::NotAnInput { conn, .. }
             | Diagnostic::KindMismatch { conn, .. }
             | Diagnostic::TypeMismatch { conn, .. }
-            | Diagnostic::DrainedInputOnCycle { conn, .. }
-            | Diagnostic::FeedbackIntoDrainedInput { conn, .. }
-            | Diagnostic::FeedbackOnFuture { conn, .. }
+            | Diagnostic::AsyncFeedback { conn, .. }
             | Diagnostic::UselessFeedback { conn } => Location::Connection(conn.clone()),
             Diagnostic::MultipleWriters { port, .. }
+            | Diagnostic::AsyncFanOut { port, .. }
             | Diagnostic::RequiredInputUnconnected { port } => Location::Port(port.clone()),
-            Diagnostic::DuplicateComponent(component) => Location::Component(component.clone()),
+            Diagnostic::DuplicateComponent(component) | Diagnostic::ContractNotFound(component) => {
+                Location::Component(component.clone())
+            }
             Diagnostic::DuplicatePortName { component, .. }
-            | Diagnostic::UndrainableInput { component, .. }
             | Diagnostic::OptionalOutput { component, .. }
-            | Diagnostic::DrainedOutput { component, .. } => Location::Component(component.clone()),
+            | Diagnostic::OptionalAsyncInput { component, .. } => {
+                Location::Component(component.clone())
+            }
             Diagnostic::IllegalCycle { nodes } => Location::Cycle(nodes.clone()),
-            Diagnostic::ConfigUnknownPort { node, .. }
-            | Diagnostic::ConfigNotValueInput { node, .. }
-            | Diagnostic::ConfigTypeMismatch { node, .. } => Location::Node(node.clone()),
         }
     }
 }
@@ -504,11 +472,20 @@ mod tests {
                 Location::Connection("c".into()),
             ),
             (
-                Diagnostic::FeedbackIntoDrainedInput {
+                Diagnostic::AsyncFeedback {
                     conn: "c".into(),
                     port: PortRef::new("n", "p"),
+                    kind: PortKind::Stream,
                 },
                 Location::Connection("c".into()),
+            ),
+            (
+                Diagnostic::AsyncFanOut {
+                    port: PortRef::new("n", "p"),
+                    kind: PortKind::Stream,
+                    connections: vec!["c1".into(), "c2".into()],
+                },
+                Location::Port(PortRef::new("n", "p")),
             ),
             (
                 Diagnostic::RequiredInputUnconnected {
@@ -537,6 +514,19 @@ mod tests {
         assert_eq!(
             diagnostic.to_string(),
             "input port `n.in` has multiple writers: c"
+        );
+    }
+
+    #[test]
+    fn async_fan_out_message_counts_consumers() {
+        let diagnostic = Diagnostic::AsyncFanOut {
+            port: PortRef::new("n", "out"),
+            kind: PortKind::Stream,
+            connections: vec!["c1".into(), "c2".into()],
+        };
+        assert_eq!(
+            diagnostic.to_string(),
+            "stream output `n.out` has 2 consumers (c1, c2); stream and future outputs connect to at most one input"
         );
     }
 

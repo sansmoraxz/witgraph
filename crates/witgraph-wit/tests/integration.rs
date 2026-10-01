@@ -1,7 +1,7 @@
 //! End-to-end proof: WIT fixtures are loaded and lowered, wired into a graph
-//! exercising all four port kinds and a feedback boundary, compiled,
-//! serialized editor-independently, and reflected into the committed metadata
-//! catalog.
+//! exercising every port kind, stream islands and a feedback boundary,
+//! compiled against the re-derived contracts, serialized as plain component
+//! references, and reflected into the committed metadata catalog.
 
 // Test helpers outside #[test] fns aren't covered by allow-*-in-tests.
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
@@ -9,13 +9,14 @@
 use std::collections::BTreeSet;
 
 use witgraph_wit::ir::{
-    Capability, ComponentContract, ConsumptionMode, Diagnostic, Graph, PortKind, PortRef,
+    Capability, ComponentContract, Diagnostic, Graph, NodeShape, PortKind, PortRef, RunKind,
 };
-use witgraph_wit::{load_components, metadata};
+use witgraph_wit::{load_components, load_lowered, metadata};
+
+const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/demo");
 
 fn fixtures() -> Vec<ComponentContract> {
-    load_components(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/demo"))
-        .expect("fixtures load and lower")
+    load_components(FIXTURES).expect("fixtures load and lower")
 }
 
 fn contract<'a>(contracts: &'a [ComponentContract], world: &str) -> &'a ComponentContract {
@@ -25,34 +26,31 @@ fn contract<'a>(contracts: &'a [ComponentContract], world: &str) -> &'a Componen
         .unwrap_or_else(|| panic!("no `{world}` contract"))
 }
 
-/// sensor ─samples→ filter ─filtered→ display, filter ─done→ display,
-/// sensor ─samples→ collector (drained input), sensor ─threshold-crossed→
-/// alarm, accumulator state loop via feedback.
+/// Island 1: sensor ─samples→ filter ─filtered→ display, filter ─done→
+/// display, sensor ─threshold-crossed→ alarm.
+/// Island 2: archive (a second sensor) ─samples→ collector.
+/// Island 3: accumulator, whose state loops back over a feedback edge.
 fn demo_graph(contracts: &[ComponentContract]) -> Graph {
     let mut builder = Graph::builder("demo");
     for c in contracts {
-        builder = builder.add_component(c.clone());
+        builder = builder.add_component(c);
     }
-    for world in [
-        "sensor",
-        "filter",
-        "display",
-        "alarm",
-        "accumulator",
-        "collector",
+    for (node, world) in [
+        ("sensor", "sensor"),
+        ("archive", "sensor"),
+        ("filter", "filter"),
+        ("display", "display"),
+        ("alarm", "alarm"),
+        ("collector", "collector"),
+        ("accumulator", "accumulator"),
     ] {
-        builder = builder.add_node(world, contract(contracts, world).id.clone());
+        builder = builder.add_node(node, contract(contracts, world).id.clone());
     }
     builder
         .connect(
             "samples",
             PortRef::new("sensor", "samples"),
             PortRef::new("filter", "raw"),
-        )
-        .connect(
-            "collect",
-            PortRef::new("sensor", "samples"),
-            PortRef::new("collector", "samples"),
         )
         .connect(
             "view",
@@ -69,6 +67,11 @@ fn demo_graph(contracts: &[ComponentContract]) -> Graph {
             PortRef::new("sensor", "threshold-crossed"),
             PortRef::new("alarm", "trigger"),
         )
+        .connect(
+            "collect",
+            PortRef::new("archive", "samples"),
+            PortRef::new("collector", "samples"),
+        )
         .connect_feedback(
             "state",
             PortRef::new("accumulator", "state-out"),
@@ -77,8 +80,16 @@ fn demo_graph(contracts: &[ComponentContract]) -> Graph {
         .build()
 }
 
+fn diagnostics(graph: Graph, contracts: &[ComponentContract]) -> Vec<Diagnostic> {
+    graph
+        .compile(contracts)
+        .expect_err("expected compilation failure")
+        .diagnostics
+        .into_vec()
+}
+
 #[test]
-fn fixtures_lower_with_all_four_port_kinds() {
+fn fixtures_lower_with_every_port_kind() {
     let contracts = fixtures();
     assert_eq!(contracts.len(), 6);
 
@@ -93,17 +104,16 @@ fn fixtures_lower_with_all_four_port_kinds() {
     };
     assert_eq!(kind("sensor", "latest"), PortKind::Value);
     assert_eq!(kind("sensor", "samples"), PortKind::Stream);
-    assert_eq!(kind("sensor", "threshold-crossed"), PortKind::Event);
+    assert_eq!(kind("sensor", "threshold-crossed"), PortKind::Stream);
     assert_eq!(kind("filter", "done"), PortKind::Future);
+    assert_eq!(kind("collector", "samples"), PortKind::Stream);
 
+    let accumulator = contract(&contracts, "accumulator");
+    assert_eq!(accumulator.run, RunKind::Sync);
+    assert_eq!(accumulator.shape(), NodeShape::Reactive);
     let collector = contract(&contracts, "collector");
-    let samples = collector
-        .inputs
-        .iter()
-        .find(|p| p.name.as_str() == "samples")
-        .expect("collector has a `samples` input");
-    assert!(samples.drained);
-    assert_eq!(collector.consumption_mode(), ConsumptionMode::Sync);
+    assert_eq!(collector.run, RunKind::Async);
+    assert_eq!(collector.shape(), NodeShape::Streaming);
 
     for c in &contracts {
         let hash = c.id.content_hash.as_deref().expect("every contract hashed");
@@ -115,7 +125,7 @@ fn fixtures_lower_with_all_four_port_kinds() {
 fn demo_graph_compiles_and_aggregates_capabilities() {
     let contracts = fixtures();
     let compiled = demo_graph(&contracts)
-        .compile()
+        .compile(&contracts)
         .expect("demo graph is valid");
 
     assert!(compiled.warnings().is_empty(), "{}", compiled.warnings());
@@ -137,6 +147,27 @@ fn demo_graph_compiles_and_aggregates_capabilities() {
     assert!(position("sensor") < position("filter"));
     assert!(position("filter") < position("display"));
     assert!(position("sensor") < position("alarm"));
+    assert!(position("archive") < position("collector"));
+}
+
+#[test]
+fn demo_graph_partitions_into_stream_islands() {
+    let contracts = fixtures();
+    let compiled = demo_graph(&contracts).compile(&contracts).unwrap();
+    let mut islands: Vec<BTreeSet<&str>> = compiled
+        .islands()
+        .iter()
+        .map(|island| island.iter().map(|n| n.as_str()).collect())
+        .collect();
+    islands.sort();
+    assert_eq!(
+        islands,
+        vec![
+            BTreeSet::from(["accumulator"]),
+            BTreeSet::from(["alarm", "display", "filter", "sensor"]),
+            BTreeSet::from(["archive", "collector"]),
+        ]
+    );
 }
 
 #[test]
@@ -150,9 +181,8 @@ fn value_to_stream_connection_rejected() {
         .unwrap();
     samples.from = PortRef::new("sensor", "latest");
 
-    let failure = graph.compile().unwrap_err();
-    let diags = failure.diagnostics.into_vec();
-    assert_eq!(diags.len(), 1);
+    let diags = diagnostics(graph, &contracts);
+    assert_eq!(diags.len(), 1, "{diags:?}");
     assert!(matches!(
         diags[0],
         Diagnostic::KindMismatch {
@@ -167,20 +197,19 @@ fn value_to_stream_connection_rejected() {
 fn second_writer_rejected() {
     let contracts = fixtures();
     let mut graph = demo_graph(&contracts);
-    let mut second = graph
-        .connections
-        .iter()
-        .find(|c| c.id.as_str() == "samples")
-        .unwrap()
-        .clone();
-    second.id = "samples-again".into();
-    second.from = PortRef::new("sensor", "samples");
+    let spare = graph.nodes[0].clone();
+    graph.nodes.push(witgraph_wit::ir::Node {
+        id: "spare".into(),
+        ..spare
+    });
+    let mut second = graph.connections[0].clone();
+    second.id = "spare-view".into();
+    second.from = PortRef::new("spare", "samples");
     second.to = PortRef::new("display", "view");
     graph.connections.push(second);
 
-    let failure = graph.compile().unwrap_err();
-    let diags = failure.diagnostics.into_vec();
-    assert_eq!(diags.len(), 1);
+    let diags = diagnostics(graph, &contracts);
+    assert_eq!(diags.len(), 1, "{diags:?}");
     match &diags[0] {
         Diagnostic::MultipleWriters { port, connections } => {
             assert_eq!(*port, PortRef::new("display", "view"));
@@ -188,6 +217,52 @@ fn second_writer_rejected() {
         }
         other => panic!("expected MultipleWriters, got {other:?}"),
     }
+}
+
+#[test]
+fn stream_fan_out_rejected() {
+    let contracts = fixtures();
+    let mut graph = demo_graph(&contracts);
+    let mut tap = graph.connections[0].clone();
+    tap.id = "tap".into();
+    tap.from = PortRef::new("sensor", "samples");
+    tap.to = PortRef::new("collector", "samples");
+    graph.connections.retain(|c| c.id.as_str() != "collect");
+    graph.connections.push(tap);
+
+    let diags = diagnostics(graph, &contracts);
+    assert!(
+        diags.iter().any(|d| matches!(
+            d,
+            Diagnostic::AsyncFanOut { port, kind: PortKind::Stream, connections }
+                if *port == PortRef::new("sensor", "samples") && connections.len() == 2
+        )),
+        "{diags:?}"
+    );
+}
+
+#[test]
+fn feedback_on_stream_rejected() {
+    let contracts = fixtures();
+    let mut graph = demo_graph(&contracts);
+    let view = graph
+        .connections
+        .iter_mut()
+        .find(|c| c.id.as_str() == "view")
+        .unwrap();
+    view.feedback = true;
+
+    let diags = diagnostics(graph, &contracts);
+    assert!(
+        diags.iter().any(|d| matches!(
+            d,
+            Diagnostic::AsyncFeedback {
+                kind: PortKind::Stream,
+                ..
+            }
+        )),
+        "{diags:?}"
+    );
 }
 
 #[test]
@@ -201,7 +276,7 @@ fn state_loop_without_feedback_flag_rejected() {
         .unwrap();
     state.feedback = false;
 
-    let failure = graph.compile().unwrap_err();
+    let failure = graph.compile(&contracts).unwrap_err();
     assert!(failure.diagnostics.iter().any(|d| matches!(
         d,
         Diagnostic::IllegalCycle { nodes } if nodes.iter().any(|n| n.as_str() == "accumulator")
@@ -209,24 +284,51 @@ fn state_loop_without_feedback_flag_rejected() {
 }
 
 #[test]
-fn serialized_graph_is_editor_independent() {
+fn serialized_graph_holds_refs_and_recompiles_against_rederived_contracts() {
     let contracts = fixtures();
     let graph = demo_graph(&contracts);
 
-    let json = serde_json::to_string_pretty(&graph).unwrap();
-    let restored: Graph = serde_json::from_str(&json).unwrap();
-    assert_eq!(graph, restored);
+    let json = serde_json::to_value(&graph).unwrap();
+    for entry in json["components"].as_array().unwrap() {
+        let entry = entry.as_object().unwrap();
+        assert!(
+            entry.contains_key("content_hash"),
+            "refs are pinned: {entry:?}"
+        );
+        assert!(
+            !entry.contains_key("inputs") && !entry.contains_key("outputs"),
+            "no contract data is serialized: {entry:?}"
+        );
+    }
 
-    // The deserialized graph is self-contained: it re-compiles with no
-    // resolver, filesystem, or editor state.
+    let restored: Graph = serde_json::from_value(json).unwrap();
+    assert_eq!(graph, restored);
     restored
-        .compile()
-        .expect("round-tripped graph still compiles");
+        .compile(&fixtures())
+        .expect("round-tripped graph compiles against freshly lowered contracts");
+}
+
+#[test]
+fn edited_component_no_longer_satisfies_a_pinned_graph() {
+    let contracts = fixtures();
+    let graph = demo_graph(&contracts);
+    let mut edited = contracts.clone();
+    let alarm = edited.iter_mut().find(|c| c.id.world == "alarm").unwrap();
+    alarm.id.content_hash = Some("0".repeat(64));
+
+    let diags = diagnostics(graph, &edited);
+    assert!(
+        diags.iter().any(|d| matches!(
+            d,
+            Diagnostic::ContractNotFound(id) if id.world == "alarm"
+        )),
+        "{diags:?}"
+    );
 }
 
 #[test]
 fn catalog_matches_committed_golden() {
-    let catalog = metadata::generate_catalog(&fixtures());
+    let catalog = metadata::generate_catalog(&load_lowered(FIXTURES).unwrap());
     let json = metadata::to_json(&catalog).unwrap();
     let golden_path = concat!(
         env!("CARGO_MANIFEST_DIR"),

@@ -1,42 +1,26 @@
-#[allow(warnings)]
-mod bindings {
-    wit_bindgen::generate!({
-        path: "../../../witgraph-runtime/wit",
-        world: "graph-node",
-    });
-}
+wit_bindgen::generate!({ path: "wit", world: "stream-producer" });
 
-use bindings::exports::witgraph::runtime::node::Guest;
-use bindings::witgraph::runtime::runtime_host;
-use bindings::witgraph::runtime::types::{ActivationKind, ActivationResult};
+use exports::node::{Guest, Inputs, Outputs};
 
-#[derive(serde::Serialize, serde::Deserialize)]
-enum Val {
-    U32(u32),
-}
+struct Producer;
 
-struct StreamProducer;
-
-impl Guest for StreamProducer {
-    fn init() {}
-
-    fn activate(_reason: ActivationKind) -> ActivationResult {
-        let burst_size = runtime_host::read_value("burst-size")
-            .and_then(|bytes| serde_json::from_slice::<Val>(&bytes).ok())
-            .map(|v| match v {
-                Val::U32(n) => n,
-            })
-            .unwrap_or(1);
-
-        for i in 0..burst_size {
-            let item = serde_json::to_vec(&Val::U32(i)).unwrap_or_default();
-            runtime_host::push_stream("items", &item);
-        }
-        runtime_host::close_stream("items");
-        ActivationResult::Completed
+impl Guest for Producer {
+    async fn run(inputs: Inputs) -> Outputs {
+        let (mut tx, rx) = wit_stream::new::<u32>();
+        // Return the reader first and write afterwards: the consumer can
+        // only start once this `run` has handed over its stream.
+        wit_bindgen::spawn_local(async move {
+            let mut i = 0u32;
+            while inputs.burst_size.is_none_or(|n| i < n) {
+                // `Some` back means the reader was dropped.
+                if tx.write_one(i).await.is_some() {
+                    break;
+                }
+                i = i.wrapping_add(1);
+            }
+        });
+        Outputs { items: rx }
     }
-
-    fn dispose() {}
 }
 
-bindings::export!(StreamProducer with_types_in bindings);
+export!(Producer);

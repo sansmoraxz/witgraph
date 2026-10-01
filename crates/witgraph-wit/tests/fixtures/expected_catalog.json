@@ -1,28 +1,24 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "components": [
     {
       "id": "demo:graph/accumulator@0.1.0",
       "package": "demo:graph@0.1.0",
       "world": "accumulator",
-      "content_hash": "db8d1567b59843d546cbfa7c845363857153f0b6b24ea663c6e624b9e955903d",
+      "content_hash": "bc429cc21835d5a477999a4b0e08b61f8f393ed0731128c9ed8be51fa4795ea6",
       "docs": "Integrates deltas into a running total carried across iterations.",
       "inputs": [
         {
           "name": "delta",
           "kind": "value",
           "type_display": "f64",
-          "type": "f64",
-          "optional": true,
-          "drained": false
+          "optional": true
         },
         {
           "name": "state-in",
           "kind": "value",
           "type_display": "f64",
-          "type": "f64",
           "optional": true,
-          "drained": false,
           "docs": "Previous iteration's total, delivered over a feedback edge."
         }
       ],
@@ -31,80 +27,61 @@
           "name": "state-out",
           "kind": "value",
           "type_display": "f64",
-          "type": "f64",
-          "optional": false,
-          "drained": false
+          "optional": false
         }
       ],
+      "run": "sync",
       "capabilities": []
     },
     {
       "id": "demo:graph/alarm@0.1.0",
       "package": "demo:graph@0.1.0",
       "world": "alarm",
-      "content_hash": "26e059c07740161daa4019e9485cf388df636a00d38bc291c70837be092ccdc1",
-      "docs": "Reacts to threshold events.",
+      "content_hash": "d974a15c0c0ed016b329573184952ac7ca45147cc033f7e328960662cba80e8a",
+      "docs": "Reacts to threshold crossings.",
       "inputs": [
         {
           "name": "trigger",
-          "kind": "event",
+          "kind": "stream",
           "type_display": "f64",
-          "type": "f64",
-          "optional": false,
-          "drained": false
+          "optional": false
         }
       ],
       "outputs": [],
+      "run": "async",
       "capabilities": []
     },
     {
       "id": "demo:graph/collector@0.1.0",
       "package": "demo:graph@0.1.0",
       "world": "collector",
-      "content_hash": "558ecfa2513c26299ab9be6f9ff7e0a8b920b6b5a0cdcdd199f63486d66b9596",
-      "docs": "Sums an entire stream of readings once it closes: the stream is a drained\ninput, so the node runs synchronously with the latched total.",
+      "content_hash": "919424732c55fe9f533cd6e0dc5bf179578c2b87b5c5769ec99842cda206e088",
+      "docs": "Sums an entire stream of readings. The node collects the stream itself\n(reading it to end-of-stream) and resolves `summary` once it closes.",
       "inputs": [
-        {
-          "name": "scale",
-          "kind": "value",
-          "type_display": "f64",
-          "type": "f64",
-          "optional": true,
-          "drained": false,
-          "docs": "Latched scale factor, sampled when the drained batch fires."
-        },
         {
           "name": "samples",
           "kind": "stream",
           "type_display": "record { value: f64, timestamp: u64 }",
-          "type": {
-            "record": {
-              "fields": [
-                {
-                  "name": "value",
-                  "type": "f64"
-                },
-                {
-                  "name": "timestamp",
-                  "type": "u64"
-                }
-              ]
-            }
-          },
-          "optional": false,
-          "drained": true
+          "optional": false
+        },
+        {
+          "name": "scale",
+          "kind": "value",
+          "type_display": "f64",
+          "optional": true,
+          "docs": "Scale factor, read when `run` starts."
         }
       ],
       "outputs": [
         {
-          "name": "total",
-          "kind": "value",
+          "name": "summary",
+          "kind": "future",
           "type_display": "f64",
-          "type": "f64",
           "optional": false,
-          "drained": false
+          "docs": "The scaled total, resolved when `samples` closes."
         }
       ],
+      "run": "async",
       "capabilities": [],
       "types": [
         {
@@ -117,40 +94,24 @@
       "id": "demo:graph/display@0.1.0",
       "package": "demo:graph@0.1.0",
       "world": "display",
-      "content_hash": "d62a3d0b07b011b333f09aa5d3f64655161fa31e72e61d235f2103c382389157",
+      "content_hash": "27c19708ddce3b19032d31a1d0d848bd442a030db9c34fa1bf0c6fa52c0c0241",
       "docs": "Renders the filtered stream.",
       "inputs": [
         {
           "name": "view",
           "kind": "stream",
           "type_display": "record { value: f64, timestamp: u64 }",
-          "type": {
-            "record": {
-              "fields": [
-                {
-                  "name": "value",
-                  "type": "f64"
-                },
-                {
-                  "name": "timestamp",
-                  "type": "u64"
-                }
-              ]
-            }
-          },
-          "optional": false,
-          "drained": false
+          "optional": false
         },
         {
           "name": "done",
           "kind": "future",
           "type_display": "string",
-          "type": "string",
-          "optional": false,
-          "drained": false
+          "optional": false
         }
       ],
       "outputs": [],
+      "run": "async",
       "capabilities": [],
       "types": [
         {
@@ -163,29 +124,14 @@
       "id": "demo:graph/filter@0.1.0",
       "package": "demo:graph@0.1.0",
       "world": "filter",
-      "content_hash": "9843932ad29617eaf389336a70980d49454cee8cce36117af4de8796ecc60ace",
+      "content_hash": "78aa34fac1712f23fb902d3e01e656fce9c42b0dcde392beab50d84d310ccb76",
       "docs": "Smooths a stream of readings.",
       "inputs": [
         {
           "name": "raw",
           "kind": "stream",
           "type_display": "record { value: f64, timestamp: u64 }",
-          "type": {
-            "record": {
-              "fields": [
-                {
-                  "name": "value",
-                  "type": "f64"
-                },
-                {
-                  "name": "timestamp",
-                  "type": "u64"
-                }
-              ]
-            }
-          },
-          "optional": false,
-          "drained": false
+          "optional": false
         }
       ],
       "outputs": [
@@ -193,33 +139,17 @@
           "name": "filtered",
           "kind": "stream",
           "type_display": "record { value: f64, timestamp: u64 }",
-          "type": {
-            "record": {
-              "fields": [
-                {
-                  "name": "value",
-                  "type": "f64"
-                },
-                {
-                  "name": "timestamp",
-                  "type": "u64"
-                }
-              ]
-            }
-          },
-          "optional": false,
-          "drained": false
+          "optional": false
         },
         {
           "name": "done",
           "kind": "future",
           "type_display": "string",
-          "type": "string",
           "optional": false,
-          "drained": false,
           "docs": "Resolves with a summary when the input stream closes."
         }
       ],
+      "run": "async",
       "capabilities": [
         "demo:caps/log@0.1.0"
       ],
@@ -234,16 +164,14 @@
       "id": "demo:graph/sensor@0.1.0",
       "package": "demo:graph@0.1.0",
       "world": "sensor",
-      "content_hash": "5c39b2052876479676ba02f63496c36ec059c526458e079a65807705753596f8",
+      "content_hash": "98826b5bd214a9589d1c757ee520c9d3e9e90aad7dca1c9c3519a8690dbd89f9",
       "docs": "Periodically samples a sensor and publishes readings.",
       "inputs": [
         {
           "name": "sample-rate",
           "kind": "value",
           "type_display": "u32",
-          "type": "u32",
           "optional": true,
-          "drained": false,
           "docs": "Samples per second; the component picks a default when absent."
         }
       ],
@@ -252,56 +180,25 @@
           "name": "latest",
           "kind": "value",
           "type_display": "record { value: f64, timestamp: u64 }",
-          "type": {
-            "record": {
-              "fields": [
-                {
-                  "name": "value",
-                  "type": "f64"
-                },
-                {
-                  "name": "timestamp",
-                  "type": "u64"
-                }
-              ]
-            }
-          },
           "optional": false,
-          "drained": false,
-          "docs": "Latched most recent reading."
+          "docs": "The first reading, available as soon as `run` returns."
         },
         {
           "name": "samples",
           "kind": "stream",
           "type_display": "record { value: f64, timestamp: u64 }",
-          "type": {
-            "record": {
-              "fields": [
-                {
-                  "name": "value",
-                  "type": "f64"
-                },
-                {
-                  "name": "timestamp",
-                  "type": "u64"
-                }
-              ]
-            }
-          },
           "optional": false,
-          "drained": false,
           "docs": "Ordered stream of all readings."
         },
         {
           "name": "threshold-crossed",
-          "kind": "event",
+          "kind": "stream",
           "type_display": "f64",
-          "type": "f64",
           "optional": false,
-          "drained": false,
-          "docs": "Fires when a reading crosses the configured threshold."
+          "docs": "One item each time a reading crosses the configured threshold."
         }
       ],
+      "run": "async",
       "capabilities": [
         "demo:caps/clock@0.1.0"
       ],

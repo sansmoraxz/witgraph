@@ -1,47 +1,51 @@
 //! Runtime mode trait and implementations.
 //!
 //! [`RuntimeMode`] is a zero-cost generic parameter on
-//! [`RuntimeGraph`](crate::graph::RuntimeGraph). In [`Release`] mode
-//! all callbacks are empty and monomorphized away. In [`struct@Debug`] mode
-//! every callback records a [`TraceEvent`] behind a mutex for
-//! post-mortem inspection.
+//! [`RuntimeGraph`](crate::graph::RuntimeGraph). In [`Release`] mode all
+//! callbacks are empty and monomorphized away. In [`struct@Debug`] mode
+//! every callback records a [`TraceEvent`] behind a mutex for post-mortem
+//! inspection.
+//!
+//! Stream and future items move guest-to-guest and are never seen by the
+//! host, so there are no per-item events.
 
 use std::sync::Mutex;
 
-use witgraph_ir::{NodeId, PortRef};
+use witgraph_ir::NodeId;
 
-use crate::abi::{Activation, ActivationResult};
 use crate::error::NodeFault;
 use crate::node::NodePhase;
-use witgraph_ir::Val;
 
 /// A trace event recorded by [`struct@Debug`] mode.
 #[derive(Debug, Clone)]
 pub enum TraceEvent {
-    /// Recorded before a node activation.
-    BeforeActivate {
-        /// The node being activated.
+    /// An island started a generation.
+    GenerationStarted {
+        /// The island's index in
+        /// [`CompiledGraph::islands`](witgraph_ir::CompiledGraph::islands).
+        island: usize,
+        /// The island's generation counter, starting at 1.
+        generation: u64,
+    },
+    /// A node's `run` was called.
+    RunStarted {
+        /// The node.
         node: NodeId,
-        /// The activation reason.
-        activation: Activation,
     },
-    /// Recorded after a node activation.
-    AfterActivate {
-        /// The node that was activated.
+    /// A node's `run` returned; its Value outputs are latched.
+    RunReturned {
+        /// The node.
         node: NodeId,
-        /// The activation result.
-        result: ActivationResult,
     },
-    /// Recorded when a value is written to a channel.
-    ChannelWrite {
-        /// The source port.
-        from: PortRef,
-        /// The destination port.
-        to: PortRef,
-        /// The value written.
-        val: Val,
+    /// Every `run` of an island's generation returned and no guest task is
+    /// left in its Store.
+    GenerationFinished {
+        /// The island's index.
+        island: usize,
+        /// The generation that finished.
+        generation: u64,
     },
-    /// Recorded when a node changes phase.
+    /// A node changed phase.
     PhaseTransition {
         /// The node changing phase.
         node: NodeId,
@@ -50,19 +54,19 @@ pub enum TraceEvent {
         /// The phase after the transition.
         to: NodePhase,
     },
-    /// Recorded when a node faults.
+    /// A node faulted (every node of the faulting island is reported).
     Fault {
         /// The faulting node.
         node: NodeId,
         /// The fault.
         fault: NodeFault,
     },
-    /// Recorded when a node is cancelled.
+    /// A node was cancelled.
     Cancelled {
         /// The cancelled node.
         node: NodeId,
     },
-    /// Recorded when a cancelled node is re-instantiated.
+    /// A faulted or cancelled node's island was rebuilt.
     Restarted {
         /// The restarted node.
         node: NodeId,
@@ -71,51 +75,54 @@ pub enum TraceEvent {
 
 /// Callbacks fired at runtime instrumentation points.
 ///
-/// Takes `&self` so callbacks can be called from concurrent actor
-/// activations without borrow conflicts. Implementations that record
-/// state use interior mutability (e.g. `Mutex`).
+/// Takes `&self`; implementations that record state use interior
+/// mutability (e.g. `Mutex`).
 pub trait RuntimeMode: Send + Sync + 'static {
-    /// Called before a node is activated.
-    fn on_before_activate(&self, _node: &NodeId, _activation: &Activation) {}
-    /// Called after a node activation completes.
-    fn on_after_activate(&self, _node: &NodeId, _result: &ActivationResult) {}
-    /// Called when a value is written through a channel.
-    fn on_channel_write(&self, _from: &PortRef, _to: &PortRef, _val: &Val) {}
-    /// Called when a node transitions between phases.
+    /// An island started a generation.
+    fn on_generation_started(&self, _island: usize, _generation: u64) {}
+    /// A node's `run` was called.
+    fn on_run_started(&self, _node: &NodeId) {}
+    /// A node's `run` returned.
+    fn on_run_returned(&self, _node: &NodeId) {}
+    /// An island's generation finished.
+    fn on_generation_finished(&self, _island: usize, _generation: u64) {}
+    /// A node changed phase.
     fn on_phase_transition(&self, _node: &NodeId, _from: NodePhase, _to: NodePhase) {}
-    /// Called when a node faults.
+    /// A node faulted.
     fn on_node_fault(&self, _node: &NodeId, _fault: &NodeFault) {}
-    /// Called when a node is cancelled.
+    /// A node was cancelled.
     fn on_cancelled(&self, _node: &NodeId) {}
-    /// Called when a cancelled node is re-instantiated.
+    /// A node's island was rebuilt.
     fn on_restarted(&self, _node: &NodeId) {}
 }
 
-/// Release mode: all instrumentation callbacks are no-ops,
-/// monomorphized away by the compiler.
+/// Release mode: every instrumentation callback is a no-op.
 pub struct Release;
 
 impl RuntimeMode for Release {}
 
-/// Debug mode: every instrumentation callback records a [`TraceEvent`]
-/// behind a mutex for post-mortem inspection.
+/// Debug mode: every instrumentation callback records a [`TraceEvent`].
 pub struct Debug {
     trace: Mutex<Vec<TraceEvent>>,
 }
 
 impl Debug {
-    /// Creates a new debug mode instance with an empty trace.
+    /// Creates a debug mode with an empty trace.
     pub fn new() -> Self {
         Self {
             trace: Mutex::new(Vec::new()),
         }
     }
 
-    /// Returns a snapshot of all recorded trace events.
-    ///
-    /// Returns an empty vec if the lock is poisoned.
+    /// A snapshot of every recorded event. Empty if the lock is poisoned.
     pub fn trace(&self) -> Vec<TraceEvent> {
         self.trace.lock().map_or_else(|_| Vec::new(), |g| g.clone())
+    }
+
+    fn record(&self, event: TraceEvent) {
+        if let Ok(mut trace) = self.trace.lock() {
+            trace.push(event);
+        }
     }
 }
 
@@ -126,66 +133,42 @@ impl Default for Debug {
 }
 
 impl RuntimeMode for Debug {
-    fn on_before_activate(&self, node: &NodeId, activation: &Activation) {
-        if let Ok(mut trace) = self.trace.lock() {
-            trace.push(TraceEvent::BeforeActivate {
-                node: node.clone(),
-                activation: activation.clone(),
-            });
-        }
+    fn on_generation_started(&self, island: usize, generation: u64) {
+        self.record(TraceEvent::GenerationStarted { island, generation });
     }
 
-    fn on_after_activate(&self, node: &NodeId, result: &ActivationResult) {
-        if let Ok(mut trace) = self.trace.lock() {
-            trace.push(TraceEvent::AfterActivate {
-                node: node.clone(),
-                result: *result,
-            });
-        }
+    fn on_run_started(&self, node: &NodeId) {
+        self.record(TraceEvent::RunStarted { node: node.clone() });
     }
 
-    fn on_channel_write(&self, from: &PortRef, to: &PortRef, val: &Val) {
-        if let Ok(mut trace) = self.trace.lock() {
-            trace.push(TraceEvent::ChannelWrite {
-                from: from.clone(),
-                to: to.clone(),
-                val: val.clone(),
-            });
-        }
+    fn on_run_returned(&self, node: &NodeId) {
+        self.record(TraceEvent::RunReturned { node: node.clone() });
+    }
+
+    fn on_generation_finished(&self, island: usize, generation: u64) {
+        self.record(TraceEvent::GenerationFinished { island, generation });
     }
 
     fn on_phase_transition(&self, node: &NodeId, from: NodePhase, to: NodePhase) {
-        if let Ok(mut trace) = self.trace.lock() {
-            trace.push(TraceEvent::PhaseTransition {
-                node: node.clone(),
-                from,
-                to,
-            });
-        }
+        self.record(TraceEvent::PhaseTransition {
+            node: node.clone(),
+            from,
+            to,
+        });
     }
 
     fn on_node_fault(&self, node: &NodeId, fault: &NodeFault) {
-        if let Ok(mut trace) = self.trace.lock() {
-            trace.push(TraceEvent::Fault {
-                node: node.clone(),
-                fault: fault.clone(),
-            });
-        }
+        self.record(TraceEvent::Fault {
+            node: node.clone(),
+            fault: fault.clone(),
+        });
     }
 
     fn on_cancelled(&self, node: &NodeId) {
-        if let Ok(mut trace) = self.trace.lock() {
-            trace.push(TraceEvent::Cancelled {
-                node: node.clone(),
-            });
-        }
+        self.record(TraceEvent::Cancelled { node: node.clone() });
     }
 
     fn on_restarted(&self, node: &NodeId) {
-        if let Ok(mut trace) = self.trace.lock() {
-            trace.push(TraceEvent::Restarted {
-                node: node.clone(),
-            });
-        }
+        self.record(TraceEvent::Restarted { node: node.clone() });
     }
 }

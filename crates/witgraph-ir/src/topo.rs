@@ -127,7 +127,10 @@ pub(crate) fn depth_map(
         if conn.feedback || !resolved.contains(&conn.id) {
             continue;
         }
-        preds.entry(&conn.to.node).or_default().push(&conn.from.node);
+        preds
+            .entry(&conn.to.node)
+            .or_default()
+            .push(&conn.from.node);
     }
 
     let mut depth: HashMap<NodeId, usize> = HashMap::with_capacity(order.len());

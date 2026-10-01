@@ -19,6 +19,8 @@ world filter {
             /// Resolves with a summary when the input stream closes.
             done: future<string>,
         }
+
+        run: async func(inputs: inputs) -> outputs;
     }
 }
 
@@ -34,11 +36,13 @@ world display {
             view: stream<reading>,
             done: future<string>,
         }
+
+        run: async func(inputs: inputs);
     }
 }
 
-/// Sums an entire stream of readings once it closes: the stream is a drained
-/// input, so the node runs synchronously with the latched total.
+/// Sums an entire stream of readings. The node collects the stream itself
+/// (reading it to end-of-stream) and resolves `summary` once it closes.
 world collector {
     export node: interface {
         record reading {
@@ -46,26 +50,28 @@ world collector {
             timestamp: u64,
         }
 
-        record drained-inputs {
-            samples: stream<reading>,
-        }
-
         record inputs {
-            /// Latched scale factor, sampled when the drained batch fires.
+            samples: stream<reading>,
+            /// Scale factor, read when `run` starts.
             scale: option<f64>,
         }
 
         record outputs {
-            total: f64,
+            /// The scaled total, resolved when `samples` closes.
+            summary: future<f64>,
         }
+
+        run: async func(inputs: inputs) -> outputs;
     }
 }
 
-/// Reacts to threshold events.
+/// Reacts to threshold crossings.
 world alarm {
     export node: interface {
-        record input-events {
-            trigger: f64,
+        record inputs {
+            trigger: stream<f64>,
         }
+
+        run: async func(inputs: inputs);
     }
 }

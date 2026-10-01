@@ -1,20 +1,77 @@
 //! Error types for the witgraph runtime.
 //!
-//! Three tiers: [`RuntimeError`] for graph-level failures during loading,
-//! [`NodeFault`] for per-node failures during execution, and
-//! [`ChannelError`] for channel-level protocol violations.
+//! Two tiers: [`RuntimeError`] for failures the host sees when loading or
+//! driving the graph, and [`NodeFault`] for a failure inside an island,
+//! which faults every node of that island.
 
 use witgraph_ir::{ComponentRef, NodeId, PortName};
 
-/// A graph-level runtime error, typically during loading or configuration.
+/// A graph-level runtime error: loading, or a host call with bad arguments.
 #[derive(Debug, Clone, thiserror::Error, miette::Diagnostic)]
 pub enum RuntimeError {
-    /// A node's component has no corresponding WASM module.
-    #[error("no WASM module provided for component `{component}`")]
+    /// A component has no corresponding WASM bytes.
+    #[error("no WASM component provided for `{component}`")]
     #[diagnostic(code(witgraph::runtime::missing_wasm))]
     MissingWasm {
-        /// The component missing its WASM bytes.
+        /// The component missing its bytes.
         component: Box<ComponentRef>,
+    },
+    /// The WIT embedded in a component's bytes could not be decoded or
+    /// lowered into a contract.
+    #[error("component `{component}` does not describe a witgraph node: {message}")]
+    #[diagnostic(code(witgraph::runtime::bad_component))]
+    BadComponent {
+        /// The component whose bytes were rejected.
+        component: Box<ComponentRef>,
+        /// What went wrong.
+        message: String,
+    },
+    /// A component's bytes implement a different contract than the one the
+    /// graph was compiled against.
+    #[error(
+        "component `{component}` does not match its contract: \
+         expected content hash {expected}, the bytes hash to {found}"
+    )]
+    #[diagnostic(code(witgraph::runtime::contract_mismatch))]
+    ContractMismatch {
+        /// The component whose bytes were rejected.
+        component: Box<ComponentRef>,
+        /// The content hash the compiled graph expects.
+        expected: String,
+        /// The content hash of the contract lowered from the bytes.
+        found: String,
+    },
+    /// A node's component failed to compile or instantiate.
+    #[error("failed to instantiate node `{node}`: {message}")]
+    #[diagnostic(code(witgraph::runtime::instantiation))]
+    Instantiation {
+        /// The node whose component could not be instantiated.
+        node: NodeId,
+        /// The underlying error message.
+        message: String,
+    },
+    /// A restore was attempted while a generation is in flight. Restore
+    /// onto a freshly loaded graph, or after `shutdown`/`cancel`.
+    #[error("a generation is in flight; restore needs a graph with nothing in flight")]
+    #[diagnostic(code(witgraph::runtime::not_quiescent))]
+    NotQuiescent,
+    /// A snapshot was taken from a different graph.
+    #[error("snapshot does not belong to this graph: {message}")]
+    #[diagnostic(code(witgraph::runtime::snapshot_mismatch))]
+    SnapshotMismatch {
+        /// What differs.
+        message: String,
+    },
+    /// A snapshot value is not valid for its port.
+    #[error("snapshot value for `{node}.{port}` is not valid: {message}")]
+    #[diagnostic(code(witgraph::runtime::snapshot_value))]
+    SnapshotValue {
+        /// The node the value belongs to.
+        node: NodeId,
+        /// The port the value belongs to.
+        port: PortName,
+        /// Why it was rejected (WAVE parse error, unknown port, ...).
+        message: String,
     },
     /// A referenced node does not exist in the graph.
     #[error("unknown node `{node}`")]
@@ -23,13 +80,30 @@ pub enum RuntimeError {
         /// The missing node.
         node: NodeId,
     },
-    /// A WASM component failed to instantiate.
-    #[error("failed to instantiate node `{node}`: {message}")]
-    #[diagnostic(code(witgraph::runtime::instantiation))]
-    Instantiation {
-        /// The node whose component could not be instantiated.
+    /// A referenced port is not a Value input (for [`inject`]) or Value
+    /// output (for [`read_output`]) of the node.
+    ///
+    /// [`inject`]: crate::RuntimeGraph::inject
+    /// [`read_output`]: crate::RuntimeGraph::read_output
+    #[error("`{node}.{port}` is not a Value {direction} port")]
+    #[diagnostic(code(witgraph::runtime::not_a_value_port))]
+    NotAValuePort {
+        /// The node.
         node: NodeId,
-        /// The underlying error message.
+        /// The port.
+        port: PortName,
+        /// `input` or `output`.
+        direction: &'static str,
+    },
+    /// An injected value does not have the port's type.
+    #[error("value for `{node}.{port}` does not have the port's type: {message}")]
+    #[diagnostic(code(witgraph::runtime::value_type))]
+    ValueType {
+        /// The node.
+        node: NodeId,
+        /// The port.
+        port: PortName,
+        /// Why the value was rejected.
         message: String,
     },
     /// The runtime configuration is invalid.
@@ -41,83 +115,36 @@ pub enum RuntimeError {
     },
 }
 
-/// A per-node execution fault. The faulted node transitions to
-/// [`Faulted`](crate::node::NodePhase::Faulted) and the graph continues
-/// with reduced functionality, unless the fault is [`Fatal`](Self::Fatal).
+/// Why an island faulted. Every node of the island carries the same fault;
+/// a trap poisons the island's whole Store.
 #[derive(Debug, Clone, thiserror::Error, miette::Diagnostic)]
 pub enum NodeFault {
-    /// The WASM component trapped.
+    /// A component in the island trapped.
     #[error("WASM trap: {message}")]
     #[diagnostic(code(witgraph::runtime::wasm_trap))]
     WasmTrap {
         /// The trap message.
         message: String,
     },
-    /// The node exhausted its fuel budget.
+    /// The island burned its whole fuel budget
+    /// ([`RuntimeConfig::fuel_per_run`](crate::RuntimeConfig::fuel_per_run))
+    /// before its next `run` started.
     #[error("fuel exhausted")]
     #[diagnostic(code(witgraph::runtime::fuel_exhausted))]
     FuelExhausted,
-    /// The node exceeded its epoch deadline.
-    #[error("epoch interrupted")]
-    #[diagnostic(code(witgraph::runtime::epoch_interrupted))]
-    EpochInterrupted,
-    /// An output channel overflowed its capacity.
-    #[error("channel overflow on port `{port}` (capacity {capacity})")]
-    #[diagnostic(code(witgraph::runtime::channel_overflow))]
-    ChannelOverflow {
-        /// The port whose channel overflowed.
-        port: PortName,
-        /// The channel's capacity limit.
-        capacity: usize,
-    },
-    /// A future output was resolved more than once.
-    #[error("future on port `{port}` already resolved")]
-    #[diagnostic(code(witgraph::runtime::double_resolve))]
-    DoubleResolve {
-        /// The port whose future was double-resolved.
-        port: PortName,
-    },
-    /// A write was attempted on a closed stream.
-    #[error("write after close on port `{port}`")]
-    #[diagnostic(code(witgraph::runtime::write_after_close))]
-    WriteAfterClose {
-        /// The port whose stream was already closed.
-        port: PortName,
-    },
-    /// A value written to a port did not match the port's declared type.
-    #[error("type mismatch on port `{port}`: expected {expected}, got {actual}")]
-    #[diagnostic(code(witgraph::runtime::type_mismatch))]
-    TypeMismatch {
-        /// The port with the mismatched type.
-        port: PortName,
-        /// The expected type (rendered).
-        expected: String,
-        /// The actual type (rendered).
-        actual: String,
-    },
-    /// The component signaled a graph-fatal condition via the `fatal()`
-    /// host function. The tick halts immediately.
+    /// A node called `witgraph:runtime/host.fatal`. The tick that saw it
+    /// returned [`TickResult::Aborted`](crate::TickResult::Aborted).
     #[error("fatal: {message}")]
     #[diagnostic(code(witgraph::runtime::fatal))]
     Fatal {
-        /// The fatal error message from the component.
+        /// The message passed to `fatal`.
         message: String,
     },
-}
-
-/// A channel-level protocol violation.
-#[derive(Debug, Clone, thiserror::Error, miette::Diagnostic)]
-pub enum ChannelError {
-    /// The channel is at capacity.
-    #[error("channel is at capacity ({0})")]
-    #[diagnostic(code(witgraph::runtime::channel_full))]
-    Full(usize),
-    /// A future slot was resolved more than once.
-    #[error("future already resolved")]
-    #[diagnostic(code(witgraph::runtime::already_resolved))]
-    AlreadyResolved,
-    /// A write was attempted on a closed stream.
-    #[error("stream is closed")]
-    #[diagnostic(code(witgraph::runtime::closed))]
-    Closed,
+    /// Rebuilding the island for a restart failed.
+    #[error("restart failed: {message}")]
+    #[diagnostic(code(witgraph::runtime::restart))]
+    Restart {
+        /// Why the island could not be rebuilt.
+        message: String,
+    },
 }

@@ -1,106 +1,87 @@
-//! Per-resource weighted semaphore for concurrency control.
+//! Per-resource weighted semaphore, at island granularity.
 //!
-//! Each named resource has an implicit capacity of 1.0. Active nodes hold
-//! fractional claims; the scheduler checks availability before activation
-//! and releases claims when nodes complete, fault, or cancel.
+//! Each named resource has an implicit capacity of 1.0. An island's claim
+//! on a resource is the sum of its nodes' claims; it is acquired when the
+//! island starts a generation and released when the generation finishes,
+//! faults or is cancelled.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
-use witgraph_ir::{NodeId, ResourceClaim, ResourceId};
+use witgraph_ir::ResourceId;
+
+/// Tolerance for summing fractional claims.
+const EPSILON: f64 = 1e-9;
 
 /// Tracks the allocated fraction of each named resource.
 #[derive(Debug, Default)]
 pub(crate) struct ResourcePool {
-    node_claims: HashMap<NodeId, BTreeMap<ResourceId, ResourceClaim>>,
+    claims: HashMap<usize, BTreeMap<ResourceId, f64>>,
     allocated: HashMap<ResourceId, f64>,
-    held_by: HashSet<NodeId>,
+    held_by: HashSet<usize>,
 }
 
 impl ResourcePool {
-    pub(crate) fn from_nodes(nodes: &[(NodeId, BTreeMap<ResourceId, ResourceClaim>)]) -> Self {
-        let mut pool = Self::default();
-        for (node_id, claims) in nodes {
-            if !claims.is_empty() {
-                pool.node_claims.insert(node_id.clone(), claims.clone());
-            }
+    /// Registers an island's summed claims. Returns the first resource the
+    /// island over-commits on its own (more than 1.0), which it could
+    /// never acquire.
+    pub(crate) fn register(
+        &mut self,
+        island: usize,
+        claims: BTreeMap<ResourceId, f64>,
+    ) -> Result<(), ResourceId> {
+        if let Some((resource, _)) = claims.iter().find(|(_, f)| **f > 1.0 + EPSILON) {
+            return Err(resource.clone());
         }
-        pool
+        if !claims.is_empty() {
+            self.claims.insert(island, claims);
+        }
+        Ok(())
     }
 
-    pub(crate) fn can_acquire(&self, node: &NodeId) -> bool {
-        let Some(claims) = self.node_claims.get(node) else {
+    pub(crate) fn can_acquire(&self, island: usize) -> bool {
+        if self.held_by.contains(&island) {
+            return true;
+        }
+        let Some(claims) = self.claims.get(&island) else {
             return true;
         };
-        for (resource, claim) in claims {
-            let current = self.allocated.get(resource).copied().unwrap_or(0.0);
-            if current + claim.fraction.get() > 1.0 + f64::EPSILON {
-                return false;
+        claims.iter().all(|(resource, fraction)| {
+            self.allocated.get(resource).copied().unwrap_or(0.0) + fraction <= 1.0 + EPSILON
+        })
+    }
+
+    pub(crate) fn acquire(&mut self, island: usize) {
+        if !self.held_by.insert(island) {
+            return;
+        }
+        if let Some(claims) = self.claims.get(&island) {
+            for (resource, fraction) in claims {
+                *self.allocated.entry(resource.clone()).or_insert(0.0) += fraction;
             }
         }
-        true
     }
 
-    pub(crate) fn acquire(&mut self, node: &NodeId) {
-        let Some(claims) = self.node_claims.get(node) else {
+    /// Releases everything the island holds. Idempotent.
+    pub(crate) fn release(&mut self, island: usize) {
+        if !self.held_by.remove(&island) {
+            return;
+        }
+        let Some(claims) = self.claims.get(&island) else {
             return;
         };
-        for (resource, claim) in claims {
-            *self.allocated.entry(resource.clone()).or_insert(0.0) += claim.fraction.get();
-        }
-        self.held_by.insert(node.clone());
-    }
-
-    /// Releases ALL claims for a node. Used on Complete, Fault, Cancel.
-    pub(crate) fn release(&mut self, node: &NodeId) {
-        if !self.held_by.remove(node) {
-            return;
-        }
-        self.subtract_claims(node, |_| true);
-    }
-
-    /// Releases only non-held claims (`hold == false`). Used on Suspend.
-    /// Returns `true` if the node still holds any resources after release.
-    pub(crate) fn release_non_held(&mut self, node: &NodeId) -> bool {
-        if !self.held_by.contains(node) {
-            return false;
-        }
-        self.subtract_claims(node, |claim| !claim.hold);
-        let still_holds = self
-            .node_claims
-            .get(node)
-            .is_some_and(|claims| claims.values().any(|c| c.hold));
-        if !still_holds {
-            self.held_by.remove(node);
-        }
-        still_holds
-    }
-
-    pub(crate) fn is_held(&self, node: &NodeId) -> bool {
-        self.held_by.contains(node)
-    }
-
-    /// Moves all entries from `deferred` into `ready`.
-    pub(crate) fn drain_deferred_into(
-        deferred: &mut BTreeSet<(usize, NodeId)>,
-        ready: &mut BTreeSet<(usize, NodeId)>,
-    ) {
-        ready.append(deferred);
-    }
-
-    fn subtract_claims(&mut self, node: &NodeId, predicate: impl Fn(&ResourceClaim) -> bool) {
-        let Some(claims) = self.node_claims.get(node) else {
-            return;
-        };
-        for (resource, claim) in claims {
-            if predicate(claim)
-                && let Some(alloc) = self.allocated.get_mut(resource)
-            {
-                *alloc = (*alloc - claim.fraction.get()).max(0.0);
-                if *alloc < f64::EPSILON {
+        for (resource, fraction) in claims {
+            if let Some(alloc) = self.allocated.get_mut(resource) {
+                *alloc -= fraction;
+                if *alloc < EPSILON {
                     self.allocated.remove(resource);
                 }
             }
         }
+    }
+
+    #[cfg(test)]
+    fn is_held(&self, island: usize) -> bool {
+        self.held_by.contains(&island)
     }
 }
 
@@ -108,132 +89,85 @@ impl ResourcePool {
 mod tests {
     use super::*;
 
-    use witgraph_ir::Fraction;
-
-    /// A claim in test shorthand: `(resource, fraction, hold)`.
-    type Claim<'a> = (&'a str, f64, bool);
-
-    fn pool_with(entries: &[(&str, &[Claim])]) -> ResourcePool {
-        let nodes: Vec<(NodeId, BTreeMap<ResourceId, ResourceClaim>)> = entries
-            .iter()
-            .map(|(node, claims)| {
-                let claims: BTreeMap<ResourceId, ResourceClaim> = claims
-                    .iter()
-                    .map(|(r, f, h)| {
-                        (
-                            ResourceId::from(r.to_string()),
-                            ResourceClaim {
-                                fraction: Fraction::new(*f).unwrap(),
-                                hold: *h,
-                            },
-                        )
-                    })
-                    .collect();
-                (NodeId::from(node.to_string()), claims)
-            })
-            .collect();
-        ResourcePool::from_nodes(&nodes)
+    fn pool_with(entries: &[(usize, &[(&str, f64)])]) -> ResourcePool {
+        let mut pool = ResourcePool::default();
+        for (island, claims) in entries {
+            let claims = claims
+                .iter()
+                .map(|(r, f)| (ResourceId::from((*r).to_string()), *f))
+                .collect();
+            pool.register(*island, claims).unwrap();
+        }
+        pool
     }
 
     #[test]
     fn acquire_and_release() {
-        let mut pool = pool_with(&[("a", &[("disk", 0.5, false)])]);
-        let a: NodeId = "a".into();
-
-        assert!(pool.can_acquire(&a));
-        pool.acquire(&a);
-        assert!(pool.is_held(&a));
-
-        pool.release(&a);
-        assert!(!pool.is_held(&a));
+        let mut pool = pool_with(&[(0, &[("disk", 0.5)])]);
+        assert!(pool.can_acquire(0));
+        pool.acquire(0);
+        assert!(pool.is_held(0));
+        pool.release(0);
+        assert!(!pool.is_held(0));
     }
 
     #[test]
     fn mutual_exclusion() {
-        let mut pool = pool_with(&[
-            ("a", &[("disk", 0.6, false)]),
-            ("b", &[("disk", 0.6, false)]),
-        ]);
-        let a: NodeId = "a".into();
-        let b: NodeId = "b".into();
-
-        pool.acquire(&a);
-        assert!(!pool.can_acquire(&b));
-
-        pool.release(&a);
-        assert!(pool.can_acquire(&b));
+        let mut pool = pool_with(&[(0, &[("disk", 0.6)]), (1, &[("disk", 0.6)])]);
+        pool.acquire(0);
+        assert!(!pool.can_acquire(1));
+        pool.release(0);
+        assert!(pool.can_acquire(1));
     }
 
     #[test]
     fn compatible_claims() {
-        let mut pool = pool_with(&[
-            ("a", &[("disk", 0.5, false)]),
-            ("b", &[("disk", 0.5, false)]),
-        ]);
-        let a: NodeId = "a".into();
-        let b: NodeId = "b".into();
-
-        pool.acquire(&a);
-        assert!(pool.can_acquire(&b));
-        pool.acquire(&b);
-        assert!(pool.is_held(&a));
-        assert!(pool.is_held(&b));
-    }
-
-    #[test]
-    fn release_non_held_frees_compute_keeps_vram() {
-        let mut pool = pool_with(&[("a", &[("gpu_compute", 0.5, false), ("vram", 0.3, true)])]);
-        let a: NodeId = "a".into();
-
-        pool.acquire(&a);
-        let still_holds = pool.release_non_held(&a);
-        assert!(still_holds);
-        assert!(pool.is_held(&a));
-
-        // gpu_compute freed, vram still allocated
-        assert_eq!(pool.allocated.get(&ResourceId::from("gpu_compute".to_string())), None);
-        assert!(pool.allocated.contains_key(&ResourceId::from("vram".to_string())));
-    }
-
-    #[test]
-    fn release_non_held_all_non_held_clears_holder() {
-        let mut pool = pool_with(&[("a", &[("disk", 0.5, false)])]);
-        let a: NodeId = "a".into();
-
-        pool.acquire(&a);
-        let still_holds = pool.release_non_held(&a);
-        assert!(!still_holds);
-        assert!(!pool.is_held(&a));
+        let mut pool = pool_with(&[(0, &[("disk", 0.5)]), (1, &[("disk", 0.5)])]);
+        pool.acquire(0);
+        assert!(pool.can_acquire(1));
+        pool.acquire(1);
+        assert!(pool.is_held(0) && pool.is_held(1));
     }
 
     #[test]
     fn no_claims_always_acquires() {
-        let pool = ResourcePool::default();
-        let x: NodeId = "x".into();
-        assert!(pool.can_acquire(&x));
+        assert!(ResourcePool::default().can_acquire(7));
     }
 
     #[test]
-    fn release_is_idempotent() {
-        let mut pool = pool_with(&[("a", &[("disk", 0.5, false)])]);
-        let a: NodeId = "a".into();
-        pool.acquire(&a);
-        pool.release(&a);
-        pool.release(&a); // second release is a no-op
-        assert!(!pool.is_held(&a));
+    fn release_and_acquire_are_idempotent() {
+        let mut pool = pool_with(&[(0, &[("disk", 0.5)]), (1, &[("disk", 0.5)])]);
+        pool.acquire(0);
+        pool.acquire(0);
+        assert!(
+            pool.can_acquire(1),
+            "a repeated acquire must not double-count"
+        );
+        pool.release(0);
+        pool.release(0);
+        assert!(!pool.is_held(0));
     }
 
     #[test]
     fn multiple_resources_checked_together() {
         let mut pool = pool_with(&[
-            ("a", &[("disk", 0.6, false), ("gpu", 0.3, false)]),
-            ("b", &[("disk", 0.3, false), ("gpu", 0.8, false)]),
+            (0, &[("disk", 0.6), ("gpu", 0.3)]),
+            (1, &[("disk", 0.3), ("gpu", 0.8)]),
         ]);
-        let a: NodeId = "a".into();
-        let b: NodeId = "b".into();
-
-        pool.acquire(&a);
+        pool.acquire(0);
         // disk: 0.6 + 0.3 = 0.9 OK; gpu: 0.3 + 0.8 = 1.1 > 1.0
-        assert!(!pool.can_acquire(&b));
+        assert!(!pool.can_acquire(1));
+    }
+
+    #[test]
+    fn over_committed_island_is_rejected() {
+        let mut pool = ResourcePool::default();
+        let claims = [(ResourceId::from("disk".to_string()), 1.2)]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            pool.register(0, claims),
+            Err(ResourceId::from("disk".to_string()))
+        );
     }
 }

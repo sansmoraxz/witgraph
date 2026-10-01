@@ -24,7 +24,16 @@ pub enum Error {
 }
 
 /// Load a `.wit` file or directory and lower every witgraph component world
-/// found in it.
+/// found in it, keeping only the contracts.
 pub fn load_components(path: impl AsRef<Path>) -> Result<Vec<ComponentContract>, Error> {
+    Ok(load_lowered(path)?
+        .into_iter()
+        .map(|lowered| lowered.contract)
+        .collect())
+}
+
+/// Like [`load_components`], but keeps each world's named types alongside
+/// its contract (what [`metadata::generate_catalog`] needs).
+pub fn load_lowered(path: impl AsRef<Path>) -> Result<Vec<lower::Lowered>, Error> {
     Ok(lower::lower(&load::load_path(path)?)?)
 }

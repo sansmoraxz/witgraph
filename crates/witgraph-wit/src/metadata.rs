@@ -4,10 +4,12 @@
 //! frontend editors (palette entries, port pickers, tooltips).
 
 use serde::Serialize;
-use witgraph_ir::{ComponentContract, PortDef, PortKind, Type};
+use witgraph_ir::{PortDef, PortKind, RunKind};
+
+use crate::lower::Lowered;
 
 /// The catalog format version this crate emits.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// The full set of components available to an editor.
 #[derive(Debug, Clone, Serialize)]
@@ -37,6 +39,8 @@ pub struct ComponentMeta {
     pub inputs: Vec<PortMeta>,
     /// The component's output ports.
     pub outputs: Vec<PortMeta>,
+    /// Whether the component's `run` export is `sync` or `async`.
+    pub run: RunKind,
     /// What the component requires from its host: imported interface ids and
     /// `func:`-prefixed bare function imports.
     pub capabilities: Vec<String>,
@@ -50,7 +54,7 @@ pub struct ComponentMeta {
 pub struct TypeMeta {
     /// The type's WIT kebab-case name.
     pub name: String,
-    /// WIT-like rendering of the type, for display.
+    /// WIT-syntax rendering of the type, for display.
     pub type_display: String,
     /// Doc comment from the WIT declaration, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -64,16 +68,12 @@ pub struct PortMeta {
     pub name: String,
     /// The port's delivery semantics; serialized lowercase.
     pub kind: PortKind,
-    /// WIT-like rendering of the payload type, for display.
+    /// WIT-syntax rendering of the payload type (`_` for a bare `stream` or
+    /// `future`). Editors resolve structure by re-deriving the contract from
+    /// WIT, never from this string.
     pub type_display: String,
-    /// Structured payload type, for editors that type-check while wiring.
-    #[serde(rename = "type")]
-    pub ty: Type,
-    /// Input ports only: the port may be left unconnected.
+    /// Value input ports only: the port may be left unconnected.
     pub optional: bool,
-    /// Input ports only: consumed to completion before the node's first
-    /// activation.
-    pub drained: bool,
     /// Doc comment from the WIT field, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub docs: Option<String>,
@@ -83,21 +83,20 @@ fn port_meta(port: &PortDef) -> PortMeta {
     PortMeta {
         name: port.name.to_string(),
         kind: port.kind,
-        type_display: port.ty.to_string(),
-        ty: port.ty.clone(),
+        type_display: port.type_display(),
         optional: port.optional,
-        drained: port.drained,
         docs: port.docs.clone(),
     }
 }
 
-/// Build a catalog from lowered contracts. Components are sorted by their
+/// Build a catalog from lowered worlds. Components are sorted by their
 /// structured reference — not the rendered id string — so versions order
 /// numerically (`0.2.0` before `0.10.0`) and the output is stable
 /// regardless of load order.
-pub fn generate_catalog(contracts: &[ComponentContract]) -> Catalog {
-    let mut sorted: Vec<&ComponentContract> = contracts.iter().collect();
+pub fn generate_catalog(lowered: &[Lowered]) -> Catalog {
+    let mut sorted: Vec<&Lowered> = lowered.iter().collect();
     sorted.sort_by(|a, b| {
+        let (a, b) = (&a.contract, &b.contract);
         (
             &a.id.package.namespace,
             &a.id.package.name,
@@ -115,7 +114,7 @@ pub fn generate_catalog(contracts: &[ComponentContract]) -> Catalog {
     });
     let components = sorted
         .into_iter()
-        .map(|contract| ComponentMeta {
+        .map(|Lowered { contract, types }| ComponentMeta {
             id: contract.id.to_string(),
             package: contract.id.package.to_string(),
             world: contract.id.world.clone(),
@@ -123,13 +122,13 @@ pub fn generate_catalog(contracts: &[ComponentContract]) -> Catalog {
             docs: contract.docs.clone(),
             inputs: contract.inputs.iter().map(port_meta).collect(),
             outputs: contract.outputs.iter().map(port_meta).collect(),
+            run: contract.run,
             capabilities: contract
                 .capabilities
                 .iter()
                 .map(|c| c.interface.clone())
                 .collect(),
-            types: contract
-                .type_names
+            types: types
                 .iter()
                 .map(|decl| TypeMeta {
                     name: decl.name.clone(),
@@ -164,15 +163,24 @@ mod tests {
             "test.wit",
             r#"
             package demo:test@0.1.0;
-            world zeta { export node: interface { record outputs { out: u32 } } }
-            world alpha { export node: interface { record inputs { rate: option<u32> } } }
+            world zeta {
+                export node: interface {
+                    record outputs { out: stream<u32> }
+                    run: async func() -> outputs;
+                }
+            }
+            world alpha {
+                export node: interface {
+                    record inputs { rate: option<u32> }
+                    run: func(inputs: inputs);
+                }
+            }
             "#,
         )
         .unwrap();
-        let contracts = lower(&source).unwrap();
-        let catalog = generate_catalog(&contracts);
+        let catalog = generate_catalog(&lower(&source).unwrap());
 
-        assert_eq!(catalog.schema_version, 1);
+        assert_eq!(catalog.schema_version, SCHEMA_VERSION);
         let ids: Vec<&str> = catalog.components.iter().map(|c| c.id.as_str()).collect();
         assert_eq!(ids, ["demo:test/alpha@0.1.0", "demo:test/zeta@0.1.0"]);
 
@@ -182,7 +190,18 @@ mod tests {
         assert_eq!(alpha.inputs[0].kind, PortKind::Value);
         assert_eq!(alpha.inputs[0].type_display, "u32");
         assert!(alpha.inputs[0].optional);
-        assert!(to_json(&catalog).unwrap().ends_with('\n'));
+        assert_eq!(alpha.run, RunKind::Sync);
+        let zeta = &catalog.components[1];
+        assert_eq!(zeta.run, RunKind::Async);
+        assert_eq!(zeta.outputs[0].kind, PortKind::Stream);
+        assert_eq!(zeta.outputs[0].type_display, "u32");
+        let json = to_json(&catalog).unwrap();
+        assert!(json.ends_with('\n'));
+        assert!(json.contains("\"run\": \"async\""), "{json}");
+        assert!(
+            !json.contains("\"type\""),
+            "no structured types in the catalog: {json}"
+        );
     }
 
     #[test]
@@ -191,7 +210,12 @@ mod tests {
             format!(
                 r#"
                 package demo:test@{version};
-                world w {{ export node: interface {{ record outputs {{ out: u32 }} }} }}
+                world w {{
+                    export node: interface {{
+                        record outputs {{ out: u32 }}
+                        run: func() -> outputs;
+                    }}
+                }}
                 "#
             )
         };
@@ -212,6 +236,7 @@ mod tests {
                 /// A reading.
                 record reading { value: f64 }
                 record outputs { latest: reading }
+                run: func() -> outputs;
             }
             world w { export node; }
             "#,
@@ -229,7 +254,12 @@ mod tests {
             "bare.wit",
             r#"
             package demo:test@0.1.0;
-            world w { export node: interface { record outputs { out: u32 } } }
+            world w {
+                export node: interface {
+                    record outputs { out: u32 }
+                    run: func() -> outputs;
+                }
+            }
             "#,
         )
         .unwrap();

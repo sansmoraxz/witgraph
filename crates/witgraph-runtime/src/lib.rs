@@ -1,53 +1,47 @@
-//! Event-driven WASM graph runtime for witgraph.
+//! Component-model graph runtime for witgraph.
 //!
-//! This crate extends the witgraph typestate chain with
-//! [`RuntimeGraph`], which loads a [`CompiledGraph`](witgraph_ir::CompiledGraph)
-//! together with WASM component bytes and executes it reactively.
-//! Every node is a WASM component; execution is event-driven, with
-//! independent nodes running concurrently.
-//!
-//! # Typestate chain
+//! This crate extends the witgraph typestate chain with [`RuntimeGraph`],
+//! which loads a [`CompiledGraph`](witgraph_ir::CompiledGraph) together
+//! with WASM component bytes and runs it on wasmtime.
 //!
 //! ```text
 //! GraphBuilder -> Graph -> CompiledGraph -> RuntimeGraph
 //! ```
 //!
+//! Every node is a component whose world is its contract: an exported
+//! `node` interface with up to two records, `inputs` and `outputs` (at least
+//! one), and a `run` function. Nodes joined by stream/future connections
+//! form an *island* that shares one wasmtime Store, so stream and future
+//! handles pass directly between them; Value connections between islands go
+//! through the host. Islands run concurrently, in generations, on the task
+//! that calls [`RuntimeGraph::tick`]. The island is the unit with a
+//! lifecycle (a typestate); a node's [`NodeState`] is a view of its
+//! island's. See [`engine`] and [`graph`] for the invariants.
+//!
 //! # Crate layout
 //!
-//! - [`Val`] — Runtime value enum (re-exported from [`witgraph_ir`]).
-//! - [`channel`] — Port interconnection channels ([`Channel`],
-//!   [`ValueSlot`], [`EventQueue`],
-//!   [`StreamChannel`], [`FutureSlot`]).
-//! - [`error`] — Error types ([`RuntimeError`], [`NodeFault`],
-//!   [`ChannelError`]).
-//! - [`abi`] — Activation interface ([`Activation`], [`ActivationResult`],
-//!   [`InputSnapshot`], [`OutputCollector`]).
-//! - [`node`] — Node lifecycle as a typestate machine ([`Node`],
-//!   [`NodeState`], [`NodePhase`]).
-//! - [`mode`] — Runtime mode ([`RuntimeMode`], [`Release`],
-//!   [`struct@Debug`]).
-//! - [`schedule`] — Scheduler events ([`SchedulerEvent`], [`TickResult`]).
-//! - [`engine`] — Wasmtime engine
-//!   ([`engine::WasmEngine`], [`engine::NodeInstance`]).
-//! - [`graph`] — Runtime graph ([`RuntimeGraph`], [`RuntimeConfig`]).
+//! - [`graph`] — [`RuntimeGraph`], [`RuntimeConfig`], [`Snapshot`].
+//! - [`engine`] — island Stores and the generation driver ([`HostState`]).
+//! - [`node`] — a node's lifecycle state, projected from its island
+//!   ([`NodeState`], [`NodePhase`]).
+//! - [`mode`] — instrumentation ([`RuntimeMode`], [`Release`],
+//!   [`struct@Debug`], [`TraceEvent`]).
+//! - [`schedule`] — [`TickResult`].
+//! - [`error`] — [`RuntimeError`], [`NodeFault`].
 
-pub mod abi;
-pub mod channel;
 pub mod engine;
 pub mod error;
 pub mod graph;
+pub(crate) mod island;
 pub mod mode;
 pub mod node;
 pub(crate) mod resource;
 pub mod schedule;
 
-// Re-exports for convenience.
-pub use abi::{Activation, ActivationResult, InputSnapshot, OutputCollector, OutputWrite};
-pub use channel::{Channel, EventQueue, FutureSlot, StreamChannel, StreamPull, ValueSlot};
-pub use engine::{val_to_bytes, NodeHostState};
-pub use error::{ChannelError, NodeFault, RuntimeError};
-pub use graph::{RuntimeConfig, RuntimeGraph, ValuesSnapshot};
+pub use engine::HostState;
+pub use error::{NodeFault, RuntimeError};
+pub use graph::{IslandSnapshot, PortValues, RuntimeConfig, RuntimeGraph, Snapshot};
 pub use mode::{Debug, Release, RuntimeMode, TraceEvent};
-pub use node::{Node, NodePhase, NodeState};
-pub use schedule::{SchedulerEvent, TickResult};
-pub use witgraph_ir::Val;
+pub use node::{NodePhase, NodeState};
+pub use schedule::TickResult;
+pub use wasmtime::component::Val;

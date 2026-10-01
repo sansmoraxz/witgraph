@@ -1,0 +1,15 @@
+package test:stream-producer@0.1.0;
+
+/// Streams 0, 1, 2, ... — `burst-size` items, or forever when absent. Stops
+/// early if the reader is dropped.
+world stream-producer {
+    export node: interface {
+        record inputs {
+            burst-size: option<u32>,
+        }
+        record outputs {
+            items: stream<u32>,
+        }
+        run: async func(inputs: inputs) -> outputs;
+    }
+}

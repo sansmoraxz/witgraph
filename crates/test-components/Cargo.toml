@@ -5,4 +5,4 @@ edition = "2024"
 publish = false
 
 [build-dependencies]
-wit-component = "0.227"
+wit-component = { workspace = true }
