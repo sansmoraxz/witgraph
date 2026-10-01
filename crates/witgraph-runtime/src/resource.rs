@@ -92,12 +92,12 @@ impl ResourcePool {
             return;
         };
         for (resource, claim) in claims {
-            if predicate(claim) {
-                if let Some(alloc) = self.allocated.get_mut(resource) {
-                    *alloc = (*alloc - claim.fraction.get()).max(0.0);
-                    if *alloc < f64::EPSILON {
-                        self.allocated.remove(resource);
-                    }
+            if predicate(claim)
+                && let Some(alloc) = self.allocated.get_mut(resource)
+            {
+                *alloc = (*alloc - claim.fraction.get()).max(0.0);
+                if *alloc < f64::EPSILON {
+                    self.allocated.remove(resource);
                 }
             }
         }
@@ -110,7 +110,10 @@ mod tests {
 
     use witgraph_ir::Fraction;
 
-    fn pool_with(entries: &[(&str, &[(&str, f64, bool)])]) -> ResourcePool {
+    /// A claim in test shorthand: `(resource, fraction, hold)`.
+    type Claim<'a> = (&'a str, f64, bool);
+
+    fn pool_with(entries: &[(&str, &[Claim])]) -> ResourcePool {
         let nodes: Vec<(NodeId, BTreeMap<ResourceId, ResourceClaim>)> = entries
             .iter()
             .map(|(node, claims)| {
@@ -189,7 +192,7 @@ mod tests {
 
         // gpu_compute freed, vram still allocated
         assert_eq!(pool.allocated.get(&ResourceId::from("gpu_compute".to_string())), None);
-        assert!(pool.allocated.get(&ResourceId::from("vram".to_string())).is_some());
+        assert!(pool.allocated.contains_key(&ResourceId::from("vram".to_string())));
     }
 
     #[test]

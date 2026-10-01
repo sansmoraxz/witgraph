@@ -1,3 +1,4 @@
+#![cfg(test)]
 #![allow(missing_docs)]
 
 use std::collections::{HashMap, VecDeque};
@@ -336,7 +337,7 @@ async fn connected_nodes_propagate() {
         .add_node("src", echo_cref())
         .add_node("dst", echo_cref())
         .add_node("sink", echo_cref())
-        .set_config("src", "in", Val::F64(3.14)).unwrap()
+        .set_config("src", "in", Val::F64(2.5)).unwrap()
         .connect(
             "c1",
             PortRef::new("src", "out"),
@@ -360,8 +361,8 @@ async fn connected_nodes_propagate() {
 
     tick_until_idle(&mut rt).await;
 
-    assert_eq!(read_f64(&rt, "src", "out"), 3.14, "source output");
-    assert_eq!(read_f64(&rt, "dst", "out"), 3.14, "propagated through chain");
+    assert_eq!(read_f64(&rt, "src", "out"), 2.5, "source output");
+    assert_eq!(read_f64(&rt, "dst", "out"), 2.5, "propagated through chain");
 }
 
 // ---- Stream / async tests ----
@@ -423,6 +424,92 @@ async fn stream_producer_consumer() {
     tick_until_done(&mut rt).await;
 
     assert_eq!(read_u32_output(&rt, "cons", "total"), 10); // 0+1+2+3+4
+}
+
+/// The `(from, to)` phase transitions recorded for one node.
+fn phase_path(trace: &[TraceEvent], node: &str) -> Vec<(NodePhase, NodePhase)> {
+    trace
+        .iter()
+        .filter_map(|e| match e {
+            TraceEvent::PhaseTransition { node: n, from, to } if n.as_str() == node => {
+                Some((*from, *to))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// A drained stream input is consumed to completion before the node
+/// settles: it initializes into `Draining`, goes back to `Draining`
+/// between drain activations, and only becomes `Ready` once the last
+/// drain has finished.
+#[tokio::test]
+async fn drained_input_drains_before_ready() {
+    let drained_consumer = ComponentContract {
+        inputs: vec![PortDef::new("items", PortKind::Stream, Type::U32).drained()],
+        ..stream_consumer_contract()
+    };
+    let graph = Graph::builder("drain-test")
+        .add_component(stream_producer_contract())
+        .add_component(drained_consumer)
+        .add_node("prod", stream_producer_cref())
+        .add_node("cons", stream_consumer_cref())
+        .set_config("prod", "burst-size", Val::U32(3)).unwrap()
+        .connect(
+            "s1",
+            PortRef::new("prod", "items"),
+            PortRef::new("cons", "items"),
+        )
+        .build();
+    let compiled = graph.compile().expect("valid graph");
+    let mut rt = RuntimeGraph::load(
+        compiled,
+        &stream_wasm_map(),
+        RuntimeConfig::default(),
+        Debug::new(),
+    )
+    .await
+    .expect("load");
+
+    // The consumer never completes (the guest ignores drain items), so
+    // the graph ends idle rather than completed.
+    tick_until_idle(&mut rt).await;
+
+    let cons = NodeId::from("cons");
+    let state = rt.node_state(&cons).unwrap();
+    assert_eq!(state.phase(), NodePhase::Ready);
+    assert_eq!(state.pending_drains(), 0);
+
+    let trace = rt.mode().trace();
+    let path = phase_path(&trace, "cons");
+
+    assert_eq!(path.first(), Some(&(NodePhase::Created, NodePhase::Draining)));
+    assert_eq!(path.last(), Some(&(NodePhase::Running, NodePhase::Ready)));
+
+    // One activation per drained item, each returning to `Draining`
+    // until the last drain finishes.
+    let after_running: Vec<NodePhase> = path
+        .iter()
+        .filter(|(from, _)| *from == NodePhase::Running)
+        .map(|(_, to)| *to)
+        .collect();
+    assert!(after_running.len() >= 3, "expected one activation per drained item: {path:?}");
+    let (last, earlier) = after_running.split_last().unwrap();
+    assert_eq!(*last, NodePhase::Ready, "{path:?}");
+    assert!(
+        earlier.iter().all(|to| *to == NodePhase::Draining),
+        "drains still pending after an activation should return to Draining: {path:?}"
+    );
+    assert!(
+        !path.contains(&(NodePhase::Draining, NodePhase::Ready)),
+        "a draining node leaves `Draining` only by running: {path:?}"
+    );
+
+    let faults: Vec<_> = trace
+        .iter()
+        .filter(|e| matches!(e, TraceEvent::Fault { .. }))
+        .collect();
+    assert!(faults.is_empty(), "no faults expected: {faults:?}");
 }
 
 #[tokio::test]
@@ -533,11 +620,11 @@ async fn stream_close_completes_consumer() {
     tick_until_done(&mut rt).await;
 
     assert_eq!(
-        rt.node_state(&NodeId::from("prod")).unwrap().phase,
+        rt.node_state(&NodeId::from("prod")).unwrap().phase(),
         NodePhase::Completed,
     );
     assert_eq!(
-        rt.node_state(&NodeId::from("cons")).unwrap().phase,
+        rt.node_state(&NodeId::from("cons")).unwrap().phase(),
         NodePhase::Completed,
     );
 }
@@ -680,11 +767,11 @@ async fn wide_graph_full_flow() {
 
     // Stream nodes complete
     assert_eq!(
-        rt.node_state(&NodeId::from("data_gen")).unwrap().phase,
+        rt.node_state(&NodeId::from("data_gen")).unwrap().phase(),
         NodePhase::Completed,
     );
     assert_eq!(
-        rt.node_state(&NodeId::from("consumer")).unwrap().phase,
+        rt.node_state(&NodeId::from("consumer")).unwrap().phase(),
         NodePhase::Completed,
     );
 
@@ -744,7 +831,7 @@ async fn fuel_exhaustion_faults_node() {
     tick_until_idle(&mut rt).await;
 
     assert_eq!(
-        rt.node_state(&NodeId::from("e")).unwrap().phase,
+        rt.node_state(&NodeId::from("e")).unwrap().phase(),
         NodePhase::Faulted,
     );
 
@@ -787,7 +874,7 @@ async fn cancel_ready_node() {
     tick_until_idle(&mut rt).await;
 
     assert_eq!(
-        rt.node_state(&NodeId::from("e")).unwrap().phase,
+        rt.node_state(&NodeId::from("e")).unwrap().phase(),
         NodePhase::Cancelled,
     );
 
@@ -845,7 +932,7 @@ async fn cancel_suspended_node() {
     );
 
     assert_eq!(
-        rt.node_state(&NodeId::from("prod")).unwrap().phase,
+        rt.node_state(&NodeId::from("prod")).unwrap().phase(),
         NodePhase::Suspended,
     );
 
@@ -856,7 +943,7 @@ async fn cancel_suspended_node() {
     rt.tick().await;
 
     assert_eq!(
-        rt.node_state(&NodeId::from("prod")).unwrap().phase,
+        rt.node_state(&NodeId::from("prod")).unwrap().phase(),
         NodePhase::Cancelled,
     );
 }
@@ -897,12 +984,12 @@ async fn cancel_propagates_upstream() {
     tick_until_done(&mut rt).await;
 
     assert_eq!(
-        rt.node_state(&NodeId::from("cons")).unwrap().phase,
+        rt.node_state(&NodeId::from("cons")).unwrap().phase(),
         NodePhase::Completed,
     );
     // Producer also completed itself via ActivationResult::Completed.
     assert_eq!(
-        rt.node_state(&NodeId::from("prod")).unwrap().phase,
+        rt.node_state(&NodeId::from("prod")).unwrap().phase(),
         NodePhase::Completed,
     );
 
@@ -946,17 +1033,17 @@ async fn cancel_propagates_upstream() {
     tick_until_idle(&mut rt2).await;
 
     assert_eq!(
-        rt2.node_state(&NodeId::from("sink")).unwrap().phase,
+        rt2.node_state(&NodeId::from("sink")).unwrap().phase(),
         NodePhase::Cancelled,
     );
     // mid's only consumer (sink) is terminal → mid should be cancelled.
     assert_eq!(
-        rt2.node_state(&NodeId::from("mid")).unwrap().phase,
+        rt2.node_state(&NodeId::from("mid")).unwrap().phase(),
         NodePhase::Cancelled,
     );
     // src's only consumer (mid) is terminal → src should be cancelled.
     assert_eq!(
-        rt2.node_state(&NodeId::from("src")).unwrap().phase,
+        rt2.node_state(&NodeId::from("src")).unwrap().phase(),
         NodePhase::Cancelled,
     );
 }
@@ -999,11 +1086,11 @@ async fn cancelled_node_restarts_on_input() {
     rt.cancel(&NodeId::from("sink")).expect("cancel");
     tick_until_idle(&mut rt).await;
     assert_eq!(
-        rt.node_state(&NodeId::from("src")).unwrap().phase,
+        rt.node_state(&NodeId::from("src")).unwrap().phase(),
         NodePhase::Cancelled,
     );
     assert_eq!(
-        rt.node_state(&NodeId::from("dst")).unwrap().phase,
+        rt.node_state(&NodeId::from("dst")).unwrap().phase(),
         NodePhase::Cancelled,
     );
 

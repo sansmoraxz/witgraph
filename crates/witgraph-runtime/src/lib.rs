@@ -22,7 +22,8 @@
 //!   [`ChannelError`]).
 //! - [`abi`] — Activation interface ([`Activation`], [`ActivationResult`],
 //!   [`InputSnapshot`], [`OutputCollector`]).
-//! - [`node`] — Node lifecycle ([`NodePhase`], [`NodeState`]).
+//! - [`node`] — Node lifecycle as a typestate machine ([`Node`],
+//!   [`NodeState`], [`NodePhase`]).
 //! - [`mode`] — Runtime mode ([`RuntimeMode`], [`Release`],
 //!   [`struct@Debug`]).
 //! - [`schedule`] — Scheduler events ([`SchedulerEvent`], [`TickResult`]).
@@ -47,6 +48,6 @@ pub use engine::{val_to_bytes, NodeHostState};
 pub use error::{ChannelError, NodeFault, RuntimeError};
 pub use graph::{RuntimeConfig, RuntimeGraph, ValuesSnapshot};
 pub use mode::{Debug, Release, RuntimeMode, TraceEvent};
-pub use node::{NodePhase, NodeState};
+pub use node::{Node, NodePhase, NodeState};
 pub use schedule::{SchedulerEvent, TickResult};
 pub use witgraph_ir::Val;

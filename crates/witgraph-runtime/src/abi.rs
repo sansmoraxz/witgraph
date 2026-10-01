@@ -246,8 +246,8 @@ mod tests {
         let mut snapshot = InputSnapshot::new();
         assert!(snapshot.read_value(&"in".into()).is_none());
 
-        snapshot.insert("in".into(), Val::F64(3.14));
-        assert_eq!(snapshot.read_value(&"in".into()), Some(&Val::F64(3.14)));
+        snapshot.insert("in".into(), Val::F64(2.5));
+        assert_eq!(snapshot.read_value(&"in".into()), Some(&Val::F64(2.5)));
     }
 
     #[test]

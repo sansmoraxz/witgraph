@@ -377,7 +377,7 @@ mod tests {
 
     #[test]
     fn val_round_trip_floats() {
-        let val = Val::F64(3.14);
+        let val = Val::F64(2.5);
         let bytes = val_to_bytes(&val).unwrap();
         assert_eq!(bytes_to_val(&bytes).unwrap(), val);
     }

@@ -16,7 +16,7 @@ use crate::engine::{
 };
 use crate::error::{ChannelError, NodeFault, RuntimeError};
 use crate::mode::{Release, RuntimeMode};
-use crate::node::{NodePhase, NodeState};
+use crate::node::{Node, NodeState, SuspendedOutput};
 use crate::resource::ResourcePool;
 use crate::schedule::{SchedulerEvent, TickResult};
 use witgraph_ir::Val;
@@ -76,34 +76,10 @@ pub(crate) enum FeedbackWrite {
 enum CommitOutcome {
     /// All writes committed successfully.
     Committed,
-    /// A downstream bounded channel was full. The producing node's
-    /// uncommitted writes have been saved and the node should
-    /// transition to [`NodePhase::Suspended`].
-    Backpressured,
-}
-
-/// Saved output state for a node suspended due to downstream channel
-/// backpressure.
-///
-/// When a producer's output commit encounters a full bounded channel,
-/// the uncommitted writes are captured here. On resumption (after the
-/// consumer frees capacity), the scheduler retries the commit without
-/// re-executing the node's WASM activation.
-pub(crate) struct SuspendedOutput {
-    /// The activation result from the original WASM activation, applied
-    /// once all writes finally commit.
-    activation_result: ActivationResult,
-    /// The connection whose channel was at capacity, triggering
-    /// suspension.
-    blocked_conn: ConnectionId,
-    /// Fan-out connections still pending for the first entry in
-    /// `writes`. Subsequent entries use the full fan-out set from
-    /// `output_map`.
-    pending_conns: Vec<ConnectionId>,
-    /// The uncommitted output writes. The first entry is partially
-    /// committed (only `pending_conns` remain); subsequent entries are
-    /// fully uncommitted.
-    writes: Vec<OutputWrite>,
+    /// A downstream bounded channel was full. The uncommitted writes
+    /// are handed back so the caller can suspend the producing node
+    /// with them.
+    Backpressured(SuspendedOutput),
 }
 
 /// A compiled graph loaded with WASM component instances, ready for
@@ -120,7 +96,7 @@ pub struct RuntimeGraph<M: RuntimeMode = Release> {
     pub(crate) engine: WasmEngine,
     /// Per-node WASM component instances.
     pub(crate) instances: HashMap<NodeId, NodeInstance>,
-    /// Per-node runtime state.
+    /// Per-node lifecycle state.
     pub(crate) nodes: HashMap<NodeId, NodeState>,
     /// Per-connection channel.
     pub(crate) channels: HashMap<ConnectionId, Channel>,
@@ -147,11 +123,10 @@ pub struct RuntimeGraph<M: RuntimeMode = Release> {
     /// Per-node input connections, sorted by port name for deterministic
     /// iteration in `derive_activation`.
     pub(crate) node_inputs: HashMap<NodeId, Arc<[(PortRef, ConnectionId)]>>,
-    /// Per-node saved output state for producers suspended by
-    /// downstream backpressure.
-    pub(crate) suspended_outputs: HashMap<NodeId, SuspendedOutput>,
     /// Reverse lookup from a blocked connection to the suspended
-    /// producer node waiting for capacity on that channel.
+    /// producer node waiting for capacity on that channel. The saved
+    /// output itself lives in the node's [`Suspended`](crate::node::Suspended)
+    /// state.
     pub(crate) suspended_on_conn: HashMap<ConnectionId, NodeId>,
     /// Pending scheduler events.
     pub(crate) pending: VecDeque<SchedulerEvent>,
@@ -386,18 +361,11 @@ impl<M: RuntimeMode> RuntimeGraph<M> {
         for node in &compiled.graph().nodes {
             if let Some(contract) = compiled.contract_for(&node.id) {
                 let mode_val = contract.consumption_mode();
-                let mut state = NodeState::new(node.id.clone(), mode_val);
-
-                // Count drained inputs.
                 let drain_count = contract.inputs.iter().filter(|p| p.drained).count();
-                if drain_count > 0 {
-                    state.pending_drains = drain_count;
-                    state.phase = NodePhase::Draining;
-                } else {
-                    state.phase = NodePhase::Created;
-                }
-
-                nodes.insert(node.id.clone(), state);
+                nodes.insert(
+                    node.id.clone(),
+                    Node::new(node.id.clone(), mode_val, drain_count).into(),
+                );
             }
         }
 
@@ -470,7 +438,6 @@ impl<M: RuntimeMode> RuntimeGraph<M> {
             conn_target,
             conn_source,
             node_inputs,
-            suspended_outputs: HashMap::new(),
             suspended_on_conn: HashMap::new(),
             pending: VecDeque::new(),
             cancelled: HashSet::new(),
@@ -614,64 +581,20 @@ impl<M: RuntimeMode> RuntimeGraph<M> {
                 return TickResult::StepLimitReached;
             }
 
-            // Skip terminal nodes.
-            let phase = match self.nodes.get(&node_id) {
-                Some(state) if state.phase.is_terminal() => continue,
-                Some(state) => state.phase,
+            match self.nodes.get(&node_id) {
                 None => continue,
-            };
-
-            // Resume a backpressure-suspended commit: retry the saved
-            // output writes without re-executing WASM activation.
-            if let Some(suspended) = self.suspended_outputs.remove(&node_id) {
-                self.suspended_on_conn.remove(&suspended.blocked_conn);
-
-                // Transition to Running if valid (Suspended -> Running).
-                // Silently skipped for Draining nodes where the
-                // transition is not defined.
-                self.transition_phase(&node_id, NodePhase::Running);
-
-                let saved_result = suspended.activation_result;
-                let first_conns = Some(suspended.pending_conns);
-
-                match self.commit_writes(
-                    &node_id,
-                    suspended.writes,
-                    first_conns,
-                    saved_result,
-                ) {
-                    Ok(CommitOutcome::Committed) => {
-                        self.apply_post_commit(&node_id, saved_result).await;
+                // Skip terminal nodes.
+                Some(state) if state.is_terminal() => continue,
+                // Resume a backpressure-suspended commit: retry the saved
+                // output writes without re-executing WASM activation.
+                Some(NodeState::Suspended(_)) => {
+                    if let Some(aborted) = self.resume_suspended(&node_id).await {
+                        return aborted;
                     }
-                    Ok(CommitOutcome::Backpressured) => {
-                        // Still blocked on a (possibly different)
-                        // channel. The node stays suspended.
-                        self.transition_phase(
-                            &node_id,
-                            NodePhase::Suspended,
-                        );
-                    }
-                    Err(fault) => {
-                        self.resources.release(&node_id);
-                        ResourcePool::drain_deferred_into(
-                            &mut self.resource_deferred,
-                            &mut self.ready,
-                        );
-                        self.mode.on_node_fault(&node_id, &fault);
-                        self.transition_phase(&node_id, NodePhase::Faulted);
-                        let _ = self.call_node_dispose(&node_id).await;
-                        if matches!(fault, NodeFault::Fatal { .. }) {
-                            return TickResult::Aborted {
-                                node: node_id,
-                                fault,
-                            };
-                        }
-                        self.propagate_cancellation(&node_id);
-                    }
+                    steps += 1;
+                    continue;
                 }
-
-                steps += 1;
-                continue;
+                Some(_) => {}
             }
 
             // Resource budget gate: defer if claims cannot be satisfied.
@@ -683,127 +606,36 @@ impl<M: RuntimeMode> RuntimeGraph<M> {
                 self.resources.acquire(&node_id);
             }
 
-            // Call init() on first activation (Created or Draining).
-            let needs_init = self
-                .nodes
-                .get(&node_id)
-                .is_some_and(|s| !s.initialized);
-            if needs_init {
+            // Call init() on first activation. A node that has been
+            // initialized is `Draining` or `Ready`.
+            if matches!(self.nodes.get(&node_id), Some(NodeState::Created(_))) {
                 if let Err(fault) = self.call_node_init(&node_id).await {
-                    self.resources.release(&node_id);
-                    ResourcePool::drain_deferred_into(
-                        &mut self.resource_deferred,
-                        &mut self.ready,
-                    );
-                    self.mode.on_node_fault(&node_id, &fault);
-                    self.transition_phase(&node_id, NodePhase::Faulted);
-                    if matches!(fault, NodeFault::Fatal { .. }) {
-                        return TickResult::Aborted {
-                            node: node_id,
-                            fault,
-                        };
+                    if let Some(aborted) = self.fail_node(&node_id, fault, false).await {
+                        return aborted;
                     }
-                    self.propagate_cancellation(&node_id);
                     continue;
                 }
-                if let Some(state) = self.nodes.get_mut(&node_id) {
-                    state.initialized = true;
-                }
-                // Created nodes transition to Ready before Running.
-                if phase == NodePhase::Created {
-                    self.transition_phase(&node_id, NodePhase::Ready);
-                }
+                self.transition(&node_id, |s| s.map_created(Node::initialized));
             }
 
-            // Transition to Running.
-            self.transition_phase(&node_id, NodePhase::Running);
+            self.transition(&node_id, NodeState::activate);
 
-            // Activate the node.
-            let result = self.activate_node(&node_id).await;
-
-            match result {
-                Ok((activation_result, collector)) => {
-                    // Check for fatal signal in the collector.
-                    if let Some(msg) = collector.fatal() {
-                        let fault = NodeFault::Fatal {
-                            message: msg.to_string(),
-                        };
-                        self.resources.release(&node_id);
-                        ResourcePool::drain_deferred_into(
-                            &mut self.resource_deferred,
-                            &mut self.ready,
-                        );
-                        self.mode.on_node_fault(&node_id, &fault);
-                        self.transition_phase(&node_id, NodePhase::Faulted);
-                        let _ = self.call_node_dispose(&node_id).await;
-                        return TickResult::Aborted {
-                            node: node_id,
-                            fault,
-                        };
-                    }
-
-                    // Commit outputs to downstream channels.
-                    match self.commit_outputs(
-                        &node_id,
-                        collector,
-                        activation_result,
-                    ) {
-                        Ok(CommitOutcome::Committed) => {
-                            self.apply_post_commit(
-                                &node_id,
-                                activation_result,
-                            )
-                            .await;
-                        }
-                        Ok(CommitOutcome::Backpressured) => {
-                            self.resources.release_non_held(&node_id);
-                            ResourcePool::drain_deferred_into(
-                                &mut self.resource_deferred,
-                                &mut self.ready,
-                            );
-                            self.transition_phase(
-                                &node_id,
-                                NodePhase::Suspended,
-                            );
-                        }
-                        Err(fault) => {
-                            self.resources.release(&node_id);
-                            ResourcePool::drain_deferred_into(
-                                &mut self.resource_deferred,
-                                &mut self.ready,
-                            );
-                            self.mode.on_node_fault(&node_id, &fault);
-                            self.transition_phase(
-                                &node_id,
-                                NodePhase::Faulted,
-                            );
-                            let _ = self.call_node_dispose(&node_id).await;
-                            if matches!(fault, NodeFault::Fatal { .. }) {
-                                return TickResult::Aborted {
-                                    node: node_id,
-                                    fault,
-                                };
-                            }
-                            self.propagate_cancellation(&node_id);
-                        }
-                    }
+            match self.activate_and_commit(&node_id).await {
+                Ok((CommitOutcome::Committed, activation_result)) => {
+                    self.apply_post_commit(&node_id, activation_result).await;
                 }
-                Err(fault) => {
-                    self.resources.release(&node_id);
+                Ok((CommitOutcome::Backpressured(out), _)) => {
+                    self.resources.release_non_held(&node_id);
                     ResourcePool::drain_deferred_into(
                         &mut self.resource_deferred,
                         &mut self.ready,
                     );
-                    self.mode.on_node_fault(&node_id, &fault);
-                    self.transition_phase(&node_id, NodePhase::Faulted);
-                    let _ = self.call_node_dispose(&node_id).await;
-                    if matches!(fault, NodeFault::Fatal { .. }) {
-                        return TickResult::Aborted {
-                            node: node_id,
-                            fault,
-                        };
+                    self.suspend(&node_id, out);
+                }
+                Err(fault) => {
+                    if let Some(aborted) = self.fail_node(&node_id, fault, true).await {
+                        return aborted;
                     }
-                    self.propagate_cancellation(&node_id);
                 }
             }
 
@@ -826,7 +658,7 @@ impl<M: RuntimeMode> RuntimeGraph<M> {
             return TickResult::Progress;
         }
 
-        if self.nodes.values().all(|s| s.phase.is_terminal()) {
+        if self.nodes.values().all(NodeState::is_terminal) {
             return TickResult::Completed;
         }
 
@@ -868,7 +700,7 @@ impl<M: RuntimeMode> RuntimeGraph<M> {
     }
 
     /// Marks a node for cancellation. The node is disposed and
-    /// transitioned to [`NodePhase::Cancelled`] at the start of the
+    /// transitioned to [`Cancelled`](crate::node::Cancelled) at the start of the
     /// next [`tick`](Self::tick). Cancellation propagates upstream:
     /// producers whose every downstream consumer is terminal are
     /// cancelled automatically.
@@ -876,7 +708,7 @@ impl<M: RuntimeMode> RuntimeGraph<M> {
         let state = self.nodes.get(node_id).ok_or(RuntimeError::UnknownNode {
             node: node_id.clone(),
         })?;
-        if !state.phase.is_terminal() {
+        if !state.is_terminal() {
             self.cancelled.insert(node_id.clone());
         }
         Ok(())
@@ -907,13 +739,7 @@ impl<M: RuntimeMode> RuntimeGraph<M> {
                         };
                         if let Some(err) = write_err {
                             let fault = channel_error_to_fault(&port, err);
-                            self.resources.release(&node);
-                            ResourcePool::drain_deferred_into(
-                                &mut self.resource_deferred,
-                                &mut self.ready,
-                            );
-                            self.mode.on_node_fault(&node, &fault);
-                            self.transition_phase(&node, NodePhase::Faulted);
+                            self.fault_node(&node, &fault);
                             self.propagate_cancellation(&node);
                             continue;
                         }
@@ -1008,6 +834,24 @@ impl<M: RuntimeMode> RuntimeGraph<M> {
         Ok((result, collector))
     }
 
+    /// Activates a node and commits the outputs it produced.
+    ///
+    /// A `fatal()` signal from the node is reported as
+    /// [`NodeFault::Fatal`], like any other fault.
+    async fn activate_and_commit(
+        &mut self,
+        node_id: &NodeId,
+    ) -> Result<(CommitOutcome, ActivationResult), NodeFault> {
+        let (activation_result, collector) = self.activate_node(node_id).await?;
+        if let Some(message) = collector.fatal() {
+            return Err(NodeFault::Fatal {
+                message: message.to_string(),
+            });
+        }
+        let outcome = self.commit_outputs(node_id, collector, activation_result)?;
+        Ok((outcome, activation_result))
+    }
+
     /// Commits an [`OutputCollector`] produced by a node activation.
     ///
     /// Delegates to [`commit_writes`](Self::commit_writes). When a
@@ -1032,10 +876,10 @@ impl<M: RuntimeMode> RuntimeGraph<M> {
     /// downstream node is inserted into the ready queue.
     ///
     /// When a bounded channel (event queue or stream) is full, the
-    /// current write and all remaining writes are saved in
-    /// [`suspended_outputs`](Self::suspended_outputs) and
-    /// [`CommitOutcome::Backpressured`] is returned. Non-capacity
-    /// errors (double-resolve, write-after-close) remain hard faults.
+    /// current write and all remaining writes are returned in
+    /// [`CommitOutcome::Backpressured`] for the caller to suspend the
+    /// node with. Non-capacity errors (double-resolve,
+    /// write-after-close) remain hard faults.
     ///
     /// `first_pending_conns` provides the fan-out connections for the
     /// first write when resuming a partially committed output. For
@@ -1169,19 +1013,12 @@ impl<M: RuntimeMode> RuntimeGraph<M> {
                     saved_writes.push(output_write);
                     saved_writes.extend(remaining.drain(..));
 
-                    self.suspended_on_conn
-                        .insert(conn_id.clone(), node_id.clone());
-                    self.suspended_outputs.insert(
-                        node_id.clone(),
-                        SuspendedOutput {
-                            activation_result,
-                            blocked_conn: conn_id.clone(),
-                            pending_conns,
-                            writes: saved_writes,
-                        },
-                    );
-
-                    return Ok(CommitOutcome::Backpressured);
+                    return Ok(CommitOutcome::Backpressured(SuspendedOutput {
+                        activation_result,
+                        blocked_conn: conn_id.clone(),
+                        pending_conns,
+                        writes: saved_writes,
+                    }));
                 }
 
                 // Enqueue the downstream node.
@@ -1195,11 +1032,12 @@ impl<M: RuntimeMode> RuntimeGraph<M> {
     /// Applies the post-commit actions for a node whose outputs have
     /// been fully committed.
     ///
-    /// For [`ActivationResult::Continue`], transitions the node to
-    /// [`NodePhase::Ready`] (unless it is still draining) and
-    /// re-enqueues it if input data is pending. For
-    /// [`ActivationResult::Completed`], transitions to
-    /// [`NodePhase::Completed`] and disposes the node.
+    /// For [`ActivationResult::Continue`], the node goes back to
+    /// [`Draining`](crate::node::Draining) if it still has drains
+    /// pending and to [`Ready`](crate::node::Ready) otherwise, and is
+    /// re-enqueued if input data is pending. For
+    /// [`ActivationResult::Completed`], the node completes and is
+    /// disposed.
     async fn apply_post_commit(
         &mut self,
         node_id: &NodeId,
@@ -1207,11 +1045,7 @@ impl<M: RuntimeMode> RuntimeGraph<M> {
     ) {
         match activation_result {
             ActivationResult::Continue => {
-                let current_phase =
-                    self.nodes.get(node_id).map(|s| s.phase);
-                if current_phase != Some(NodePhase::Draining) {
-                    self.transition_phase(node_id, NodePhase::Ready);
-                }
+                self.transition(node_id, |s| s.map_running(Node::proceed));
                 self.resources.release(node_id);
                 ResourcePool::drain_deferred_into(
                     &mut self.resource_deferred,
@@ -1222,7 +1056,7 @@ impl<M: RuntimeMode> RuntimeGraph<M> {
                 }
             }
             ActivationResult::Completed => {
-                self.transition_phase(node_id, NodePhase::Completed);
+                self.transition(node_id, |s| s.map_running(|n| n.complete().into()));
                 self.resources.release(node_id);
                 ResourcePool::drain_deferred_into(
                     &mut self.resource_deferred,
@@ -1333,12 +1167,13 @@ impl<M: RuntimeMode> RuntimeGraph<M> {
     /// Derives the activation kind from the node's input channel state.
     ///
     /// Scans the node's input channels in deterministic (port-name-sorted)
-    /// order. For nodes in the [`NodePhase::Draining`] phase, checks
-    /// drained input ports first: pulls one item from a drained stream or
-    /// clones a resolved future, returning [`Activation::DrainItem`].
-    /// When a drained stream is closed and empty, decrements
-    /// [`NodeState::pending_drains`]. When all drains complete,
-    /// transitions the node to [`NodePhase::Ready`].
+    /// order. For a node that still has drains pending, checks drained
+    /// input ports first: pulls one item from a drained stream or clones
+    /// a resolved future, returning [`Activation::DrainItem`]. When a
+    /// drained stream is closed and empty, or a drained future resolves,
+    /// the running node's pending drain count is decremented; once it
+    /// reaches zero the node goes to [`Ready`](crate::node::Ready) when
+    /// the activation finishes (see [`Node::proceed`]).
     ///
     /// For non-draining (or drain-complete) nodes, checks for pending
     /// events, stream items, stream closes, and future resolutions in
@@ -1355,7 +1190,7 @@ impl<M: RuntimeMode> RuntimeGraph<M> {
         let is_draining = self
             .nodes
             .get(node_id)
-            .is_some_and(|s| s.pending_drains > 0);
+            .is_some_and(|s| s.pending_drains() > 0);
 
         if is_draining {
             // Collect the set of drained port names from the contract
@@ -1403,20 +1238,14 @@ impl<M: RuntimeMode> RuntimeGraph<M> {
                                 };
                             }
                         } else if stream.is_closed() {
-                            if let Some(state) = self.nodes.get_mut(node_id) {
-                                state.pending_drains =
-                                    state.pending_drains.saturating_sub(1);
-                            }
+                            self.complete_drain(node_id);
                             self.consumed_oneshots.insert(conn_id.clone());
                         }
                     }
                     Some(Channel::Future(slot)) => {
                         if let Some(val) = slot.poll() {
                             let val = val.clone();
-                            if let Some(state) = self.nodes.get_mut(node_id) {
-                                state.pending_drains =
-                                    state.pending_drains.saturating_sub(1);
-                            }
+                            self.complete_drain(node_id);
                             self.consumed_oneshots.insert(conn_id.clone());
                             return Activation::DrainItem {
                                 port: port_ref.port.clone(),
@@ -1428,14 +1257,14 @@ impl<M: RuntimeMode> RuntimeGraph<M> {
                 }
             }
 
-            // Check whether all drains completed.
-            let drains_done = self
+            // If drains remain there is nothing else to deliver yet. When
+            // the last one just completed, fall through to deliver any
+            // other pending input in this same activation.
+            let drains_pending = self
                 .nodes
                 .get(node_id)
-                .is_some_and(|s| s.pending_drains == 0);
-            if drains_done {
-                self.transition_phase(node_id, NodePhase::Ready);
-            } else {
+                .is_some_and(|s| s.pending_drains() > 0);
+            if drains_pending {
                 return Activation::Sync;
             }
         }
@@ -1552,27 +1381,128 @@ impl<M: RuntimeMode> RuntimeGraph<M> {
         false
     }
 
-    /// Transitions a node to a new phase if the transition is valid,
-    /// firing the mode callback. Invalid transitions are silently
-    /// skipped (the node keeps its current phase).
-    fn transition_phase(&mut self, node_id: &NodeId, to: NodePhase) {
-        if let Some(state) = self.nodes.get_mut(node_id)
-            && state.phase.can_transition_to(to)
-        {
-            let from = state.phase;
-            state.phase = to;
-            self.mode.on_phase_transition(node_id, from, to);
+    /// Applies a lifecycle transition to a node, firing the mode
+    /// callback if its phase changed.
+    ///
+    /// `f` receives the node's current state and returns its next one;
+    /// the typed transitions on [`Node`] and the `map_*` methods on
+    /// [`NodeState`] are what it is built from.
+    fn transition(&mut self, node_id: &NodeId, f: impl FnOnce(NodeState) -> NodeState) {
+        Self::transition_in(&mut self.nodes, &self.mode, node_id, f);
+    }
+
+    /// [`transition`](Self::transition) over the individual fields it
+    /// touches, for callers that hold other borrows of `self`.
+    fn transition_in(
+        nodes: &mut HashMap<NodeId, NodeState>,
+        mode: &M,
+        node_id: &NodeId,
+        f: impl FnOnce(NodeState) -> NodeState,
+    ) {
+        let Some((key, state)) = nodes.remove_entry(node_id) else {
+            return;
+        };
+        let from = state.phase();
+        let next = f(state);
+        let to = next.phase();
+        nodes.insert(key, next);
+        if from != to {
+            mode.on_phase_transition(node_id, from, to);
         }
+    }
+
+    /// Records that one of a running node's drained inputs completed.
+    fn complete_drain(&mut self, node_id: &NodeId) {
+        if let Some(NodeState::Running(node)) = self.nodes.get_mut(node_id) {
+            node.complete_drain();
+        }
+    }
+
+    /// Suspends a running node whose outputs hit downstream
+    /// backpressure, and registers it to be woken when the blocking
+    /// channel frees capacity.
+    fn suspend(&mut self, node_id: &NodeId, out: SuspendedOutput) {
+        self.suspended_on_conn
+            .insert(out.blocked_conn.clone(), node_id.clone());
+        self.transition(node_id, |s| s.map_running(|n| n.suspend(out).into()));
+    }
+
+    /// Retries committing the output of a backpressure-suspended node.
+    ///
+    /// The node stays suspended if a channel is still full. Returns
+    /// `Some(TickResult::Aborted)` if the node faulted fatally.
+    async fn resume_suspended(&mut self, node_id: &NodeId) -> Option<TickResult> {
+        let mut saved = None;
+        self.transition(node_id, |s| {
+            s.map_suspended(|n| {
+                let (running, out) = n.resume();
+                saved = Some(out);
+                running.into()
+            })
+        });
+        let out = saved?;
+        self.suspended_on_conn.remove(&out.blocked_conn);
+
+        let activation_result = out.activation_result;
+        match self.commit_writes(
+            node_id,
+            out.writes,
+            Some(out.pending_conns),
+            activation_result,
+        ) {
+            Ok(CommitOutcome::Committed) => {
+                self.apply_post_commit(node_id, activation_result).await;
+                None
+            }
+            // Still blocked on a (possibly different) channel.
+            Ok(CommitOutcome::Backpressured(out)) => {
+                self.suspend(node_id, out);
+                None
+            }
+            Err(fault) => self.fail_node(node_id, fault, true).await,
+        }
+    }
+
+    /// Records a node fault: releases the node's resources, notifies the
+    /// mode, and moves the node to [`Faulted`](crate::node::Faulted).
+    fn fault_node(&mut self, node_id: &NodeId, fault: &NodeFault) {
+        self.resources.release(node_id);
+        ResourcePool::drain_deferred_into(&mut self.resource_deferred, &mut self.ready);
+        self.mode.on_node_fault(node_id, fault);
+        self.transition(node_id, |s| s.fault(fault.clone()));
+    }
+
+    /// Handles a fault raised while running a node.
+    ///
+    /// Faults the node, disposes it if `dispose` is set, then either
+    /// reports a fatal fault as `Some(TickResult::Aborted)` or
+    /// propagates cancellation upstream and returns `None`.
+    async fn fail_node(
+        &mut self,
+        node_id: &NodeId,
+        fault: NodeFault,
+        dispose: bool,
+    ) -> Option<TickResult> {
+        self.fault_node(node_id, &fault);
+        if dispose {
+            let _ = self.call_node_dispose(node_id).await;
+        }
+        if matches!(fault, NodeFault::Fatal { .. }) {
+            return Some(TickResult::Aborted {
+                node: node_id.clone(),
+                fault,
+            });
+        }
+        self.propagate_cancellation(node_id);
+        None
     }
 
     /// Inserts a node into the ready queue using its topological index.
     /// If the node is cancelled, marks it for restart instead.
     fn enqueue_node(&mut self, node_id: &NodeId) {
-        if let Some(state) = self.nodes.get(node_id) {
-            if state.phase == NodePhase::Cancelled {
-                self.restart_pending.insert(node_id.clone());
-                return;
-            }
+        if let Some(NodeState::Cancelled(_)) = self.nodes.get(node_id) {
+            self.restart_pending.insert(node_id.clone());
+            return;
         }
         if let Some(&idx) = self.topo_index.get(node_id) {
             self.ready.insert((idx, node_id.clone()));
@@ -1580,58 +1510,59 @@ impl<M: RuntimeMode> RuntimeGraph<M> {
     }
 
     /// Processes all pending cancellations: disposes each cancelled
-    /// node, transitions it to [`NodePhase::Cancelled`], and propagates
-    /// cancellation upstream.
+    /// node, transitions it to [`Cancelled`](crate::node::Cancelled), and
+    /// propagates cancellation upstream.
     ///
     /// Returns `Some(TickResult::Aborted)` if a fatal fault is
     /// encountered during dispose; otherwise `None`.
     async fn process_cancellations(&mut self) -> Option<TickResult> {
         loop {
-        let batch: Vec<NodeId> = self.cancelled.drain().collect();
-        if batch.is_empty() {
-            return None;
-        }
-        for node_id in batch {
-            if self
-                .nodes
-                .get(&node_id)
-                .is_some_and(|s| s.phase.is_terminal())
-            {
-                continue;
+            let batch: Vec<NodeId> = self.cancelled.drain().collect();
+            if batch.is_empty() {
+                return None;
             }
+            for node_id in batch {
+                if self
+                    .nodes
+                    .get(&node_id)
+                    .is_some_and(NodeState::is_terminal)
+                {
+                    continue;
+                }
 
-            // Clean up any suspended output state.
-            if let Some(suspended) = self.suspended_outputs.remove(&node_id) {
-                self.suspended_on_conn.remove(&suspended.blocked_conn);
-            }
+                // A suspended node is no longer waiting on its blocked
+                // channel (its saved output is dropped with the state).
+                if let Some(NodeState::Suspended(node)) = self.nodes.get(&node_id) {
+                    self.suspended_on_conn.remove(node.blocked_on());
+                }
 
-            // Release any held resources.
-            self.resources.release(&node_id);
-            ResourcePool::drain_deferred_into(
-                &mut self.resource_deferred,
-                &mut self.ready,
-            );
+                // Release any held resources.
+                self.resources.release(&node_id);
+                ResourcePool::drain_deferred_into(
+                    &mut self.resource_deferred,
+                    &mut self.ready,
+                );
 
-            // Remove from the ready queue.
-            if let Some(&idx) = self.topo_index.get(&node_id) {
-                self.ready.remove(&(idx, node_id.clone()));
-            }
+                // Remove from the ready queue.
+                if let Some(&idx) = self.topo_index.get(&node_id) {
+                    self.ready.remove(&(idx, node_id.clone()));
+                }
 
-            self.mode.on_cancelled(&node_id);
-            self.transition_phase(&node_id, NodePhase::Cancelled);
+                self.mode.on_cancelled(&node_id);
+                self.transition(&node_id, NodeState::cancel);
 
-            if let Err(fault) = self.call_node_dispose(&node_id).await {
-                if matches!(fault, NodeFault::Fatal { .. }) {
+                if let Err(fault) = self.call_node_dispose(&node_id).await
+                    && matches!(fault, NodeFault::Fatal { .. })
+                {
                     return Some(TickResult::Aborted {
                         node: node_id,
                         fault,
                     });
                 }
-            }
 
-            self.propagate_cancellation(&node_id);
+                self.propagate_cancellation(&node_id);
+            }
         }
-        } // loop
     }
 
     /// Checks whether every downstream consumer of a node is terminal.
@@ -1652,7 +1583,7 @@ impl<M: RuntimeMode> RuntimeGraph<M> {
             if self
                 .nodes
                 .get(&producer_id)
-                .is_some_and(|s| s.phase.is_terminal())
+                .is_some_and(NodeState::is_terminal)
             {
                 continue;
             }
@@ -1678,7 +1609,7 @@ impl<M: RuntimeMode> RuntimeGraph<M> {
                     let is_terminal = self
                         .nodes
                         .get(&target.node)
-                        .is_some_and(|s| s.phase.is_terminal());
+                        .is_some_and(NodeState::is_terminal);
                     if !is_terminal {
                         return false;
                     }
@@ -1689,11 +1620,16 @@ impl<M: RuntimeMode> RuntimeGraph<M> {
     }
 
     /// Re-instantiates all nodes in `restart_pending`: creates a fresh
-    /// WASM instance, resets state to [`NodePhase::Created`], resets
-    /// output channels, and enqueues the node.
+    /// WASM instance, restarts the node from [`Created`](crate::node::Created),
+    /// resets output channels, and enqueues the node.
     async fn process_restarts(&mut self) -> Result<(), RuntimeError> {
         let batch: Vec<NodeId> = self.restart_pending.drain().collect();
         for (i, node_id) in batch.iter().enumerate() {
+            // Only cancelled nodes are queued for restart, and nothing
+            // moves a terminal node out of its phase in between.
+            if !matches!(self.nodes.get(node_id), Some(NodeState::Cancelled(_))) {
+                continue;
+            }
             let Some(contract) = self.compiled.contract_for(node_id) else {
                 continue;
             };
@@ -1725,15 +1661,11 @@ impl<M: RuntimeMode> RuntimeGraph<M> {
             };
             self.instances.insert(node_id.clone(), instance);
 
-            // Reset node state.
-            let mode_val = contract.consumption_mode();
+            // Restart the node from `Created`.
             let drain_count = contract.inputs.iter().filter(|p| p.drained).count();
-            let mut state = NodeState::new(node_id.clone(), mode_val);
-            if drain_count > 0 {
-                state.pending_drains = drain_count;
-                state.phase = NodePhase::Draining;
-            }
-            self.nodes.insert(node_id.clone(), state);
+            Self::transition_in(&mut self.nodes, &self.mode, node_id, |s| {
+                s.map_cancelled(|n| n.restart(drain_count).into())
+            });
 
             // Reset output channels only where the downstream consumer is
             // terminal. Channels with live downstream consumers keep their
@@ -1746,14 +1678,11 @@ impl<M: RuntimeMode> RuntimeGraph<M> {
                             .conn_target
                             .get(conn_id)
                             .and_then(|target| self.nodes.get(&target.node))
-                            .is_some_and(|state| state.phase.is_terminal());
-                        if downstream_terminal {
-                            if let Some(ch) = self.channels.get_mut(conn_id) {
-                                *ch = Channel::for_kind(
-                                    output.kind,
-                                    self.config.channel_capacity,
-                                );
-                            }
+                            .is_some_and(NodeState::is_terminal);
+                        if downstream_terminal
+                            && let Some(ch) = self.channels.get_mut(conn_id)
+                        {
+                            *ch = Channel::for_kind(output.kind, self.config.channel_capacity);
                         }
                     }
                 }
