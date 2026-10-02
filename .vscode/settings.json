@@ -1,0 +1,12 @@
+{
+  "rust-analyzer.linkedProjects": [
+    "Cargo.toml",
+    "test-fixtures/test-components/guests/busy-loop/Cargo.toml",
+    "test-fixtures/test-components/guests/configurable/Cargo.toml",
+    "test-fixtures/test-components/guests/echo/Cargo.toml",
+    "test-fixtures/test-components/guests/mqtt-node/Cargo.toml",
+    "test-fixtures/test-components/guests/relay/Cargo.toml",
+    "test-fixtures/test-components/guests/stream-consumer/Cargo.toml",
+    "test-fixtures/test-components/guests/stream-producer/Cargo.toml"
+  ]
+}

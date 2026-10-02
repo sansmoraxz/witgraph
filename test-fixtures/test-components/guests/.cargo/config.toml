@@ -1,0 +1,4 @@
+# Guests only make sense on wasm; this makes `cargo check` (and rust-analyzer)
+# run from a guest directory target it by default.
+[build]
+target = "wasm32-unknown-unknown"
