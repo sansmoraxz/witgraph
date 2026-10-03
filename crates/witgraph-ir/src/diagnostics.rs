@@ -8,7 +8,7 @@ use core::fmt;
 
 pub use miette::Severity;
 
-use crate::id::{ComponentRef, ConnectionId, NodeId, PortName, PortRef};
+use crate::id::{ComponentRef, ConnectionId, NodeId, PortName, PortRef, ResourceId};
 use crate::port::{PortDirection, PortKind};
 
 /// Where in the graph a diagnostic points.
@@ -22,56 +22,54 @@ pub enum Location {
     Component(ComponentRef),
     /// One node.
     Node(NodeId),
+    /// Several nodes, in declaration order.
+    Nodes(Vec<NodeId>),
     /// One port on one node.
     Port(PortRef),
     /// One connection.
     Connection(ConnectionId),
     /// The nodes forming a cycle.
     Cycle(Vec<NodeId>),
+    /// The members of one island.
+    Island(Vec<NodeId>),
 }
 
-fn join<T: fmt::Display>(items: &[T]) -> String {
+/// The items joined with `, `.
+fn join<T: fmt::Display>(items: impl IntoIterator<Item = T>) -> String {
     let mut out = String::new();
-    for (i, item) in items.iter().enumerate() {
+    for (i, item) in items.into_iter().enumerate() {
         if i > 0 {
             out.push_str(", ");
         }
         out.push_str(&item.to_string());
+    }
+    out
+}
+
+/// Node ids, the first [`LISTED`] of them.
+fn join_nodes(nodes: &[NodeId]) -> String {
+    let mut out = join(nodes.iter().take(LISTED).map(|n| format!("`{n}`")));
+    if nodes.len() > LISTED {
+        out.push_str(&format!(" and {} more", nodes.len() - LISTED));
     }
     out
 }
 
 /// Like [`join`], but repeated items render once (first occurrence wins).
-fn join_unique<T: fmt::Display + Eq>(items: &[T]) -> String {
-    let mut seen: Vec<&T> = Vec::with_capacity(items.len());
-    for item in items {
-        if !seen.contains(&item) {
-            seen.push(item);
-        }
-    }
-    let mut out = String::new();
-    for (i, item) in seen.iter().enumerate() {
-        if i > 0 {
-            out.push_str(", ");
-        }
-        out.push_str(&item.to_string());
-    }
-    out
+fn join_unique<T: fmt::Display + Eq + core::hash::Hash>(items: &[T]) -> String {
+    let mut seen = std::collections::HashSet::with_capacity(items.len());
+    join(items.iter().filter(|item| seen.insert(*item)))
 }
 
-/// Component refs including their content hashes, which the `Display` impl
-/// deliberately omits.
-fn join_with_hashes(refs: &[ComponentRef]) -> String {
-    let mut out = String::new();
-    for (i, r) in refs.iter().enumerate() {
-        if i > 0 {
-            out.push_str(", ");
-        }
-        out.push_str(&r.to_string());
-        if let Some(hash) = &r.content_hash {
-            out.push('#');
-            out.push_str(hash);
-        }
+/// At most this many items of a long list are rendered.
+const LISTED: usize = 16;
+
+/// Component refs in their pinned form (`{:#}`, content hash included),
+/// the first [`LISTED`] of them.
+fn join_pinned(refs: &[ComponentRef]) -> String {
+    let mut out = join(refs.iter().take(LISTED).map(|r| format!("{r:#}")));
+    if refs.len() > LISTED {
+        out.push_str(&format!(" and {} more", refs.len() - LISTED));
     }
     out
 }
@@ -84,9 +82,15 @@ fn join_with_hashes(refs: &[ComponentRef]) -> String {
 #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 pub enum Diagnostic {
     /// A node references a component missing from the graph's component
-    /// table.
-    #[error("node `{node}` references unknown component `{component}`")]
-    #[diagnostic(code(witgraph::ir::unknown_component))]
+    /// table, or one whose content hash differs from the contract the
+    /// matching table entry resolved to.
+    #[error("node `{node}` references unknown component `{component:#}`")]
+    #[diagnostic(
+        code(witgraph::ir::unknown_component),
+        help(
+            "add it to the component table, or re-pin the node to the revision the table resolves to"
+        )
+    )]
     UnknownComponent {
         /// The referencing node.
         node: NodeId,
@@ -98,15 +102,33 @@ pub enum Diagnostic {
     /// revision with a different content hash.
     ///
     /// [`ContractSource`]: crate::ContractSource
-    #[error("no contract was supplied for component `{0}`")]
+    #[error("no contract was supplied for component `{0:#}`")]
     #[diagnostic(
         code(witgraph::ir::contract_not_found),
         help(
-            "looked up {}; re-derive the contract from the component's WIT, or re-pin the graph to the revision you have",
-            join_with_hashes(core::slice::from_ref(_0))
+            "re-derive the contract from the component's WIT, or re-pin the graph to the revision you have"
         )
     )]
     ContractNotFound(ComponentRef),
+    /// An unhashed component table entry that several contracts supplied by
+    /// the [`ContractSource`] fit: revisions with other content hashes, or
+    /// differing hashless contracts with the entry's id.
+    ///
+    /// [`ContractSource`]: crate::ContractSource
+    #[error(
+        "component `{component}` is ambiguous: {} contracts were supplied",
+        matches.len()
+    )]
+    #[diagnostic(
+        code(witgraph::ir::ambiguous_contract),
+        help("pin the entry to one of: {}", join_pinned(matches))
+    )]
+    AmbiguousContract {
+        /// The unhashed table entry.
+        component: ComponentRef,
+        /// Every revision that fits it.
+        matches: Vec<ComponentRef>,
+    },
     /// Two entries in the graph's component table share an identity
     /// (package, world, version, and content hash all equal).
     #[error("component table contains duplicate component `{0}`")]
@@ -123,23 +145,25 @@ pub enum Diagnostic {
         /// The repeated port name.
         port: PortName,
     },
-    /// A node's component reference matches more than one contract in the
-    /// graph's component table (e.g. an unhashed reference amid several
-    /// hashed revisions of the same world).
+    /// A component reference that matches more than one distinct entry in
+    /// the graph's component table (e.g. an unhashed reference amid several
+    /// hashed revisions of the same world). Reported once per reference,
+    /// with every node using it.
     #[error(
-        "node `{node}` component reference `{component}` is ambiguous: it matches {} contracts",
+        "component reference `{component:#}` (used by {}) is ambiguous: it matches {} contracts",
+        join_nodes(nodes),
         matches.len()
     )]
     #[diagnostic(
         code(witgraph::ir::ambiguous_component),
-        help("matching contracts: {}", join_with_hashes(matches))
+        help("matching contracts: {}", join_pinned(matches))
     )]
     AmbiguousComponent {
-        /// The referencing node.
-        node: NodeId,
+        /// The nodes using the reference, in declaration order.
+        nodes: Vec<NodeId>,
         /// The ambiguous component reference.
         component: ComponentRef,
-        /// Every contract id the reference matches.
+        /// Every distinct contract id the reference matches, sorted.
         matches: Vec<ComponentRef>,
     },
     /// Two nodes share an id.
@@ -238,6 +262,20 @@ pub enum Diagnostic {
         /// The unconnected input port.
         port: PortRef,
     },
+    /// A required input written only by feedback connections. A feedback
+    /// edge delivers the previous iteration's value, so the input has no
+    /// value (and its node cannot run) until the feedback source first
+    /// produces one, or a value is injected.
+    #[error(
+        "required input port `{port}` is fed only by feedback connection `{conn}`; it has no value until its feedback source first produces one or a value is injected"
+    )]
+    #[diagnostic(code(witgraph::ir::feedback_only_input), severity(Warning))]
+    FeedbackOnlyInput {
+        /// The input port.
+        port: PortRef,
+        /// A feedback connection writing it.
+        conn: ConnectionId,
+    },
     /// An output port marked optional: optionality only applies to inputs.
     #[error(
         "output port `{port}` on `{component}` is marked optional; only inputs may be optional"
@@ -271,7 +309,7 @@ pub enum Diagnostic {
     #[error(
         "{kind} output `{port}` has {} consumers ({}); stream and future outputs connect to at most one input",
         connections.len(),
-        join_unique(connections)
+        join(connections)
     )]
     #[diagnostic(
         code(witgraph::ir::async_fan_out),
@@ -285,6 +323,37 @@ pub enum Diagnostic {
         /// Every connection reading from it.
         connections: Vec<ConnectionId>,
     },
+    /// A Value port with no payload type. Only a bare `stream` or `future`
+    /// carries none; no component can declare such a Value port.
+    #[error("{direction} value port `{port}` on `{component}` has no payload type")]
+    #[diagnostic(code(witgraph::ir::untyped_value_port))]
+    UntypedValuePort {
+        /// The component declaring the port.
+        component: ComponentRef,
+        /// Which side of the contract the port is on.
+        direction: PortDirection,
+        /// The port.
+        port: PortName,
+    },
+    /// An island whose members' claims on one resource sum to more than
+    /// all of it. An island holds its members' claims together for its
+    /// whole generation, so it could never start.
+    #[error(
+        "the island of {} claims more than all of resource `{resource}`",
+        join_nodes(nodes)
+    )]
+    #[diagnostic(
+        code(witgraph::ir::island_overclaims),
+        help(
+            "lower the claims, or split the island (its nodes share a stream or future connection, or were merged)"
+        )
+    )]
+    IslandOverclaims {
+        /// The island's members, in topological order.
+        nodes: Vec<NodeId>,
+        /// The overclaimed resource.
+        resource: ResourceId,
+    },
     /// A cycle in which no edge is marked as a feedback boundary. `nodes`
     /// holds the members of the offending strongly connected component,
     /// sorted — not in traversal order.
@@ -294,7 +363,22 @@ pub enum Diagnostic {
         /// The nodes forming the cycle, sorted.
         nodes: Vec<NodeId>,
     },
-    /// A feedback-marked connection that lies on no cycle.
+    /// Stream islands that a non-feedback Value path leaves and re-enters
+    /// were merged into one island, so the islands form a DAG. The merged
+    /// island shares one Store: one fault stops all of it, and its members
+    /// do not interleave. Mark a connection on the path `feedback` to keep
+    /// the islands apart.
+    #[error(
+        "nodes {} share one island: a value path leaves a stream island and re-enters it",
+        join(nodes)
+    )]
+    #[diagnostic(code(witgraph::ir::merged_island), severity(Warning))]
+    MergedIsland {
+        /// The merged island's members, in topological order.
+        nodes: Vec<NodeId>,
+    },
+    /// A feedback-marked connection that lies on no cycle and does not keep
+    /// two islands apart (see [`Diagnostic::MergedIsland`]).
     #[error("feedback connection `{conn}` is not part of any cycle")]
     #[diagnostic(code(witgraph::ir::useless_feedback), severity(Warning))]
     UselessFeedback {
@@ -331,8 +415,8 @@ impl Diagnostic {
     /// Where in the graph this defect points.
     pub fn location(&self) -> Location {
         match self {
-            Diagnostic::UnknownComponent { node, .. }
-            | Diagnostic::AmbiguousComponent { node, .. } => Location::Node(node.clone()),
+            Diagnostic::UnknownComponent { node, .. } => Location::Node(node.clone()),
+            Diagnostic::AmbiguousComponent { nodes, .. } => Location::Nodes(nodes.clone()),
             Diagnostic::DuplicateNodeId(node) => Location::Node(node.clone()),
             Diagnostic::DuplicateConnectionId(conn)
             | Diagnostic::DuplicateConnection { second: conn, .. }
@@ -346,16 +430,23 @@ impl Diagnostic {
             | Diagnostic::UselessFeedback { conn } => Location::Connection(conn.clone()),
             Diagnostic::MultipleWriters { port, .. }
             | Diagnostic::AsyncFanOut { port, .. }
-            | Diagnostic::RequiredInputUnconnected { port } => Location::Port(port.clone()),
-            Diagnostic::DuplicateComponent(component) | Diagnostic::ContractNotFound(component) => {
+            | Diagnostic::RequiredInputUnconnected { port }
+            | Diagnostic::FeedbackOnlyInput { port, .. } => Location::Port(port.clone()),
+            Diagnostic::DuplicateComponent(component)
+            | Diagnostic::ContractNotFound(component)
+            | Diagnostic::AmbiguousContract { component, .. } => {
                 Location::Component(component.clone())
             }
             Diagnostic::DuplicatePortName { component, .. }
             | Diagnostic::OptionalOutput { component, .. }
-            | Diagnostic::OptionalAsyncInput { component, .. } => {
+            | Diagnostic::OptionalAsyncInput { component, .. }
+            | Diagnostic::UntypedValuePort { component, .. } => {
                 Location::Component(component.clone())
             }
             Diagnostic::IllegalCycle { nodes } => Location::Cycle(nodes.clone()),
+            Diagnostic::MergedIsland { nodes } | Diagnostic::IslandOverclaims { nodes, .. } => {
+                Location::Island(nodes.clone())
+            }
         }
     }
 }
@@ -534,11 +625,35 @@ mod tests {
     fn ambiguous_component_help_includes_hashes() {
         use miette::Diagnostic as _;
         let diagnostic = Diagnostic::AmbiguousComponent {
-            node: "n".into(),
+            nodes: vec!["n".into(), "m".into()],
             component: cref(None),
             matches: vec![cref(Some("aa")), cref(Some("bb"))],
         };
+        assert_eq!(
+            diagnostic.to_string(),
+            "component reference `demo:graph/w` (used by `n`, `m`) is ambiguous: it matches 2 contracts"
+        );
         let help = diagnostic.help().expect("has help").to_string();
         assert_eq!(help, "matching contracts: demo:graph/w#aa, demo:graph/w#bb");
+    }
+
+    #[test]
+    fn long_lists_are_cut_short() {
+        use miette::Diagnostic as _;
+        let matches: Vec<ComponentRef> = (0..20).map(|i| cref(Some(&format!("{i:02x}")))).collect();
+        let diagnostic = Diagnostic::AmbiguousContract {
+            component: cref(None),
+            matches,
+        };
+        let help = diagnostic.help().expect("has help").to_string();
+        assert!(help.ends_with("demo:graph/w#0f and 4 more"), "{help}");
+    }
+
+    #[test]
+    fn missing_contracts_name_their_hash() {
+        assert_eq!(
+            Diagnostic::ContractNotFound(cref(Some("ab"))).to_string(),
+            "no contract was supplied for component `demo:graph/w#ab`"
+        );
     }
 }

@@ -65,6 +65,7 @@ impl<'de> serde::Deserialize<'de> for Fraction {
 /// whose own claims exceed 1.0 is rejected when the graph is loaded.
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
 pub struct ResourceClaim {
     /// Fraction of the resource consumed while running.
     pub fraction: Fraction,
@@ -82,6 +83,7 @@ impl ResourceClaim {
 /// Human-facing information about a graph.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
 pub struct GraphMetadata {
     /// The graph's name.
     pub name: String,
@@ -99,6 +101,7 @@ pub struct GraphMetadata {
 /// An instance of a component in a graph.
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
 pub struct Node {
     /// The node's graph-unique id.
     pub id: NodeId,
@@ -120,6 +123,7 @@ pub struct Node {
 /// A directed edge from an output port to an input port.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
 pub struct Connection {
     /// The connection's graph-unique id.
     pub id: ConnectionId,
@@ -141,6 +145,7 @@ pub struct Connection {
 /// yet compiled flow graph.
 #[derive(Debug, Clone, PartialEq, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
 pub struct Graph {
     /// Human-facing information about the graph.
     pub metadata: GraphMetadata,
@@ -168,6 +173,17 @@ impl Graph {
             },
         }
     }
+}
+
+/// [`GraphBuilder::set_resource`] named a node the builder does not have.
+/// Carries the builder back, unchanged.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("unknown node `{node}`")]
+pub struct UnknownNodeError {
+    /// The builder, as it was before the call.
+    pub builder: Box<GraphBuilder>,
+    /// The node that was not found.
+    pub node: NodeId,
 }
 
 /// First stage of the typestate chain: `GraphBuilder → Graph →
@@ -199,22 +215,25 @@ impl GraphBuilder {
 
     /// Declares that the named node consumes `claim.fraction` of the
     /// shared resource `resource` while active. Overwrites any previous
-    /// claim on the same resource for the same node.
+    /// claim on the same resource for the same node. Fails, handing the
+    /// builder back, when no node has that id yet.
     pub fn set_resource(
         mut self,
         node: impl Into<NodeId>,
         resource: impl Into<ResourceId>,
         claim: ResourceClaim,
-    ) -> Result<Self, String> {
-        let node_id = node.into();
-        let n = self
-            .graph
-            .nodes
-            .iter_mut()
-            .find(|n| n.id == node_id)
-            .ok_or_else(|| format!("set_resource: unknown node `{node_id}`"))?;
-        n.resources.insert(resource.into(), claim);
-        Ok(self)
+    ) -> Result<Self, UnknownNodeError> {
+        let node = node.into();
+        match self.graph.nodes.iter_mut().find(|n| n.id == node) {
+            Some(n) => {
+                n.resources.insert(resource.into(), claim);
+                Ok(self)
+            }
+            None => Err(UnknownNodeError {
+                builder: Box::new(self),
+                node,
+            }),
+        }
     }
 
     /// Connects an output port to an input port.
@@ -347,6 +366,28 @@ mod tests {
             !json.as_object().unwrap().contains_key("resources"),
             "empty resources omitted from wire format"
         );
+    }
+
+    #[test]
+    fn unknown_fields_are_rejected() {
+        let misspelled = r#"{"package":{"namespace":"d","name":"g","version":null},"world":"w","contentHash":"aa"}"#;
+        assert!(
+            serde_json::from_str::<ComponentRef>(misspelled).is_err(),
+            "a misspelled key must not silently drop the pin"
+        );
+        let conn = r#"{"id":"c","from":{"node":"a","port":"o"},"to":{"node":"b","port":"i"},"feedbak":true}"#;
+        assert!(serde_json::from_str::<Connection>(conn).is_err());
+        let node = r#"{"id":"n","component":{"package":{"namespace":"d","name":"g","version":null},"world":"w"},"resource":{}}"#;
+        assert!(serde_json::from_str::<Node>(node).is_err());
+    }
+
+    #[test]
+    fn component_refs_are_validated_on_deserialize() {
+        let bad = r#"{"package":{"namespace":"Demo X","name":"g","version":null},"world":"w"}"#;
+        assert!(serde_json::from_str::<ComponentRef>(bad).is_err());
+        let good =
+            r#"{"package":{"namespace":"demo","name":"g","version":null},"world":"stage-2"}"#;
+        assert!(serde_json::from_str::<ComponentRef>(good).is_ok());
     }
 
     #[test]

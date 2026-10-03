@@ -1,30 +1,53 @@
 //! Component contracts and capability requirements.
 
+use std::collections::BTreeMap;
+
 use crate::id::ComponentRef;
 use crate::port::{NodeShape, PortDef};
 
 /// A capability a component requires from its host.
 ///
-/// A component's WIT world's imported functions and function-carrying
-/// interfaces are its capabilities: each is "something the host must
-/// provide". Type-only imports (bare types, function-less interfaces) are
-/// structural, not capabilities, and neither are imports from the built-in
-/// `witgraph:runtime` package. Named interface imports render in full id
-/// form (`wasi:clocks/monotonic-clock@0.2.3`); anonymous inline interface
-/// imports render world-scoped (`demo:graph/world.import-name@0.1.0`); bare
-/// function imports are prefixed `func:`.
+/// A component's WIT world's imported functions, its imported interfaces
+/// that carry functions or declare resources, and the resources it declares
+/// itself are its capabilities: each is "something the host must provide".
+/// Type-only imports (bare types, interfaces with neither) are structural,
+/// not capabilities, and neither is the built-in `witgraph:runtime/host`
+/// interface.
+///
+/// A capability is named after what the component imports:
+/// - a named interface by its full id (`wasi:clocks/monotonic-clock@0.2.3`);
+/// - an anonymous inline interface by its import name (`config`);
+/// - a bare function by its import name prefixed `func:` (`func:blink`;
+///   the host links `blink` at its linker's root);
+/// - a resource declared in the world by its name prefixed `resource:`
+///   (`resource:r`; the host links `r`, its constructor, methods and static
+///   functions at the root), with those functions as its items.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Capability {
-    /// Full interface id, or a `func:`-prefixed bare function import name.
+    /// Full interface id, inline interface import name, `func:`-prefixed
+    /// bare function import name, or `resource:`-prefixed world resource
+    /// name.
     pub interface: String,
+    /// What the host implements for it: each function (`[method]`,
+    /// `[static]` and `[constructor]` ones included) and resource, by name,
+    /// mapped to a canonical rendering of its signature (`resource` for a
+    /// resource). A bare function import has one item, under its own name.
+    /// Part of the content hash, so two revisions whose capabilities differ
+    /// only in signature hash differently.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "BTreeMap::is_empty")
+    )]
+    pub items: BTreeMap<String, String>,
 }
 
 impl Capability {
-    /// A capability on the given interface id.
+    /// A capability on the given interface id, with no items recorded.
     pub fn new(interface: impl Into<String>) -> Self {
         Self {
             interface: interface.into(),
+            items: BTreeMap::new(),
         }
     }
 }

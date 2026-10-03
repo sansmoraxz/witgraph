@@ -15,16 +15,20 @@ workspace = true
 witgraph-ir = { workspace = true }
 witgraph-wit = { path = "../witgraph-wit" }
 wit-parser = { workspace = true }
+semver = { workspace = true }
+wasmparser = { version = "0.258", default-features = false, features = ["std", "validate", "component-model", "features"] }
 thiserror = { workspace = true }
 miette = { workspace = true }
 futures = "0.3"
 wasmtime = { workspace = true, features = [
     "runtime", "cranelift", "component-model", "component-model-async", "async", "std",
-    "wave",
+    "wave", "parallel-compilation",
 ] }
 serde = { workspace = true, features = ["std"] }
 
 [dev-dependencies]
 serde_json = { workspace = true }
-tokio = { version = "1", features = ["rt", "macros", "time"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time"] }
 test-components = { path = "../../test-fixtures/test-components" }
+wit-component = { workspace = true, features = ["dummy-module"] }
+wat = "1"

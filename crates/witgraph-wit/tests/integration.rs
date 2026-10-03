@@ -9,7 +9,7 @@
 use std::collections::BTreeSet;
 
 use witgraph_wit::ir::{
-    Capability, ComponentContract, Diagnostic, Graph, NodeShape, PortKind, PortRef, RunKind,
+    ComponentContract, Diagnostic, Graph, NodeShape, PortKind, PortRef, RunKind,
 };
 use witgraph_wit::{load_components, load_lowered, metadata};
 
@@ -129,12 +129,28 @@ fn demo_graph_compiles_and_aggregates_capabilities() {
         .expect("demo graph is valid");
 
     assert!(compiled.warnings().is_empty(), "{}", compiled.warnings());
+    let required = compiled.required_capabilities();
+    let capabilities: Vec<(&str, Vec<(&str, &str)>)> = required
+        .iter()
+        .map(|c| {
+            (
+                c.interface.as_str(),
+                c.items
+                    .iter()
+                    .flat_map(|(n, signatures)| signatures.iter().map(|s| (n.as_str(), s.as_str())))
+                    .collect(),
+            )
+        })
+        .collect();
     assert_eq!(
-        compiled.required_capabilities(),
-        BTreeSet::from([
-            Capability::new("demo:caps/clock@0.1.0"),
-            Capability::new("demo:caps/log@0.1.0"),
-        ])
+        capabilities,
+        [
+            ("demo:caps/clock@0.1.0", vec![("now", "func()->u64")]),
+            (
+                "demo:caps/log@0.1.0",
+                vec![("emit", r#"func("msg":string)"#)]
+            ),
+        ]
     );
 
     let order = compiled.topological_order();

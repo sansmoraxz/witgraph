@@ -20,13 +20,20 @@
 //!
 //! # Crate layout
 //!
-//! - [`graph`] — [`RuntimeGraph`], [`RuntimeConfig`], [`Snapshot`].
-//! - [`engine`] — island Stores and the generation driver ([`HostState`]).
+//! - [`graph`] — [`RuntimeGraph`], [`RuntimeConfig`], [`Snapshot`],
+//!   [`PreparedComponent`].
+//! - [`engine`] — island Stores and the generation driver; the embedder's
+//!   [`Host`] and its Store data ([`IslandData`], [`HostState`]).
 //! - [`node`] — a node's lifecycle state, projected from its island
 //!   ([`NodeState`], [`NodePhase`]).
-//! - [`mode`] — instrumentation ([`RuntimeMode`], [`Release`],
-//!   [`struct@Debug`], [`TraceEvent`]).
-//! - [`schedule`] — [`TickResult`].
+//! - [`mode`] — instrumentation ([`RuntimeMode`], [`Perf`],
+//!   [`Trace`], [`TraceEvent`]).
+//! - [`schedule`] — [`TickResult`], [`FaultReport`].
+//!
+//! The crate's public API is built on [`wasmtime`] (its `Engine`, `Linker`
+//! and component `Val` and `Type`) and [`witgraph_ir`]; both are
+//! re-exported, so an embedder can use exactly the versions it was built
+//! against.
 //! - [`error`] — [`RuntimeError`], [`NodeFault`].
 
 pub mod engine;
@@ -38,10 +45,13 @@ pub mod node;
 pub(crate) mod resource;
 pub mod schedule;
 
-pub use engine::HostState;
+pub use engine::{Host, HostState, IslandData, NoCapabilities};
 pub use error::{NodeFault, RuntimeError};
-pub use graph::{IslandSnapshot, PortValues, RuntimeConfig, RuntimeGraph, Snapshot};
-pub use mode::{Debug, Release, RuntimeMode, TraceEvent};
+pub use graph::{
+    IslandSnapshot, PortValues, PreparedComponent, RuntimeConfig, RuntimeGraph, Snapshot,
+};
+pub use mode::{Perf, RuntimeMode, Trace, TraceEvent};
 pub use node::{NodePhase, NodeState};
-pub use schedule::TickResult;
+pub use schedule::{FaultReport, TickResult};
 pub use wasmtime::component::Val;
+pub use {wasmtime, witgraph_ir};

@@ -7,7 +7,7 @@
 //!
 //! | island phase               | node phase                         |
 //! |----------------------------|------------------------------------|
-//! | built, never ran           | [`Pending`](NodePhase::Pending)     |
+//! | loaded or restored, not run | [`Pending`](NodePhase::Pending)   |
 //! | generation in flight       | [`Running`](NodePhase::Running)     |
 //! | generation finished        | [`Idle`](NodePhase::Idle)           |
 //! | stopped by a fault         | [`Faulted`](NodePhase::Faulted)     |
@@ -15,8 +15,8 @@
 //!
 //! `Running` covers the entire generation, including guest work that
 //! continues after the node's own `run` has returned (a stream writer,
-//! say). A stopped island is rebuilt before it runs again, so its nodes go
-//! back to `Pending`.
+//! say). A stopped island is rebuilt at the start of its next generation,
+//! so its nodes go straight to `Running`.
 
 use witgraph_ir::{NodeId, NodeShape};
 
@@ -26,24 +26,27 @@ use crate::error::NodeFault;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum NodePhase {
-    /// Its island has not run since it was built (or rebuilt).
+    /// Its island has not run since the graph was loaded, or since a
+    /// restore.
     Pending,
     /// Its island's generation is in flight.
     Running,
     /// Its island finished its last generation; it runs again when an
     /// input changes.
     Idle,
-    /// Its island faulted. Restartable: new input rebuilds the island.
+    /// Its island faulted. Restartable: new input, or
+    /// [`rerun`](crate::RuntimeGraph::rerun), rebuilds the island.
     Faulted,
-    /// Its island was cancelled or shut down. Restartable: new input
-    /// rebuilds the island.
+    /// Its island was cancelled or shut down. Restartable: new input, or
+    /// [`rerun`](crate::RuntimeGraph::rerun), rebuilds the island.
     Cancelled,
 }
 
 impl NodePhase {
     /// Returns `true` for [`Faulted`](Self::Faulted) and
-    /// [`Cancelled`](Self::Cancelled): the island has no Store until it is
-    /// rebuilt.
+    /// [`Cancelled`](Self::Cancelled): the island was stopped and is rebuilt
+    /// before it runs again. An island stopped by a restore has no Store
+    /// either, but reads as [`Pending`](Self::Pending).
     pub fn is_stopped(self) -> bool {
         matches!(self, NodePhase::Faulted | NodePhase::Cancelled)
     }
@@ -57,6 +60,7 @@ pub struct NodeState {
     shape: NodeShape,
     phase: NodePhase,
     fault: Option<NodeFault>,
+    culprit: Option<NodeId>,
 }
 
 impl NodeState {
@@ -65,12 +69,14 @@ impl NodeState {
         shape: NodeShape,
         phase: NodePhase,
         fault: Option<NodeFault>,
+        culprit: Option<NodeId>,
     ) -> Self {
         Self {
             id,
             shape,
             phase,
             fault,
+            culprit,
         }
     }
 
@@ -90,9 +96,19 @@ impl NodeState {
     }
 
     /// Why the node's island faulted, if the node is
-    /// [`Faulted`](NodePhase::Faulted).
+    /// [`Faulted`](NodePhase::Faulted). Every member of the island carries
+    /// the same fault; see [`culprit`](Self::culprit) for which one caused
+    /// it.
     pub fn fault_cause(&self) -> Option<&NodeFault> {
         self.fault.as_ref()
+    }
+
+    /// The member of the node's island that caused its fault, when that is
+    /// known: the node that called `fatal`, the one that failed to
+    /// instantiate on a rebuild, or the only member whose `run` had
+    /// started and not returned.
+    pub fn culprit(&self) -> Option<&NodeId> {
+        self.culprit.as_ref()
     }
 }
 
@@ -116,6 +132,7 @@ mod tests {
             NodeShape::Reactive,
             NodePhase::Faulted,
             Some(NodeFault::FuelExhausted),
+            Some("n".into()),
         );
         assert_eq!(state.id(), &NodeId::from("n"));
         assert_eq!(state.phase(), NodePhase::Faulted);

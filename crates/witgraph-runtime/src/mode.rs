@@ -1,9 +1,9 @@
 //! Runtime mode trait and implementations.
 //!
 //! [`RuntimeMode`] is a zero-cost generic parameter on
-//! [`RuntimeGraph`](crate::graph::RuntimeGraph). In [`Release`] mode all
-//! callbacks are empty and monomorphized away. In [`struct@Debug`] mode
-//! every callback records a [`TraceEvent`] behind a mutex for post-mortem
+//! [`RuntimeGraph`](crate::graph::RuntimeGraph). In [`Perf`] mode all
+//! callbacks are empty and monomorphized away. In [`Trace`] mode every
+//! callback records a [`TraceEvent`] behind a mutex for post-mortem
 //! inspection.
 //!
 //! Stream and future items move guest-to-guest and are never seen by the
@@ -16,7 +16,7 @@ use witgraph_ir::NodeId;
 use crate::error::NodeFault;
 use crate::node::NodePhase;
 
-/// A trace event recorded by [`struct@Debug`] mode.
+/// A trace event recorded by [`Trace`] mode.
 #[derive(Debug, Clone)]
 pub enum TraceEvent {
     /// An island started a generation.
@@ -45,6 +45,15 @@ pub enum TraceEvent {
         /// The generation that finished.
         generation: u64,
     },
+    /// An island's generation ended without finishing: it faulted, or the
+    /// host cancelled it or shut the graph down. Every `GenerationStarted`
+    /// is paired with a `GenerationFinished` or a `GenerationStopped`.
+    GenerationStopped {
+        /// The island's index.
+        island: usize,
+        /// The generation that stopped.
+        generation: u64,
+    },
     /// A node changed phase.
     PhaseTransition {
         /// The node changing phase.
@@ -66,7 +75,8 @@ pub enum TraceEvent {
         /// The cancelled node.
         node: NodeId,
     },
-    /// A faulted or cancelled node's island was rebuilt.
+    /// A node's island was rebuilt into a fresh Store: after a fault, a
+    /// cancel, a shutdown or a restore.
     Restarted {
         /// The restarted node.
         node: NodeId,
@@ -86,6 +96,9 @@ pub trait RuntimeMode: Send + Sync + 'static {
     fn on_run_returned(&self, _node: &NodeId) {}
     /// An island's generation finished.
     fn on_generation_finished(&self, _island: usize, _generation: u64) {}
+    /// An island's generation ended without finishing (a fault, a cancel,
+    /// or shutdown).
+    fn on_generation_stopped(&self, _island: usize, _generation: u64) {}
     /// A node changed phase.
     fn on_phase_transition(&self, _node: &NodeId, _from: NodePhase, _to: NodePhase) {}
     /// A node faulted.
@@ -96,18 +109,19 @@ pub trait RuntimeMode: Send + Sync + 'static {
     fn on_restarted(&self, _node: &NodeId) {}
 }
 
-/// Release mode: every instrumentation callback is a no-op.
-pub struct Release;
+/// Performance mode: every instrumentation callback is a no-op, so it
+/// costs nothing.
+pub struct Perf;
 
-impl RuntimeMode for Release {}
+impl RuntimeMode for Perf {}
 
-/// Debug mode: every instrumentation callback records a [`TraceEvent`].
-pub struct Debug {
+/// Trace mode: every instrumentation callback records a [`TraceEvent`].
+pub struct Trace {
     trace: Mutex<Vec<TraceEvent>>,
 }
 
-impl Debug {
-    /// Creates a debug mode with an empty trace.
+impl Trace {
+    /// Creates a trace mode with an empty trace.
     pub fn new() -> Self {
         Self {
             trace: Mutex::new(Vec::new()),
@@ -119,6 +133,15 @@ impl Debug {
         self.trace.lock().map_or_else(|_| Vec::new(), |g| g.clone())
     }
 
+    /// Takes every recorded event, leaving the trace empty, so a
+    /// long-running graph's trace does not grow without bound. Empty if the
+    /// lock is poisoned.
+    pub fn take_trace(&self) -> Vec<TraceEvent> {
+        self.trace
+            .lock()
+            .map_or_else(|_| Vec::new(), |mut g| std::mem::take(&mut *g))
+    }
+
     fn record(&self, event: TraceEvent) {
         if let Ok(mut trace) = self.trace.lock() {
             trace.push(event);
@@ -126,13 +149,13 @@ impl Debug {
     }
 }
 
-impl Default for Debug {
+impl Default for Trace {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl RuntimeMode for Debug {
+impl RuntimeMode for Trace {
     fn on_generation_started(&self, island: usize, generation: u64) {
         self.record(TraceEvent::GenerationStarted { island, generation });
     }
@@ -147,6 +170,10 @@ impl RuntimeMode for Debug {
 
     fn on_generation_finished(&self, island: usize, generation: u64) {
         self.record(TraceEvent::GenerationFinished { island, generation });
+    }
+
+    fn on_generation_stopped(&self, island: usize, generation: u64) {
+        self.record(TraceEvent::GenerationStopped { island, generation });
     }
 
     fn on_phase_transition(&self, node: &NodeId, from: NodePhase, to: NodePhase) {

@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::{env, fs};
 
-const GUESTS: [&str; 7] = [
+const GUESTS: [&str; 11] = [
     "echo",
     "configurable",
     "relay",
@@ -10,6 +10,10 @@ const GUESTS: [&str; 7] = [
     "stream-consumer",
     "mqtt-node",
     "busy-loop",
+    "maybe",
+    "relay-plus",
+    "relay-wide",
+    "named-echo",
 ];
 
 fn main() {
@@ -29,6 +33,10 @@ fn main() {
             .args(["build", "--release", "--target", "wasm32-unknown-unknown"])
             .arg("--manifest-path")
             .arg(crate_dir.join("Cargo.toml"))
+            // Pinned, because the wasm is read from there below: an inherited
+            // `CARGO_TARGET_DIR` would send the build elsewhere.
+            .arg("--target-dir")
+            .arg(crate_dir.join("target"))
             // The outer build's flags target the host, not the guest.
             .env_remove("RUSTFLAGS")
             .env_remove("CARGO_ENCODED_RUSTFLAGS")

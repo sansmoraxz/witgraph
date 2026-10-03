@@ -6,6 +6,7 @@ struct Producer;
 
 impl Guest for Producer {
     async fn run(inputs: Inputs) -> Outputs {
+        let limit = inputs.burst_size.unwrap_or(u32::MAX);
         let (mut tx, rx) = wit_stream::new::<u32>();
         // Return the reader first and write afterwards: the consumer can
         // only start once this `run` has handed over its stream.
@@ -19,7 +20,7 @@ impl Guest for Producer {
                 i = i.wrapping_add(1);
             }
         });
-        Outputs { items: rx }
+        Outputs { items: rx, limit }
     }
 }
 

@@ -9,7 +9,7 @@ use witgraph_ir::{PortDef, PortKind, RunKind};
 use crate::lower::Lowered;
 
 /// The catalog format version this crate emits.
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// The full set of components available to an editor.
 #[derive(Debug, Clone, Serialize)]
@@ -23,7 +23,10 @@ pub struct Catalog {
 /// Editor-facing view of one component contract.
 #[derive(Debug, Clone, Serialize)]
 pub struct ComponentMeta {
-    /// Full component reference, e.g. `demo:graph/sensor@0.1.0`.
+    /// The pinned component reference, content hash included
+    /// (`demo:graph/sensor@0.1.0#<hash>`): unique per entry, even for two
+    /// revisions of one world, and parsed back by
+    /// [`ComponentRef`](witgraph_ir::ComponentRef)'s `FromStr`.
     pub id: String,
     /// The WIT package, e.g. `demo:graph@0.1.0`.
     pub package: String,
@@ -41,8 +44,10 @@ pub struct ComponentMeta {
     pub outputs: Vec<PortMeta>,
     /// Whether the component's `run` export is `sync` or `async`.
     pub run: RunKind,
-    /// What the component requires from its host: imported interface ids and
-    /// `func:`-prefixed bare function imports.
+    /// What the component requires from its host, named as the component
+    /// imports it: interface ids, inline interface import names,
+    /// `func:`-prefixed bare function imports and `resource:`-prefixed
+    /// world resources.
     pub capabilities: Vec<String>,
     /// Named types referenced by the ports, for tooltips and pickers.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -54,6 +59,11 @@ pub struct ComponentMeta {
 pub struct TypeMeta {
     /// The type's WIT kebab-case name.
     pub name: String,
+    /// The named interface declaring it, by full id; absent when it is
+    /// declared in an anonymous inline interface. Two types may share a
+    /// name when their owners differ.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
     /// WIT-syntax rendering of the type, for display.
     pub type_display: String,
     /// Doc comment from the WIT declaration, if any.
@@ -95,48 +105,37 @@ fn port_meta(port: &PortDef) -> PortMeta {
 /// regardless of load order.
 pub fn generate_catalog(lowered: &[Lowered]) -> Catalog {
     let mut sorted: Vec<&Lowered> = lowered.iter().collect();
-    sorted.sort_by(|a, b| {
-        let (a, b) = (&a.contract, &b.contract);
-        (
-            &a.id.package.namespace,
-            &a.id.package.name,
-            &a.id.package.version,
-            &a.id.world,
-            &a.id.content_hash,
-        )
-            .cmp(&(
-                &b.id.package.namespace,
-                &b.id.package.name,
-                &b.id.package.version,
-                &b.id.world,
-                &b.id.content_hash,
-            ))
-    });
+    sorted.sort_by(|a, b| a.contract.id.cmp(&b.contract.id));
     let components = sorted
         .into_iter()
-        .map(|Lowered { contract, types }| ComponentMeta {
-            id: contract.id.to_string(),
-            package: contract.id.package.to_string(),
-            world: contract.id.world.clone(),
-            content_hash: contract.id.content_hash.clone(),
-            docs: contract.docs.clone(),
-            inputs: contract.inputs.iter().map(port_meta).collect(),
-            outputs: contract.outputs.iter().map(port_meta).collect(),
-            run: contract.run,
-            capabilities: contract
-                .capabilities
-                .iter()
-                .map(|c| c.interface.clone())
-                .collect(),
-            types: types
-                .iter()
-                .map(|decl| TypeMeta {
-                    name: decl.name.clone(),
-                    type_display: decl.ty.to_string(),
-                    docs: decl.docs.clone(),
-                })
-                .collect(),
-        })
+        .map(
+            |Lowered {
+                 contract, types, ..
+             }| ComponentMeta {
+                id: format!("{:#}", contract.id),
+                package: contract.id.package.to_string(),
+                world: contract.id.world.clone(),
+                content_hash: contract.id.content_hash.clone(),
+                docs: contract.docs.clone(),
+                inputs: contract.inputs.iter().map(port_meta).collect(),
+                outputs: contract.outputs.iter().map(port_meta).collect(),
+                run: contract.run,
+                capabilities: contract
+                    .capabilities
+                    .iter()
+                    .map(|c| c.interface.clone())
+                    .collect(),
+                types: types
+                    .iter()
+                    .map(|decl| TypeMeta {
+                        name: decl.name.clone(),
+                        owner: decl.owner.clone(),
+                        type_display: decl.ty.to_string(),
+                        docs: decl.docs.clone(),
+                    })
+                    .collect(),
+            },
+        )
         .collect();
     Catalog {
         schema_version: SCHEMA_VERSION,
@@ -181,7 +180,11 @@ mod tests {
         let catalog = generate_catalog(&lower(&source).unwrap());
 
         assert_eq!(catalog.schema_version, SCHEMA_VERSION);
-        let ids: Vec<&str> = catalog.components.iter().map(|c| c.id.as_str()).collect();
+        let ids: Vec<&str> = catalog
+            .components
+            .iter()
+            .map(|c| c.id.split('#').next().unwrap_or_default())
+            .collect();
         assert_eq!(ids, ["demo:test/alpha@0.1.0", "demo:test/zeta@0.1.0"]);
 
         let alpha = &catalog.components[0];
@@ -205,6 +208,32 @@ mod tests {
     }
 
     #[test]
+    fn two_revisions_of_one_world_get_distinct_ids() {
+        let wit = |out: &str| {
+            format!(
+                r#"
+                package demo:test@0.1.0;
+                world w {{
+                    export node: interface {{
+                        record outputs {{ {out}: u32 }}
+                        run: func() -> outputs;
+                    }}
+                }}
+                "#
+            )
+        };
+        let mut lowered = lower(&load_str("a.wit", &wit("a")).unwrap()).unwrap();
+        lowered.extend(lower(&load_str("b.wit", &wit("b")).unwrap()).unwrap());
+        let catalog = generate_catalog(&lowered);
+        let ids: Vec<&str> = catalog.components.iter().map(|c| c.id.as_str()).collect();
+        assert_ne!(ids[0], ids[1]);
+        for (id, entry) in ids.iter().zip(&catalog.components) {
+            let parsed: witgraph_ir::ComponentRef = id.parse().unwrap();
+            assert_eq!(parsed.content_hash, entry.content_hash, "the id is pinned");
+        }
+    }
+
+    #[test]
     fn versions_sort_numerically_not_lexically() {
         let wit = |version: &str| {
             format!(
@@ -222,7 +251,11 @@ mod tests {
         let mut contracts = lower(&load_str("a.wit", &wit("0.10.0")).unwrap()).unwrap();
         contracts.extend(lower(&load_str("b.wit", &wit("0.2.0")).unwrap()).unwrap());
         let catalog = generate_catalog(&contracts);
-        let ids: Vec<&str> = catalog.components.iter().map(|c| c.id.as_str()).collect();
+        let ids: Vec<&str> = catalog
+            .components
+            .iter()
+            .map(|c| c.id.split('#').next().unwrap_or_default())
+            .collect();
         assert_eq!(ids, ["demo:test/w@0.2.0", "demo:test/w@0.10.0"]);
     }
 

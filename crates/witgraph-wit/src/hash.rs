@@ -4,14 +4,16 @@ use core::fmt::Write as _;
 
 use sha2::{Digest, Sha256};
 use wasm_wave::wasm::{WasmType, WasmTypeKind};
-use witgraph_ir::{ComponentContract, PortDef, PortDirection, Type};
+use wit_parser::{Function, Handle, PackageName, Resolve, TypeDefKind, TypeId, TypeOwner};
+use witgraph_ir::{Capability, ComponentContract, PortDef, PortDirection, Type};
 
 /// Canonical text encoding of the structural contract.
 ///
 /// The identity is purely structural: package, world, version, docs, and
 /// declared type names are all excluded, so any two contracts with the same
-/// port, `run` and capability shapes hash identically. Ports and
-/// capabilities are sorted, so declaration order doesn't matter either.
+/// port, `run` and capability shapes hash identically. A capability's shape
+/// is its link name plus every item's signature. Ports, capabilities and
+/// items are sorted, so declaration order doesn't matter either.
 /// Variable-length strings (port names, rendered types, capabilities) are
 /// Debug-quoted so no crafted name can forge another line's field boundary.
 ///
@@ -24,18 +26,17 @@ use witgraph_ir::{ComponentContract, PortDef, PortDirection, Type};
 /// format change shifts hashes explicitly rather than colliding with old
 /// ones.
 fn canonical(contract: &ComponentContract) -> String {
-    let mut out = String::from("witgraph-contract v2\n");
+    let mut out = String::from("witgraph-contract v3\n");
     let _ = writeln!(out, "run {}", contract.run);
     write_ports(&mut out, PortDirection::Input, &contract.inputs);
     write_ports(&mut out, PortDirection::Output, &contract.outputs);
-    let mut capabilities: Vec<&str> = contract
-        .capabilities
-        .iter()
-        .map(|c| c.interface.as_str())
-        .collect();
+    let mut capabilities: Vec<&Capability> = contract.capabilities.iter().collect();
     capabilities.sort_unstable();
     for capability in capabilities {
-        let _ = writeln!(out, "capability {capability:?}");
+        let _ = writeln!(out, "capability {:?}", capability.interface);
+        for (name, signature) in &capability.items {
+            let _ = writeln!(out, "item {name:?} {signature:?}");
+        }
     }
     out
 }
@@ -63,23 +64,13 @@ fn write_ports(out: &mut String, direction: PortDirection, ports: &[PortDef]) {
 /// names are Debug-quoted; an absent payload renders as `_`.
 fn encode_type(ty: &Type) -> String {
     let mut out = String::new();
-    write_type(&mut out, ty, &mut None);
+    write_type(&mut out, ty);
     out
 }
 
-/// The first type kind inside `ty` that this encoding cannot represent
-/// faithfully. Lowering rejects payloads for which this returns `Some`, which
-/// keeps [`content_hash`] collision-free. Fixed-length lists are the case in
-/// practice: wasm-wave's [`WasmType`] accessors don't expose their length.
-pub(crate) fn unsupported_kind(ty: &Type) -> Option<WasmTypeKind> {
-    let mut unsupported = None;
-    write_type(&mut String::new(), ty, &mut unsupported);
-    unsupported
-}
-
-fn write_opt(out: &mut String, ty: Option<&Type>, unsupported: &mut Option<WasmTypeKind>) {
+fn write_opt(out: &mut String, ty: Option<&Type>) {
     match ty {
-        Some(ty) => write_type(out, ty, unsupported),
+        Some(ty) => write_type(out, ty),
         None => out.push('_'),
     }
 }
@@ -97,7 +88,7 @@ fn write_list<T>(
     }
 }
 
-fn write_type(out: &mut String, ty: &Type, unsupported: &mut Option<WasmTypeKind>) {
+fn write_type(out: &mut String, ty: &Type) {
     let kind = ty.kind();
     let simple = match kind {
         WasmTypeKind::Bool => Some("bool"),
@@ -122,21 +113,21 @@ fn write_type(out: &mut String, ty: &Type, unsupported: &mut Option<WasmTypeKind
     match kind {
         WasmTypeKind::List => {
             out.push_str("list<");
-            write_opt(out, ty.list_element_type().as_ref(), unsupported);
+            write_opt(out, ty.list_element_type().as_ref());
             out.push('>');
         }
         WasmTypeKind::Record => {
             out.push_str("record{");
             write_list(out, ty.record_fields(), |out, (name, field)| {
                 let _ = write!(out, "{:?}:", name.as_ref());
-                write_type(out, &field, unsupported);
+                write_type(out, &field);
             });
             out.push('}');
         }
         WasmTypeKind::Tuple => {
             out.push_str("tuple<");
             write_list(out, ty.tuple_element_types(), |out, element| {
-                write_type(out, &element, unsupported);
+                write_type(out, &element);
             });
             out.push('>');
         }
@@ -144,7 +135,7 @@ fn write_type(out: &mut String, ty: &Type, unsupported: &mut Option<WasmTypeKind
             out.push_str("variant{");
             write_list(out, ty.variant_cases(), |out, (name, payload)| {
                 let _ = write!(out, "{:?}:", name.as_ref());
-                write_opt(out, payload.as_ref(), unsupported);
+                write_opt(out, payload.as_ref());
             });
             out.push('}');
         }
@@ -157,15 +148,15 @@ fn write_type(out: &mut String, ty: &Type, unsupported: &mut Option<WasmTypeKind
         }
         WasmTypeKind::Option => {
             out.push_str("option<");
-            write_opt(out, ty.option_some_type().as_ref(), unsupported);
+            write_opt(out, ty.option_some_type().as_ref());
             out.push('>');
         }
         WasmTypeKind::Result => {
             let (ok, err) = ty.result_types().unwrap_or((None, None));
             out.push_str("result<");
-            write_opt(out, ok.as_ref(), unsupported);
+            write_opt(out, ok.as_ref());
             out.push(',');
-            write_opt(out, err.as_ref(), unsupported);
+            write_opt(out, err.as_ref());
             out.push('>');
         }
         WasmTypeKind::Flags => {
@@ -175,12 +166,205 @@ fn write_type(out: &mut String, ty: &Type, unsupported: &mut Option<WasmTypeKind
             });
             out.push('}');
         }
-        // Lowering rejects these via `unsupported_kind`; render the kind
-        // by name so the encoding stays total.
+        // Lowering rejects payloads with any other kind (fixed-length
+        // lists, whose length wasm-wave's accessors do not expose, say);
+        // render the kind by name so the encoding stays total.
         other => {
-            unsupported.get_or_insert(other);
             let _ = write!(out, "?{other}");
         }
+    }
+}
+
+/// Canonical rendering of a capability function's signature: `async` when
+/// it is, then every parameter (name and type) and the result. Types are
+/// rendered structurally with this module's own encoding, so the same
+/// signature renders identically from WIT source and from the WIT decoded
+/// out of a component. A resource renders as its owning interface's id (if
+/// it has one), versioned by its semver compatibility track, and its name.
+/// Recursion follows the type's nesting, which lowering bounds first.
+pub(crate) fn encode_function(resolve: &Resolve, function: &Function) -> String {
+    let mut out = String::new();
+    if function.kind.is_async() {
+        out.push_str("async ");
+    }
+    out.push_str("func(");
+    for (i, param) in function.params.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        let _ = write!(out, "{:?}:", param.name);
+        write_wit_type(&mut out, resolve, &param.ty);
+    }
+    out.push(')');
+    if let Some(result) = &function.result {
+        out.push_str("->");
+        write_wit_type(&mut out, resolve, result);
+    }
+    out
+}
+
+fn write_wit_opt(out: &mut String, resolve: &Resolve, ty: Option<&wit_parser::Type>) {
+    match ty {
+        Some(ty) => write_wit_type(out, resolve, ty),
+        None => out.push('_'),
+    }
+}
+
+fn write_resource(out: &mut String, resolve: &Resolve, id: TypeId) {
+    let def = &resolve.types[crate::lower::dealias(resolve, id)];
+    // The owner's id on its semver compatibility track (`@1` for 1.x,
+    // `@0.2` for 0.2.x, the exact version for 0.0.x): wit-component merges
+    // compatible imports to the newest version, so a resource keeps its
+    // identity across them, and only across them.
+    let owner = match def.owner {
+        TypeOwner::Interface(interface) => {
+            let iface = &resolve.interfaces[interface];
+            match (iface.package, &iface.name) {
+                (Some(package), Some(name)) => {
+                    let package = &resolve.packages[package].name;
+                    let mut id = format!("{}:{}/{name}", package.namespace, package.name);
+                    if let Some(version) = &package.version {
+                        id.push('@');
+                        id.push_str(&PackageName::version_compat_track_string(version));
+                    }
+                    Some(id)
+                }
+                _ => None,
+            }
+        }
+        TypeOwner::World(_) | TypeOwner::None => None,
+    };
+    let _ = write!(
+        out,
+        "{:?}.{:?}",
+        owner.unwrap_or_default(),
+        def.name.as_deref().unwrap_or_default()
+    );
+}
+
+fn write_wit_type(out: &mut String, resolve: &Resolve, ty: &wit_parser::Type) {
+    use wit_parser::Type as T;
+    let name = match ty {
+        T::Bool => "bool",
+        T::U8 => "u8",
+        T::U16 => "u16",
+        T::U32 => "u32",
+        T::U64 => "u64",
+        T::S8 => "s8",
+        T::S16 => "s16",
+        T::S32 => "s32",
+        T::S64 => "s64",
+        T::F32 => "f32",
+        T::F64 => "f64",
+        T::Char => "char",
+        T::String => "string",
+        T::ErrorContext => "error-context",
+        T::Id(id) => {
+            // Aliases followed in a loop: a chain may be far longer than
+            // types nest.
+            write_wit_def(out, resolve, crate::lower::dealias(resolve, *id));
+            return;
+        }
+    };
+    out.push_str(name);
+}
+
+fn write_wit_def(out: &mut String, resolve: &Resolve, id: TypeId) {
+    match &resolve.types[id].kind {
+        TypeDefKind::Type(ty) => write_wit_type(out, resolve, ty),
+        TypeDefKind::Record(record) => {
+            out.push_str("record{");
+            write_list(out, record.fields.iter(), |out, field| {
+                let _ = write!(out, "{:?}:", field.name);
+                write_wit_type(out, resolve, &field.ty);
+            });
+            out.push('}');
+        }
+        // A bare resource in a signature is an owned handle.
+        TypeDefKind::Resource => {
+            out.push_str("own<");
+            write_resource(out, resolve, id);
+            out.push('>');
+        }
+        TypeDefKind::Handle(Handle::Own(resource)) => {
+            out.push_str("own<");
+            write_resource(out, resolve, *resource);
+            out.push('>');
+        }
+        TypeDefKind::Handle(Handle::Borrow(resource)) => {
+            out.push_str("borrow<");
+            write_resource(out, resolve, *resource);
+            out.push('>');
+        }
+        TypeDefKind::Flags(flags) => {
+            out.push_str("flags{");
+            write_list(out, flags.flags.iter(), |out, flag| {
+                let _ = write!(out, "{:?}", flag.name);
+            });
+            out.push('}');
+        }
+        TypeDefKind::Tuple(tuple) => {
+            out.push_str("tuple<");
+            write_list(out, tuple.types.iter(), |out, ty| {
+                write_wit_type(out, resolve, ty);
+            });
+            out.push('>');
+        }
+        TypeDefKind::Variant(variant) => {
+            out.push_str("variant{");
+            write_list(out, variant.cases.iter(), |out, case| {
+                let _ = write!(out, "{:?}:", case.name);
+                write_wit_opt(out, resolve, case.ty.as_ref());
+            });
+            out.push('}');
+        }
+        TypeDefKind::Enum(cases) => {
+            out.push_str("enum{");
+            write_list(out, cases.cases.iter(), |out, case| {
+                let _ = write!(out, "{:?}", case.name);
+            });
+            out.push('}');
+        }
+        TypeDefKind::Option(ty) => {
+            out.push_str("option<");
+            write_wit_type(out, resolve, ty);
+            out.push('>');
+        }
+        TypeDefKind::Result(result) => {
+            out.push_str("result<");
+            write_wit_opt(out, resolve, result.ok.as_ref());
+            out.push(',');
+            write_wit_opt(out, resolve, result.err.as_ref());
+            out.push('>');
+        }
+        TypeDefKind::List(ty) => {
+            out.push_str("list<");
+            write_wit_type(out, resolve, ty);
+            out.push('>');
+        }
+        TypeDefKind::FixedLengthList(ty, len) => {
+            out.push_str("list<");
+            write_wit_type(out, resolve, ty);
+            let _ = write!(out, ",{len}>");
+        }
+        TypeDefKind::Map(key, value) => {
+            out.push_str("map<");
+            write_wit_type(out, resolve, key);
+            out.push(',');
+            write_wit_type(out, resolve, value);
+            out.push('>');
+        }
+        TypeDefKind::Future(ty) => {
+            out.push_str("future<");
+            write_wit_opt(out, resolve, ty.as_ref());
+            out.push('>');
+        }
+        TypeDefKind::Stream(ty) => {
+            out.push_str("stream<");
+            write_wit_opt(out, resolve, ty.as_ref());
+            out.push('>');
+        }
+        TypeDefKind::Unknown => out.push('?'),
     }
 }
 
@@ -278,7 +462,7 @@ mod tests {
         c.outputs = vec![PortDef::new("out", PortKind::Stream, Type::U32)];
         assert_eq!(
             canonical(&c),
-            "witgraph-contract v2\nrun sync\ninput \"in\" value false \"f64\"\noutput \"out\" stream false \"u32\"\n"
+            "witgraph-contract v3\nrun sync\ninput \"in\" value false \"f64\"\noutput \"out\" stream false \"u32\"\n"
         );
     }
 

@@ -35,7 +35,8 @@ pub const RELAY: Guest = guest!("RELAY_WASM", "relay");
 
 /// Async. `burst-size: option<u32>` → `items: stream<u32>` streaming
 /// 0, 1, 2, ... (forever when `burst-size` is absent), stopping once the
-/// reader is dropped.
+/// reader is dropped; `limit: u32` is `burst-size`, or `u32::MAX` when
+/// endless, returned at once.
 pub const STREAM_PRODUCER: Guest = guest!("STREAM_PRODUCER_WASM", "stream-producer");
 
 /// Async. `items: stream<u32>`, `take: option<u32>`, `delay: option<u32>` →
@@ -51,3 +52,19 @@ pub const MQTT_NODE: Guest = guest!("MQTT_NODE_WASM", "mqtt-node");
 /// `finish`) → `done: u32`.
 /// Spins forever, traps, or calls `witgraph:runtime/host.fatal` on request.
 pub const BUSY_LOOP: Guest = guest!("BUSY_LOOP_WASM", "busy-loop");
+
+/// Sync. `x: option<u32>` → `maybe: option<u32>`, passed straight through.
+pub const MAYBE: Guest = guest!("MAYBE_WASM", "maybe");
+
+/// Sync. The `relay` contract under `test:relay@0.2.0`, implemented
+/// differently: `out = in + add + 1`. Its contract hashes like
+/// [`RELAY`]'s.
+pub const RELAY_PLUS: Guest = guest!("RELAY_PLUS_WASM", "relay-plus");
+
+/// Sync. Another revision of `test:relay/relay@0.1.0` (the same id as
+/// [`RELAY`], another content hash): adds `doubled: u32 = out * 2`.
+pub const RELAY_WIDE: Guest = guest!("RELAY_WIDE_WASM", "relay-wide");
+
+/// Sync. Exports `node` as the named interface `test:named/node@0.1.0`:
+/// `in: option<f64>` → `out: f64 = in * 2` (absent reads as 0.0).
+pub const NAMED_ECHO: Guest = guest!("NAMED_ECHO_WASM", "named-echo");

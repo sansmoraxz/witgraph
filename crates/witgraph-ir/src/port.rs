@@ -120,6 +120,19 @@ impl PortDef {
         self.optional = true;
         self
     }
+
+    /// Whether this Value output, of type `option<T>`, feeds `input`, an
+    /// optional Value input of payload `T`: the option passes straight
+    /// through (`none` reads as `none`, `some(x)` as `x`). Equal types are
+    /// the ordinary case and do not count.
+    pub fn unwraps_into(&self, input: &PortDef) -> bool {
+        self.kind == PortKind::Value
+            && input.kind == PortKind::Value
+            && input.optional
+            && self.ty != input.ty
+            && self.ty.is_some()
+            && self.ty == input.ty.clone().map(Type::option)
+    }
 }
 
 #[cfg(test)]

@@ -4,20 +4,24 @@
 //! driving the graph, and [`NodeFault`] for a failure inside an island,
 //! which faults every node of that island.
 
-use witgraph_ir::{ComponentRef, NodeId, PortName};
+use witgraph_ir::{ComponentRef, ConnectionId, NodeId, PortDirection, PortName};
 
 /// A graph-level runtime error: loading, or a host call with bad arguments.
 #[derive(Debug, Clone, thiserror::Error, miette::Diagnostic)]
 pub enum RuntimeError {
     /// A component has no corresponding WASM bytes.
-    #[error("no WASM component provided for `{component}`")]
+    #[error(
+        "no WASM component provided for `{component}`{}",
+        component.content_hash.as_ref().map(|h| format!(" (content hash {h})")).unwrap_or_default()
+    )]
     #[diagnostic(code(witgraph::runtime::missing_wasm))]
     MissingWasm {
         /// The component missing its bytes.
         component: Box<ComponentRef>,
     },
-    /// The WIT embedded in a component's bytes could not be decoded or
-    /// lowered into a contract.
+    /// A component's bytes are not a valid component, embed WIT that could
+    /// not be decoded or lowered into exactly one node contract, or failed
+    /// to compile on the engine.
     #[error("component `{component}` does not describe a witgraph node: {message}")]
     #[diagnostic(code(witgraph::runtime::bad_component))]
     BadComponent {
@@ -27,21 +31,20 @@ pub enum RuntimeError {
         message: String,
     },
     /// A component's bytes implement a different contract than the one the
-    /// graph was compiled against.
-    #[error(
-        "component `{component}` does not match its contract: \
-         expected content hash {expected}, the bytes hash to {found}"
-    )]
+    /// graph was compiled against: other ports or `run` kind, or an import
+    /// the contract does not declare as a capability.
+    #[error("component `{component}` does not match its contract: {message}")]
     #[diagnostic(code(witgraph::runtime::contract_mismatch))]
     ContractMismatch {
         /// The component whose bytes were rejected.
         component: Box<ComponentRef>,
-        /// The content hash the compiled graph expects.
-        expected: String,
-        /// The content hash of the contract lowered from the bytes.
-        found: String,
+        /// The first difference found.
+        message: String,
     },
-    /// A node's component failed to compile or instantiate.
+    /// A node failed to link or instantiate (a missing capability import,
+    /// a trapping start function, an island over its memory limit), or
+    /// [`Host::island_data`](crate::Host::island_data) failed for its
+    /// island.
     #[error("failed to instantiate node `{node}`: {message}")]
     #[diagnostic(code(witgraph::runtime::instantiation))]
     Instantiation {
@@ -80,10 +83,11 @@ pub enum RuntimeError {
         /// The missing node.
         node: NodeId,
     },
-    /// A referenced port is not a Value input (for [`inject`]) or Value
-    /// output (for [`read_output`]) of the node.
+    /// A referenced port is not a Value input (for [`inject`] and
+    /// [`clear_input`]) or Value output (for [`read_output`]) of the node.
     ///
     /// [`inject`]: crate::RuntimeGraph::inject
+    /// [`clear_input`]: crate::RuntimeGraph::clear_input
     /// [`read_output`]: crate::RuntimeGraph::read_output
     #[error("`{node}.{port}` is not a Value {direction} port")]
     #[diagnostic(code(witgraph::runtime::not_a_value_port))]
@@ -92,8 +96,23 @@ pub enum RuntimeError {
         node: NodeId,
         /// The port.
         port: PortName,
-        /// `input` or `output`.
-        direction: &'static str,
+        /// Which kind of port was expected.
+        direction: PortDirection,
+    },
+    /// [`inject`](crate::RuntimeGraph::inject) targeted an input that a
+    /// non-feedback connection writes. An input has one writer: inject
+    /// only into unconnected inputs and inputs fed by feedback connections.
+    #[error(
+        "`{node}.{port}` is written by connection `{connection}`; only unconnected and feedback-fed inputs take injected values"
+    )]
+    #[diagnostic(code(witgraph::runtime::connected_input))]
+    ConnectedInput {
+        /// The node.
+        node: NodeId,
+        /// The port.
+        port: PortName,
+        /// The connection writing the port.
+        connection: ConnectionId,
     },
     /// An injected value does not have the port's type.
     #[error("value for `{node}.{port}` does not have the port's type: {message}")]
@@ -119,13 +138,29 @@ pub enum RuntimeError {
 /// a trap poisons the island's whole Store.
 #[derive(Debug, Clone, thiserror::Error, miette::Diagnostic)]
 pub enum NodeFault {
-    /// A component in the island trapped.
+    /// A component in the island trapped (spawned tasks included).
     #[error("WASM trap: {message}")]
     #[diagnostic(code(witgraph::runtime::wasm_trap))]
     WasmTrap {
         /// The trap message.
         message: String,
     },
+    /// Growing a linear memory or table would have taken the island past
+    /// [`RuntimeConfig::max_island_memory`](crate::RuntimeConfig::max_island_memory).
+    #[error("the island needs {requested} bytes of memory, over its limit of {limit}")]
+    #[diagnostic(code(witgraph::runtime::memory_limit))]
+    MemoryLimit {
+        /// The bytes the island would have held after the growth.
+        requested: usize,
+        /// The island's limit.
+        limit: usize,
+    },
+    /// One call copied more out of a guest than
+    /// [`RuntimeConfig::hostcall_fuel`](crate::RuntimeConfig::hostcall_fuel)
+    /// allows.
+    #[error("a call copied more data out of the guest than `hostcall_fuel` allows")]
+    #[diagnostic(code(witgraph::runtime::hostcall_fuel))]
+    HostcallFuelExhausted,
     /// The island burned its whole fuel budget
     /// ([`RuntimeConfig::fuel_per_run`](crate::RuntimeConfig::fuel_per_run))
     /// before its next `run` started.
@@ -140,7 +175,9 @@ pub enum NodeFault {
         /// The message passed to `fatal`.
         message: String,
     },
-    /// Rebuilding the island for a restart failed.
+    /// Rebuilding the stopped island, at the start of its next generation,
+    /// failed: a member failed to instantiate, or
+    /// [`Host::island_data`](crate::Host::island_data) failed.
     #[error("restart failed: {message}")]
     #[diagnostic(code(witgraph::runtime::restart))]
     Restart {

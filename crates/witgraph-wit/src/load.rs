@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use wit_parser::{PackageId, PackageName, Resolve, UnresolvedPackageGroup};
+use wit_parser::{PackageId, PackageName, ParseError, Resolve, SourceMap, UnresolvedPackageGroup};
 
 /// A resolved WIT source: the shared type arena plus the root packages that
 /// were pushed (dependencies are reachable through `resolve`).
@@ -26,18 +26,21 @@ pub enum LoadError {
         #[source]
         source: std::io::Error,
     },
-    /// The WIT text failed to parse. The message is wit-parser's rendered
-    /// diagnostic, source location included.
+    /// WIT text failed to parse: the source's own, or a dependency's. The
+    /// message is wit-parser's rendered diagnostic, source location
+    /// included.
     #[error("{rendered}")]
     Parse {
         /// The rendered parse diagnostic.
         rendered: String,
     },
-    /// The parsed packages failed to resolve (for example, a missing
-    /// dependency or a cross-package inconsistency).
+    /// The source parsed but failed to resolve (for example, a missing
+    /// dependency or a cross-package inconsistency), or a wasm-encoded
+    /// package failed to decode.
     #[error("failed to resolve WIT: {message}")]
     Resolve {
-        /// wit-parser's flattened error chain.
+        /// wit-parser's error, rendered with its source location when it
+        /// has one.
         message: String,
     },
     /// A root package parsed from the source did not survive resolution.
@@ -85,35 +88,76 @@ fn root_ids(resolve: &Resolve, names: Vec<PackageName>) -> Result<Vec<PackageId>
         .collect()
 }
 
-/// wit-parser reports resolution failures as an opaque error chain; flatten
-/// it into the [`LoadError::Resolve`] message.
-fn resolve_error(err: impl core::fmt::Display) -> LoadError {
-    LoadError::Resolve {
-        message: format!("{err:#}"),
-    }
+/// Whether `bytes` are a wasm-encoded WIT package (binary or text form)
+/// rather than WIT text, as [`Resolve::push_path`] decides for a file.
+fn is_wasm(path: &Path, bytes: &[u8]) -> bool {
+    bytes.starts_with(b"\0asm")
+        || path
+            .extension()
+            .is_some_and(|ext| ext == "wasm" || ext == "wat")
 }
 
-/// Load from a `.wit` file or a directory (with optional `deps/` folder).
-/// Packages nested inside the source become roots alongside the main package.
-pub fn load_path(path: impl AsRef<Path>) -> Result<WitSource, LoadError> {
-    let path = path.as_ref();
-    // Parse once up front to learn the root package names (main + nested);
-    // `push_path` resolves nested packages but reports only the main one.
-    let group = if path.is_dir() {
-        UnresolvedPackageGroup::parse_dir(path).map_err(|err| LoadError::Parse {
-            rendered: format!("{err:#}"),
-        })?
+/// The names of the main package parsed from WIT text at `path` (a file or
+/// a directory of `.wit` files) and of the packages nested in it; `None`
+/// for a wasm-encoded package, which nests none (its dependencies come
+/// with it, as dependencies).
+fn main_group_names(path: &Path) -> Result<Option<Vec<PackageName>>, LoadError> {
+    let mut map = SourceMap::default();
+    let read = |message: String| LoadError::Resolve { message };
+    if path.is_dir() {
+        map.push_dir(path).map_err(|e| read(format!("{e:#}")))?;
     } else {
-        let contents = std::fs::read_to_string(path).map_err(|source| LoadError::Read {
+        let bytes = std::fs::read(path).map_err(|source| LoadError::Read {
             path: path.to_path_buf(),
             source,
         })?;
-        parse_group(&path.display().to_string(), &contents)?
-    };
-    let names = root_names(&group);
+        if is_wasm(path, &bytes) {
+            return Ok(None);
+        }
+        map.push_file(path).map_err(|e| read(format!("{e:#}")))?;
+    }
+    match map.parse() {
+        Ok(group) => Ok(Some(root_names(&group))),
+        Err((map, err)) => Err(LoadError::Parse {
+            rendered: err.render(&map),
+        }),
+    }
+}
+
+/// Load from a `.wit` file, a directory (with an optional `deps/` folder),
+/// or a wasm-encoded WIT package: whatever [`Resolve::push_path`] accepts.
+/// Packages nested inside the root source become roots alongside the main
+/// package. Errors keep their source locations (`file:line:col`), in
+/// dependencies too.
+pub fn load_path(path: impl AsRef<Path>) -> Result<WitSource, LoadError> {
+    let path = path.as_ref();
+    // A missing or unreadable path is a read error, not a parse error.
+    std::fs::metadata(path).map_err(|source| LoadError::Read {
+        path: path.to_path_buf(),
+        source,
+    })?;
     let mut resolve = new_resolve();
-    resolve.push_path(path).map_err(resolve_error)?;
-    let packages = root_ids(&resolve, names)?;
+    let main = match resolve.push_path(path) {
+        Ok((main, _)) => main,
+        Err(err) => {
+            let rendered = resolve.render_error(&err);
+            let syntax = err
+                .chain()
+                .any(|layer| layer.downcast_ref::<ParseError>().is_some());
+            return Err(if syntax {
+                LoadError::Parse { rendered }
+            } else {
+                LoadError::Resolve { message: rendered }
+            });
+        }
+    };
+    // The roots are the main package and the packages nested in its own
+    // files, read off its parse (which just succeeded), as `load_str` does.
+    // Dependencies, from `deps/` or wasm-encoded, are never roots.
+    let packages = match main_group_names(path)? {
+        Some(names) => root_ids(&resolve, names)?,
+        None => vec![main],
+    };
     Ok(WitSource { resolve, packages })
 }
 
@@ -124,7 +168,11 @@ pub fn load_str(name: &str, wit: &str) -> Result<WitSource, LoadError> {
     let group = parse_group(name, wit)?;
     let names = root_names(&group);
     let mut resolve = new_resolve();
-    resolve.push_group(group).map_err(resolve_error)?;
+    if let Err(err) = resolve.push_group(group) {
+        return Err(LoadError::Resolve {
+            message: err.render(&resolve.source_map),
+        });
+    }
     let packages = root_ids(&resolve, names)?;
     Ok(WitSource { resolve, packages })
 }
@@ -192,6 +240,152 @@ mod tests {
         ))
         .expect("single-file WIT must load");
         assert_eq!(source.packages.len(), 1);
+    }
+
+    /// A fresh directory under the system temp dir, removed when dropped
+    /// (a failing test included).
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "witgraph-load-{name}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    impl std::ops::Deref for TempDir {
+        type Target = Path;
+
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    fn names(source: &WitSource) -> Vec<String> {
+        let mut names: Vec<String> = source
+            .packages
+            .iter()
+            .map(|&id| source.resolve.packages[id].name.to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn load_path_keeps_nested_packages_as_roots() {
+        let dir = TempDir::new("nested");
+        let file = dir.join("main.wit");
+        std::fs::write(
+            &file,
+            r#"
+            package demo:outer@0.1.0;
+            package demo:inner@0.1.0 {
+                interface i { ping: func(); }
+            }
+            world w { import demo:inner/i@0.1.0; }
+            "#,
+        )
+        .unwrap();
+        let source = load_path(&file).expect("loads");
+        assert_eq!(names(&source), ["demo:inner@0.1.0", "demo:outer@0.1.0"]);
+        let source = load_path(&*dir).expect("loads as a directory too");
+        assert_eq!(names(&source), ["demo:inner@0.1.0", "demo:outer@0.1.0"]);
+    }
+
+    #[test]
+    fn wasm_encoded_dependencies_are_not_roots() {
+        // demo:lib, wasm-encoded, with a component world of its own.
+        let mut lib = new_resolve();
+        let lib_id = lib
+            .push_str(
+                "lib.wit",
+                "package demo:lib@0.1.0;\n\
+                 interface types { type sample = u32; }\n\
+                 world libnode { export node: interface { record outputs { out: u32 } run: func() -> outputs; } }\n",
+            )
+            .unwrap();
+        let encoded = wit_component::encode(&lib, lib_id).unwrap();
+        let dir = TempDir::new("wasm-dep");
+        std::fs::create_dir_all(dir.join("deps")).unwrap();
+        std::fs::write(dir.join("deps/lib.wasm"), encoded).unwrap();
+        std::fs::write(
+            dir.join("main.wit"),
+            "package demo:app@0.1.0;\n\
+             world app {\n\
+               use demo:lib/types@0.1.0.{sample};\n\
+               export node: interface { record outputs { out: u32 } run: func() -> outputs; }\n\
+             }\n",
+        )
+        .unwrap();
+        let source = load_path(&*dir).expect("loads");
+        assert_eq!(names(&source), ["demo:app@0.1.0"]);
+        let ids: Vec<String> = crate::load_components(&*dir)
+            .expect("lowers")
+            .iter()
+            .map(|c| c.id.to_string())
+            .collect();
+        assert_eq!(ids, ["demo:app/app@0.1.0"]);
+    }
+
+    #[test]
+    fn syntax_errors_are_parse_errors_wherever_they_are() {
+        let dir = TempDir::new("syntax");
+        std::fs::write(
+            dir.join("main.wit"),
+            "package demo:app@0.1.0;\nworld w { nonsense }\n",
+        )
+        .unwrap();
+        let Err(err) = load_path(&*dir) else {
+            panic!("the main package has a syntax error");
+        };
+        assert!(matches!(err, LoadError::Parse { .. }), "{err}");
+        assert!(err.to_string().contains("main.wit:2"), "{err}");
+    }
+
+    #[test]
+    fn load_str_resolution_errors_keep_their_location() {
+        let Err(err) = load_str(
+            "app.wit",
+            "package demo:app@0.1.0;\n\nworld w { import demo:missing/x@0.1.0; }\n",
+        ) else {
+            panic!("the dependency is missing");
+        };
+        assert!(matches!(err, LoadError::Resolve { .. }), "{err}");
+        assert!(err.to_string().contains("app.wit:3"), "{err}");
+    }
+
+    #[test]
+    fn errors_in_dependencies_keep_their_location() {
+        let dir = TempDir::new("deps");
+        std::fs::create_dir_all(dir.join("deps")).unwrap();
+        std::fs::write(
+            dir.join("main.wit"),
+            "package demo:app@0.1.0;\nworld w { import demo:caps/clock@0.1.0; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("deps/caps.wit"),
+            "package demo:caps@0.1.0;\ninterface clock { now: func() -> u64 }\n",
+        )
+        .unwrap();
+        let Err(err) = load_path(&*dir) else {
+            panic!("the dependency has a syntax error");
+        };
+        let message = err.to_string();
+        assert!(matches!(err, LoadError::Parse { .. }), "{message}");
+        assert!(message.contains("caps.wit:2"), "{message}");
     }
 
     #[test]

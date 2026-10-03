@@ -1,0 +1,17 @@
+package test:relay@0.1.0;
+
+/// Another revision of `test:relay/relay@0.1.0`, with an extra output: the
+/// same id, a different contract (content hash).
+world relay {
+    export node: interface {
+        record inputs {
+            in: u32,
+            add: option<u32>,
+        }
+        record outputs {
+            out: u32,
+            doubled: u32,
+        }
+        run: func(inputs: inputs) -> outputs;
+    }
+}

@@ -1,0 +1,14 @@
+package test:maybe@0.1.0;
+
+/// Passes an optional u32 through as an `option<u32>` output.
+world maybe {
+    export node: interface {
+        record inputs {
+            x: option<u32>,
+        }
+        record outputs {
+            maybe: option<u32>,
+        }
+        run: func(inputs: inputs) -> outputs;
+    }
+}

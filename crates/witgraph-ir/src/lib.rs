@@ -15,10 +15,15 @@ pub mod id;
 pub mod port;
 mod topo;
 
-pub use compile::{CompilationFailure, CompiledGraph, ContractSource};
+pub use compile::{
+    CompilationFailure, CompiledConnection, CompiledGraph, CompiledNode, ContractIndex,
+    ContractSource, RequiredCapability, Resolution, resolve_contract,
+};
 pub use component::{Capability, ComponentContract, RunKind};
 pub use diagnostics::{Diagnostic, Diagnostics, Location, Severity};
-pub use graph::{Connection, Fraction, Graph, GraphBuilder, GraphMetadata, Node, ResourceClaim};
+pub use graph::{
+    Connection, Fraction, Graph, GraphBuilder, GraphMetadata, Node, ResourceClaim, UnknownNodeError,
+};
 pub use id::{
     ComponentRef, ConnectionId, NodeId, PackageRef, ParseComponentRefError, PortName, PortRef,
     ResourceId,

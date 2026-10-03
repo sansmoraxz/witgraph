@@ -1,0 +1,17 @@
+package test:named@0.1.0;
+
+/// The `node` contract as a named package interface (`export node;`)
+/// rather than an inline one: doubles its input (absent reads as 0.0).
+interface node {
+    record inputs {
+        in: option<f64>,
+    }
+    record outputs {
+        out: f64,
+    }
+    run: func(inputs: inputs) -> outputs;
+}
+
+world named-echo {
+    export node;
+}

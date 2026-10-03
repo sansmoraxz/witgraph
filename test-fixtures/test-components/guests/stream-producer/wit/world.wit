@@ -1,7 +1,8 @@
 package test:stream-producer@0.1.0;
 
 /// Streams 0, 1, 2, ... — `burst-size` items, or forever when absent. Stops
-/// early if the reader is dropped.
+/// early if the reader is dropped. `limit` is how many items it plans to
+/// stream: `burst-size`, or u32::MAX when endless.
 world stream-producer {
     export node: interface {
         record inputs {
@@ -9,6 +10,7 @@ world stream-producer {
         }
         record outputs {
             items: stream<u32>,
+            limit: u32,
         }
         run: async func(inputs: inputs) -> outputs;
     }
