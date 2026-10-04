@@ -1,0 +1,22 @@
+[package]
+name = "witgraph-sched"
+description = "Host-neutral dataflow scheduler for witgraph"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+witgraph-ir = { workspace = true }
+thiserror = { workspace = true }
+miette = { workspace = true }
+futures = "0.3"
+serde = { workspace = true, features = ["std"] }
+
+[dev-dependencies]
+serde_json = { workspace = true }

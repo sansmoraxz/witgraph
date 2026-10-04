@@ -1,0 +1,7 @@
+package test:kv@0.1.0;
+
+/// A key-value store provided by the host.
+interface store {
+    /// The value under `key`, as this store knows it.
+    get: func(key: string) -> string;
+}

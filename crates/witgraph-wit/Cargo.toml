@@ -20,6 +20,8 @@ serde = { workspace = true, features = ["std"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+wasmparser = { version = "0.258", default-features = false, features = ["std", "validate", "component-model", "features"] }
 
 [dev-dependencies]
+wat = "1"
 wit-component = { workspace = true, features = ["dummy-module"] }

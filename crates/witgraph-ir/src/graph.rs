@@ -9,7 +9,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::id::{ComponentRef, ConnectionId, NodeId, PortRef, ResourceId};
+use crate::id::{ComponentRef, ConnectionId, LinkId, NodeId, PortRef, ResourceId};
 
 /// A validated fraction in `(0.0, 1.0]`, representing the share of a
 /// named resource pool a node consumes while active.
@@ -141,6 +141,38 @@ pub struct Connection {
     pub feedback: bool,
 }
 
+/// Satisfies one of a node's imports with another component's export,
+/// instead of leaving it to the host as a capability.
+///
+/// The provider is an ordinary component (it need not be a node). When the
+/// graph is loaded it is composed into the node's component, so the node
+/// calls it directly: each node gets a provider instance of its own, which
+/// lives and is rebuilt with the node. Links of one node that name the same
+/// provider share that instance. Whatever the provider itself imports
+/// becomes a capability of the node.
+///
+/// Compilation checks that the node and the import exist; that the export
+/// fits the import is checked when the graph is loaded, from the
+/// components themselves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
+pub struct Link {
+    /// The link's graph-unique id.
+    pub id: LinkId,
+    /// The node whose import is satisfied.
+    pub node: NodeId,
+    /// The import, as the node's contract names the capability
+    /// ([`Capability::interface`](crate::Capability::interface)): an
+    /// interface id, an inline interface's import name, or a label.
+    pub import: String,
+    /// The component providing it.
+    pub provider: ComponentRef,
+    /// The provider's export that satisfies the import
+    /// (`namespace:name/interface@version`).
+    pub export: String,
+}
+
 /// The serializable data stage of the typestate chain: a complete but not
 /// yet compiled flow graph.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -158,6 +190,12 @@ pub struct Graph {
     pub nodes: Vec<Node>,
     /// The graph's connections.
     pub connections: Vec<Connection>,
+    /// Imports of nodes satisfied by other components' exports.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Vec::is_empty")
+    )]
+    pub links: Vec<Link>,
 }
 
 impl Graph {
@@ -263,6 +301,26 @@ impl GraphBuilder {
         self
     }
 
+    /// Satisfies `node`'s import `import` with `provider`'s export `export`
+    /// (see [`Link`]).
+    pub fn link(
+        mut self,
+        id: impl Into<LinkId>,
+        node: impl Into<NodeId>,
+        import: impl Into<String>,
+        provider: ComponentRef,
+        export: impl Into<String>,
+    ) -> Self {
+        self.graph.links.push(Link {
+            id: id.into(),
+            node: node.into(),
+            import: import.into(),
+            provider,
+            export: export.into(),
+        });
+        self
+    }
+
     /// The `GraphBuilder → Graph` typestate transition. Does not validate;
     /// [`Graph::compile`] is the next transition.
     pub fn build(self) -> Graph {
@@ -274,7 +332,7 @@ impl GraphBuilder {
 mod tests {
     use super::*;
     use crate::Type;
-    use crate::component::{ComponentContract, RunKind};
+    use crate::component::ComponentContract;
     use crate::id::PackageRef;
     use crate::port::{PortDef, PortKind};
 
@@ -292,7 +350,6 @@ mod tests {
             },
             inputs: vec![PortDef::new("in", PortKind::Value, Type::STRING)],
             outputs: vec![PortDef::new("out", PortKind::Value, Type::STRING)],
-            run: RunKind::Sync,
             capabilities: vec![],
             docs: None,
         };

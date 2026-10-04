@@ -35,10 +35,10 @@ pub enum NodePhase {
     /// input changes.
     Idle,
     /// Its island faulted. Restartable: new input, or
-    /// [`rerun`](crate::RuntimeGraph::rerun), rebuilds the island.
+    /// [`rerun`](crate::Scheduler::rerun), rebuilds the island.
     Faulted,
     /// Its island was cancelled or shut down. Restartable: new input, or
-    /// [`rerun`](crate::RuntimeGraph::rerun), rebuilds the island.
+    /// [`rerun`](crate::Scheduler::rerun), rebuilds the island.
     Cancelled,
 }
 
@@ -105,8 +105,12 @@ impl NodeState {
 
     /// The member of the node's island that caused its fault, when that is
     /// known: the node that called `fatal`, the one that failed to
-    /// instantiate on a rebuild, or the only member whose `run` had
-    /// started and not returned.
+    /// instantiate on a rebuild, the island's only member, or a member the
+    /// executor pins the fault on. The wasmtime runtime pins a fault in a
+    /// Store of one member (with `split_islands`) on that member, except a
+    /// memory-limit fault, since the island's Stores share the limit. A
+    /// fault in a Store several members share has no culprit: a member that
+    /// returned may still be running a task it spawned.
     pub fn culprit(&self) -> Option<&NodeId> {
         self.culprit.as_ref()
     }

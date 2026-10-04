@@ -7,30 +7,28 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
-use futures::FutureExt;
 use futures::future::Either;
 use futures::stream::StreamExt;
 use futures::task::{ArcWake, AtomicWaker};
-use wasmtime::component::Val;
 use witgraph_ir::{ConnectionId, NodeId, PortName, PortRef};
 
-use super::{Route, RuntimeGraph};
-use crate::engine::{self, Generation, Host, IslandEvent, IslandEventKind, NodeBinary, Outcome};
 use crate::error::NodeFault;
+use crate::executor::{Executor, Generation, IslandEvent, IslandEventKind, OptionPayload, Outcome};
 use crate::island::{self, IslandState, StartInputs, StopCause, Work};
 use crate::mode::RuntimeMode;
 use crate::schedule::{FaultReport, TickResult};
+use crate::scheduler::{Route, Scheduler, Slot};
 
 /// The running islands whose generations asked to be polled again, so a
 /// wake polls those islands only, each once.
-pub(super) struct WakeSet {
+pub(crate) struct WakeSet {
     queued: Vec<AtomicBool>,
     ready: Mutex<VecDeque<usize>>,
     tick: AtomicWaker,
 }
 
 impl WakeSet {
-    pub(super) fn new(islands: usize) -> Self {
+    pub(crate) fn new(islands: usize) -> Self {
         Self {
             queued: (0..islands).map(|_| AtomicBool::new(false)).collect(),
             ready: Mutex::new(VecDeque::new()),
@@ -40,7 +38,7 @@ impl WakeSet {
 
     /// Queues `island` for polling (once, however often it is woken) and
     /// wakes the tick.
-    pub(super) fn wake(&self, island: usize) {
+    pub(crate) fn wake(&self, island: usize) {
         if let Some(queued) = self.queued.get(island)
             && !queued.swap(true, Ordering::AcqRel)
             && let Ok(mut ready) = self.ready.lock()
@@ -67,9 +65,9 @@ impl WakeSet {
 }
 
 /// The waker of one island's generation.
-pub(super) struct IslandWaker {
-    pub(super) island: usize,
-    pub(super) set: Arc<WakeSet>,
+pub(crate) struct IslandWaker {
+    pub(crate) island: usize,
+    pub(crate) set: Arc<WakeSet>,
 }
 
 impl ArcWake for IslandWaker {
@@ -79,19 +77,19 @@ impl ArcWake for IslandWaker {
 }
 
 /// What the tick loop woke up for.
-enum Wake<D: 'static> {
-    Event(IslandEvent),
-    Finished(usize, Outcome<D>),
+enum Wake<X: Executor> {
+    Event(IslandEvent<X::Value>),
+    Finished(usize, Outcome<X::Island>),
 }
 
 /// Ends a tick that did not run to its end (it was dropped, say) the way
-/// [`RuntimeGraph::tick_until`] ends an interrupted one.
-struct TickGuard<'a, M: RuntimeMode, H: Host> {
-    rt: &'a mut RuntimeGraph<M, H>,
+/// [`Scheduler::tick_until`] ends an interrupted one.
+struct TickGuard<'a, M: RuntimeMode, X: Executor> {
+    rt: &'a mut Scheduler<M, X>,
     finished: bool,
 }
 
-impl<M: RuntimeMode, H: Host> Drop for TickGuard<'_, M, H> {
+impl<M: RuntimeMode, X: Executor> Drop for TickGuard<'_, M, X> {
     fn drop(&mut self) {
         if !self.finished {
             self.rt.tick_interrupted();
@@ -100,11 +98,17 @@ impl<M: RuntimeMode, H: Host> Drop for TickGuard<'_, M, H> {
 }
 
 /// What a connection delivers to its input: the value itself, or, when the
-/// connection unwraps an option, its payload ([`engine::option_payload`]).
-fn delivered(val: &Arc<Val>, unwrap_option: bool) -> Option<Arc<Val>> {
-    match (unwrap_option, &**val) {
-        (true, Val::Option(_)) => engine::option_payload(val).map(|p| Arc::new(p.clone())),
-        _ => Some(val.clone()),
+/// connection unwraps an option, its payload
+/// ([`Executor::option_payload`]).
+fn delivered<X: Executor>(val: &Arc<X::Value>, unwrap_option: bool) -> Option<Arc<X::Value>> {
+    if !unwrap_option {
+        return Some(val.clone());
+    }
+    match X::option_payload(val) {
+        // Not an option: delivered itself, shared rather than copied.
+        OptionPayload::NotOption => Some(val.clone()),
+        OptionPayload::Some(payload) => Some(Arc::new(payload.into_owned())),
+        OptionPayload::None => None,
     }
 }
 
@@ -116,7 +120,7 @@ enum Started {
     LimitReached,
 }
 
-impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
+impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
     /// Runs one iteration of the graph: until it is quiescent, then latches
     /// feedback connections.
     ///
@@ -209,7 +213,7 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
     /// interrupted): handles the events its generations sent, and latches
     /// the feedback of every iteration that is over (see
     /// [`tick_until`](Self::tick_until)).
-    pub(super) fn tick_interrupted(&mut self) {
+    pub(crate) fn tick_interrupted(&mut self) {
         self.drain_events();
         if self.feedback.is_empty() {
             return;
@@ -236,24 +240,36 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
 
     /// Applies an island transition, keeps the count of running islands,
     /// and reports the resulting node-phase change for every member.
-    pub(super) fn transition(
+    pub(crate) fn transition(
         &mut self,
         index: usize,
-        step: impl FnOnce(IslandState<H::Data>) -> IslandState<H::Data>,
+        step: impl FnOnce(IslandState<X::Island, X::Value>) -> IslandState<X::Island, X::Value>,
     ) {
-        let state = std::mem::replace(&mut self.slots[index].state, IslandState::placeholder());
+        Self::transition_in(&mut self.slots, &mut self.running, &self.mode, index, step);
+    }
+
+    /// [`transition`](Self::transition) over the fields it touches, so
+    /// `step` may borrow the others.
+    fn transition_in(
+        slots: &mut [Slot<X>],
+        running: &mut usize,
+        mode: &M,
+        index: usize,
+        step: impl FnOnce(IslandState<X::Island, X::Value>) -> IslandState<X::Island, X::Value>,
+    ) {
+        let state = std::mem::replace(&mut slots[index].state, IslandState::placeholder());
         let (from, was_running) = (state.node_phase(), state.is_running());
         let next = step(state);
         let (to, is_running) = (next.node_phase(), next.is_running());
-        self.slots[index].state = next;
+        slots[index].state = next;
         match (was_running, is_running) {
-            (false, true) => self.running += 1,
-            (true, false) => self.running -= 1,
+            (false, true) => *running += 1,
+            (true, false) => *running -= 1,
             _ => {}
         }
         if from != to {
-            for member in &self.slots[index].plan.members {
-                self.mode.on_phase_transition(&member.node, from, to);
+            for member in &slots[index].plan.members {
+                mode.on_phase_transition(&member.node, from, to);
             }
         }
     }
@@ -261,7 +277,7 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
     /// Records a host write that changed an input: feedback buffered for
     /// it is dropped, and feedback into it from a generation in flight (or
     /// a replay owed) is stale, never overwriting it.
-    pub(super) fn note_host_write(&mut self, port: &PortRef) {
+    pub(crate) fn note_host_write(&mut self, port: &PortRef) {
         self.feedback.retain(|_, (to, _, _)| to != port);
         let Some(into) = self.feedback_into.get(port) else {
             return;
@@ -279,7 +295,7 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
 
     /// Forgets a Value input's latched value. Returns whether it had one
     /// (and so made the island owe a generation).
-    pub(super) fn clear_input_value(&mut self, port: PortRef) -> bool {
+    pub(crate) fn clear_input_value(&mut self, port: PortRef) -> bool {
         if self.inputs.remove(&port).is_none() {
             return false;
         }
@@ -293,8 +309,8 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
     /// Writes a delivered Value into an input from outside its island:
     /// unwrapped first when the connection unwraps an option, where `none`
     /// clears the input. Returns whether the input changed.
-    fn write_input(&mut self, port: PortRef, val: &Arc<Val>, unwrap_option: bool) -> bool {
-        match delivered(val, unwrap_option) {
+    fn write_input(&mut self, port: PortRef, val: &Arc<X::Value>, unwrap_option: bool) -> bool {
+        match delivered::<X>(val, unwrap_option) {
             Some(val) => self.set_input(port, val),
             None => self.clear_input_value(port),
         }
@@ -302,7 +318,7 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
 
     /// Writes a Value input from outside its island. Returns whether the
     /// value changed (and so made the island owe a generation).
-    pub(super) fn set_input(&mut self, port: PortRef, val: Arc<Val>) -> bool {
+    pub(crate) fn set_input(&mut self, port: PortRef, val: Arc<X::Value>) -> bool {
         if self.inputs.get(&port).is_some_and(|old| **old == *val) {
             return false;
         }
@@ -318,7 +334,7 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
     /// start, ignoring its phase, what is upstream of it, and resources. A
     /// replay brings its own inputs; a run on the latched inputs needs
     /// every required one to have a value.
-    pub(super) fn next_ready(&self, index: usize) -> bool {
+    pub(crate) fn next_ready(&self, index: usize) -> bool {
         let slot = &self.slots[index];
         if slot.owed.next_is_replay() {
             return true;
@@ -340,7 +356,7 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
     /// never finish (an endless stream), and what it delivers next is
     /// handled by change detection. The islands form a DAG, so an island
     /// never waits on itself. Linear in the size of the graph.
-    pub(super) fn unsettled(&self) -> (Vec<bool>, Vec<bool>) {
+    pub(crate) fn unsettled(&self) -> (Vec<bool>, Vec<bool>) {
         let mut unsettled = vec![false; self.slots.iter().map(|s| s.awaiting.len()).sum()];
         let mut blocked = vec![false; self.slots.len()];
         // Islands are in topological order, and so are each island's
@@ -392,7 +408,7 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
             {
                 continue;
             }
-            if *steps >= self.config.max_steps_per_tick {
+            if *steps >= self.max_steps_per_tick {
                 // Islands are still waiting to start.
                 self.dirty = true;
                 return Started::LimitReached;
@@ -405,9 +421,9 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
     }
 
     /// Starts the island's next owed generation. A stopped island's
-    /// generation first rebuilds its Store, inside the generation's future
-    /// (see [`engine::rebuild_and_run`]).
-    pub(super) fn start_generation(&mut self, index: usize) {
+    /// generation first rebuilds it, inside the generation's future (see
+    /// [`Executor::rebuild_and_run`]).
+    pub(crate) fn start_generation(&mut self, index: usize) {
         // Decided before any side effect: only an idle or stopped island
         // with work owed starts.
         let stopped = match &self.slots[index].state {
@@ -422,52 +438,43 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
             Work::Replay(replay) => (replay.inputs, replay.stale),
             Work::Latched => (self.external_inputs(index), BTreeSet::new()),
         };
-        let external: Vec<Vec<Option<Val>>> = started_with
+        let external: Vec<Vec<Option<X::Value>>> = started_with
             .iter()
             .map(|fields| fields.iter().map(|v| v.as_deref().cloned()).collect())
             .collect();
-        let slot = &self.slots[index];
-        let plan = slot.plan.clone();
-        let settings = self.settings;
+        let plan = self.slots[index].plan.clone();
         let events = self.events_tx.clone();
+        let stream_items = self.mode.wants_stream_items();
         let generation = |number| Generation {
             plan,
             external,
-            settings,
             number,
+            stream_items,
             events,
         };
         let mut number = 0;
-        if stopped {
-            let members: Vec<NodeId> = slot.plan.members.iter().map(|m| m.node.clone()).collect();
-            let binaries: Vec<(NodeId, Arc<NodeBinary<H::Data>>)> = members
-                .iter()
-                .cloned()
-                .zip(slot.binaries.iter().cloned())
-                .collect();
-            let state = engine::HostState::new(self.config.max_island_memory, members.len());
-            let data = self.host.island_data(&members, state);
-            let engine = self.engine.clone();
-            self.transition(index, |state| match state {
+        let executor = &self.executor;
+        Self::transition_in(
+            &mut self.slots,
+            &mut self.running,
+            &self.mode,
+            index,
+            |state| match state {
                 IslandState::Stopped(island) => island
                     .start_rebuilt(started_with, |n| {
                         number = n;
-                        engine::rebuild_and_run(engine, binaries, data, generation(n)).boxed()
+                        executor.rebuild_and_run(generation(n))
                     })
                     .into(),
-                other => island::misuse(other, "Stopped"),
-            });
-        } else {
-            self.transition(index, |state| match state {
                 IslandState::Idle(island) => island
-                    .start(started_with, |store, n| {
+                    .start(started_with, |live, n| {
                         number = n;
-                        engine::run_generation(store, generation(n)).boxed()
+                        executor.run(live, generation(n))
                     })
                     .into(),
-                other => island::misuse(other, "Idle"),
-            });
-        }
+                other => island::misuse(other, if stopped { "Stopped" } else { "Idle" }),
+            },
+        );
         let slot = &mut self.slots[index];
         slot.awaiting.fill(true);
         slot.stale_feedback = stale;
@@ -477,7 +484,7 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
     }
 
     /// The latched external Value inputs of each member, per field.
-    fn external_inputs(&self, index: usize) -> StartInputs {
+    fn external_inputs(&self, index: usize) -> StartInputs<X::Value> {
         self.slots[index]
             .plan
             .members
@@ -495,7 +502,7 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
     /// Waits for the next island event or finished generation, polling
     /// only the islands whose generations asked to be polled. A generation
     /// lives in its island's state, so dropping this future loses nothing.
-    async fn next_wake(&mut self) -> Wake<H::Data> {
+    async fn next_wake(&mut self) -> Wake<X> {
         let Self {
             slots,
             events_rx,
@@ -531,7 +538,7 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
 
     /// Handles every event already queued. Returns whether any belonged
     /// to a current generation.
-    pub(super) fn drain_events(&mut self) -> bool {
+    pub(crate) fn drain_events(&mut self) -> bool {
         let mut any = false;
         while let Ok(event) = self.events_rx.try_recv() {
             any |= self.handle_event(event);
@@ -541,7 +548,7 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
 
     /// Handles one event. Returns `false` for a stale one (from a dropped
     /// generation).
-    fn handle_event(&mut self, event: IslandEvent) -> bool {
+    fn handle_event(&mut self, event: IslandEvent<X::Value>) -> bool {
         let current = self
             .slots
             .get(event.island)
@@ -559,6 +566,15 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
             IslandEventKind::Rebuilt => {
                 for member in &plan.members {
                     self.mode.on_restarted(&member.node);
+                }
+            }
+            IslandEventKind::StreamItems {
+                member,
+                port,
+                count,
+            } => {
+                if let Some(member) = plan.members.get(member) {
+                    self.mode.on_stream_items(&member.node, &port, count);
                 }
             }
             IslandEventKind::RunReturned { member, values } => {
@@ -579,7 +595,7 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
     /// Latches a returned `run`'s Value outputs and routes them. Each value
     /// is shared, not copied, between the outputs, the inputs it reaches
     /// and buffered feedback. Guest values are already canonical.
-    fn deliver(&mut self, island: usize, node: &NodeId, values: Vec<(PortName, Val)>) {
+    fn deliver(&mut self, island: usize, node: &NodeId, values: Vec<(PortName, X::Value)>) {
         for (port, val) in values {
             let output = PortRef::new(node.clone(), port);
             let val = Arc::new(val);
@@ -598,7 +614,7 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
                         }
                         // Consumed inside this generation; recorded, not a
                         // change.
-                        Route::Internal => match delivered(&val, edge.unwrap_option) {
+                        Route::Internal => match delivered::<X>(&val, edge.unwrap_option) {
                             Some(val) => {
                                 self.inputs.insert(edge.to.clone(), val);
                             }
@@ -620,7 +636,7 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
     /// result when a `fatal` call aborts it. Work the island owes survives
     /// a fault: if an input changed while the failing generation ran, the
     /// island is rebuilt and runs again.
-    fn handle_finished(&mut self, index: usize, outcome: Outcome<H::Data>) -> Option<TickResult> {
+    fn handle_finished(&mut self, index: usize, outcome: Outcome<X::Island>) -> Option<TickResult> {
         let generation = self.slots[index].state.running_generation().unwrap_or(0);
         self.resources.release(index);
         self.dirty = true;
@@ -685,7 +701,7 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
     /// cancelled. An island already cancelled or shut down, or a faulted
     /// one on shutdown, keeps its phase and reports nothing. Either way,
     /// islands it was holding back may start now.
-    pub(super) fn stop_island(&mut self, index: usize, cause: StopCause) {
+    pub(crate) fn stop_island(&mut self, index: usize, cause: StopCause) {
         self.dirty = true;
         self.slots[index].owed.clear();
         let compiled = &self.compiled;
@@ -714,7 +730,7 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
 
     /// Writes the buffered feedback values `latch` picks to their targets,
     /// keeping the others buffered. Returns whether any input changed.
-    pub(super) fn latch_feedback(&mut self, mut latch: impl FnMut(&ConnectionId) -> bool) -> bool {
+    pub(crate) fn latch_feedback(&mut self, mut latch: impl FnMut(&ConnectionId) -> bool) -> bool {
         let mut changed = false;
         for (conn, (to, unwrap_option, val)) in std::mem::take(&mut self.feedback) {
             if latch(&conn) {

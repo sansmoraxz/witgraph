@@ -8,9 +8,7 @@
 
 use std::collections::BTreeSet;
 
-use witgraph_wit::ir::{
-    ComponentContract, Diagnostic, Graph, NodeShape, PortKind, PortRef, RunKind,
-};
+use witgraph_wit::ir::{ComponentContract, Diagnostic, Graph, NodeShape, PortKind, PortRef};
 use witgraph_wit::{load_components, load_lowered, metadata};
 
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/demo");
@@ -109,10 +107,8 @@ fn fixtures_lower_with_every_port_kind() {
     assert_eq!(kind("collector", "samples"), PortKind::Stream);
 
     let accumulator = contract(&contracts, "accumulator");
-    assert_eq!(accumulator.run, RunKind::Sync);
     assert_eq!(accumulator.shape(), NodeShape::Reactive);
     let collector = contract(&contracts, "collector");
-    assert_eq!(collector.run, RunKind::Async);
     assert_eq!(collector.shape(), NodeShape::Streaming);
 
     for c in &contracts {

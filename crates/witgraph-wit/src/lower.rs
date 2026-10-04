@@ -26,8 +26,8 @@
 //! `option<T>` is a Value whose payload is the option itself. `stream` and
 //! `future` may appear only at the top level of a field.
 //!
-//! `run` must be `func` or `async func` (recorded as
-//! [`RunKind`]). It takes exactly `(inputs: inputs)`
+//! `run` must be an `async func`: witgraph nodes are async only, so a
+//! plain `func` is rejected. It takes exactly `(inputs: inputs)`
 //! when an `inputs` record exists and no parameters otherwise, and returns
 //! `outputs` when an `outputs` record exists and nothing otherwise. No other
 //! function may appear in `node`.
@@ -57,7 +57,10 @@
 //! - an anonymous inline interface, by its import name (`config`);
 //! - a bare function, as `func:<name>`;
 //! - a resource declared in the world itself, as `resource:<name>`, with
-//!   its constructor, methods and static functions as items.
+//!   its constructor, methods and static functions as items;
+//! - a named interface imported under a label (`import primary: clock;`),
+//!   by the label, with the interface's id recorded beside it. One
+//!   interface may be imported under several labels.
 //!
 //! Type-only imports are structural, and the built-in
 //! `witgraph:runtime/host@0.1.x` interface is provided by every witgraph
@@ -79,8 +82,7 @@ use wasm_wave::value::resolve_wit_type;
 use wit_parser as wp;
 use wit_parser::{Resolve, TypeId, WorldItem, WorldKey};
 use witgraph_ir::{
-    Capability, ComponentContract, ComponentRef, PackageRef, PortDef, PortDirection, PortKind,
-    RunKind, Type,
+    Capability, ComponentContract, ComponentRef, PackageRef, PortDef, PortDirection, PortKind, Type,
 };
 
 use crate::hash;
@@ -191,12 +193,13 @@ pub enum LowerErrorKind {
         /// The kind of type actually found.
         found: &'static str,
     },
-    /// The world imports or exports a named interface under a label
-    /// (`import primary: clock;`), which the runtime's engine cannot
-    /// instantiate.
+    /// The world exports a named interface under a label
+    /// (`export primary: node;`), or imports the built-in
+    /// `witgraph:runtime/host` under one: the runtime finds both by their
+    /// own names. Any other interface may be imported under a label.
     #[error(
         "{direction} `{label}` gives interface `{interface}` a label; \
-         import or export the interface by its own name"
+         {direction} the interface by its own name"
     )]
     LabeledInterface {
         /// `import` or `export`.
@@ -206,11 +209,8 @@ pub enum LowerErrorKind {
         /// The labelled interface's name.
         interface: String,
     },
-    /// The world uses `@external-id`, which the runtime's engine cannot
-    /// instantiate.
-    #[error(
-        "`{name}` carries `@external-id`; components with it need the `cm-implements` extension, which the runtime does not enable"
-    )]
+    /// The world uses `@external-id`, which witgraph does not support.
+    #[error("`{name}` carries `@external-id`, which witgraph does not support")]
     ExternalId {
         /// The item carrying it.
         name: String,
@@ -355,6 +355,14 @@ pub enum FieldErrorKind {
 /// lowering from overflowing the stack on adversarial WIT.
 pub const MAX_TYPE_DEPTH: usize = 100;
 
+/// The built-in interface every witgraph host provides, unversioned: a
+/// component may import it at any `0.1.x` (see the [module docs](self)).
+pub const HOST_INTERFACE: &str = "witgraph:runtime/host";
+
+/// The version hosts provide [`HOST_INTERFACE`] at; a semver-compatible
+/// import (`0.1.x`) resolves to it.
+pub const HOST_VERSION: &str = "0.1.0";
+
 /// The effective size a type or function must stay under: wasmparser's
 /// `MAX_WASM_TYPE_SIZE`. A primitive, `flags`, `enum` or handle has size 1,
 /// any other type 1 plus the sizes of its members (a type used twice counts
@@ -397,6 +405,15 @@ pub fn lower(source: &WitSource) -> Result<Vec<Lowered>, LowerFailures> {
 /// Like [`lower`], but one result per component world, in package/world
 /// declaration order: a world that fails does not discard the others.
 pub fn lower_each(source: &WitSource) -> Vec<Result<Lowered, LowerError>> {
+    lower_matching(source, |_| true)
+}
+
+/// Like [`lower_each`], for only the worlds `wanted` picks (by the world's
+/// ref, without a content hash); the others are not lowered at all.
+pub fn lower_matching(
+    source: &WitSource,
+    wanted: impl Fn(&ComponentRef) -> bool,
+) -> Vec<Result<Lowered, LowerError>> {
     let resolve = &source.resolve;
     let mut results = Vec::new();
     for &package_id in &source.packages {
@@ -408,17 +425,18 @@ pub fn lower_each(source: &WitSource) -> Vec<Result<Lowered, LowerError>> {
         };
         for &world_id in package.worlds.values() {
             let world = &resolve.worlds[world_id];
+            let id = ComponentRef {
+                package: package_ref.clone(),
+                world: world.name.clone(),
+                content_hash: None,
+            };
+            if !wanted(&id) {
+                continue;
+            }
             match lower_world(resolve, world, &package_ref) {
                 Ok(Some(lowered)) => results.push(Ok(lowered)),
                 Ok(None) => {}
-                Err(kind) => results.push(Err(LowerError {
-                    world: ComponentRef {
-                        package: package_ref.clone(),
-                        world: world.name.clone(),
-                        content_hash: None,
-                    },
-                    kind,
-                })),
+                Err(kind) => results.push(Err(LowerError { world: id, kind })),
             }
         }
     }
@@ -492,8 +510,8 @@ fn check_case_clashes(resolve: &Resolve, world: &wp::World) -> Result<(), LowerE
 
 /// Rejects `@external-id` on anything a component built from the world
 /// would encode: the world's imports and exports, and the functions and
-/// types of the interfaces it imports and exports. Components encode it
-/// with the `cm-implements` extension, which the runtime does not enable.
+/// types of the interfaces it imports and exports. witgraph does not
+/// support it.
 fn check_external_ids(resolve: &Resolve, world: &wp::World) -> Result<(), LowerErrorKind> {
     let found = |name: String| Err(LowerErrorKind::ExternalId { name });
     for (key, item) in world.imports.iter().chain(&world.exports) {
@@ -521,9 +539,11 @@ fn check_external_ids(resolve: &Resolve, world: &wp::World) -> Result<(), LowerE
     Ok(())
 }
 
-/// Rejects a named interface imported or exported under a label
-/// (`import primary: clock;`). Components encode those with the
-/// `cm-implements` extension, which the runtime does not enable.
+/// Rejects a named interface exported under a label (`export primary:
+/// node;`), and the built-in `witgraph:runtime/host` imported under one:
+/// the runtime looks both up by their own names. Any other named interface
+/// may be imported under a label, which makes it a capability named after
+/// the label (see [`capabilities`]).
 fn check_labels(resolve: &Resolve, world: &wp::World) -> Result<(), LowerErrorKind> {
     let items = world
         .imports
@@ -532,12 +552,14 @@ fn check_labels(resolve: &Resolve, world: &wp::World) -> Result<(), LowerErrorKi
         .chain(world.exports.iter().map(|item| ("export", item)));
     for (direction, (key, item)) in items {
         if let (WorldKey::Name(label), WorldItem::Interface { id, .. }) = (key, item)
-            && let Some(interface) = &resolve.interfaces[*id].name
+            && let interface = &resolve.interfaces[*id]
+            && let Some(name) = &interface.name
+            && (direction == "export" || is_witgraph_runtime(resolve, interface))
         {
             return Err(LowerErrorKind::LabeledInterface {
                 direction,
                 label: label.clone(),
-                interface: interface.clone(),
+                interface: name.clone(),
             });
         }
     }
@@ -592,7 +614,7 @@ fn lower_world(
         .get("run")
         .ok_or(LowerErrorKind::MissingRun)?;
     let [inputs_id, outputs_id] = record_ids;
-    let run = run_kind(resolve, run, inputs_id, outputs_id)?;
+    check_run(resolve, run, inputs_id, outputs_id)?;
 
     let mut inputs = Vec::new();
     let mut outputs = Vec::new();
@@ -621,7 +643,6 @@ fn lower_world(
         },
         inputs,
         outputs,
-        run,
         capabilities: capabilities(resolve, world),
         docs: world.docs.contents.clone(),
     };
@@ -1253,20 +1274,18 @@ fn defining_id(resolve: &Resolve, ty: &wp::Type) -> Option<TypeId> {
 }
 
 /// Validates `run` against the records the node declares.
-fn run_kind(
+fn check_run(
     resolve: &Resolve,
     run: &wp::Function,
     inputs: Option<TypeId>,
     outputs: Option<TypeId>,
-) -> Result<RunKind, LowerErrorKind> {
+) -> Result<(), LowerErrorKind> {
     let bad = |reason: &str| LowerErrorKind::BadRunSignature {
         reason: reason.into(),
     };
-    let kind = match run.kind {
-        wp::FunctionKind::Freestanding => RunKind::Sync,
-        wp::FunctionKind::AsyncFreestanding => RunKind::Async,
-        _ => return Err(bad("`run` must be a plain `func` or `async func`")),
-    };
+    if !matches!(run.kind, wp::FunctionKind::AsyncFreestanding) {
+        return Err(bad("`run` must be an `async func`: nodes are async only"));
+    }
     match (inputs, run.params.as_slice()) {
         (Some(id), [param])
             if param.name == "inputs" && defining_id(resolve, &param.ty) == Some(id) => {}
@@ -1292,7 +1311,7 @@ fn run_kind(
             ));
         }
     }
-    Ok(kind)
+    Ok(())
 }
 
 /// What the host must implement for the world: imported functions,
@@ -1310,7 +1329,10 @@ fn run_kind(
 /// prefixed `func:` (`func:blink`); the host links `blink` at the root. A
 /// world resource `r` is `resource:r`, with its constructor, methods and
 /// static functions as items, like an interface's resource; the host links
-/// all of them at the root. None of these depends on the importing world's
+/// all of them at the root. A named interface imported under a label
+/// (`import primary: clock;`) is named by the label, and records the
+/// interface's id ([`Capability::implements`]); the host links it as an
+/// instance of the label. None of these depends on the importing world's
 /// package or name. Each capability also records its items' signatures
 /// (see [`Capability::items`]).
 fn capabilities(resolve: &Resolve, world: &wp::World) -> Vec<Capability> {
@@ -1340,8 +1362,15 @@ fn capabilities(resolve: &Resolve, world: &wp::World) -> Vec<Capability> {
                     }))
                     .collect();
                 if !items.is_empty() {
+                    // A label stands for a named interface; an inline
+                    // interface has only its import name.
+                    let implements = match key {
+                        WorldKey::Name(_) if interface.name.is_some() => interface_id(resolve, *id),
+                        _ => None,
+                    };
                     capabilities.push(Capability {
                         interface: resolve.name_world_key(key),
+                        implements,
                         items,
                     });
                 }
@@ -1360,6 +1389,7 @@ fn capabilities(resolve: &Resolve, world: &wp::World) -> Vec<Capability> {
                         let name = resolve.name_world_key(key);
                         capabilities.push(Capability {
                             interface: format!("func:{name}"),
+                            implements: None,
                             items: BTreeMap::from([(name, signature)]),
                         });
                     }
@@ -1377,6 +1407,7 @@ fn capabilities(resolve: &Resolve, world: &wp::World) -> Vec<Capability> {
     }
     capabilities.extend(resources.into_iter().map(|(name, items)| Capability {
         interface: format!("resource:{name}"),
+        implements: None,
         items,
     }));
     capabilities.sort();
@@ -1468,7 +1499,7 @@ mod tests {
                     out: point,
                     maybe: option<u64>,
                 }
-                run: func(inputs: inputs) -> outputs;
+                run: async func(inputs: inputs) -> outputs;
             }
 
             /// Lowers everything.
@@ -1481,7 +1512,6 @@ mod tests {
         assert_eq!(contract.id.to_string(), "demo:test/value-node@0.1.0");
         assert_eq!(contract.id.content_hash.as_ref().unwrap().len(), 64);
         assert_eq!(contract.docs.as_deref(), Some("Lowers everything."));
-        assert_eq!(contract.run, RunKind::Sync);
         assert_eq!(contract.shape(), NodeShape::Reactive);
 
         assert!(contract.inputs.iter().all(|p| p.kind == PortKind::Value));
@@ -1542,7 +1572,6 @@ mod tests {
             "#,
         );
 
-        assert_eq!(contract.run, RunKind::Async);
         assert_eq!(contract.shape(), NodeShape::Streaming);
         let samples = port(&contract.inputs, "samples");
         assert_eq!(
@@ -1601,28 +1630,19 @@ mod tests {
     }
 
     #[test]
-    fn run_kind_follows_the_function_kind() {
-        let wit = |run: &str| {
-            format!(
-                r#"
-                package demo:test@0.1.0;
-                interface node {{
-                    record inputs {{ x: u32 }}
-                    record outputs {{ y: u32 }}
-                    run: {run};
-                }}
-                world w {{ export node; }}
-                "#
-            )
-        };
-        let sync = lower_one(&wit("func(inputs: inputs) -> outputs"));
-        let r#async = lower_one(&wit("async func(inputs: inputs) -> outputs"));
-        assert_eq!(sync.run, RunKind::Sync);
-        assert_eq!(r#async.run, RunKind::Async);
-        assert_ne!(
-            sync.id.content_hash, r#async.id.content_hash,
-            "the run kind is part of the contract"
+    fn a_sync_run_is_rejected() {
+        let message = lower_err(
+            r#"
+            package demo:test@0.1.0;
+            interface node {
+                record inputs { x: u32 }
+                record outputs { y: u32 }
+                run: func(inputs: inputs) -> outputs;
+            }
+            world w { export node; }
+            "#,
         );
+        assert!(message.contains("must be an `async func`"), "{message}");
     }
 
     #[test]
@@ -1660,7 +1680,7 @@ mod tests {
             interface node {
                 record io { x: u32 }
                 type inputs = io;
-                run: func(inputs: inputs);
+                run: async func(inputs: inputs);
             }
             world w { export node; }
             "#,
@@ -1699,23 +1719,23 @@ mod tests {
         };
         for (run, expected) in [
             (
-                "func() -> outputs",
+                "async func() -> outputs",
                 "exactly one parameter, `inputs: inputs`",
             ),
             (
-                "func(x: u32) -> outputs",
+                "async func(x: u32) -> outputs",
                 "exactly one parameter, `inputs: inputs`",
             ),
             (
-                "func(i: inputs) -> outputs",
+                "async func(i: inputs) -> outputs",
                 "exactly one parameter, `inputs: inputs`",
             ),
             (
-                "func(inputs: inputs, extra: u32) -> outputs",
+                "async func(inputs: inputs, extra: u32) -> outputs",
                 "exactly one parameter, `inputs: inputs`",
             ),
-            ("func(inputs: inputs)", "must return `outputs`"),
-            ("func(inputs: inputs) -> u32", "must return `outputs`"),
+            ("async func(inputs: inputs)", "must return `outputs`"),
+            ("async func(inputs: inputs) -> u32", "must return `outputs`"),
         ] {
             let message = lower_err(&wit(run));
             assert!(
@@ -1729,7 +1749,7 @@ mod tests {
             package demo:test@0.1.0;
             interface node {
                 record inputs { x: u32 }
-                run: func(inputs: inputs) -> u32;
+                run: async func(inputs: inputs) -> u32;
             }
             world w { export node; }
             "#,
@@ -1741,7 +1761,7 @@ mod tests {
             package demo:test@0.1.0;
             interface node {
                 record outputs { y: u32 }
-                run: func(x: u32) -> outputs;
+                run: async func(x: u32) -> outputs;
             }
             world w { export node; }
             "#,
@@ -1756,7 +1776,7 @@ mod tests {
             package demo:test@0.1.0;
             interface node {
                 record inputs { x: u32 }
-                run: func(inputs: inputs);
+                run: async func(inputs: inputs);
                 go: func();
             }
             world w { export node; }
@@ -1810,7 +1830,7 @@ mod tests {
             package demo:test@0.1.0;
             interface node {
                 record reading { value: f64 }
-                run: func();
+                run: async func();
             }
             world w { export node; }
             "#,
@@ -1841,7 +1861,7 @@ mod tests {
             interface types-only { record cfg { threshold: u32 } }
             interface node {
                 record outputs { out: u32 }
-                run: func() -> outputs;
+                run: async func() -> outputs;
             }
 
             world w {
@@ -1875,7 +1895,7 @@ mod tests {
             interface dep { ping: func(); }
             interface node {
                 record outputs { out: u32 }
-                run: func() -> outputs;
+                run: async func() -> outputs;
             }
 
             world w {
@@ -1899,7 +1919,7 @@ mod tests {
             package demo:test@0.1.0;
             interface node {
                 record inputs { x: u32, x: f64 }
-                run: func(inputs: inputs);
+                run: async func(inputs: inputs);
             }
             world w { export node; }
             "#,
@@ -1918,7 +1938,7 @@ mod tests {
             interface node {
                 record inputs { x: u32 }
                 record outputs { x: u32 }
-                run: func(inputs: inputs) -> outputs;
+                run: async func(inputs: inputs) -> outputs;
             }
             world w { export node; }
             "#,
@@ -1938,7 +1958,7 @@ mod tests {
             world b {
                 export node: interface {
                     record inputs { y: map<u32, u32> }
-                    run: func(inputs: inputs);
+                    run: async func(inputs: inputs);
                 }
             }
             "#,
@@ -2010,7 +2030,7 @@ mod tests {
             }
             format!(
                 "package demo:test@0.1.0;
-                world w {{ export node: interface {{ record outputs {{ out: {ty} }} run: func() -> outputs; }} }}"
+                world w {{ export node: interface {{ record outputs {{ out: {ty} }} run: async func() -> outputs; }} }}"
             )
         };
         // `outputs` adds a level: 98 lists are 100 deep with it.
@@ -2023,7 +2043,7 @@ mod tests {
         }
         let wit = format!(
             "package demo:test@0.1.0;
-            world w {{ export node: interface {{ {aliases} record outputs {{ out: a149 }} run: func() -> outputs; }} }}"
+            world w {{ export node: interface {{ {aliases} record outputs {{ out: a149 }} run: async func() -> outputs; }} }}"
         );
         assert!(agree(&wit));
     }
@@ -2038,7 +2058,7 @@ mod tests {
             }
             format!(
                 "package demo:test@0.1.0;
-                world w {{ export node: interface {{ {types} record outputs {{ out: t{k} }} run: func() -> outputs; }} }}"
+                world w {{ export node: interface {{ {types} record outputs {{ out: t{k} }} run: async func() -> outputs; }} }}"
             )
         };
         // A component embeds the whole world: t0..t{k} (about 2^(k+3)),
@@ -2059,7 +2079,7 @@ mod tests {
             let cases: Vec<String> = (0..cases).map(|i| format!("c{i}")).collect();
             format!(
                 "package demo:test@0.1.0;
-                world w {{ export node: interface {{ enum e {{ {} }} record outputs {{ out: e }} run: func() -> outputs; }} }}",
+                world w {{ export node: interface {{ enum e {{ {} }} record outputs {{ out: e }} run: async func() -> outputs; }} }}",
                 cases.join(", ")
             )
         };
@@ -2075,7 +2095,7 @@ mod tests {
             interface caps { f: func(a: u32, A: u32); }
             world w {
                 import caps;
-                export node: interface { record outputs { out: u32 } run: func() -> outputs; }
+                export node: interface { record outputs { out: u32 } run: async func() -> outputs; }
             }";
         let message = lower_err(wit);
         assert!(message.contains("duplicate parameter `A`"), "{message}");
@@ -2089,7 +2109,7 @@ mod tests {
             package demo:test@0.1.0;
             interface node {
                 enum inputs { a }
-                run: func(inputs: inputs);
+                run: async func(inputs: inputs);
             }
             world w { export node; }
             "#,
@@ -2107,7 +2127,7 @@ mod tests {
             package demo:test@0.1.0;
             interface node {
                 record inputs { m: map<string, u32> }
-                run: func(inputs: inputs);
+                run: async func(inputs: inputs);
             }
             world w { export node; }
             "#,
@@ -2128,7 +2148,7 @@ mod tests {
                 interface node {{
                     {decl}
                     record inputs {{ x: u32 }}
-                    run: func(inputs: inputs);
+                    run: async func(inputs: inputs);
                 }}
                 world w {{ export node; }}
                 "#
@@ -2153,7 +2173,7 @@ mod tests {
                 type inputs = io;
                 record outputs { y: io, w: list<wrapper> }
                 record unused { z: u32 }
-                run: func(inputs: inputs) -> outputs;
+                run: async func(inputs: inputs) -> outputs;
             }
             world w { export node; }
             "#,
@@ -2183,7 +2203,7 @@ mod tests {
             interface caps { get: func(); GET: func(); }
             world w {
                 import caps;
-                export node: interface { record outputs { out: u32 } run: func() -> outputs; }
+                export node: interface { record outputs { out: u32 } run: async func() -> outputs; }
             }
             "#,
         );
@@ -2202,7 +2222,7 @@ mod tests {
                 resource r;
                 export node: interface {
                     record outputs { out: u32 }
-                    run: func() -> outputs;
+                    run: async func() -> outputs;
                 }
             }
             "#,
@@ -2219,7 +2239,7 @@ mod tests {
                 /// A sample.
                 record reading { value: f64 }
                 record inputs { r: reading }
-                run: func(inputs: inputs);
+                run: async func(inputs: inputs);
             }
             world w { export node; }
             "#,
@@ -2236,7 +2256,7 @@ mod tests {
             package demo:test@0.1.0;
             interface node {
                 record inputs { l: list<u8, 4> }
-                run: func(inputs: inputs);
+                run: async func(inputs: inputs);
             }
             world w { export node; }
             "#,
@@ -2271,7 +2291,7 @@ mod tests {
                 package {package};
                 interface node {{
                     record outputs {{ out: u32 }}
-                    run: func() -> outputs;
+                    run: async func() -> outputs;
                 }}
                 world {world} {{
                     import config: interface {{ get: func() -> u32; }}
@@ -2304,7 +2324,7 @@ mod tests {
                     import blink: func(times: u8);
                     export node: interface {{
                         record outputs {{ out: u32 }}
-                        run: func() -> outputs;
+                        run: async func() -> outputs;
                     }}
                 }}
                 "#
@@ -2332,7 +2352,7 @@ mod tests {
                 import uses-handles;
                 export node: interface {
                     record outputs { out: u32 }
-                    run: func() -> outputs;
+                    run: async func() -> outputs;
                 }
             }
             "#,
@@ -2345,30 +2365,92 @@ mod tests {
     }
 
     #[test]
-    fn labelled_interfaces_are_rejected() {
-        let import = lower_err(
+    fn a_labelled_import_is_a_capability_named_by_its_label() {
+        let contract = lower_one(
             r#"
             package demo:test@0.1.0;
             interface clock { now: func() -> u64; }
             world w {
                 import primary: clock;
+                import backup: clock;
+                import clock;
                 export node: interface {
                     record outputs { out: u32 }
-                    run: func() -> outputs;
+                    run: async func() -> outputs;
                 }
             }
             "#,
         );
-        assert!(
-            import.contains("import `primary` gives interface `clock` a label"),
-            "{import}"
+        let seen: Vec<(&str, Option<&str>)> = contract
+            .capabilities
+            .iter()
+            .map(|c| (c.interface.as_str(), c.implements.as_deref()))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                ("backup", Some("demo:test/clock@0.1.0")),
+                ("demo:test/clock@0.1.0", None),
+                ("primary", Some("demo:test/clock@0.1.0")),
+            ]
         );
+        assert!(
+            contract
+                .capabilities
+                .iter()
+                .all(|c| c.items.get("now").map(String::as_str) == Some("func()->u64"))
+        );
+    }
+
+    #[test]
+    fn an_inline_interface_import_implements_nothing() {
+        let contract = lower_one(
+            r#"
+            package demo:test@0.1.0;
+            world w {
+                import config: interface { get: func() -> u32; }
+                export node: interface {
+                    record outputs { out: u32 }
+                    run: async func() -> outputs;
+                }
+            }
+            "#,
+        );
+        assert_eq!(contract.capabilities.len(), 1);
+        assert_eq!(contract.capabilities[0].interface, "config");
+        assert_eq!(contract.capabilities[0].implements, None);
+    }
+
+    #[test]
+    fn a_label_changes_the_content_hash() {
+        let wit = |import: &str| {
+            format!(
+                r#"
+                package demo:test@0.1.0;
+                interface clock {{ now: func() -> u64; }}
+                world w {{
+                    import {import};
+                    export node: interface {{
+                        record outputs {{ out: u32 }}
+                        run: async func() -> outputs;
+                    }}
+                }}
+                "#
+            )
+        };
+        let hash = |import: &str| lower_one(&wit(import)).id.content_hash;
+        assert_ne!(hash("primary: clock"), hash("clock"));
+        assert_ne!(hash("primary: clock"), hash("backup: clock"));
+    }
+
+    #[test]
+    fn labelled_exports_and_runtime_imports_are_rejected() {
         let export = lower_err(
             r#"
             package demo:test@0.1.0;
             interface contract {
                 record outputs { out: u32 }
-                run: func() -> outputs;
+                run: async func() -> outputs;
             }
             world w { export node: contract; }
             "#,
@@ -2376,6 +2458,29 @@ mod tests {
         assert!(
             export.contains("export `node` gives interface `contract` a label"),
             "{export}"
+        );
+        let runtime = lower_err(
+            r#"
+            package demo:test@0.1.0;
+
+            package witgraph:runtime@0.1.0 {
+                interface host {
+                    fatal: func(message: string);
+                }
+            }
+
+            world w {
+                import abort: witgraph:runtime/host@0.1.0;
+                export node: interface {
+                    record outputs { out: u32 }
+                    run: async func() -> outputs;
+                }
+            }
+            "#,
+        );
+        assert!(
+            runtime.contains("import `abort` gives interface `host` a label"),
+            "{runtime}"
         );
     }
 
@@ -2386,7 +2491,7 @@ mod tests {
             package demo:test@0.1.0;
             interface node {
                 record outputs { out: u32 }
-                run: func() -> outputs;
+                run: async func() -> outputs;
             }
             world w { export primary: node; }
             "#,
@@ -2401,11 +2506,11 @@ mod tests {
     fn external_ids_are_rejected() {
         for (attributed, name) in [
             (
-                r#"@external-id("abc") export node: interface { record outputs { out: u32 } run: func() -> outputs; }"#,
+                r#"@external-id("abc") export node: interface { record outputs { out: u32 } run: async func() -> outputs; }"#,
                 "node",
             ),
             (
-                r#"export node: interface { record outputs { out: u32 } @external-id("abc") run: func() -> outputs; }"#,
+                r#"export node: interface { record outputs { out: u32 } @external-id("abc") run: async func() -> outputs; }"#,
                 "run",
             ),
         ] {
@@ -2426,7 +2531,7 @@ mod tests {
             package demo:test@0.1.0;
             interface node {
                 record outputs { out: u32 }
-                run: func() -> outputs;
+                run: async func() -> outputs;
             }
             world w { export node; }
             "#,
@@ -2438,7 +2543,7 @@ mod tests {
             world w {
                 export node: interface {
                     record outputs { out: u32 }
-                    run: func() -> outputs;
+                    run: async func() -> outputs;
                 }
             }
             "#,
@@ -2458,7 +2563,7 @@ mod tests {
             interface node {{
                 {types}
                 record inputs {{ x: t{} }}
-                run: func(inputs: inputs);
+                run: async func(inputs: inputs);
             }}
             world w {{ export node; }}",
             n - 1
@@ -2499,7 +2604,7 @@ mod tests {
             interface caps {{ {aliases} get: func(x: a19999) -> a19999; }}
             world w {{
                 import caps;
-                export node: interface {{ use caps.{{a19999}}; record outputs {{ out: a19999 }} run: func() -> outputs; }}
+                export node: interface {{ use caps.{{a19999}}; record outputs {{ out: a19999 }} run: async func() -> outputs; }}
             }}"
         );
         // wit-parser itself recurses along the chain: parse on a large
@@ -2527,7 +2632,7 @@ mod tests {
             world w {
                 export node: interface {
                     record outputs { out: list<error-context> }
-                    run: func() -> outputs;
+                    run: async func() -> outputs;
                 }
             }
             "#,
@@ -2548,7 +2653,7 @@ mod tests {
                 }}
                 world w {{
                     import {import};
-                    export node: interface {{ record outputs {{ out: u32 }} run: func() -> outputs; }}
+                    export node: interface {{ record outputs {{ out: u32 }} run: async func() -> outputs; }}
                 }}
                 "#
             )
@@ -2575,7 +2680,7 @@ mod tests {
             }
             world w {
                 import witgraph:runtime/host@0.1.0;
-                export node: interface { record outputs { out: u32 } run: func() -> outputs; }
+                export node: interface { record outputs { out: u32 } run: async func() -> outputs; }
             }
             "#,
         );
@@ -2589,7 +2694,7 @@ mod tests {
             package witgraph:runtime@0.1.0;
             world w {
                 import config: interface { get: func() -> u32; }
-                export node: interface { record outputs { out: u32 } run: func() -> outputs; }
+                export node: interface { record outputs { out: u32 } run: async func() -> outputs; }
             }
             "#,
         );
@@ -2610,7 +2715,7 @@ mod tests {
                 }}
                 world w {{
                     import api;
-                    export node: interface {{ record outputs {{ out: u32 }} run: func() -> outputs; }}
+                    export node: interface {{ record outputs {{ out: u32 }} run: async func() -> outputs; }}
                 }}
                 "#
             ));
@@ -2641,7 +2746,7 @@ mod tests {
             package demo:test@0.1.0;
             interface unused { record nothing {} }
             world w {
-                export node: interface { record outputs { out: u32 } run: func() -> outputs; }
+                export node: interface { record outputs { out: u32 } run: async func() -> outputs; }
             }
             "#,
         );
@@ -2655,7 +2760,7 @@ mod tests {
             r#"
             package demo:test@0.1.0;
             world good {
-                export node: interface { record outputs { out: u32 } run: func() -> outputs; }
+                export node: interface { record outputs { out: u32 } run: async func() -> outputs; }
             }
             world bad {
                 export node: interface { record outputs { out: u32 } }
@@ -2689,7 +2794,7 @@ mod tests {
                     get: func() -> u32;
                     make: static func() -> r;
                 }
-                export node: interface { record outputs { out: u32 } run: func() -> outputs; }
+                export node: interface { record outputs { out: u32 } run: async func() -> outputs; }
             }
             "#,
         );
@@ -2731,7 +2836,7 @@ mod tests {
                 interface node {{
                     {decl}
                     record inputs {{ x: u32 }}
-                    run: func(inputs: inputs);
+                    run: async func(inputs: inputs);
                 }}
                 world w {{ export node; }}
                 "#
@@ -2749,14 +2854,14 @@ mod tests {
             package demo:inner@0.1.0 {
                 interface node {
                     record inputs { x: u32 }
-                    run: func(inputs: inputs);
+                    run: async func(inputs: inputs);
                 }
                 world inner-node { export node; }
             }
 
             interface node {
                 record outputs { y: f64 }
-                run: func() -> outputs;
+                run: async func() -> outputs;
             }
             world outer-node { export node; }
             "#,
@@ -2777,7 +2882,7 @@ mod tests {
             package demo:test;
             interface node {
                 record outputs { out: u32 }
-                run: func() -> outputs;
+                run: async func() -> outputs;
             }
             world w {
                 import config: interface { get: func() -> u32; }
@@ -2796,7 +2901,7 @@ mod tests {
             interface node {
                 record inputs { rate: u32 }
                 record outputs { out: f64 }
-                run: func(inputs: inputs) -> outputs;
+                run: async func(inputs: inputs) -> outputs;
             }
             world w { export node; }
         "#;
@@ -2809,7 +2914,7 @@ mod tests {
                 }
                 record outputs { out: f64 }
                 /// Runs once.
-                run: func(inputs: inputs) -> outputs;
+                run: async func(inputs: inputs) -> outputs;
             }
             /// Now with docs.
             world w { export node; }

@@ -4,12 +4,12 @@
 //! frontend editors (palette entries, port pickers, tooltips).
 
 use serde::Serialize;
-use witgraph_ir::{PortDef, PortKind, RunKind};
+use witgraph_ir::{ComponentContract, PortDef, PortKind};
 
 use crate::lower::Lowered;
 
 /// The catalog format version this crate emits.
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// The full set of components available to an editor.
 #[derive(Debug, Clone, Serialize)]
@@ -42,16 +42,25 @@ pub struct ComponentMeta {
     pub inputs: Vec<PortMeta>,
     /// The component's output ports.
     pub outputs: Vec<PortMeta>,
-    /// Whether the component's `run` export is `sync` or `async`.
-    pub run: RunKind,
-    /// What the component requires from its host, named as the component
-    /// imports it: interface ids, inline interface import names,
-    /// `func:`-prefixed bare function imports and `resource:`-prefixed
-    /// world resources.
-    pub capabilities: Vec<String>,
+    /// What the component requires from its host.
+    pub capabilities: Vec<CapabilityMeta>,
     /// Named types referenced by the ports, for tooltips and pickers.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub types: Vec<TypeMeta>,
+}
+
+/// Editor-facing view of one capability a component requires.
+#[derive(Debug, Clone, Serialize)]
+pub struct CapabilityMeta {
+    /// The capability as the component imports it: an interface id, an
+    /// inline interface's import name, a `func:`-prefixed bare function
+    /// import, a `resource:`-prefixed world resource, or the label of a
+    /// labelled interface import.
+    pub name: String,
+    /// For a labelled import, the full id of the interface the label
+    /// stands for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub implements: Option<String>,
 }
 
 /// Editor-facing view of one named type referenced by a port.
@@ -99,6 +108,31 @@ fn port_meta(port: &PortDef) -> PortMeta {
     }
 }
 
+impl ComponentMeta {
+    /// The editor's view of `contract`, without named types (which only a
+    /// lowered world has; see [`generate_catalog`]).
+    pub fn of(contract: &ComponentContract) -> Self {
+        Self {
+            id: format!("{:#}", contract.id),
+            package: contract.id.package.to_string(),
+            world: contract.id.world.clone(),
+            content_hash: contract.id.content_hash.clone(),
+            docs: contract.docs.clone(),
+            inputs: contract.inputs.iter().map(port_meta).collect(),
+            outputs: contract.outputs.iter().map(port_meta).collect(),
+            capabilities: contract
+                .capabilities
+                .iter()
+                .map(|c| CapabilityMeta {
+                    name: c.interface.clone(),
+                    implements: c.implements.clone(),
+                })
+                .collect(),
+            types: Vec::new(),
+        }
+    }
+}
+
 /// Build a catalog from lowered worlds. Components are sorted by their
 /// structured reference — not the rendered id string — so versions order
 /// numerically (`0.2.0` before `0.10.0`) and the output is stable
@@ -112,19 +146,6 @@ pub fn generate_catalog(lowered: &[Lowered]) -> Catalog {
             |Lowered {
                  contract, types, ..
              }| ComponentMeta {
-                id: format!("{:#}", contract.id),
-                package: contract.id.package.to_string(),
-                world: contract.id.world.clone(),
-                content_hash: contract.id.content_hash.clone(),
-                docs: contract.docs.clone(),
-                inputs: contract.inputs.iter().map(port_meta).collect(),
-                outputs: contract.outputs.iter().map(port_meta).collect(),
-                run: contract.run,
-                capabilities: contract
-                    .capabilities
-                    .iter()
-                    .map(|c| c.interface.clone())
-                    .collect(),
                 types: types
                     .iter()
                     .map(|decl| TypeMeta {
@@ -134,6 +155,7 @@ pub fn generate_catalog(lowered: &[Lowered]) -> Catalog {
                         docs: decl.docs.clone(),
                     })
                     .collect(),
+                ..ComponentMeta::of(contract)
             },
         )
         .collect();
@@ -171,7 +193,7 @@ mod tests {
             world alpha {
                 export node: interface {
                     record inputs { rate: option<u32> }
-                    run: func(inputs: inputs);
+                    run: async func(inputs: inputs);
                 }
             }
             "#,
@@ -193,14 +215,11 @@ mod tests {
         assert_eq!(alpha.inputs[0].kind, PortKind::Value);
         assert_eq!(alpha.inputs[0].type_display, "u32");
         assert!(alpha.inputs[0].optional);
-        assert_eq!(alpha.run, RunKind::Sync);
         let zeta = &catalog.components[1];
-        assert_eq!(zeta.run, RunKind::Async);
         assert_eq!(zeta.outputs[0].kind, PortKind::Stream);
         assert_eq!(zeta.outputs[0].type_display, "u32");
         let json = to_json(&catalog).unwrap();
         assert!(json.ends_with('\n'));
-        assert!(json.contains("\"run\": \"async\""), "{json}");
         assert!(
             !json.contains("\"type\""),
             "no structured types in the catalog: {json}"
@@ -216,7 +235,7 @@ mod tests {
                 world w {{
                     export node: interface {{
                         record outputs {{ {out}: u32 }}
-                        run: func() -> outputs;
+                        run: async func() -> outputs;
                     }}
                 }}
                 "#
@@ -242,7 +261,7 @@ mod tests {
                 world w {{
                     export node: interface {{
                         record outputs {{ out: u32 }}
-                        run: func() -> outputs;
+                        run: async func() -> outputs;
                     }}
                 }}
                 "#
@@ -269,7 +288,7 @@ mod tests {
                 /// A reading.
                 record reading { value: f64 }
                 record outputs { latest: reading }
-                run: func() -> outputs;
+                run: async func() -> outputs;
             }
             world w { export node; }
             "#,
@@ -290,7 +309,7 @@ mod tests {
             world w {
                 export node: interface {
                     record outputs { out: u32 }
-                    run: func() -> outputs;
+                    run: async func() -> outputs;
                 }
             }
             "#,

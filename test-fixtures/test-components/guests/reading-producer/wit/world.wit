@@ -1,0 +1,19 @@
+package test:reading-producer@0.1.0;
+
+/// Streams `burst-size` readings (forever when absent) with values 0, 1,
+/// 2, ... A stream of records is one the host cannot move between Stores,
+/// so this node shares a Store with its reader.
+world reading-producer {
+    export node: interface {
+        record reading {
+            value: u32,
+        }
+        record inputs {
+            burst-size: option<u32>,
+        }
+        record outputs {
+            items: stream<reading>,
+        }
+        run: async func(inputs: inputs) -> outputs;
+    }
+}

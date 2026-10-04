@@ -8,7 +8,7 @@ use core::fmt;
 
 pub use miette::Severity;
 
-use crate::id::{ComponentRef, ConnectionId, NodeId, PortName, PortRef, ResourceId};
+use crate::id::{ComponentRef, ConnectionId, LinkId, NodeId, PortName, PortRef, ResourceId};
 use crate::port::{PortDirection, PortKind};
 
 /// Where in the graph a diagnostic points.
@@ -28,6 +28,8 @@ pub enum Location {
     Port(PortRef),
     /// One connection.
     Connection(ConnectionId),
+    /// One link.
+    Link(LinkId),
     /// The nodes forming a cycle.
     Cycle(Vec<NodeId>),
     /// The members of one island.
@@ -174,6 +176,49 @@ pub enum Diagnostic {
     #[error("duplicate connection id `{0}`")]
     #[diagnostic(code(witgraph::ir::duplicate_connection_id))]
     DuplicateConnectionId(ConnectionId),
+    /// Two links share an id.
+    #[error("duplicate link id `{0}`")]
+    #[diagnostic(code(witgraph::ir::duplicate_link_id))]
+    DuplicateLinkId(LinkId),
+    /// A link names a node that does not exist.
+    #[error("link `{link}` references unknown node `{node}`")]
+    #[diagnostic(code(witgraph::ir::link_unknown_node))]
+    LinkUnknownNode {
+        /// The link.
+        link: LinkId,
+        /// The missing node.
+        node: NodeId,
+    },
+    /// A link names an import its node's component does not have, or one
+    /// that cannot be linked: only an interface import can (a bare function
+    /// or a world resource cannot).
+    #[error("link `{link}`: node `{node}` has no linkable import `{import}`")]
+    #[diagnostic(code(witgraph::ir::unknown_import))]
+    UnknownImport {
+        /// The link.
+        link: LinkId,
+        /// The node.
+        node: NodeId,
+        /// The import the link names.
+        import: String,
+    },
+    /// Two links satisfy the same import of one node, or two imports a
+    /// component merges into one (semver-compatible versions of one
+    /// interface).
+    #[error(
+        "link `{second}` links import `{import}` of node `{node}`, which `{first}` already links"
+    )]
+    #[diagnostic(code(witgraph::ir::import_linked_twice))]
+    ImportLinkedTwice {
+        /// The node.
+        node: NodeId,
+        /// The import.
+        import: String,
+        /// The link declared first.
+        first: LinkId,
+        /// The redundant later link.
+        second: LinkId,
+    },
     /// Two connections share the same endpoints.
     #[error("connection `{second}` duplicates the endpoints of `{first}`")]
     #[diagnostic(code(witgraph::ir::duplicate_connection))]
@@ -365,9 +410,11 @@ pub enum Diagnostic {
     },
     /// Stream islands that a non-feedback Value path leaves and re-enters
     /// were merged into one island, so the islands form a DAG. The merged
-    /// island shares one Store: one fault stops all of it, and its members
-    /// do not interleave. Mark a connection on the path `feedback` to keep
-    /// the islands apart.
+    /// island runs, faults and rebuilds as one: one fault stops all of it.
+    /// How its members share execution is the runtime's (the wasmtime
+    /// runtime keeps an island in one Store, whose members do not
+    /// interleave, unless it splits islands). Mark a connection on the path
+    /// `feedback` to keep the islands apart.
     #[error(
         "nodes {} share one island: a value path leaves a stream island and re-enters it",
         join(nodes)
@@ -428,6 +475,10 @@ impl Diagnostic {
             | Diagnostic::TypeMismatch { conn, .. }
             | Diagnostic::AsyncFeedback { conn, .. }
             | Diagnostic::UselessFeedback { conn } => Location::Connection(conn.clone()),
+            Diagnostic::DuplicateLinkId(link)
+            | Diagnostic::LinkUnknownNode { link, .. }
+            | Diagnostic::UnknownImport { link, .. }
+            | Diagnostic::ImportLinkedTwice { second: link, .. } => Location::Link(link.clone()),
             Diagnostic::MultipleWriters { port, .. }
             | Diagnostic::AsyncFanOut { port, .. }
             | Diagnostic::RequiredInputUnconnected { port }

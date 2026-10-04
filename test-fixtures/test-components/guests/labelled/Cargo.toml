@@ -1,0 +1,15 @@
+[package]
+name = "labelled-guest"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[dependencies]
+wit-bindgen = { version = "=0.61.0", features = ["async-spawn"] }
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+opt-level = "s"

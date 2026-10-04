@@ -5,7 +5,7 @@ use exports::node::{Guest, Inputs, Outputs};
 struct RelayWide;
 
 impl Guest for RelayWide {
-    fn run(inputs: Inputs) -> Outputs {
+    async fn run(inputs: Inputs) -> Outputs {
         let out = inputs.in_.wrapping_add(inputs.add.unwrap_or(0));
         Outputs {
             out,

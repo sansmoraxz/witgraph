@@ -1,0 +1,15 @@
+package test:stream-relay@0.1.0;
+
+/// Passes its input stream straight through: `run` returns the reader it
+/// was given, so the items are written by whoever wrote them upstream.
+world stream-relay {
+    export node: interface {
+        record inputs {
+            items: stream<u32>,
+        }
+        record outputs {
+            items: stream<u32>,
+        }
+        run: async func(inputs: inputs) -> outputs;
+    }
+}

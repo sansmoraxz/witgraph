@@ -47,6 +47,11 @@ string_id! {
 }
 
 string_id! {
+    /// Identifies a link within a graph.
+    LinkId
+}
+
+string_id! {
     /// Identifies a named resource pool for scheduling budgets.
     ResourceId
 }

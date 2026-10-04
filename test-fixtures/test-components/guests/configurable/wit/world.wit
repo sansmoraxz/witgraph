@@ -10,6 +10,6 @@ world configurable {
         record outputs {
             %result: f64,
         }
-        run: func(inputs: inputs) -> outputs;
+        run: async func(inputs: inputs) -> outputs;
     }
 }

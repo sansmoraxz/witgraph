@@ -1,0 +1,17 @@
+package test:future-writer@0.1.0;
+
+/// Returns a future and writes 7 to it from a task it spawned, after `run`
+/// returned. `last` is how the previous run's write ended: 0 before any
+/// ended, 1 when a reader took the value, 2 when the reader was dropped.
+world future-writer {
+    export node: interface {
+        record inputs {
+            again: option<u32>,
+        }
+        record outputs {
+            done: future<u32>,
+            last: u32,
+        }
+        run: async func(inputs: inputs) -> outputs;
+    }
+}

@@ -3,34 +3,98 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
-use wasmtime::component::{Type, Val};
-use witgraph_ir::PortRef;
+use witgraph_ir::{
+    ComponentRef, Connection, ConnectionId, Link, NodeId, PortDirection, PortName, PortRef,
+};
 
-use super::load::sorted_members;
-use super::{IslandSnapshot, PortValues, RuntimeGraph, Snapshot};
-use crate::engine::{self, Host};
 use crate::error::RuntimeError;
+use crate::executor::Executor;
 use crate::island::{Replay, StartInputs, StopCause};
 use crate::mode::RuntimeMode;
+use crate::node::NodePhase;
+use crate::scheduler::Scheduler;
 
-/// A Value as WAVE text. Rendering into a `String` cannot fail, and a
-/// Value port never holds a kind WAVE cannot render (a handle, say).
-fn wave(val: &Val) -> String {
-    val.to_wave().unwrap_or_default()
+/// WAVE text per port, keyed by node id then port name.
+pub type PortValues = BTreeMap<NodeId, BTreeMap<PortName, String>>;
+
+/// The host-visible state of a runtime graph at one point in time, for
+/// point-in-time restores and debugging. Produced by
+/// [`Scheduler::snapshot`] (at any time), applied by
+/// [`Scheduler::restore`].
+///
+/// Values are WAVE text, parsed against the port types on restore. Only
+/// what the host sees is captured: latched Values, pending feedback, node
+/// phases, and the inputs each in-flight or queued generation starts with.
+/// Guest memory (including suspended tasks) is not captured either.
+///
+/// Snapshots do not store stream or future contents. Restoring re-runs any
+/// generation that was in flight, which recreates its streams from the
+/// recorded inputs; the result matches the original only if the guests are
+/// deterministic.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Snapshot {
+    /// Each node's resolved component (id and content hash). A snapshot
+    /// restores only onto a graph with exactly these nodes and components.
+    pub nodes: BTreeMap<NodeId, ComponentRef>,
+    /// The graph's connections, sorted by id. A snapshot restores only onto
+    /// a graph wired exactly the same way.
+    pub connections: Vec<Connection>,
+    /// The graph's links, sorted by id. A snapshot restores only onto a
+    /// graph whose nodes are linked to the same providers, by ref. Like
+    /// nodes, providers are named, not their bytes, and a provider's content
+    /// hash is not checked against its bytes (it has no contract to hash):
+    /// a pinned ref only selects the key its bytes are loaded under. Keep
+    /// the bytes behind a provider's key unchanged for a restore to replay
+    /// the same code.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<Link>,
+    /// Whether no generation was in flight when the snapshot was taken. A
+    /// replay owed after a restore is not in flight, so it is listed in
+    /// [`islands`](Self::islands) while this is `true`.
+    pub quiescent: bool,
+    /// Every node's phase when the snapshot was taken. Informational:
+    /// [`Scheduler::restore`] does not re-fault or re-cancel islands.
+    pub phases: BTreeMap<NodeId, NodePhase>,
+    /// Latched Value inputs: injected, delivered by connections, or latched
+    /// from feedback.
+    pub inputs: PortValues,
+    /// Latched Value outputs: what each node's `run` returned last
+    /// (including `run`s of an in-flight generation that already returned).
+    pub outputs: PortValues,
+    /// Feedback values waiting for the next latch, by connection, as the
+    /// source port produced them.
+    pub feedback: BTreeMap<ConnectionId, String>,
+    /// Islands with an in-flight or queued generation.
+    pub islands: Vec<IslandSnapshot>,
 }
 
-/// Latched values as WAVE text, by node and port.
-fn port_values(map: &HashMap<PortRef, Arc<Val>>) -> PortValues {
-    let mut out = PortValues::new();
-    for (port, val) in map {
-        out.entry(port.node.clone())
-            .or_default()
-            .insert(port.port.clone(), wave(val));
-    }
-    out
+/// An island with work outstanding when a [`Snapshot`] was taken.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IslandSnapshot {
+    /// The island's members, sorted. [`Scheduler::restore`] matches
+    /// islands by their set of members, in any order.
+    pub members: Vec<NodeId>,
+    /// The external Value inputs the in-flight generation started with, by
+    /// member, or those of a restored replay not started yet; `None` when
+    /// there is neither.
+    pub running: Option<PortValues>,
+    /// Whether another generation was queued (an input changed since the
+    /// last start). It runs with the latched inputs.
+    pub queued: bool,
+    /// The feedback connections out of this island whose target the host
+    /// wrote after the [`running`](Self::running) generation started: what
+    /// that generation feeds back there is stale, and its replay drops it.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub stale_feedback: BTreeSet<ConnectionId>,
 }
 
-impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
+/// What a snapshot says an island owes: a replay, and whether a run on the
+/// latched inputs is queued.
+type OwedWork<V> = (Option<Replay<V>>, bool);
+
+impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
     /// Captures the graph's host-visible state, at any time: latched Value
     /// inputs and outputs, pending feedback, every node's phase, and the
     /// start inputs of each in-flight or queued generation. See
@@ -41,6 +105,17 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
     /// recorded inputs; the result matches the original only if the guests are
     /// deterministic.
     pub fn snapshot(&self) -> Snapshot {
+        let wave = |val: &X::Value| self.executor.to_wave(val);
+        // Latched values as WAVE text, by node and port.
+        let port_values = |map: &HashMap<PortRef, Arc<X::Value>>| {
+            let mut out = PortValues::new();
+            for (port, val) in map {
+                out.entry(port.node.clone())
+                    .or_default()
+                    .insert(port.port.clone(), wave(val));
+            }
+            out
+        };
         let feedback = self
             .feedback
             .iter()
@@ -71,7 +146,7 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
             let queued = slot.owed.has_latched();
             if running.is_some() || queued {
                 islands.push(IslandSnapshot {
-                    members: sorted_members(&slot.plan),
+                    members: slot.plan.sorted_members(),
                     running,
                     queued,
                     stale_feedback,
@@ -81,6 +156,7 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
         Snapshot {
             nodes: self.components.clone(),
             connections: self.connections.clone(),
+            links: self.links.clone(),
             quiescent: self.running == 0,
             phases: self
                 .slots
@@ -114,7 +190,8 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
     /// — freshly loaded, after [`shutdown`](Self::shutdown), or right after
     /// every running island was [`cancel`](Self::cancel)led — and exactly
     /// the snapshot's nodes (every one with a phase), components (by
-    /// content hash) and connections ([`RuntimeError::SnapshotMismatch`],
+    /// content hash), connections and links
+    /// ([`RuntimeError::SnapshotMismatch`],
     /// as for an island that does not exist, is listed twice, names a node
     /// outside it, or lists stale feedback that is not a feedback
     /// connection out of it). Every value is parsed against its port's type
@@ -155,33 +232,36 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
         if snapshot.connections != self.connections {
             return Err(mismatch("the graph's connections differ".into()));
         }
-        let parse = |types: &HashMap<PortRef, Type>, port: &PortRef, text: &str, what: &str| {
+        if snapshot.links != self.links {
+            return Err(mismatch("the graph's links differ".into()));
+        }
+        let executor = &self.executor;
+        let parse = |port: &PortRef, direction: PortDirection, text: &str| {
             let invalid = |message: String| RuntimeError::SnapshotValue {
                 node: port.node.clone(),
                 port: port.port.clone(),
                 message,
             };
-            let ty = types
-                .get(port)
-                .ok_or_else(|| invalid(format!("not a Value {what} port")))?;
-            engine::parse_wave(ty, text).map(Arc::new).map_err(invalid)
+            let ty = executor
+                .port_type(port, direction)
+                .ok_or_else(|| invalid(format!("not a Value {direction} port")))?;
+            executor.parse_wave(ty, text).map(Arc::new).map_err(invalid)
         };
         let parse_values = |values: &PortValues,
-                            types: &HashMap<PortRef, Type>,
-                            what: &str|
-         -> Result<HashMap<PortRef, Arc<Val>>, RuntimeError> {
+                            direction: PortDirection|
+         -> Result<HashMap<PortRef, Arc<X::Value>>, RuntimeError> {
             let mut out = HashMap::new();
             for (node, ports) in values {
                 for (port, text) in ports {
                     let port = PortRef::new(node.clone(), port.clone());
-                    let val = parse(types, &port, text, what)?;
+                    let val = parse(&port, direction, text)?;
                     out.insert(port, val);
                 }
             }
             Ok(out)
         };
-        let inputs = parse_values(&snapshot.inputs, &self.input_types, "input")?;
-        let outputs = parse_values(&snapshot.outputs, &self.output_types, "output")?;
+        let inputs = parse_values(&snapshot.inputs, PortDirection::Input)?;
+        let outputs = parse_values(&snapshot.outputs, PortDirection::Output)?;
         let mut feedback = BTreeMap::new();
         for (conn, text) in &snapshot.feedback {
             let (from, edge) = self.feedback_edges.get(conn).ok_or_else(|| {
@@ -189,10 +269,10 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
                     "`{conn}` is not a feedback connection of this graph"
                 ))
             })?;
-            let val = parse(&self.output_types, from, text, "output")?;
+            let val = parse(from, PortDirection::Output, text)?;
             feedback.insert(conn.clone(), (edge.to.clone(), edge.unwrap_option, val));
         }
-        let mut work: HashMap<usize, (Option<Replay>, bool)> = HashMap::new();
+        let mut work: HashMap<usize, OwedWork<X::Value>> = HashMap::new();
         for island in &snapshot.islands {
             let mut members = island.members.clone();
             members.sort();
@@ -266,9 +346,9 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
         &self,
         index: usize,
         by_member: &PortValues,
-    ) -> Result<StartInputs, RuntimeError> {
+    ) -> Result<StartInputs<X::Value>, RuntimeError> {
         let plan = &self.slots[index].plan;
-        let mut external: StartInputs = plan
+        let mut external: StartInputs<X::Value> = plan
             .members
             .iter()
             .map(|m| vec![None; m.field_count()])
@@ -295,10 +375,13 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
                         invalid("not an external Value input of the replayed generation")
                     })?;
                 let ty = self
-                    .input_types
-                    .get(&input.port)
+                    .executor
+                    .port_type(&input.port, PortDirection::Input)
                     .ok_or_else(|| invalid("not a Value input port"))?;
-                let val = engine::parse_wave(ty, text).map_err(|e| invalid(&e))?;
+                let val = self
+                    .executor
+                    .parse_wave(ty, text)
+                    .map_err(|e| invalid(&e))?;
                 external[position][field] = Some(Arc::new(val));
             }
         }

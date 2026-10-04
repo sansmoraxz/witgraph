@@ -1,0 +1,20 @@
+{
+  "name": "witgraph-loader",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Runs witgraph graphs in a browser or Node: jco-transpiled nodes under the witgraph scheduler, with hooks for debugging and simulation",
+  "license": "BSD-3-Clause",
+  "type": "module",
+  "exports": "./src/index.ts",
+  "scripts": {
+    "build:wasm": "cargo build --release -p witgraph-web --target wasm32-unknown-unknown --target-dir ../../target && wasm-bindgen --target web --out-dir pkg ../../target/wasm32-unknown-unknown/release/witgraph_web.wasm",
+    "test": "node --test test/",
+    "typecheck": "tsc -p ."
+  },
+  "dependencies": {
+    "@bytecodealliance/jco": "^1.35.0"
+  },
+  "devDependencies": {
+    "typescript": "^7.0.2"
+  }
+}

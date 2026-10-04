@@ -1,0 +1,18 @@
+package test:reading-consumer@0.1.0;
+
+/// Sums the values of a stream of readings.
+world reading-consumer {
+    export node: interface {
+        record reading {
+            value: u32,
+        }
+        record inputs {
+            items: stream<reading>,
+        }
+        record outputs {
+            total: u32,
+            count: u32,
+        }
+        run: async func(inputs: inputs) -> outputs;
+    }
+}

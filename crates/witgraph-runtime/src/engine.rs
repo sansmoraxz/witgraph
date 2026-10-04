@@ -3,24 +3,30 @@
 //! # Islands
 //!
 //! An island ([`CompiledGraph::islands`](witgraph_ir::CompiledGraph::islands))
-//! is a set of nodes joined by stream/future connections. All of its nodes
-//! are instantiated in one wasmtime [`Store`], because a component-model
-//! stream or future handle belongs to one Store and the host cannot move
-//! items of an arbitrary payload type between Stores. A node with no
-//! stream or future connection is an island of one, unless compilation
-//! merged it into a stream island to keep the islands a DAG.
+//! is a set of nodes joined by stream/future connections: the unit the
+//! scheduler runs, faults and rebuilds. A component-model stream or future
+//! handle belongs to one wasmtime [`Store`], so members joined by a handle
+//! the host cannot move are instantiated in one Store, and the handle
+//! passes straight from one to the other. By default an island is one
+//! Store. With [`RuntimeConfig::split_islands`](crate::RuntimeConfig::split_islands),
+//! the host moves a stream of scalars or strings itself, by pumping its
+//! items between two Stores, and members joined only by such streams each
+//! get a Store of their own. A node with no stream or future
+//! connection is an island of one, unless compilation merged it into a
+//! stream island to keep the islands a DAG.
 //!
 //! # Generations
 //!
-//! `run_generation` drives one generation of an island inside
-//! [`Store::run_concurrent`]. Invariants:
+//! `run_generation` drives one generation of an island, each of its Stores
+//! inside its own [`Store::run_concurrent`], all at once. Invariants:
 //!
 //! - A member's `run` is called once every in-island producer it reads
 //!   from (over a non-feedback connection, of any kind) has returned. Its
 //!   arguments are those producers' fresh outputs plus the host-supplied
-//!   external Value inputs. Stream/future handles are passed straight from
-//!   the producer's results into the consumer's arguments; the host never
-//!   touches their items.
+//!   external Value inputs. Inside a Store, stream/future handles are
+//!   passed straight from the producer's results into the consumer's
+//!   arguments, and the host never touches their items; between Stores, a
+//!   stream is pumped.
 //! - Calls are concurrent: a member's call starts as soon as its own
 //!   dependencies have returned, independently of its siblings.
 //! - A stream/future output with no in-island consumer is closed as soon as
@@ -30,52 +36,66 @@
 //!   and wake downstream islands while this generation is still going
 //!   (once no other member upstream of them is still to return).
 //! - The generation finishes when every `run` has returned **and** no guest
-//!   task is left in the Store
+//!   task is left in any of its Stores
 //!   ([`Accessor::poll_no_interesting_tasks`]): work a guest spawned after
-//!   returning, such as a stream writer, belongs to the generation.
+//!   returning, such as a stream writer, belongs to the generation. Split,
+//!   a Store also runs until every stream it pumps out has ended, whoever
+//!   writes it (a node may return a stream it was given), and then cuts
+//!   the streams it took in.
 //! - Any error, a trap in a spawned task included, faults the whole island:
-//!   a trap poisons its Store.
+//!   a trap poisons its Store, and the island's other Stores are dropped
+//!   with it.
 //!
 //! # Embedding
 //!
-//! An island Store's data is the embedder's [`Host::Data`], which carries
+//! A Store's data is the embedder's [`Host::Data`], which carries
 //! witgraph's own [`HostState`] ([`IslandData`]). The [`Host`] links each
-//! node's capability imports and creates the data of every island Store,
-//! on load and on every rebuild, so capability state can live per island.
+//! node's capability imports and creates the data of every Store, on load
+//! and on every rebuild, so capability state can live per Store.
 //!
 //! # Sandboxing
 //!
-//! Every island Store meters fuel. `fuel_async_yield_interval` makes a busy
-//! island yield to the executor every `yield_interval` units, so other
-//! islands keep running and a timeout around a tick can fire; there is no
-//! interleaving *within* one Store. The Store's fuel is reset to the
-//! per-run budget before every `run` call (the budget is shared by
-//! everything executing in the island, spawned tasks included). An island
-//! that burns the budget before its next `run` starts traps with
-//! [`NodeFault::FuelExhausted`]; that includes an endless streaming
-//! generation once it has consumed the budget, so endless islands need an
-//! unlimited (`None`) or suitably large budget.
+//! Every Store meters fuel. `fuel_async_yield_interval` makes a busy Store
+//! yield to the executor every `yield_interval` units, so other Stores
+//! keep running and a timeout around a tick can fire; there is no
+//! interleaving *within* one Store. A Store's fuel is reset to the per-run
+//! budget before every `run` call in it (the budget is shared by
+//! everything executing in the Store, spawned tasks included). A Store
+//! that burns the budget before its next `run` starts traps, and its
+//! island faults with [`NodeFault::FuelExhausted`]; that includes an
+//! endless streaming generation once it has consumed the budget, so
+//! endless islands need an unlimited (`None`) or suitably large budget.
 //!
-//! Each Store also caps the linear memory and tables its instances may hold
-//! in total (`max_island_memory`), how many instances, memories and tables
-//! it may hold (in proportion to its members), and the host memory the
-//! values lifted out of a guest in a single call may take (wasmtime's
-//! hostcall fuel). Exceeding any of them faults the island.
+//! An island's Stores share one cap on the linear memory and tables their
+//! instances may hold in total (`max_island_memory`). Each Store also caps
+//! how many instances, memories and tables it may hold (in proportion to
+//! the components its members instantiate, providers included), and the host memory the values lifted out of a guest in a
+//! single call may take (wasmtime's hostcall fuel). Exceeding any of them
+//! faults the island. Fuel is wasmtime's per Store: in an island of several
+//! Stores, each gets the per-run budget.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::future::poll_fn;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::task::Poll;
 
-use futures::channel::mpsc::UnboundedSender;
+use futures::FutureExt;
+use futures::channel::{mpsc, oneshot};
 use futures::stream::{FuturesUnordered, StreamExt};
 use wasmtime::component::{Accessor, Func, InstancePre, Linker, Type, Val};
 use wasmtime::{AsContextMut, Engine, Store, StoreContextMut};
-use witgraph_ir::wasm_wave::ast::{Node, NodeType};
-use witgraph_ir::wasm_wave::untyped::UntypedValue;
-use witgraph_ir::wasm_wave::wasm::{WasmType, WasmValue};
-use witgraph_ir::{ComponentContract, NodeId, PortKind, PortName, PortRef};
+use witgraph_ir::{
+    Capability, ComponentContract, NodeId, PortDirection, PortKind, PortName, PortRef,
+};
+use witgraph_sched::plan::{IslandPlan, MemberPlan};
+use witgraph_sched::{
+    Executor, Generation, GenerationFuture, IslandEventKind, NodeCaller, NodeFault, OptionPayload,
+    Outcome, drive, missing_input_message,
+};
 
-use crate::error::NodeFault;
+use crate::pump::{Ended, Intake, StreamRx, Tap, export_stream, import_stream};
 
 /// witgraph's own state in every island Store: who called `fatal`, and the
 /// island's memory accounting.
@@ -89,28 +109,66 @@ use crate::error::NodeFault;
 pub struct HostState {
     /// The first `fatal` call in this Store: the calling node and message.
     fatal: Option<(NodeId, String)>,
-    /// Bytes the island's linear memories and tables have been granted, in
-    /// total.
-    memory: usize,
-    /// The most `memory` may grow to; `None` is unlimited.
-    memory_limit: Option<usize>,
-    /// How many members the island has: what its item limits scale with.
-    members: usize,
+    /// The island's memory accounting, shared by all its Stores.
+    memory: Arc<IslandMemory>,
+    /// How many components the Store's members instantiate (a member with
+    /// links counts its providers too): what its item limits scale with.
+    components: usize,
+}
+
+/// The memory an island has been granted: its Stores' linear memories and
+/// tables, and the stream items the host holds between its Stores
+/// ([`crate::pump`]).
+#[derive(Debug)]
+pub(crate) struct IslandMemory {
+    /// Bytes granted so far, in total.
+    used: AtomicUsize,
+    /// The most `used` may grow to; `None` is unlimited.
+    limit: Option<usize>,
+}
+
+impl IslandMemory {
+    /// Charges `bytes` against the limit.
+    pub(crate) fn charge(&self, bytes: usize) -> Result<(), MemoryLimitExceeded> {
+        let limit = self.limit;
+        self.used
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                let requested = used.saturating_add(bytes);
+                limit
+                    .is_none_or(|limit| requested <= limit)
+                    .then_some(requested)
+            })
+            .map(|_| ())
+            .map_err(|used| MemoryLimitExceeded {
+                requested: used.saturating_add(bytes),
+                limit: limit.unwrap_or(usize::MAX),
+            })
+    }
+
+    /// Gives back `bytes` the host charged and no longer holds. Never on a
+    /// guest's word (see [`HostState`]'s limiter).
+    pub(crate) fn release(&self, bytes: usize) {
+        let _ = self
+            .used
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                Some(used.saturating_sub(bytes))
+            });
+    }
 }
 
 /// Bytes charged for one table element: a reference.
 const TABLE_ELEMENT_BYTES: usize = 8;
 
-/// The most core instances one island Store may hold, per member. A
-/// component built by wit-component has a handful.
-pub(crate) const INSTANCES_PER_MEMBER: usize = 64;
+/// The most core instances one island Store may hold, per component its
+/// members instantiate. A component built by wit-component has a handful.
+pub(crate) const INSTANCES_PER_COMPONENT: usize = 64;
 
 /// The most linear memories, and the most tables, one island Store may
-/// hold, per member. Every memory reserves address space up front
+/// hold, per component its members instantiate. Every memory reserves address space up front
 /// (`memory_reservation`) whatever its size, so their number is capped
 /// apart from `max_island_memory`: a crafted component cannot exhaust the
 /// process's address space with empty memories.
-pub(crate) const MEMORIES_PER_MEMBER: usize = 16;
+pub(crate) const MEMORIES_PER_COMPONENT: usize = 16;
 
 /// Growing a linear memory or table would take an island past its
 /// `max_island_memory`.
@@ -133,30 +191,36 @@ impl std::fmt::Display for MemoryLimitExceeded {
 impl std::error::Error for MemoryLimitExceeded {}
 
 impl HostState {
-    /// Fresh state for an island of `members` nodes limited to
-    /// `memory_limit` bytes.
-    pub(crate) fn new(memory_limit: Option<usize>, members: usize) -> Self {
-        Self {
-            fatal: None,
-            memory: 0,
-            memory_limit,
-            members: members.max(1),
-        }
+    /// Fresh state for each Store of an island limited to `memory_limit`
+    /// bytes in total, one per entry of `stores`: how many components the
+    /// Store's members instantiate.
+    pub(crate) fn island(
+        memory_limit: Option<usize>,
+        stores: impl IntoIterator<Item = usize>,
+    ) -> Vec<Self> {
+        let memory = Arc::new(IslandMemory {
+            used: AtomicUsize::new(0),
+            limit: memory_limit,
+        });
+        stores
+            .into_iter()
+            .map(|components| Self {
+                fatal: None,
+                memory: memory.clone(),
+                components: components.max(1),
+            })
+            .collect()
     }
 
     /// Charges a growth of `bytes` against the island's limit.
     fn grow(&mut self, bytes: usize) -> wasmtime::Result<bool> {
-        let requested = self.memory.saturating_add(bytes);
-        if let Some(limit) = self.memory_limit
-            && requested > limit
-        {
-            return Err(wasmtime::Error::new(MemoryLimitExceeded {
-                requested,
-                limit,
-            }));
-        }
-        self.memory = requested;
+        self.memory.charge(bytes).map_err(wasmtime::Error::new)?;
         Ok(true)
+    }
+
+    /// The island's memory accounting.
+    pub(crate) fn memory(&self) -> Arc<IslandMemory> {
+        self.memory.clone()
     }
 }
 
@@ -193,15 +257,15 @@ impl wasmtime::ResourceLimiter for HostState {
     }
 
     fn instances(&self) -> usize {
-        self.members.saturating_mul(INSTANCES_PER_MEMBER)
+        self.components.saturating_mul(INSTANCES_PER_COMPONENT)
     }
 
     fn tables(&self) -> usize {
-        self.members.saturating_mul(MEMORIES_PER_MEMBER)
+        self.components.saturating_mul(MEMORIES_PER_COMPONENT)
     }
 
     fn memories(&self) -> usize {
-        self.members.saturating_mul(MEMORIES_PER_MEMBER)
+        self.components.saturating_mul(MEMORIES_PER_COMPONENT)
     }
 }
 
@@ -231,8 +295,11 @@ pub trait Host: 'static {
     /// Adds `node`'s capability imports to its linker. Called once per
     /// node, at load, after the built-in `witgraph:runtime/host` interface
     /// has been added; the linker is kept for every rebuild of the node's
-    /// island. `contract` lists what the node's world imports
-    /// ([`ComponentContract::capabilities`]).
+    /// island. `contract` is the node's contract with its
+    /// [`capabilities`](ComponentContract::capabilities) replaced by what
+    /// the node's component actually imports: its world's imports that its
+    /// code uses, minus those links satisfy, plus what providers composed
+    /// in import themselves.
     fn link(
         &self,
         node: &NodeId,
@@ -240,19 +307,57 @@ pub trait Host: 'static {
         linker: &mut Linker<Self::Data>,
     ) -> wasmtime::Result<()>;
 
-    /// The data of a new Store for the island holding `members` (in island
-    /// order), wrapping `state`: [`IslandData::host_state`] must return
-    /// that very value for the Store's life (it carries the island's memory
-    /// limit). Called when the island is built at load, and again every
+    /// The data of a new Store for `members` (in island order), wrapping
+    /// `state`. An island has one Store, or several when its members need
+    /// not share one (see the [module docs](self)), so state kept in it is
+    /// per Store, not per island (setting
+    /// [`RuntimeConfig::split_islands`](crate::RuntimeConfig::split_islands)
+    /// to `false` keeps every island in one Store);
+    /// [`IslandData::host_state`] must return that very value for the
+    /// Store's life (it carries the island's memory accounting, which the
+    /// island's Stores share). Called when the island is built at load, and again every
     /// time it is rebuilt after a fault, cancel, shutdown or restore. An
-    /// error fails the load ([`RuntimeError::Instantiation`]) or the
-    /// rebuild ([`NodeFault::Restart`]).
+    /// error, or a panic, fails the load ([`LoadError::Instantiation`]) or
+    /// the rebuild ([`NodeFault::Restart`]).
     ///
-    /// [`RuntimeError::Instantiation`]: crate::RuntimeError::Instantiation
+    /// [`LoadError::Instantiation`]: crate::LoadError::Instantiation
     fn island_data(&self, members: &[NodeId], state: HostState) -> wasmtime::Result<Self::Data>;
+
+    /// Whether the host can provide `capability` to `node`, asked for every
+    /// capability every node's component imports (what its bytes import,
+    /// which can be fewer than its contract declares) before anything is
+    /// linked, and by `load_with_host` before anything is compiled. A gap
+    /// fails the
+    /// load with [`LoadError::MissingCapability`] or
+    /// [`LoadError::AmbiguousCapability`], naming the node and the
+    /// capability, instead of a linker error at instantiation.
+    ///
+    /// The default knows nothing and reports no gap: a capability
+    /// [`link`](Self::link) leaves out then fails the node's instantiation
+    /// ([`LoadError::Instantiation`]). [`Plugins`](crate::Plugins)
+    /// answers from what its plugins declare.
+    ///
+    /// [`LoadError::MissingCapability`]: crate::LoadError::MissingCapability
+    /// [`LoadError::AmbiguousCapability`]: crate::LoadError::AmbiguousCapability
+    /// [`LoadError::Instantiation`]: crate::LoadError::Instantiation
+    fn check(&self, node: &NodeId, capability: &Capability) -> Result<(), CapabilityGap> {
+        let _ = (node, capability);
+        Ok(())
+    }
 }
 
-/// The host of a graph whose components import no capabilities.
+/// Why a host cannot provide a capability ([`Host::check`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CapabilityGap {
+    /// Nothing provides it.
+    Missing,
+    /// Several providers could, and nothing picks one: their ids.
+    Ambiguous(Vec<String>),
+}
+
+/// The host of a graph whose components import no capabilities. A
+/// component that does fails the load with
+/// [`LoadError::MissingCapability`](crate::LoadError::MissingCapability).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoCapabilities;
 
@@ -271,14 +376,21 @@ impl Host for NoCapabilities {
     fn island_data(&self, _: &[NodeId], state: HostState) -> wasmtime::Result<HostState> {
         Ok(state)
     }
+
+    /// It provides nothing. (Lowering never lists an interface imported
+    /// only for its types as a capability.)
+    fn check(&self, _: &NodeId, _: &Capability) -> Result<(), CapabilityGap> {
+        Err(CapabilityGap::Missing)
+    }
 }
 
 /// Creates the engine every island of one graph shares.
 ///
 /// Besides the async ABI, it enables every component-model value type that
 /// lowering lets through in a capability's signature (`map`,
-/// `error-context`, fixed-length lists), so a world that lowers also loads.
-/// Port payloads are narrower: lowering rejects those types there.
+/// `error-context`, fixed-length lists) and labelled interface imports
+/// (`import primary: clock;`), so a world that lowers also loads. Port
+/// payloads are narrower: lowering rejects those types there.
 ///
 /// `memory_reservation` overrides how much address space each linear
 /// memory reserves up front, rounded up to whole 64 KiB pages (wasmtime's
@@ -300,13 +412,11 @@ pub(crate) fn new_engine(memory_reservation: Option<u64>) -> wasmtime::Result<En
         .wasm_component_model_map(true)
         .wasm_component_model_error_context(true)
         .wasm_component_model_fixed_length_lists(true)
+        .wasm_component_model_implements(true)
         .concurrency_support(true)
         .consume_fuel(true);
     Engine::new(&config)
 }
-
-/// The fully qualified name of the built-in host interface.
-const HOST_INTERFACE: &str = "witgraph:runtime/host@0.1.0";
 
 /// A linker for one node: the built-in `witgraph:runtime/host` (whose
 /// `fatal` knows which node called it) plus the host's capabilities.
@@ -318,7 +428,12 @@ pub(crate) fn node_linker<H: Host>(
 ) -> wasmtime::Result<Linker<H::Data>> {
     let mut linker = Linker::new(engine);
     let caller = node.clone();
-    linker.instance(HOST_INTERFACE)?.func_wrap(
+    let host_interface = format!(
+        "{}@{}",
+        witgraph_wit::lower::HOST_INTERFACE,
+        witgraph_wit::lower::HOST_VERSION
+    );
+    linker.instance(&host_interface)?.func_wrap(
         "fatal",
         move |mut store: StoreContextMut<'_, H::Data>, (message,): (String,)| {
             let state = store.data_mut().host_state();
@@ -355,91 +470,6 @@ impl StoreSettings {
     }
 }
 
-/// Where an input field of a member's `inputs` record comes from in a
-/// generation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum InputSource {
-    /// Supplied by the host from its latched input values: unconnected
-    /// ports, feedback connections, and connections from other islands.
-    External,
-    /// Produced by another member of the island earlier in the same
-    /// generation (routed through [`OutputField::consumers`]).
-    Member,
-}
-
-/// One field of a member's `inputs` record, in declaration order.
-#[derive(Debug, Clone)]
-pub(crate) struct InputField {
-    pub(crate) name: PortName,
-    /// The member's port this field is.
-    pub(crate) port: PortRef,
-    pub(crate) kind: PortKind,
-    /// Declared `option<T>`: the host wraps the value (or passes `none`).
-    pub(crate) optional: bool,
-    pub(crate) source: InputSource,
-}
-
-/// An in-island reader of an output, over a non-feedback connection.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct Consumer {
-    /// The reading member.
-    pub(crate) member: usize,
-    /// The field of its `inputs` record the connection writes.
-    pub(crate) field: usize,
-    /// Whether the connection unwraps an option
-    /// ([`witgraph_ir::PortDef::unwraps_into`]).
-    pub(crate) unwrap_option: bool,
-}
-
-/// One field of a member's `outputs` record.
-#[derive(Debug, Clone)]
-pub(crate) struct OutputField {
-    pub(crate) kind: PortKind,
-    /// Its in-island consumers. At most one for a stream or future.
-    pub(crate) consumers: Vec<Consumer>,
-}
-
-/// Static wiring of one island member, computed at load.
-#[derive(Debug, Clone)]
-pub(crate) struct MemberPlan {
-    pub(crate) node: NodeId,
-    /// `None` when `run` takes no `inputs` record.
-    pub(crate) inputs: Option<Vec<InputField>>,
-    /// Whether `run` returns an `outputs` record.
-    pub(crate) has_result: bool,
-    pub(crate) outputs: HashMap<PortName, OutputField>,
-    /// Members whose `run` must return before this one is called.
-    pub(crate) deps: Vec<usize>,
-    /// Members that list this one in their `deps`.
-    pub(crate) dependents: Vec<usize>,
-}
-
-impl MemberPlan {
-    /// The member's Value inputs the host supplies (unconnected ones, and
-    /// ones fed by feedback connections or from other islands), with their
-    /// field index.
-    pub(crate) fn external_values(&self) -> impl Iterator<Item = (usize, &InputField)> {
-        self.inputs
-            .iter()
-            .flatten()
-            .enumerate()
-            .filter(|(_, f)| f.source == InputSource::External && f.kind == PortKind::Value)
-    }
-
-    /// How many fields the member's `inputs` record has.
-    pub(crate) fn field_count(&self) -> usize {
-        self.inputs.as_ref().map_or(0, Vec::len)
-    }
-}
-
-/// Static wiring of one island, computed at load. Members are in
-/// topological order.
-#[derive(Debug, Clone)]
-pub(crate) struct IslandPlan {
-    pub(crate) index: usize,
-    pub(crate) members: Vec<MemberPlan>,
-}
-
 /// What instantiating one node needs: its component, pre-linked once
 /// against its linker (the built-in host interface plus the embedder's
 /// capabilities), and the name its `node` interface is exported under.
@@ -448,13 +478,33 @@ pub(crate) struct NodeBinary<D: 'static> {
     /// `node` for an inline interface, the interface's full id for a named
     /// one (see `witgraph_wit::lower::Lowered::export`).
     pub(crate) export: String,
+    /// How many components an instance holds: the node's, and one per
+    /// provider composed in. The Store's item limits scale with it.
+    pub(crate) components: usize,
 }
 
-/// A live island's wasmtime side: its Store and each member's `run` export.
-/// The island's scheduling state is in [`crate::island`].
+/// A live island's wasmtime side: its Stores, and each member's `run`
+/// export in the Store it is instantiated in. The island's scheduling
+/// state is the scheduler's.
+///
+/// Members joined by a stream the host cannot move (see [`crate::pump`]),
+/// or by a future, share a Store, so the handle passes straight from one
+/// to the other. Every other member has a Store to itself.
 pub(crate) struct IslandStore<D: 'static> {
+    cells: Vec<Cell<D>>,
+    /// Per member, in plan order: its cell, and its position in it.
+    place: Vec<(usize, usize)>,
+}
+
+/// One Store of an island, and the members instantiated in it.
+struct Cell<D: 'static> {
     store: Store<D>,
+    /// The members, by their position in the island plan.
+    members: Vec<usize>,
+    /// Each member's `run` export.
     runs: Vec<Func>,
+    /// Each member's stream outputs: the element type of each, by port.
+    streams: Vec<HashMap<String, Type>>,
 }
 
 /// The shape of a member's `run` export as the component declares it.
@@ -480,27 +530,19 @@ pub(crate) struct BuildError {
     pub(crate) fatal: Option<String>,
 }
 
-/// Instantiates every member of an island into a fresh Store.
+/// Instantiates every member of an island into fresh Stores.
 ///
 /// `members` pairs each member's node with what instantiating it needs, in
-/// the island plan's order.
+/// the island plan's order. `cells` says which members share a Store (see
+/// [`IslandStore`]): each lists positions in `members`, and `data` holds
+/// the data of each cell's Store. The signatures are in member order.
 pub(crate) async fn build_island<D: IslandData>(
     engine: &Engine,
     members: &[(&NodeId, &NodeBinary<D>)],
-    data: D,
+    cells: &[Vec<usize>],
+    data: Vec<D>,
     settings: StoreSettings,
 ) -> Result<(IslandStore<D>, Vec<RunSignature>), BuildError> {
-    let mut store = Store::new(engine, data);
-    store.limiter(|data: &mut D| data.host_state() as &mut dyn wasmtime::ResourceLimiter);
-    // Instantiation (a guest's `_initialize`, say) gets a budget of its
-    // own, as big as a `run`'s: a spinning start function faults instead
-    // of hanging the load. Every `run` resets the fuel again.
-    let setup = |store: &mut Store<D>| -> wasmtime::Result<()> {
-        store.fuel_async_yield_interval(Some(settings.yield_interval))?;
-        store.set_fuel(settings.budget())?;
-        store.set_hostcall_fuel(settings.hostcall_fuel);
-        Ok(())
-    };
     let first = members
         .first()
         .map_or_else(|| NodeId::from("?"), |(node, _)| (*node).clone());
@@ -509,40 +551,92 @@ pub(crate) async fn build_island<D: IslandData>(
         message,
         fatal: None,
     };
-    setup(&mut store).map_err(|e| plain(&first, format!("{e:#}")))?;
-
-    let mut runs = Vec::with_capacity(members.len());
-    let mut signatures = Vec::with_capacity(members.len());
-    for (node, binary) in members {
-        let instance = match binary.pre.instantiate_async(&mut store).await {
-            Ok(instance) => instance,
-            Err(e) => {
-                let fatal = store.data_mut().host_state().fatal.take();
-                return Err(BuildError {
-                    node: (*node).clone(),
-                    message: format!("{e:#}"),
-                    fatal: fatal.map(|(_, message)| message),
-                });
-            }
+    let mut built = Vec::with_capacity(cells.len());
+    let mut place = vec![(0, 0); members.len()];
+    let mut signatures: Vec<Option<RunSignature>> = members.iter().map(|_| None).collect();
+    for (index, (cell, data)) in cells.iter().zip(data).enumerate() {
+        let mut store = Store::new(engine, data);
+        store.limiter(|data: &mut D| data.host_state() as &mut dyn wasmtime::ResourceLimiter);
+        // Instantiation (a guest's `_initialize`, say) gets a budget of its
+        // own, as big as a `run`'s: a spinning start function faults
+        // instead of hanging the load. Every `run` resets the fuel again.
+        let setup = |store: &mut Store<D>| -> wasmtime::Result<()> {
+            store.fuel_async_yield_interval(Some(settings.yield_interval))?;
+            store.set_fuel(settings.budget())?;
+            store.set_hostcall_fuel(settings.hostcall_fuel);
+            Ok(())
         };
-        let missing = |what: &str| plain(node, format!("component exports no `{what}`"));
-        let export = binary.export.as_str();
-        let node_export = instance
-            .get_export_index(&mut store, None, export)
-            .ok_or_else(|| missing(export))?;
-        let run_export = instance
-            .get_export_index(&mut store, Some(&node_export), "run")
-            .ok_or_else(|| missing(&format!("{export}#run")))?;
-        let run = instance
-            .get_func(&mut store, run_export)
-            .ok_or_else(|| missing(&format!("{export}#run function")))?;
-        signatures.push(signature(&store, run));
-        runs.push(run);
+        // A failure of the Store itself is pinned on its first member.
+        let owner = cell
+            .first()
+            .and_then(|member| members.get(*member))
+            .map_or(&first, |(node, _)| *node);
+        setup(&mut store).map_err(|e| plain(owner, format!("{e:#}")))?;
+
+        let mut runs = Vec::with_capacity(cell.len());
+        let mut streams = Vec::with_capacity(cell.len());
+        for (slot, &member) in cell.iter().enumerate() {
+            let Some((node, binary)) = members.get(member) else {
+                return Err(plain(&first, format!("the island has no member {member}")));
+            };
+            let instance = match binary.pre.instantiate_async(&mut store).await {
+                Ok(instance) => instance,
+                Err(e) => {
+                    let fatal = store.data_mut().host_state().fatal.take();
+                    return Err(BuildError {
+                        node: (*node).clone(),
+                        message: format!("{e:#}"),
+                        fatal: fatal.map(|(_, message)| message),
+                    });
+                }
+            };
+            let missing = |what: &str| plain(node, format!("component exports no `{what}`"));
+            let export = binary.export.as_str();
+            let node_export = instance
+                .get_export_index(&mut store, None, export)
+                .ok_or_else(|| missing(export))?;
+            let run_export = instance
+                .get_export_index(&mut store, Some(&node_export), "run")
+                .ok_or_else(|| missing(&format!("{export}#run")))?;
+            let run = instance
+                .get_func(&mut store, run_export)
+                .ok_or_else(|| missing(&format!("{export}#run function")))?;
+            let signature = signature(&store, run);
+            streams.push(
+                signature
+                    .outputs
+                    .iter()
+                    .filter_map(|(name, ty)| match ty {
+                        Type::Stream(stream) => Some((name.clone(), stream.ty()?)),
+                        _ => None,
+                    })
+                    .collect(),
+            );
+            signatures[member] = Some(signature);
+            place[member] = (index, slot);
+            runs.push(run);
+        }
+        store
+            .set_fuel(settings.budget())
+            .map_err(|e| plain(owner, format!("{e:#}")))?;
+        built.push(Cell {
+            store,
+            members: cell.clone(),
+            runs,
+            streams,
+        });
     }
-    store
-        .set_fuel(settings.budget())
-        .map_err(|e| plain(&first, format!("{e:#}")))?;
-    Ok((IslandStore { store, runs }, signatures))
+    let signatures = signatures
+        .into_iter()
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| plain(&first, "a member of the island is in no Store".into()))?;
+    Ok((
+        IslandStore {
+            cells: built,
+            place,
+        },
+        signatures,
+    ))
 }
 
 fn signature<D>(store: &Store<D>, run: Func) -> RunSignature {
@@ -568,112 +662,499 @@ fn signature<D>(store: &Store<D>, run: Func) -> RunSignature {
     }
 }
 
-/// A report from an in-flight generation.
-#[derive(Debug)]
-pub(crate) struct IslandEvent {
-    pub(crate) island: usize,
-    pub(crate) generation: u64,
-    pub(crate) kind: IslandEventKind,
-}
-
-/// What happened in a generation, to the member at `member` in the island
-/// plan's order.
-#[derive(Debug)]
-pub(crate) enum IslandEventKind {
-    RunStarted {
-        member: usize,
-    },
-    RunReturned {
-        member: usize,
-        /// The member's Value outputs, by port.
-        values: Vec<(PortName, Val)>,
-    },
-    /// The stopped island was rebuilt into a fresh Store; its generation
-    /// starts now.
-    Rebuilt,
-}
-
-/// How a generation ended: the island back, or the fault that killed it
-/// (with the node that called `fatal`, if one did).
-pub(crate) type Outcome<D> = Result<IslandStore<D>, (NodeFault, Option<NodeId>)>;
-
-/// One generation to run.
-pub(crate) struct Generation {
-    pub(crate) plan: Arc<IslandPlan>,
-    /// Per member, per field of its `inputs` record, the host-supplied
-    /// Value input (`None` for an absent one, and for fields members of
-    /// the island write).
-    pub(crate) external: Vec<Vec<Option<Val>>>,
-    pub(crate) settings: StoreSettings,
-    /// The island's generation number.
-    pub(crate) number: u64,
-    pub(crate) events: UnboundedSender<IslandEvent>,
-}
-
 /// Runs one generation of `island`.
 pub(crate) async fn run_generation<D: IslandData>(
     mut island: IslandStore<D>,
-    generation: Generation,
-) -> Outcome<D> {
-    let Generation {
-        plan,
-        external,
-        settings,
-        number: generation,
-        events,
-    } = generation;
-    island.store.data_mut().host_state().fatal = None;
+    mut generation: Generation<Val>,
+    settings: StoreSettings,
+) -> Outcome<IslandStore<D>> {
+    for cell in &mut island.cells {
+        cell.store.data_mut().host_state().fatal = None;
+    }
     let budget = settings.budget();
-    let runs = island.runs.clone();
-    let send = |kind| {
-        // The receiver lives as long as the runtime graph; a send can only
-        // fail while the graph is being dropped.
-        let _ = events.unbounded_send(IslandEvent {
-            island: plan.index,
-            generation,
-            kind,
-        });
+    let external = std::mem::take(&mut generation.external);
+    // One Store needs no channels between Stores: its members are called
+    // straight through its accessor.
+    let failed = match island.cells.as_mut_slice() {
+        [cell] => run_cell(cell, &generation, external, budget)
+            .await
+            .map_err(|error| (error, Some(0))),
+        _ => run_cells(&mut island, &generation, external, budget).await,
     };
-    let driven = island
-        .store
-        .run_concurrent(async |acc| -> wasmtime::Result<()> {
-            drive(acc, &plan, &runs, external, budget, &send).await?;
-            poll_fn(|cx| acc.poll_no_interesting_tasks(cx)).await;
-            Ok(())
-        })
-        .await;
-    match driven.and_then(|inner| inner) {
+    match failed {
         Ok(()) => Ok(island),
-        Err(error) => {
-            let fatal = island.store.data_mut().host_state().fatal.take();
-            Err(classify(&error, fatal))
+        Err((error, index)) => {
+            // A `fatal` anywhere in the island wins over the error that
+            // ended the generation: another Store may have failed first.
+            let mut fatal = index
+                .and_then(|index| island.cells.get_mut(index))
+                .and_then(|cell| cell.store.data_mut().host_state().fatal.take());
+            for cell in &mut island.cells {
+                let state = cell.store.data_mut().host_state();
+                if fatal.is_none() {
+                    fatal = state.fatal.take();
+                }
+            }
+            if fatal.is_some() {
+                return Err(classify(&error, fatal));
+            }
+            let Some(cell) = index.and_then(|index| island.cells.get_mut(index)) else {
+                return Err(classify(&error, None));
+            };
+            let (fault, culprit) = classify(&error, None);
+            let culprit = culprit.or_else(|| {
+                pinned_on(&fault, &cell.members, island.place.len())
+                    .and_then(|member| generation.plan.members.get(member))
+                    .map(|member| member.node.clone())
+            });
+            Err((fault, culprit))
         }
     }
 }
 
-/// Rebuilds a stopped island into a fresh Store, then runs one generation
-/// in it. Both are the generation: the rebuild runs inside the generation's
-/// future, beside every other island, and survives a dropped tick. A failed
-/// rebuild is the fault [`NodeFault::Restart`], or [`NodeFault::Fatal`]
-/// when a member's start function called `fatal`.
+/// The member a fault of a Store holding `cell` (of an island of
+/// `members` members) is pinned on: a Store of one member pins it on that
+/// member. In a larger one a member that returned may still be running a
+/// task it spawned, so none is singled out. Nor is one for the memory
+/// limit, which the island's Stores share: the Store that crossed it need
+/// not hold most of it. An island of one is the scheduler's to name.
+fn pinned_on(fault: &NodeFault, cell: &[usize], members: usize) -> Option<usize> {
+    match cell {
+        [only] if members > 1 && !matches!(fault, NodeFault::MemoryLimit { .. }) => Some(*only),
+        _ => None,
+    }
+}
+
+/// A generation of an island that is one Store: every member is called
+/// through the Store's accessor, and stream and future handles pass
+/// straight from one to the next.
+async fn run_cell<D: IslandData>(
+    cell: &mut Cell<D>,
+    generation: &Generation<Val>,
+    external: Vec<Vec<Option<Val>>>,
+    budget: u64,
+) -> wasmtime::Result<()> {
+    let plan = &generation.plan;
+    let runs = &cell.runs;
+    cell.store
+        .run_concurrent(async |acc| -> wasmtime::Result<()> {
+            let members = Members {
+                acc,
+                plan,
+                runs,
+                budget,
+            };
+            let send = |kind| generation.send(kind);
+            drive(&members, plan, external, option_payload, &send).await?;
+            poll_fn(|cx| acc.poll_no_interesting_tasks(cx)).await;
+            Ok(())
+        })
+        .await?
+}
+
+/// What moves between the members of an island of several Stores.
+#[derive(Clone)]
+enum CellValue {
+    /// A value, or a handle that stays in the Store it was made in.
+    Local(Val),
+    /// A stream on its way to another Store: the receiving end of its pump,
+    /// taken by the one member that reads it.
+    Pumped(Arc<Mutex<Option<StreamRx>>>),
+    /// A stream or future nothing in the island reads: already closed in
+    /// the Store it was made in.
+    Closed,
+}
+
+/// A call's reply could not be had: the call failed, or its Store's
+/// generation ended, and the error itself is the Store's; or, with a
+/// message, the driver never made the call.
+struct CallFailed(Option<String>);
+
+/// One call of a member's `run`, asked of the Store the member is in.
+struct Request {
+    member: usize,
+    args: Vec<Option<CellValue>>,
+    reply: oneshot::Sender<Result<Vec<(String, CellValue)>, CallFailed>>,
+}
+
+/// The members of an island of several Stores, as the generation driver
+/// calls them: each call is sent to the member's Store and awaited.
+struct Remote<'a> {
+    cells: Vec<mpsc::UnboundedSender<Request>>,
+    place: &'a [(usize, usize)],
+    plan: &'a IslandPlan,
+}
+
+impl NodeCaller<CellValue> for Remote<'_> {
+    type Error = CallFailed;
+
+    async fn call(
+        &self,
+        member: usize,
+        args: Vec<Option<CellValue>>,
+    ) -> Result<Vec<(String, CellValue)>, CallFailed> {
+        let (reply, answer) = oneshot::channel();
+        let cell = self
+            .place
+            .get(member)
+            .and_then(|(cell, _)| self.cells.get(*cell))
+            .ok_or(CallFailed(None))?;
+        cell.unbounded_send(Request {
+            member,
+            args,
+            reply,
+        })
+        .map_err(|_| CallFailed(None))?;
+        answer.await.map_err(|_| CallFailed(None))?
+    }
+
+    /// Nothing to do: an unread output is closed where it was made.
+    fn close(&self, _: CellValue) -> Result<(), CallFailed> {
+        Ok(())
+    }
+
+    fn missing_input(&self, member: usize, field: &PortName) -> CallFailed {
+        CallFailed(Some(missing_input_message(self.plan, member, field)))
+    }
+}
+
+/// What a connection that unwraps an option delivers for `value`, between
+/// the Stores of an island.
+fn cell_option_payload(value: &CellValue) -> OptionPayload<'_, CellValue> {
+    match value {
+        CellValue::Local(val) => match option_payload(val) {
+            OptionPayload::Some(payload) => {
+                OptionPayload::Some(Cow::Owned(CellValue::Local(payload.into_owned())))
+            }
+            OptionPayload::NotOption => OptionPayload::NotOption,
+            OptionPayload::None => OptionPayload::None,
+        },
+        _ => OptionPayload::NotOption,
+    }
+}
+
+/// A generation of an island of several Stores. Each Store serves the
+/// calls of its own members, all Stores running at once; the driver asks
+/// them in dependency order. A stream output read in another Store is
+/// pumped there ([`crate::pump`]).
+///
+/// On failure, returns the error with the index of the cell it came from,
+/// if it came from one.
+async fn run_cells<D: IslandData>(
+    island: &mut IslandStore<D>,
+    generation: &Generation<Val>,
+    external: Vec<Vec<Option<Val>>>,
+    budget: u64,
+) -> Result<(), (wasmtime::Error, Option<usize>)> {
+    let IslandStore { cells, place } = island;
+    let place = place.as_slice();
+    let plan = &generation.plan;
+    let mut senders = Vec::with_capacity(cells.len());
+    let mut workers = FuturesUnordered::new();
+    for (index, cell) in cells.iter_mut().enumerate() {
+        let (tx, rx) = mpsc::unbounded();
+        senders.push(tx);
+        workers.push(
+            serve_cell(cell, index, generation, place, rx, budget).map(move |done| (index, done)),
+        );
+    }
+    let external = external
+        .into_iter()
+        .map(|fields| {
+            fields
+                .into_iter()
+                .map(|v| v.map(CellValue::Local))
+                .collect()
+        })
+        .collect();
+    // Dropping the driver drops the request channels, which lets every
+    // Store finish its generation.
+    let driver = async move {
+        let members = Remote {
+            cells: senders,
+            place,
+            plan,
+        };
+        let send = |kind| generation.send(local_event(kind));
+        drive(&members, plan, external, cell_option_payload, &send).await
+    }
+    .fuse();
+    futures::pin_mut!(driver);
+    let mut calls_failed = None;
+    loop {
+        futures::select! {
+            driven = driver => match driven {
+                // The driver's own failure: no call is to be made, so the
+                // Stores are stopped (dropped with their generations) now.
+                Err(CallFailed(Some(message))) => {
+                    return Err((wasmtime::format_err!("{message}"), None));
+                }
+                driven => calls_failed = driven.err(),
+            },
+            (index, done) = workers.select_next_some() => {
+                if let Err(error) = done {
+                    return Err((error, Some(index)));
+                }
+            }
+            complete => break,
+        }
+    }
+    match calls_failed {
+        // A failed call's Store reports the error itself; this is reached
+        // only if none did, so no Store is to blame.
+        Some(CallFailed(_)) => Err((wasmtime::format_err!("a call got no reply"), None)),
+        None => Ok(()),
+    }
+}
+
+/// An event of a generation, as the scheduler takes it:
+/// Value outputs are plain values.
+fn local_event(kind: IslandEventKind<CellValue>) -> IslandEventKind<Val> {
+    kind.filter_map_values(|value| match value {
+        CellValue::Local(val) => Some(val),
+        _ => None,
+    })
+}
+
+/// Serves one Store's share of a generation: calls its members as the
+/// driver asks, concurrently, until the driver is done; then waits for the
+/// streams it pumps out to end and for the guest work left in the Store,
+/// and cuts the streams it took in ([`crate::pump`]).
+async fn serve_cell<D: IslandData>(
+    cell: &mut Cell<D>,
+    index: usize,
+    generation: &Generation<Val>,
+    place: &[(usize, usize)],
+    mut requests: mpsc::UnboundedReceiver<Request>,
+    budget: u64,
+) -> wasmtime::Result<()> {
+    let Cell {
+        store,
+        runs,
+        streams,
+        ..
+    } = cell;
+    store
+        .run_concurrent(async |acc| -> wasmtime::Result<()> {
+            let served = Served {
+                acc,
+                index,
+                generation,
+                place,
+                runs,
+                streams,
+                budget,
+                pumped: Mutex::new(Vec::new()),
+                intakes: Mutex::new(Vec::new()),
+            };
+            let mut calls = FuturesUnordered::new();
+            loop {
+                futures::select! {
+                    done = calls.select_next_some() => done?,
+                    request = requests.next() => match request {
+                        Some(request) => calls.push(served.serve(request)),
+                        None => break,
+                    },
+                }
+            }
+            while let Some(done) = calls.next().await {
+                done?;
+            }
+            drop(calls);
+            // A pumped stream's writer need not be a guest task (a node may
+            // return a stream it was given), so the Store keeps forwarding
+            // until each pump has ended.
+            let pumped = std::mem::take(&mut *lock(&served.pumped)?);
+            poll_fn(|cx| {
+                // Every pump is polled, so each registers its waker.
+                pumped.iter().fold(Poll::Ready(()), |all, ended| {
+                    if ended.poll(cx).is_ready() {
+                        all
+                    } else {
+                        Poll::Pending
+                    }
+                })
+            })
+            .await;
+            poll_fn(|cx| acc.poll_no_interesting_tasks(cx)).await;
+            for intake in std::mem::take(&mut *lock(&served.intakes)?) {
+                intake.cut();
+            }
+            Ok(())
+        })
+        .await?
+}
+
+/// Locks `mutex`, which no panic holds.
+fn lock<T>(mutex: &Mutex<T>) -> wasmtime::Result<std::sync::MutexGuard<'_, T>> {
+    mutex
+        .lock()
+        .map_err(|_| wasmtime::format_err!("a lock was poisoned"))
+}
+
+/// One Store of an island of several, while it serves a generation.
+struct Served<'a, D: IslandData> {
+    acc: &'a Accessor<D>,
+    /// The Store's cell.
+    index: usize,
+    generation: &'a Generation<Val>,
+    place: &'a [(usize, usize)],
+    runs: &'a [Func],
+    streams: &'a [HashMap<String, Type>],
+    budget: u64,
+    /// The pumps this Store's members' outputs went out through.
+    pumped: Mutex<Vec<Arc<Ended>>>,
+    /// The pumps this Store's members' inputs came in through.
+    intakes: Mutex<Vec<Intake>>,
+}
+
+impl<D: IslandData> Served<'_, D> {
+    /// Answers one request. A failed call is this Store's failure: the
+    /// driver only learns that there is no reply.
+    async fn serve(&self, request: Request) -> wasmtime::Result<()> {
+        let Request {
+            member,
+            args,
+            reply,
+        } = request;
+        match self.call(member, args).await {
+            Ok(outputs) => {
+                let _ = reply.send(Ok(outputs));
+                Ok(())
+            }
+            Err(error) => {
+                let _ = reply.send(Err(CallFailed(None)));
+                Err(error)
+            }
+        }
+    }
+
+    /// Calls a member's `run`: streams pumped from other Stores become
+    /// streams of this one first, and stream outputs read in other Stores
+    /// are pumped out afterwards.
+    async fn call(
+        &self,
+        member: usize,
+        args: Vec<Option<CellValue>>,
+    ) -> wasmtime::Result<Vec<(String, CellValue)>> {
+        let plan = self
+            .generation
+            .plan
+            .members
+            .get(member)
+            .ok_or_else(|| wasmtime::format_err!("the island has no member {member}"))?;
+        let slot = match self.place.get(member) {
+            Some(&(cell, slot)) if cell == self.index => slot,
+            _ => wasmtime::bail!("`{}` is not in this Store", plan.node),
+        };
+        let args = args
+            .into_iter()
+            .map(|arg| match arg {
+                Some(CellValue::Local(val)) => Ok(Some(val)),
+                Some(CellValue::Pumped(rx)) => {
+                    let rx = rx.lock().ok().and_then(|mut rx| rx.take());
+                    let rx = rx.ok_or_else(|| wasmtime::format_err!("a stream was read twice"))?;
+                    let (val, intake) = import_stream(self.acc, rx)?;
+                    lock(&self.intakes)?.push(intake);
+                    Ok(Some(val))
+                }
+                Some(CellValue::Closed) | None => Ok(None),
+            })
+            .collect::<wasmtime::Result<Vec<_>>>()?;
+        let run = self
+            .runs
+            .get(slot)
+            .ok_or_else(|| wasmtime::format_err!("`{}` has no `run`", plan.node))?;
+        call_run(self.acc, run, plan, args, self.budget)
+            .await?
+            .into_iter()
+            .map(|(name, val)| {
+                let value = self.output(member, slot, plan, &name, val)?;
+                Ok((name, value))
+            })
+            .collect()
+    }
+
+    /// What an output of a member becomes on its way to its readers.
+    fn output(
+        &self,
+        member: usize,
+        slot: usize,
+        plan: &MemberPlan,
+        name: &str,
+        val: Val,
+    ) -> wasmtime::Result<CellValue> {
+        // Found by name without allocating a key: a member has few outputs.
+        let Some((port, output)) = plan.outputs.iter().find(|(port, _)| port.as_str() == name)
+        else {
+            return Ok(CellValue::Local(val));
+        };
+        if output.kind == PortKind::Value {
+            return Ok(CellValue::Local(val));
+        }
+        // A stream or future has one reader in the island, or none.
+        let reader = output.consumers.first().map(|consumer| consumer.member);
+        let here = |member: usize| {
+            self.place
+                .get(member)
+                .is_some_and(|(cell, _)| *cell == self.index)
+        };
+        match (reader, val) {
+            (None, val) => {
+                close(self.acc, val)?;
+                Ok(CellValue::Closed)
+            }
+            (Some(reader), val) if here(reader) => Ok(CellValue::Local(val)),
+            (Some(_), Val::Stream(stream)) => {
+                let element = self
+                    .streams
+                    .get(slot)
+                    .and_then(|streams| streams.get(name))
+                    .ok_or_else(|| {
+                        wasmtime::format_err!("stream `{}.{name}` has no element type", plan.node)
+                    })?;
+                let tap = self.generation.stream_items.then(|| Tap {
+                    reporter: self.generation.reporter(),
+                    member,
+                    port: port.clone(),
+                });
+                let (rx, ended) = export_stream(self.acc, stream, element, tap)?;
+                lock(&self.pumped)?.push(ended);
+                Ok(CellValue::Pumped(Arc::new(Mutex::new(Some(rx)))))
+            }
+            (Some(_), _) => Err(wasmtime::format_err!(
+                "`{}.{name}` cannot leave its Store",
+                plan.node
+            )),
+        }
+    }
+}
+
+/// Rebuilds a stopped island into fresh Stores, then runs one generation
+/// in them. Both are the generation: the rebuild runs inside the
+/// generation's future, beside every other island, and survives a dropped
+/// tick. A failed rebuild is the fault [`NodeFault::Restart`], or
+/// [`NodeFault::Fatal`] when a member's start function called `fatal`.
 pub(crate) async fn rebuild_and_run<D: IslandData>(
     engine: Engine,
-    members: Vec<(NodeId, Arc<NodeBinary<D>>)>,
-    data: wasmtime::Result<D>,
-    generation: Generation,
-) -> Outcome<D> {
+    members: IslandBinaries<D>,
+    cells: Vec<Vec<usize>>,
+    data: Vec<wasmtime::Result<D>>,
+    generation: Generation<Val>,
+    settings: StoreSettings,
+) -> Outcome<IslandStore<D>> {
     let parts: Vec<(&NodeId, &NodeBinary<D>)> = members
         .iter()
         .map(|(node, binary)| (node, &**binary))
         .collect();
-    let data = match data {
+    let data = match data.into_iter().collect::<wasmtime::Result<Vec<D>>>() {
         Ok(data) => data,
         Err(e) => {
             let message = format!("island data: {e:#}");
             return Err((NodeFault::Restart { message }, None));
         }
     };
-    let island = match build_island(&engine, &parts, data, generation.settings).await {
+    let island = match build_island(&engine, &parts, &cells, data, settings).await {
         Ok((island, _)) => island,
         Err(BuildError {
             node,
@@ -685,121 +1166,68 @@ pub(crate) async fn rebuild_and_run<D: IslandData>(
             return Err((NodeFault::Restart { message }, Some(node)));
         }
     };
-    let _ = generation.events.unbounded_send(IslandEvent {
-        island: generation.plan.index,
-        generation: generation.number,
-        kind: IslandEventKind::Rebuilt,
-    });
-    run_generation(island, generation).await
+    generation.send(IslandEventKind::Rebuilt);
+    run_generation(island, generation, settings).await
 }
 
-/// Calls every member's `run` in dependency order, concurrently, and
-/// routes outputs. Returns once every call has returned.
-async fn drive<D: IslandData>(
-    acc: &Accessor<D>,
-    plan: &IslandPlan,
-    runs: &[Func],
-    mut args: Vec<Vec<Option<Val>>>,
+/// The members of an island of one Store, as the generation driver calls
+/// them: each `run` export, called through the Store's accessor.
+struct Members<'a, D: IslandData> {
+    acc: &'a Accessor<D>,
+    plan: &'a IslandPlan,
+    runs: &'a [Func],
+    /// The fuel level set before every `run` call.
     budget: u64,
-    send: &impl Fn(IslandEventKind),
-) -> wasmtime::Result<()> {
-    let mut waiting: Vec<usize> = plan.members.iter().map(|m| m.deps.len()).collect();
-    let mut calls = FuturesUnordered::new();
-    for (i, member) in plan.members.iter().enumerate() {
-        if waiting[i] == 0 {
-            let params = params(member, std::mem::take(&mut args[i]))?;
-            send(IslandEventKind::RunStarted { member: i });
-            calls.push(call(acc, runs[i], params, member.has_result, budget, i));
-        }
-    }
-
-    while let Some((i, results)) = calls.next().await {
-        let results = results?;
-        let member = &plan.members[i];
-        let mut values = Vec::new();
-        if let Some(Val::Record(fields)) = results.into_iter().next() {
-            for (name, val) in fields {
-                let port = PortName::from(name);
-                let Some(output) = member.outputs.get(&port) else {
-                    continue;
-                };
-                match output.kind {
-                    PortKind::Value => {
-                        for consumer in &output.consumers {
-                            let delivered = if consumer.unwrap_option {
-                                option_payload(&val).cloned()
-                            } else {
-                                Some(val.clone())
-                            };
-                            args[consumer.member][consumer.field] = delivered;
-                        }
-                        values.push((port, val));
-                    }
-                    PortKind::Stream | PortKind::Future => match output.consumers.first() {
-                        Some(consumer) => args[consumer.member][consumer.field] = Some(val),
-                        None => close(acc, val)?,
-                    },
-                }
-            }
-        }
-        send(IslandEventKind::RunReturned { member: i, values });
-        for &k in &member.dependents {
-            waiting[k] -= 1;
-            if waiting[k] == 0 {
-                let target = &plan.members[k];
-                let params = params(target, std::mem::take(&mut args[k]))?;
-                send(IslandEventKind::RunStarted { member: k });
-                calls.push(call(acc, runs[k], params, target.has_result, budget, k));
-            }
-        }
-    }
-    Ok(())
 }
 
-async fn call<D: IslandData>(
-    acc: &Accessor<D>,
-    run: Func,
-    params: Vec<Val>,
-    has_result: bool,
-    budget: u64,
-    index: usize,
-) -> (usize, wasmtime::Result<Vec<Val>>) {
-    if let Err(e) = acc.with(|mut access| access.as_context_mut().set_fuel(budget)) {
-        return (index, Err(e));
+impl<D: IslandData> NodeCaller<Val> for Members<'_, D> {
+    type Error = wasmtime::Error;
+
+    async fn call(
+        &self,
+        member: usize,
+        args: Vec<Option<Val>>,
+    ) -> wasmtime::Result<Vec<(String, Val)>> {
+        call_run(
+            self.acc,
+            &self.runs[member],
+            &self.plan.members[member],
+            args,
+            self.budget,
+        )
+        .await
     }
-    let mut results = if has_result {
+
+    fn close(&self, val: Val) -> wasmtime::Result<()> {
+        close(self.acc, val)
+    }
+
+    fn missing_input(&self, member: usize, field: &PortName) -> wasmtime::Error {
+        wasmtime::format_err!("{}", missing_input_message(self.plan, member, field))
+    }
+}
+
+/// Calls a member's `run` with its collected inputs, after resetting the
+/// Store's fuel to `budget`, and returns its outputs by field name.
+async fn call_run<D: IslandData>(
+    acc: &Accessor<D>,
+    run: &Func,
+    plan: &MemberPlan,
+    args: Vec<Option<Val>>,
+    budget: u64,
+) -> wasmtime::Result<Vec<(String, Val)>> {
+    let params = params(plan, args)?;
+    acc.with(|mut access| access.as_context_mut().set_fuel(budget))?;
+    let mut results = if plan.has_result {
         vec![Val::Bool(false)]
     } else {
         Vec::new()
     };
-    let outcome = run.call_concurrent(acc, &params, &mut results).await;
-    (index, outcome.map(|()| results))
-}
-
-/// Builds `run`'s parameter list from a member's collected inputs, one per
-/// field of its `inputs` record.
-fn params(member: &MemberPlan, args: Vec<Option<Val>>) -> wasmtime::Result<Vec<Val>> {
-    let Some(fields) = &member.inputs else {
-        return Ok(Vec::new());
-    };
-    let mut record = Vec::with_capacity(fields.len());
-    let mut args = args.into_iter();
-    for field in fields {
-        let value = args.next().flatten();
-        let value = if field.optional {
-            Val::Option(value.map(Box::new))
-        } else {
-            value.ok_or_else(|| {
-                wasmtime::format_err!(
-                    "no value for required input `{}.{}`",
-                    member.node,
-                    field.name
-                )
-            })?
-        };
-        record.push((field.name.to_string(), value));
-    }
-    Ok(vec![Val::Record(record)])
+    run.call_concurrent(acc, &params, &mut results).await?;
+    Ok(match results.into_iter().next() {
+        Some(Val::Record(fields)) => fields,
+        _ => Vec::new(),
+    })
 }
 
 /// Drops the host's copy of an unconsumed stream or future handle so the
@@ -809,6 +1237,146 @@ fn close<D: IslandData>(acc: &Accessor<D>, val: Val) -> wasmtime::Result<()> {
         Val::Stream(mut stream) => acc.with(|mut access| stream.close(&mut access)),
         Val::Future(mut future) => acc.with(|mut access| future.close(&mut access)),
         _ => Ok(()),
+    }
+}
+
+/// Builds `run`'s parameter list from a member's collected inputs, one per
+/// field of its `inputs` record. [`drive`] has checked that every required
+/// input has a value.
+fn params(member: &MemberPlan, args: Vec<Option<Val>>) -> wasmtime::Result<Vec<Val>> {
+    let Some(fields) = &member.inputs else {
+        return Ok(Vec::new());
+    };
+    let mut record = Vec::with_capacity(fields.len());
+    let mut args = args.into_iter();
+    for field in fields {
+        let value = args.next().flatten();
+        let value = match (field.optional, value) {
+            (true, value) => Val::Option(value.map(Box::new)),
+            (false, Some(value)) => value,
+            (false, None) => wasmtime::bail!("`{}.{}` has no value", member.node, field.name),
+        };
+        record.push((field.name.to_string(), value));
+    }
+    Ok(vec![Val::Record(record)])
+}
+
+/// An island's members, in island order, with what instantiating each
+/// needs.
+pub(crate) type IslandBinaries<D> = Vec<(NodeId, Arc<NodeBinary<D>>)>;
+
+/// The wasmtime executor: runs each island of a graph in a Store of its
+/// own, with the embedder's [`Host`] providing capabilities and Store data.
+pub(crate) struct Wasmtime<H: Host> {
+    pub(crate) host: H,
+    pub(crate) engine: Engine,
+    pub(crate) settings: StoreSettings,
+    /// What a new island Store's memory is limited to.
+    pub(crate) max_island_memory: Option<usize>,
+    /// Per island, in island order: its members with what instantiating
+    /// each needs, for rebuilds.
+    pub(crate) binaries: Vec<IslandBinaries<H::Data>>,
+    /// Per island: which of its members share a Store (see
+    /// [`IslandStore`]), as positions in the island.
+    pub(crate) cells: Vec<Vec<Vec<usize>>>,
+    /// Payload type of every Value input port (inner type when optional).
+    pub(crate) input_types: HashMap<PortRef, Type>,
+    /// Type of every Value output port.
+    pub(crate) output_types: HashMap<PortRef, Type>,
+}
+
+/// The data of a new Store for each of an island's `cells` (positions in
+/// `members`, the island's), all charged against one `memory_limit`.
+pub(crate) fn island_data<H: Host>(
+    host: &H,
+    memory_limit: Option<usize>,
+    members: &[(&NodeId, &NodeBinary<H::Data>)],
+    cells: &[Vec<usize>],
+) -> Vec<wasmtime::Result<H::Data>> {
+    let components = cells.iter().map(|cell| {
+        cell.iter()
+            .filter_map(|member| members.get(*member))
+            .map(|(_, binary)| binary.components)
+            .sum()
+    });
+    let states = HostState::island(memory_limit, components);
+    cells
+        .iter()
+        .zip(states)
+        .map(|(cell, state)| {
+            let nodes: Vec<NodeId> = cell
+                .iter()
+                .filter_map(|member| members.get(*member))
+                .map(|(node, _)| (*node).clone())
+                .collect();
+            // The embedder's code: a panic in it fails this Store (a rebuild
+            // then faults with `Restart`) rather than unwinding through the
+            // scheduler while it swaps the island's state.
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                host.island_data(&nodes, state)
+            }))
+            .unwrap_or_else(|_| Err(wasmtime::format_err!("`Host::island_data` panicked")))
+        })
+        .collect()
+}
+
+impl<H: Host> Executor for Wasmtime<H> {
+    type Value = Val;
+    type Type = Type;
+    type Island = IslandStore<H::Data>;
+
+    fn run(
+        &self,
+        island: Self::Island,
+        generation: Generation<Val>,
+    ) -> GenerationFuture<Self::Island> {
+        run_generation(island, generation, self.settings).boxed()
+    }
+
+    fn rebuild_and_run(&self, generation: Generation<Val>) -> GenerationFuture<Self::Island> {
+        let index = generation.plan.index;
+        let members = self.binaries.get(index).cloned().unwrap_or_default();
+        let cells = self.cells.get(index).cloned().unwrap_or_default();
+        let parts: Vec<(&NodeId, &NodeBinary<H::Data>)> = members
+            .iter()
+            .map(|(node, binary)| (node, &**binary))
+            .collect();
+        let data = island_data(&self.host, self.max_island_memory, &parts, &cells);
+        rebuild_and_run(
+            self.engine.clone(),
+            members,
+            cells,
+            data,
+            generation,
+            self.settings,
+        )
+        .boxed()
+    }
+
+    fn option_payload(value: &Val) -> OptionPayload<'_, Val> {
+        option_payload(value)
+    }
+
+    fn port_type(&self, port: &PortRef, direction: PortDirection) -> Option<&Type> {
+        match direction {
+            PortDirection::Input => self.input_types.get(port),
+            PortDirection::Output => self.output_types.get(port),
+        }
+    }
+
+    fn check_input(&self, ty: &Type, value: Val) -> Result<Val, String> {
+        check_type(ty, &value)?;
+        Ok(canonical(ty, value))
+    }
+
+    fn parse_wave(&self, ty: &Type, text: &str) -> Result<Val, String> {
+        parse_wave(ty, text)
+    }
+
+    /// Rendering into a `String` cannot fail, and a Value port never holds
+    /// a kind WAVE cannot render (a handle, say).
+    fn to_wave(&self, value: &Val) -> String {
+        value.to_wave().unwrap_or_default()
     }
 }
 
@@ -822,7 +1390,11 @@ fn classify(
     if error.downcast_ref::<wasmtime::Trap>() == Some(&wasmtime::Trap::OutOfFuel) {
         return (NodeFault::FuelExhausted, None);
     }
-    if let Some(exceeded) = error.downcast_ref::<MemoryLimitExceeded>() {
+    // A pump's charge arrives wrapped in the failed write's error.
+    if let Some(exceeded) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<MemoryLimitExceeded>())
+    {
         let MemoryLimitExceeded { requested, limit } = *exceeded;
         return (NodeFault::MemoryLimit { requested, limit }, None);
     }
@@ -841,12 +1413,12 @@ fn classify(
     )
 }
 
-/// What a connection that unwraps an option delivers for `val`: the
-/// payload of `some`, or `None` for `none` (an absent optional input).
-pub(crate) fn option_payload(val: &Val) -> Option<&Val> {
+/// What a connection that unwraps an option delivers for `val`.
+pub(crate) fn option_payload(val: &Val) -> OptionPayload<'_, Val> {
     match val {
-        Val::Option(payload) => payload.as_deref(),
-        other => Some(other),
+        Val::Option(Some(payload)) => OptionPayload::Some(Cow::Borrowed(payload)),
+        Val::Option(None) => OptionPayload::None,
+        _ => OptionPayload::NotOption,
     }
 }
 
@@ -854,217 +1426,14 @@ pub(crate) fn option_payload(val: &Val) -> Option<&Val> {
 /// WAVE's own parser, it rejects record fields, cases and flags the type
 /// does not have, and fields given twice.
 pub(crate) fn parse_wave(ty: &Type, text: &str) -> Result<Val, String> {
-    let parsed = UntypedValue::parse(text).map_err(|e| format!("{e:#}"))?;
-    check_labels(ty, parsed.node(), text)?;
-    let val: Val = parsed.to_wasm_value(ty).map_err(|e| format!("{e:#}"))?;
+    let val: Val = witgraph_ir::wave::parse(ty, text)?;
     Ok(canonical(ty, val))
 }
 
-/// Checks every label in parsed WAVE text against `ty`. Shape mismatches
-/// are left to the typed conversion, which reports them.
-fn check_labels(ty: &Type, node: &Node, src: &str) -> Result<(), String> {
-    match (ty, node.ty()) {
-        (Type::Record(record), NodeType::Record) => {
-            let fields = node.as_record(src).map_err(|e| format!("{e:#}"))?;
-            let mut seen = Vec::new();
-            for (label, value) in fields {
-                if seen.contains(&label) {
-                    return Err(format!("field `{label}` is given twice"));
-                }
-                seen.push(label);
-                let field = record
-                    .fields()
-                    .find(|f| f.name == label)
-                    .ok_or_else(|| format!("the record has no field `{label}`"))?;
-                check_labels(&field.ty, value, src).map_err(|e| format!("field `{label}`: {e}"))?;
-            }
-            Ok(())
-        }
-        (Type::List(list), NodeType::List) => {
-            let elem = list.ty();
-            let items = node.as_list().map_err(|e| format!("{e:#}"))?;
-            items
-                .into_iter()
-                .try_for_each(|item| check_labels(&elem, item, src))
-        }
-        (Type::FixedLengthList(list), NodeType::List) => {
-            let elem = list.ty();
-            let items = node.as_list().map_err(|e| format!("{e:#}"))?;
-            items
-                .into_iter()
-                .try_for_each(|item| check_labels(&elem, item, src))
-        }
-        (Type::Tuple(tuple), NodeType::Tuple) => {
-            let items = node.as_tuple().map_err(|e| format!("{e:#}"))?;
-            tuple
-                .types()
-                .zip(items)
-                .try_for_each(|(ty, item)| check_labels(&ty, item, src))
-        }
-        (Type::Option(option), NodeType::OptionSome | NodeType::OptionNone) => {
-            match node.as_option().map_err(|e| format!("{e:#}"))? {
-                Some(payload) => check_labels(&option.ty(), payload, src),
-                None => Ok(()),
-            }
-        }
-        // An option's payload may be written bare.
-        (Type::Option(option), _) => check_labels(&option.ty(), node, src),
-        (Type::Result(result), NodeType::ResultOk | NodeType::ResultErr) => {
-            match node.as_result().map_err(|e| format!("{e:#}"))? {
-                Ok(Some(payload)) => match result.ok() {
-                    Some(ty) => check_labels(&ty, payload, src),
-                    None => Ok(()),
-                },
-                Err(Some(payload)) => match result.err() {
-                    Some(ty) => check_labels(&ty, payload, src),
-                    None => Ok(()),
-                },
-                _ => Ok(()),
-            }
-        }
-        (Type::Variant(variant), NodeType::Label | NodeType::VariantWithPayload) => {
-            let (label, payload) = node.as_variant(src).map_err(|e| format!("{e:#}"))?;
-            let case = variant
-                .cases()
-                .find(|c| c.name == label)
-                .ok_or_else(|| format!("the variant has no case `{label}`"))?;
-            match (case.ty, payload) {
-                (Some(ty), Some(payload)) => check_labels(&ty, payload, src),
-                _ => Ok(()),
-            }
-        }
-        (Type::Enum(cases), NodeType::Label) => {
-            let label = node.as_enum(src).map_err(|e| format!("{e:#}"))?;
-            if cases.names().any(|case| case == label) {
-                Ok(())
-            } else {
-                Err(format!("the enum has no case `{label}`"))
-            }
-        }
-        (Type::Flags(flags), NodeType::Flags) => {
-            let set = node.as_flags(src).map_err(|e| format!("{e:#}"))?;
-            let mut seen = Vec::new();
-            for flag in set {
-                if !flags.names().any(|name| name == flag) {
-                    return Err(format!("the flags have no flag `{flag}`"));
-                }
-                if seen.contains(&flag) {
-                    return Err(format!("flag `{flag}` is given twice"));
-                }
-                seen.push(flag);
-            }
-            Ok(())
-        }
-        _ => Ok(()),
-    }
-}
-
-/// Checks that `val` structurally has value type `ty` (record field names
-/// and order, case names, numeric widths). Handles and resources are never
-/// port values.
+/// Checks that `val` has type `ty`, as every executor does
+/// ([`witgraph_ir::wave::check_value`]).
 pub(crate) fn check_type(ty: &Type, val: &Val) -> Result<(), String> {
-    let mismatch = || Err(format!("expected {}, found {}", ty.kind(), val.kind()));
-    let payload = |ty: Option<Type>, val: &Option<Box<Val>>| match (ty, val) {
-        (None, None) => Ok(()),
-        (Some(ty), Some(val)) => check_type(&ty, val),
-        (Some(_), None) => Err("missing payload".to_string()),
-        (None, Some(_)) => Err("unexpected payload".to_string()),
-    };
-    match (ty, val) {
-        (Type::Bool, Val::Bool(_))
-        | (Type::S8, Val::S8(_))
-        | (Type::U8, Val::U8(_))
-        | (Type::S16, Val::S16(_))
-        | (Type::U16, Val::U16(_))
-        | (Type::S32, Val::S32(_))
-        | (Type::U32, Val::U32(_))
-        | (Type::S64, Val::S64(_))
-        | (Type::U64, Val::U64(_))
-        | (Type::Float32, Val::Float32(_))
-        | (Type::Float64, Val::Float64(_))
-        | (Type::Char, Val::Char(_))
-        | (Type::String, Val::String(_)) => Ok(()),
-        (Type::List(list), Val::List(items)) => {
-            let elem = list.ty();
-            items.iter().try_for_each(|item| check_type(&elem, item))
-        }
-        (Type::FixedLengthList(list), Val::FixedLengthList(items)) => {
-            if items.len() != list.len() as usize {
-                return Err(format!(
-                    "expected {} elements, found {}",
-                    list.len(),
-                    items.len()
-                ));
-            }
-            let elem = list.ty();
-            items.iter().try_for_each(|item| check_type(&elem, item))
-        }
-        (Type::Map(map), Val::Map(entries)) => entries.iter().try_for_each(|(k, v)| {
-            check_type(&map.key(), k)?;
-            check_type(&map.value(), v)
-        }),
-        (Type::Record(record), Val::Record(fields)) => {
-            if record.fields().len() != fields.len() {
-                return mismatch();
-            }
-            record
-                .fields()
-                .zip(fields)
-                .try_for_each(|(field, (name, value))| {
-                    if field.name != name {
-                        return Err(format!("expected field `{}`, found `{name}`", field.name));
-                    }
-                    check_type(&field.ty, value).map_err(|e| format!("field `{name}`: {e}"))
-                })
-        }
-        (Type::Tuple(tuple), Val::Tuple(items)) => {
-            if tuple.types().len() != items.len() {
-                return mismatch();
-            }
-            tuple
-                .types()
-                .zip(items)
-                .try_for_each(|(ty, item)| check_type(&ty, item))
-        }
-        (Type::Variant(variant), Val::Variant(name, value)) => {
-            match variant.cases().find(|case| case.name == name) {
-                Some(case) => payload(case.ty, value).map_err(|e| format!("case `{name}`: {e}")),
-                None => Err(format!("no case `{name}`")),
-            }
-        }
-        (Type::Enum(cases), Val::Enum(name)) => {
-            if cases.names().any(|case| case == name) {
-                Ok(())
-            } else {
-                Err(format!("no case `{name}`"))
-            }
-        }
-        (Type::Option(option), Val::Option(value)) => match value {
-            Some(value) => check_type(&option.ty(), value),
-            None => Ok(()),
-        },
-        (Type::Result(result), Val::Result(value)) => match value {
-            Ok(ok) => payload(result.ok(), ok),
-            Err(err) => payload(result.err(), err),
-        },
-        (Type::Flags(flags), Val::Flags(set)) => {
-            if let Some(flag) = set
-                .iter()
-                .find(|flag| !flags.names().any(|name| name == flag.as_str()))
-            {
-                return Err(format!("no flag `{flag}`"));
-            }
-            match set
-                .iter()
-                .enumerate()
-                .find(|(i, flag)| set[..*i].contains(flag))
-            {
-                Some((_, flag)) => Err(format!("flag `{flag}` is set twice")),
-                None => Ok(()),
-            }
-        }
-        _ => mismatch(),
-    }
+    witgraph_ir::wave::check_value(ty, val)
 }
 
 /// `val` (of type `ty`, as [`check_type`] accepts it) in the one form a
@@ -1162,6 +1531,7 @@ mod tests {
         let binary = NodeBinary {
             pre: linker.instantiate_pre(&component).unwrap(),
             export: "node".into(),
+            components: 1,
         };
         let settings = StoreSettings {
             yield_interval: 100_000,
@@ -1171,7 +1541,8 @@ mod tests {
         let (_, signatures) = build_island(
             &engine,
             &[(&node, &binary)],
-            HostState::new(None, 1),
+            &[vec![0]],
+            HostState::island(None, [1]),
             settings,
         )
         .await
@@ -1188,7 +1559,8 @@ mod tests {
     #[test]
     fn island_memory_counts_tables_and_skips_failed_growth() {
         use wasmtime::ResourceLimiter;
-        let mut state = HostState::new(Some(64 * 1024), 2);
+        let mut states = HostState::island(Some(64 * 1024), [2, 1]);
+        let mut state = states.remove(0);
         assert!(state.memory_growing(0, 65536, None).unwrap());
         assert!(
             state.table_growing(0, 16 << 20, None).is_err(),
@@ -1196,7 +1568,7 @@ mod tests {
         );
         // A grow past the memory's own maximum fails, and costs nothing.
         assert!(!state.memory_growing(65536, 131072, Some(65536)).unwrap());
-        assert_eq!(state.memory, 65536);
+        assert_eq!(state.memory.used.load(Ordering::Relaxed), 65536);
         // A failure wasmtime reports refunds nothing: it could be forged.
         state
             .memory_grow_failed(wasmtime::format_err!("no"))
@@ -1204,12 +1576,17 @@ mod tests {
         state
             .table_grow_failed(wasmtime::format_err!("no"))
             .unwrap();
-        assert_eq!(state.memory, 65536);
+        assert_eq!(state.memory.used.load(Ordering::Relaxed), 65536);
         let err = state.memory_growing(65536, 131072, None).unwrap_err();
         assert!(err.downcast_ref::<MemoryLimitExceeded>().is_some());
-        assert_eq!(state.instances(), 2 * INSTANCES_PER_MEMBER);
-        assert_eq!(state.memories(), 2 * MEMORIES_PER_MEMBER);
-        assert_eq!(state.tables(), 2 * MEMORIES_PER_MEMBER);
+        // The island's other Store draws on the same limit.
+        let mut other = states.remove(0);
+        let err = other.memory_growing(0, 1, None).unwrap_err();
+        assert!(err.downcast_ref::<MemoryLimitExceeded>().is_some());
+        assert_eq!(other.instances(), INSTANCES_PER_COMPONENT);
+        assert_eq!(state.instances(), 2 * INSTANCES_PER_COMPONENT);
+        assert_eq!(state.memories(), 2 * MEMORIES_PER_COMPONENT);
+        assert_eq!(state.tables(), 2 * MEMORIES_PER_COMPONENT);
     }
 
     #[test]
@@ -1222,9 +1599,12 @@ mod tests {
     #[test]
     fn option_payloads_unwrap() {
         let some = Val::Option(Some(Box::new(Val::U32(5))));
-        assert_eq!(option_payload(&some), Some(&Val::U32(5)));
-        assert_eq!(option_payload(&Val::Option(None)), None);
-        assert_eq!(option_payload(&Val::U32(5)), Some(&Val::U32(5)));
+        assert_eq!(
+            option_payload(&some),
+            OptionPayload::Some(Cow::Borrowed(&Val::U32(5)))
+        );
+        assert_eq!(option_payload(&Val::Option(None)), OptionPayload::None);
+        assert_eq!(option_payload(&Val::U32(5)), OptionPayload::NotOption);
     }
 
     /// Change detection is `Val ==`: the README promises how floats compare.
@@ -1302,6 +1682,26 @@ mod tests {
         let ty = echo_in_type().await;
         assert_eq!(parse_wave(&ty, "1.5"), Ok(Val::Float64(1.5)));
         assert!(parse_wave(&ty, "\"wrong\"").is_err());
+    }
+
+    #[test]
+    fn a_fault_is_pinned_only_on_the_one_member_of_its_store() {
+        let trap = NodeFault::WasmTrap {
+            message: "boom".into(),
+        };
+        let memory = NodeFault::MemoryLimit {
+            requested: 2,
+            limit: 1,
+        };
+        // A Store of one member, in an island of several Stores.
+        assert_eq!(pinned_on(&trap, &[2], 3), Some(2));
+        assert_eq!(pinned_on(&NodeFault::FuelExhausted, &[2], 3), Some(2));
+        // The Stores share the memory limit.
+        assert_eq!(pinned_on(&memory, &[2], 3), None);
+        // A Store of several members.
+        assert_eq!(pinned_on(&trap, &[0, 1], 3), None);
+        // An island of one: the scheduler names its member.
+        assert_eq!(pinned_on(&trap, &[0], 1), None);
     }
 
     #[tokio::test]

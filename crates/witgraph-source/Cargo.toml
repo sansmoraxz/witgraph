@@ -1,0 +1,30 @@
+[package]
+name = "witgraph-source"
+description = "Resolving witgraph component bytes from files and OCI registries"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+witgraph-ir = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true, features = ["std"] }
+sha2 = { workspace = true }
+hex = { workspace = true }
+oci-client = { version = "0.18", default-features = false, features = ["rustls-tls"] }
+tokio = { version = "1", features = ["fs", "io-util", "rt"] }
+futures = "0.3"
+bytes = "1"
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tokio = { version = "1", features = ["rt", "macros", "net", "io-util", "time"] }
+witgraph-wit = { path = "../witgraph-wit" }
+witgraph-runtime = { workspace = true }
+test-components = { path = "../../test-fixtures/test-components" }

@@ -11,6 +11,6 @@ world relay {
         record outputs {
             out: u32,
         }
-        run: func(inputs: inputs) -> outputs;
+        run: async func(inputs: inputs) -> outputs;
     }
 }

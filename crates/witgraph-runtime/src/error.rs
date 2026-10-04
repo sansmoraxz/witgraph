@@ -1,20 +1,34 @@
-//! Error types for the witgraph runtime.
-//!
-//! Two tiers: [`RuntimeError`] for failures the host sees when loading or
-//! driving the graph, and [`NodeFault`] for a failure inside an island,
-//! which faults every node of that island.
+//! What loading a graph's components can fail with ([`LoadError`]),
+//! besides the scheduler's [`RuntimeError`].
 
-use witgraph_ir::{ComponentRef, ConnectionId, NodeId, PortDirection, PortName};
+use witgraph_ir::{ComponentRef, NodeId};
+use witgraph_sched::RuntimeError;
 
-/// A graph-level runtime error: loading, or a host call with bad arguments.
+/// Why a graph could not be loaded: its components, their links and
+/// capabilities, or instantiating its islands; or a [`RuntimeError`] (an
+/// invalid config, say).
 #[derive(Debug, Clone, thiserror::Error, miette::Diagnostic)]
-pub enum RuntimeError {
+pub enum LoadError {
+    /// A link names its provider without a content hash, and several
+    /// pinned keys of the WASM map match it: which bytes to compose in is
+    /// not known.
+    #[error(
+        "provider `{provider}` matches several components: {}; pin it, or key one without a hash",
+        candidates.iter().map(|c| format!("`{c:#}`")).collect::<Vec<_>>().join(", ")
+    )]
+    #[diagnostic(code(witgraph::load::ambiguous_provider))]
+    AmbiguousProvider {
+        /// The provider as the link names it.
+        provider: Box<ComponentRef>,
+        /// The keys that match it.
+        candidates: Vec<ComponentRef>,
+    },
     /// A component has no corresponding WASM bytes.
     #[error(
         "no WASM component provided for `{component}`{}",
         component.content_hash.as_ref().map(|h| format!(" (content hash {h})")).unwrap_or_default()
     )]
-    #[diagnostic(code(witgraph::runtime::missing_wasm))]
+    #[diagnostic(code(witgraph::load::missing_wasm))]
     MissingWasm {
         /// The component missing its bytes.
         component: Box<ComponentRef>,
@@ -23,7 +37,7 @@ pub enum RuntimeError {
     /// not be decoded or lowered into exactly one node contract, or failed
     /// to compile on the engine.
     #[error("component `{component}` does not describe a witgraph node: {message}")]
-    #[diagnostic(code(witgraph::runtime::bad_component))]
+    #[diagnostic(code(witgraph::load::bad_component))]
     BadComponent {
         /// The component whose bytes were rejected.
         component: Box<ComponentRef>,
@@ -34,154 +48,91 @@ pub enum RuntimeError {
     /// graph was compiled against: other ports or `run` kind, or an import
     /// the contract does not declare as a capability.
     #[error("component `{component}` does not match its contract: {message}")]
-    #[diagnostic(code(witgraph::runtime::contract_mismatch))]
+    #[diagnostic(code(witgraph::load::contract_mismatch))]
     ContractMismatch {
         /// The component whose bytes were rejected.
         component: Box<ComponentRef>,
         /// The first difference found.
         message: String,
     },
+    /// A [`Link`](witgraph_ir::Link) could not be made: the provider has no
+    /// such export, the export does not fit the node's import, or the node
+    /// and its providers do not compose.
+    #[error("component `{component}` cannot link import `{import}`: {message}")]
+    #[diagnostic(code(witgraph::load::bad_link))]
+    BadLink {
+        /// The node's component.
+        component: Box<ComponentRef>,
+        /// The import the link satisfies.
+        import: String,
+        /// What went wrong.
+        message: String,
+    },
     /// A node failed to link or instantiate (a missing capability import,
     /// a trapping start function, an island over its memory limit), or
-    /// [`Host::island_data`](crate::Host::island_data) failed for its
+    /// the host failed to make the data of its
     /// island.
     #[error("failed to instantiate node `{node}`: {message}")]
-    #[diagnostic(code(witgraph::runtime::instantiation))]
+    #[diagnostic(code(witgraph::load::instantiation))]
     Instantiation {
         /// The node whose component could not be instantiated.
         node: NodeId,
         /// The underlying error message.
         message: String,
     },
-    /// A restore was attempted while a generation is in flight. Restore
-    /// onto a freshly loaded graph, or after `shutdown`/`cancel`.
-    #[error("a generation is in flight; restore needs a graph with nothing in flight")]
-    #[diagnostic(code(witgraph::runtime::not_quiescent))]
-    NotQuiescent,
-    /// A snapshot was taken from a different graph.
-    #[error("snapshot does not belong to this graph: {message}")]
-    #[diagnostic(code(witgraph::runtime::snapshot_mismatch))]
-    SnapshotMismatch {
-        /// What differs.
-        message: String,
-    },
-    /// A snapshot value is not valid for its port.
-    #[error("snapshot value for `{node}.{port}` is not valid: {message}")]
-    #[diagnostic(code(witgraph::runtime::snapshot_value))]
-    SnapshotValue {
-        /// The node the value belongs to.
-        node: NodeId,
-        /// The port the value belongs to.
-        port: PortName,
-        /// Why it was rejected (WAVE parse error, unknown port, ...).
-        message: String,
-    },
-    /// A referenced node does not exist in the graph.
-    #[error("unknown node `{node}`")]
-    #[diagnostic(code(witgraph::runtime::unknown_node))]
-    UnknownNode {
-        /// The missing node.
-        node: NodeId,
-    },
-    /// A referenced port is not a Value input (for [`inject`] and
-    /// [`clear_input`]) or Value output (for [`read_output`]) of the node.
-    ///
-    /// [`inject`]: crate::RuntimeGraph::inject
-    /// [`clear_input`]: crate::RuntimeGraph::clear_input
-    /// [`read_output`]: crate::RuntimeGraph::read_output
-    #[error("`{node}.{port}` is not a Value {direction} port")]
-    #[diagnostic(code(witgraph::runtime::not_a_value_port))]
-    NotAValuePort {
-        /// The node.
-        node: NodeId,
-        /// The port.
-        port: PortName,
-        /// Which kind of port was expected.
-        direction: PortDirection,
-    },
-    /// [`inject`](crate::RuntimeGraph::inject) targeted an input that a
-    /// non-feedback connection writes. An input has one writer: inject
-    /// only into unconnected inputs and inputs fed by feedback connections.
+    /// A node imports a capability the host does not provide
+    /// ([`Host::check`](crate::Host::check)). Reported before anything is
+    /// linked.
     #[error(
-        "`{node}.{port}` is written by connection `{connection}`; only unconnected and feedback-fed inputs take injected values"
+        "node `{node}` imports capability `{capability}`{}, which the host does not provide",
+        implements.as_ref().map(|i| format!(" (`{i}`)")).unwrap_or_default()
     )]
-    #[diagnostic(code(witgraph::runtime::connected_input))]
-    ConnectedInput {
-        /// The node.
+    #[diagnostic(code(witgraph::load::missing_capability))]
+    MissingCapability {
+        /// The node importing it.
         node: NodeId,
-        /// The port.
-        port: PortName,
-        /// The connection writing the port.
-        connection: ConnectionId,
+        /// The capability, as the node imports it.
+        capability: String,
+        /// For a labelled import, the interface the label stands for.
+        implements: Option<String>,
     },
-    /// An injected value does not have the port's type.
-    #[error("value for `{node}.{port}` does not have the port's type: {message}")]
-    #[diagnostic(code(witgraph::runtime::value_type))]
-    ValueType {
-        /// The node.
+    /// Several providers could serve a capability a node imports, and
+    /// nothing picks one.
+    #[error(
+        "node `{node}` imports capability `{capability}`{}, which {} could each provide; {}",
+        implements.as_ref().map(|i| format!(" (`{i}`)")).unwrap_or_default(),
+        providers.iter().map(|p| format!("`{p}`")).collect::<Vec<_>>().join(", "),
+        ambiguity_fix(capability, implements.is_some())
+    )]
+    #[diagnostic(code(witgraph::load::ambiguous_capability))]
+    AmbiguousCapability {
+        /// The node importing it.
         node: NodeId,
-        /// The port.
-        port: PortName,
-        /// Why the value was rejected.
-        message: String,
+        /// The capability, as the node imports it.
+        capability: String,
+        /// For a labelled import, the interface the label stands for.
+        implements: Option<String>,
+        /// The ids of the providers that could serve it.
+        providers: Vec<String>,
     },
-    /// The runtime configuration is invalid.
-    #[error("invalid config: {message}")]
-    #[diagnostic(code(witgraph::runtime::invalid_config))]
-    InvalidConfig {
-        /// What is wrong with the configuration.
-        message: String,
-    },
+    /// A scheduler error: an invalid config, an unknown node, or a graph
+    /// the scheduler cannot run.
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    Runtime(#[from] RuntimeError),
 }
 
-/// Why an island faulted. Every node of the island carries the same fault;
-/// a trap poisons the island's whole Store.
-#[derive(Debug, Clone, thiserror::Error, miette::Diagnostic)]
-pub enum NodeFault {
-    /// A component in the island trapped (spawned tasks included).
-    #[error("WASM trap: {message}")]
-    #[diagnostic(code(witgraph::runtime::wasm_trap))]
-    WasmTrap {
-        /// The trap message.
-        message: String,
-    },
-    /// Growing a linear memory or table would have taken the island past
-    /// [`RuntimeConfig::max_island_memory`](crate::RuntimeConfig::max_island_memory).
-    #[error("the island needs {requested} bytes of memory, over its limit of {limit}")]
-    #[diagnostic(code(witgraph::runtime::memory_limit))]
-    MemoryLimit {
-        /// The bytes the island would have held after the growth.
-        requested: usize,
-        /// The island's limit.
-        limit: usize,
-    },
-    /// One call copied more out of a guest than
-    /// [`RuntimeConfig::hostcall_fuel`](crate::RuntimeConfig::hostcall_fuel)
-    /// allows.
-    #[error("a call copied more data out of the guest than `hostcall_fuel` allows")]
-    #[diagnostic(code(witgraph::runtime::hostcall_fuel))]
-    HostcallFuelExhausted,
-    /// The island burned its whole fuel budget
-    /// ([`RuntimeConfig::fuel_per_run`](crate::RuntimeConfig::fuel_per_run))
-    /// before its next `run` started.
-    #[error("fuel exhausted")]
-    #[diagnostic(code(witgraph::runtime::fuel_exhausted))]
-    FuelExhausted,
-    /// A node called `witgraph:runtime/host.fatal`. The tick that saw it
-    /// returned [`TickResult::Aborted`](crate::TickResult::Aborted).
-    #[error("fatal: {message}")]
-    #[diagnostic(code(witgraph::runtime::fatal))]
-    Fatal {
-        /// The message passed to `fatal`.
-        message: String,
-    },
-    /// Rebuilding the stopped island, at the start of its next generation,
-    /// failed: a member failed to instantiate, or
-    /// [`Host::island_data`](crate::Host::island_data) failed.
-    #[error("restart failed: {message}")]
-    #[diagnostic(code(witgraph::runtime::restart))]
-    Restart {
-        /// Why the island could not be rebuilt.
-        message: String,
-    },
+/// What resolves an ambiguous capability: renaming its label after one
+/// provider, labelling it so (an interface imported by its id), or else
+/// keeping only one of the providers.
+fn ambiguity_fix(capability: &str, labelled: bool) -> &'static str {
+    // Only an interface id has a `/`.
+    let by_id = capability.contains('/');
+    if labelled {
+        "rename the label after one of them"
+    } else if by_id {
+        "import it under a label naming one of them"
+    } else {
+        "WIT cannot label it, so register only one of them"
+    }
 }

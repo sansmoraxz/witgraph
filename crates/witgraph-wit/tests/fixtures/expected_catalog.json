@@ -1,11 +1,11 @@
 {
-  "schema_version": 4,
+  "schema_version": 5,
   "components": [
     {
-      "id": "demo:graph/accumulator@0.1.0#fd5fdb481f6c365ad4a567fba802fbba22b74da25a0e85bf86c13729d787e289",
+      "id": "demo:graph/accumulator@0.1.0#94faeb0830cf0001362e34384e96a9944dfbce1a8a469a49a1f13ebe8af2e2bb",
       "package": "demo:graph@0.1.0",
       "world": "accumulator",
-      "content_hash": "fd5fdb481f6c365ad4a567fba802fbba22b74da25a0e85bf86c13729d787e289",
+      "content_hash": "94faeb0830cf0001362e34384e96a9944dfbce1a8a469a49a1f13ebe8af2e2bb",
       "docs": "Integrates deltas into a running total carried across iterations.",
       "inputs": [
         {
@@ -30,7 +30,6 @@
           "optional": false
         }
       ],
-      "run": "sync",
       "capabilities": []
     },
     {
@@ -48,7 +47,6 @@
         }
       ],
       "outputs": [],
-      "run": "async",
       "capabilities": []
     },
     {
@@ -81,7 +79,6 @@
           "docs": "The scaled total, resolved when `samples` closes."
         }
       ],
-      "run": "async",
       "capabilities": [],
       "types": [
         {
@@ -111,7 +108,6 @@
         }
       ],
       "outputs": [],
-      "run": "async",
       "capabilities": [],
       "types": [
         {
@@ -149,9 +145,10 @@
           "docs": "Resolves with a summary when the input stream closes."
         }
       ],
-      "run": "async",
       "capabilities": [
-        "demo:caps/log@0.1.0"
+        {
+          "name": "demo:caps/log@0.1.0"
+        }
       ],
       "types": [
         {
@@ -198,9 +195,10 @@
           "docs": "One item each time a reading crosses the configured threshold."
         }
       ],
-      "run": "async",
       "capabilities": [
-        "demo:caps/clock@0.1.0"
+        {
+          "name": "demo:caps/clock@0.1.0"
+        }
       ],
       "types": [
         {

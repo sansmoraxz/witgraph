@@ -6,17 +6,19 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use test_components::{
-    BUSY_LOOP, CONFIGURABLE, ECHO, Guest, MAYBE, MQTT_NODE, NAMED_ECHO, RELAY, RELAY_PLUS,
-    RELAY_WIDE, STREAM_CONSUMER, STREAM_PRODUCER,
+    BUSY_LOOP, CALC, CONFIGURABLE, ECHO, FUTURE_WRITER, Guest, LABELLED, MATH, MAYBE, MQTT_NODE,
+    NAMED_ECHO, READING_CONSUMER, READING_PRODUCER, RELAY, RELAY_PLUS, RELAY_WIDE, STREAM_CONSUMER,
+    STREAM_DRAIN, STREAM_PRODUCER, STREAM_RELAY,
 };
 use wasmtime::StoreContextMut;
 use witgraph_ir::{
-    ComponentContract, ComponentRef, Graph, GraphBuilder, NodeId, PortDirection, PortRef,
-    ResourceClaim,
+    Capability, ComponentContract, ComponentRef, Graph, GraphBuilder, NodeId, PortDirection,
+    PortRef, ResourceClaim,
 };
 use witgraph_runtime::{
-    Host, HostState, IslandSnapshot, NodeFault, NodePhase, RuntimeConfig, RuntimeError,
-    RuntimeGraph, RuntimeMode, Snapshot, TickResult, Trace, TraceEvent, Val,
+    CapabilityPlugin, Host, HostState, IslandSnapshot, LinkedProvider, LoadError, NodeFault,
+    NodePhase, PluginData, Plugins, PreparedComponent, RuntimeConfig, RuntimeError, RuntimeGraph,
+    RuntimeMode, Snapshot, TickResult, Trace, TraceEvent, Val,
 };
 
 // ---- Fixtures ----
@@ -376,7 +378,10 @@ async fn zero_limits_are_invalid() {
             .await
             .err()
             .expect("the limit is rejected");
-        assert!(matches!(err, RuntimeError::InvalidConfig { .. }), "{err}");
+        assert!(
+            matches!(err, LoadError::Runtime(RuntimeError::InvalidConfig { .. })),
+            "{err}"
+        );
     }
 }
 
@@ -507,10 +512,7 @@ async fn two_revisions_of_one_world_are_told_apart_by_hash() {
         .await
         .err()
         .expect("relay's bytes lack `doubled`");
-    assert!(
-        matches!(err, RuntimeError::ContractMismatch { .. }),
-        "{err}"
-    );
+    assert!(matches!(err, LoadError::ContractMismatch { .. }), "{err}");
 }
 
 #[tokio::test]
@@ -565,6 +567,19 @@ fn pipeline(kit: &Kit) -> Graph {
         .build()
 }
 
+/// Both island layouts: one Store per island (the default), and members
+/// joined by a pumpable stream in Stores of their own.
+fn both_layouts() -> [RuntimeConfig; 2] {
+    [RuntimeConfig::default(), split()]
+}
+
+fn split() -> RuntimeConfig {
+    RuntimeConfig {
+        split_islands: true,
+        ..RuntimeConfig::default()
+    }
+}
+
 /// Sets the producer's burst size and the consumer's take count; `None`
 /// leaves the optional input absent (endless producer / take everything).
 fn feed_pipeline<M: RuntimeMode, H: Host>(
@@ -583,54 +598,148 @@ fn feed_pipeline<M: RuntimeMode, H: Host>(
 #[tokio::test]
 async fn stream_producer_consumer_share_an_island() {
     let kit = Kit::new(&[STREAM_PRODUCER, STREAM_CONSUMER]);
-    let mut rt = kit
-        .load(pipeline(&kit), RuntimeConfig::default(), Trace::new())
-        .await;
-    feed_pipeline(&mut rt, Some(5), None);
-    assert_eq!(rt.compiled().islands().len(), 1);
-    settle(&mut rt).await;
+    for config in both_layouts() {
+        let split = config.split_islands;
+        let mut rt = kit.load(pipeline(&kit), config, Trace::new()).await;
+        feed_pipeline(&mut rt, Some(5), None);
+        assert_eq!(rt.compiled().islands().len(), 1);
+        settle(&mut rt).await;
 
-    assert_eq!(read_u32(&rt, "cons", "total"), 10);
-    assert_eq!(read_u32(&rt, "cons", "count"), 5);
-    assert_eq!(phase(&rt, "prod"), NodePhase::Idle);
-    assert_eq!(phase(&rt, "cons"), NodePhase::Idle);
-    let trace = rt.mode().trace();
-    assert!(trace.iter().any(|e| matches!(
-        e,
-        TraceEvent::GenerationFinished {
-            island: 0,
-            generation: 1
-        }
-    )));
-    assert!(faults(&trace).is_empty(), "{:?}", faults(&trace));
+        assert_eq!(read_u32(&rt, "cons", "total"), 10, "split: {split}");
+        assert_eq!(read_u32(&rt, "cons", "count"), 5, "split: {split}");
+        assert_eq!(phase(&rt, "prod"), NodePhase::Idle, "split: {split}");
+        assert_eq!(phase(&rt, "cons"), NodePhase::Idle, "split: {split}");
+        let trace = rt.mode().trace();
+        assert!(trace.iter().any(|e| matches!(
+            e,
+            TraceEvent::GenerationFinished {
+                island: 0,
+                generation: 1
+            }
+        )));
+        assert!(faults(&trace).is_empty(), "{:?}", faults(&trace));
+    }
 }
 
 #[tokio::test]
 async fn backpressure_slow_consumer_gets_every_item() {
     let kit = Kit::new(&[STREAM_PRODUCER, STREAM_CONSUMER]);
-    let mut rt = kit
-        .load(pipeline(&kit), RuntimeConfig::default(), Trace::new())
-        .await;
-    feed_pipeline(&mut rt, Some(2000), None);
-    inject(&mut rt, "cons", "delay", Val::U32(3));
-    settle(&mut rt).await;
-    assert_eq!(read_u32(&rt, "cons", "count"), 2000);
-    assert_eq!(read_u32(&rt, "cons", "total"), (0..2000).sum::<u32>());
+    for config in both_layouts() {
+        let split = config.split_islands;
+        let mut rt = kit.load(pipeline(&kit), config, Trace::new()).await;
+        feed_pipeline(&mut rt, Some(2000), None);
+        inject(&mut rt, "cons", "delay", Val::U32(3));
+        settle(&mut rt).await;
+        assert_eq!(read_u32(&rt, "cons", "count"), 2000, "split: {split}");
+        let total = (0..2000).sum::<u32>();
+        assert_eq!(read_u32(&rt, "cons", "total"), total, "split: {split}");
+    }
 }
 
 #[tokio::test]
 async fn early_reader_drop_stops_an_infinite_producer() {
     let kit = Kit::new(&[STREAM_PRODUCER, STREAM_CONSUMER]);
-    // No burst-size: the producer streams forever unless its reader goes.
+    for config in both_layouts() {
+        let split = config.split_islands;
+        // No burst-size: the producer streams forever unless its reader
+        // goes.
+        let mut rt = kit.load(pipeline(&kit), config, Trace::new()).await;
+        feed_pipeline(&mut rt, None, Some(3));
+        settle(&mut rt).await;
+        assert_eq!(read_u32(&rt, "cons", "count"), 3, "split: {split}");
+        assert_eq!(read_u32(&rt, "cons", "total"), 3, "split: {split}");
+        // The generation finished, so the producer's writer task exited.
+        assert_eq!(phase(&rt, "prod"), NodePhase::Idle, "split: {split}");
+    }
+}
+
+/// prod → relay → cons, where the relay returns the stream it was given:
+/// split, the relay's Store forwards a stream the host writes.
+fn relayed(kit: &Kit) -> Graph {
+    kit.builder("relayed")
+        .add_node("prod", kit.get(STREAM_PRODUCER))
+        .add_node("relay", kit.get(STREAM_RELAY))
+        .add_node("cons", kit.get(STREAM_CONSUMER))
+        .connect("a", port("prod", "items"), port("relay", "items"))
+        .connect("b", port("relay", "items"), port("cons", "items"))
+        .build()
+}
+
+#[tokio::test]
+async fn a_stream_passed_through_a_node_reaches_its_reader() {
+    let kit = Kit::new(&[STREAM_PRODUCER, STREAM_RELAY, STREAM_CONSUMER]);
+    for config in both_layouts() {
+        let split = config.split_islands;
+        let mut rt = kit.load(relayed(&kit), config, Trace::new()).await;
+        // More items than a pump holds at once, so the relay's Store keeps
+        // forwarding after the relay returned.
+        feed_pipeline(&mut rt, Some(100_000), None);
+        settle(&mut rt).await;
+        assert_eq!(read_u32(&rt, "cons", "count"), 100_000, "split: {split}");
+        let total = (0..100_000u32).fold(0u32, u32::wrapping_add);
+        assert_eq!(read_u32(&rt, "cons", "total"), total, "split: {split}");
+        for node in ["prod", "relay", "cons"] {
+            assert_eq!(phase(&rt, node), NodePhase::Idle, "{node}, split: {split}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_passed_through_stream_is_forwarded_after_its_reader_returned() {
+    let kit = Kit::new(&[STREAM_PRODUCER, STREAM_RELAY, STREAM_DRAIN]);
+    let graph = kit
+        .builder("drained")
+        .add_node("prod", kit.get(STREAM_PRODUCER))
+        .add_node("relay", kit.get(STREAM_RELAY))
+        .add_node("drain", kit.get(STREAM_DRAIN))
+        .connect("a", port("prod", "items"), port("relay", "items"))
+        .connect("b", port("relay", "items"), port("drain", "items"))
+        .build();
+    for config in both_layouts() {
+        let split = config.split_islands;
+        let mut rt = kit.load(graph.clone(), config, Trace::new()).await;
+        inject(&mut rt, "prod", "burst-size", Val::U32(100_000));
+        // Every call returns before the stream ends: the generation lasts
+        // until the producer has written it all and the drain read it.
+        settle(&mut rt).await;
+        for node in ["prod", "relay", "drain"] {
+            assert_eq!(phase(&rt, node), NodePhase::Idle, "{node}, split: {split}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_reader_dropping_a_passed_through_stream_stops_its_producer() {
+    let kit = Kit::new(&[STREAM_PRODUCER, STREAM_RELAY, STREAM_CONSUMER]);
+    for config in both_layouts() {
+        let split = config.split_islands;
+        for _ in 0..10 {
+            let mut rt = kit.load(relayed(&kit), config.clone(), Trace::new()).await;
+            feed_pipeline(&mut rt, None, Some(3));
+            settle(&mut rt).await;
+            assert_eq!(read_u32(&rt, "cons", "count"), 3, "split: {split}");
+            // The generation finished, so the producer's writer task exited.
+            assert_eq!(phase(&rt, "prod"), NodePhase::Idle, "split: {split}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_future_output_nothing_reads_is_closed() {
+    let kit = Kit::new(&[FUTURE_WRITER]);
+    let graph = kit
+        .builder("future")
+        .add_node("w", kit.get(FUTURE_WRITER))
+        .build();
     let mut rt = kit
-        .load(pipeline(&kit), RuntimeConfig::default(), Trace::new())
+        .load(graph, RuntimeConfig::default(), Trace::new())
         .await;
-    feed_pipeline(&mut rt, None, Some(3));
     settle(&mut rt).await;
-    assert_eq!(read_u32(&rt, "cons", "count"), 3);
-    assert_eq!(read_u32(&rt, "cons", "total"), 3);
-    // The generation finished, so the producer's writer task exited.
-    assert_eq!(phase(&rt, "prod"), NodePhase::Idle);
+    inject(&mut rt, "w", "again", Val::U32(1));
+    settle(&mut rt).await;
+    // The first run's write found the read end dropped.
+    assert_eq!(read_u32(&rt, "w", "last"), 2);
+    assert!(faults(&rt.mode().trace()).is_empty());
 }
 
 #[tokio::test]
@@ -658,6 +767,414 @@ async fn capability_import_feeds_a_stream() {
     assert_eq!(read_u32(&rt, "cons", "count"), 5);
     assert_eq!(read_u32(&rt, "cons", "total"), 25);
     assert!(feed.lock().unwrap().is_empty());
+}
+
+/// Serves `test:kv/store`. `get` answers `<plugin id>:<key>#<n>`, where `n`
+/// counts the calls made in the island so far, by any store: the count
+/// lives in the island's plugin state.
+struct KvStore(&'static str);
+
+#[derive(Default)]
+struct Calls(u32);
+
+impl CapabilityPlugin for KvStore {
+    fn id(&self) -> &str {
+        self.0
+    }
+
+    fn provides(&self) -> Vec<String> {
+        vec!["test:kv/store@0.1.0".into()]
+    }
+
+    fn link(
+        &self,
+        _node: &NodeId,
+        capability: &Capability,
+        linker: &mut wasmtime::component::Linker<PluginData>,
+    ) -> wasmtime::Result<()> {
+        let id = self.0;
+        linker.instance(&capability.interface)?.func_wrap(
+            "get",
+            move |mut store: StoreContextMut<'_, PluginData>, (key,): (String,)| {
+                let extensions = store.data_mut().extensions();
+                let calls = extensions.get::<Calls>().map_or(0, |c| c.0) + 1;
+                extensions.insert(Calls(calls));
+                Ok((format!("{id}:{key}#{calls}"),))
+            },
+        )?;
+        Ok(())
+    }
+}
+
+/// A one-node graph over the `labelled` guest, loaded with `plugins`.
+async fn load_labelled(plugins: Plugins) -> Result<RuntimeGraph<Perf, Plugins>, LoadError> {
+    let kit = Kit::new(&[LABELLED]);
+    let graph = kit
+        .builder("labelled")
+        .add_node("n", kit.get(LABELLED))
+        .build();
+    let compiled = graph.compile(&kit.contracts).expect("compiles");
+    RuntimeGraph::load_with_host(compiled, &kit.wasm, RuntimeConfig::default(), Perf, plugins).await
+}
+
+fn read_string<M: RuntimeMode, H: Host>(rt: &RuntimeGraph<M, H>, node: &str, port: &str) -> String {
+    match read(rt, node, port) {
+        Some(Val::String(s)) => s,
+        other => panic!("expected a string, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn labels_route_one_interface_to_two_plugins() {
+    let plugins = Plugins::new()
+        .with(KvStore("backup"))
+        .unwrap()
+        .with(KvStore("primary"))
+        .unwrap();
+    let mut rt = load_labelled(plugins)
+        .await
+        .expect("both labels name a plugin");
+    inject(&mut rt, "n", "key", Val::String("k".into()));
+    settle(&mut rt).await;
+    // Each label reached the plugin of its name; the call count is the
+    // island's, shared by both plugins.
+    assert_eq!(read_string(&rt, "n", "primary"), "primary:k#1");
+    assert_eq!(read_string(&rt, "n", "backup"), "backup:k#2");
+}
+
+#[tokio::test]
+async fn labels_naming_no_plugin_reach_the_only_one_serving_the_interface() {
+    let plugins = Plugins::new().with(KvStore("only")).unwrap();
+    let mut rt = load_labelled(plugins)
+        .await
+        .expect("one plugin serves both");
+    settle(&mut rt).await;
+    assert_eq!(read_string(&rt, "n", "primary"), "only:#1");
+    assert_eq!(read_string(&rt, "n", "backup"), "only:#2");
+}
+
+#[tokio::test]
+async fn a_capability_no_plugin_provides_fails_the_load_by_name() {
+    let err = load_labelled(Plugins::new())
+        .await
+        .err()
+        .expect("nothing serves the store");
+    match &err {
+        LoadError::MissingCapability {
+            node,
+            capability,
+            implements,
+        } => {
+            assert_eq!(node.as_str(), "n");
+            assert_eq!(capability, "backup");
+            assert_eq!(implements.as_deref(), Some("test:kv/store@0.1.0"));
+        }
+        other => panic!("expected MissingCapability, got {other}"),
+    }
+    assert_eq!(
+        err.to_string(),
+        "node `n` imports capability `backup` (`test:kv/store@0.1.0`), which the host does not provide"
+    );
+}
+
+#[tokio::test]
+async fn a_label_between_two_plugins_it_does_not_name_is_ambiguous() {
+    let plugins = Plugins::new()
+        .with(KvStore("east"))
+        .unwrap()
+        .with(KvStore("west"))
+        .unwrap();
+    let err = load_labelled(plugins)
+        .await
+        .err()
+        .expect("neither label names a plugin");
+    match err {
+        LoadError::AmbiguousCapability { providers, .. } => {
+            assert_eq!(providers, ["east", "west"]);
+        }
+        other => panic!("expected AmbiguousCapability, got {other}"),
+    }
+}
+
+/// The `math` provider, as links name it.
+fn math() -> ComponentRef {
+    "test:math/math@0.1.0".parse().unwrap()
+}
+
+/// The interface `calc` imports and `math` exports.
+const OPS: &str = "test:math/ops@0.1.0";
+
+/// `calc` and what links may compose into it.
+fn calc_kit() -> Kit {
+    let mut kit = Kit::new(&[CALC]);
+    kit.wasm.insert(math(), MATH.wasm);
+    kit
+}
+
+#[tokio::test]
+async fn a_link_satisfies_an_import_with_a_providers_export() {
+    let kit = calc_kit();
+    let graph = kit
+        .builder("links")
+        .add_node("a", kit.get(CALC))
+        .add_node("b", kit.get(CALC))
+        .link("la", "a", OPS, math(), OPS)
+        .link("lb", "b", OPS, math(), OPS)
+        .build();
+    let compiled = graph.compile(&kit.contracts).expect("compiles");
+    assert!(
+        compiled.required_capabilities().is_empty(),
+        "the links leave the host nothing to provide"
+    );
+    // No host: the provider is all `calc` needs.
+    let mut rt = RuntimeGraph::load(compiled, &kit.wasm, RuntimeConfig::default(), Perf)
+        .await
+        .expect("the provider is composed in");
+    inject(&mut rt, "a", "x", Val::U32(5));
+    inject(&mut rt, "b", "x", Val::U32(3));
+    settle(&mut rt).await;
+    // A sync call, an async call and a stream all cross the link.
+    assert_eq!(read_u32(&rt, "a", "doubled"), 10);
+    assert_eq!(read_u32(&rt, "a", "slow"), 10);
+    assert_eq!(read_u32(&rt, "a", "total"), 10);
+    assert_eq!(read_u32(&rt, "b", "doubled"), 6);
+    assert_eq!(read_u32(&rt, "b", "total"), 3);
+
+    // Each node has a provider of its own, which lives as long as the
+    // node's island does.
+    assert_eq!(read_u32(&rt, "a", "calls"), 1);
+    assert_eq!(read_u32(&rt, "b", "calls"), 1);
+    inject(&mut rt, "a", "x", Val::U32(4));
+    settle(&mut rt).await;
+    assert_eq!(read_u32(&rt, "a", "calls"), 2);
+    assert_eq!(read_u32(&rt, "b", "calls"), 1);
+    // A rebuilt island gets a fresh provider with the node.
+    rt.cancel(&id("a")).unwrap();
+    rt.rerun(&id("a")).unwrap();
+    settle(&mut rt).await;
+    assert_eq!(read_u32(&rt, "a", "calls"), 1);
+
+    // A snapshot names the links: it restores only onto the same ones.
+    let snapshot = rt.snapshot();
+    assert_eq!(snapshot.links.len(), 2);
+    let mut other = snapshot.clone();
+    other.links[0].export = "test:math/other@0.1.0".into();
+    let err = rt.restore(&other).expect_err("the links differ");
+    assert!(
+        matches!(err, RuntimeError::SnapshotMismatch { .. }),
+        "{err}"
+    );
+    rt.restore(&snapshot).expect("the same links");
+}
+
+#[tokio::test]
+async fn an_unpinned_provider_is_found_under_its_one_pinned_key() {
+    let mut kit = Kit::new(&[CALC]);
+    let pinned: ComponentRef = format!("{}#{}", math(), "ab".repeat(32)).parse().unwrap();
+    kit.wasm.insert(pinned, MATH.wasm);
+    let graph = kit
+        .builder("pinned-provider")
+        .add_node("a", kit.get(CALC))
+        .link("la", "a", OPS, math(), OPS)
+        .build();
+    let compiled = graph.compile(&kit.contracts).expect("compiles");
+    let mut rt = RuntimeGraph::load(compiled, &kit.wasm, RuntimeConfig::default(), Perf)
+        .await
+        .expect("the provider is found under its pinned key");
+    inject(&mut rt, "a", "x", Val::U32(5));
+    settle(&mut rt).await;
+    assert_eq!(read_u32(&rt, "a", "doubled"), 10);
+}
+
+/// A provider of `ops` like `math`, whose every function traps.
+fn trapping_math() -> &'static [u8] {
+    use wit_parser::{LiftLowerAbi, ManglingAndAbi, Resolve};
+    let mut resolve = Resolve::default();
+    let (package, _) = resolve.push_dir(MATH.wit).unwrap();
+    let world = resolve.select_world(&[package], Some("math")).unwrap();
+    let mut module =
+        wit_component::dummy_module(&resolve, world, ManglingAndAbi::Legacy(LiftLowerAbi::Sync));
+    wit_component::embed_component_metadata(
+        &mut module,
+        &resolve,
+        world,
+        wit_component::StringEncoding::UTF8,
+    )
+    .unwrap();
+    let bytes = wit_component::ComponentEncoder::default()
+        .module(&module)
+        .unwrap()
+        .encode()
+        .unwrap();
+    Box::leak(bytes.into_boxed_slice())
+}
+
+#[tokio::test]
+async fn each_node_runs_the_composition_built_for_its_links() {
+    let mut kit = calc_kit();
+    let pinned: ComponentRef = format!("{}#{}", math(), "ab".repeat(32)).parse().unwrap();
+    kit.wasm.insert(pinned.clone(), trapping_math());
+    // `b` comes first and pins the trapping provider; `a` names `math`
+    // unpinned, which that pin also matches.
+    let graph = kit
+        .builder("two-providers")
+        .add_node("b", kit.get(CALC))
+        .add_node("a", kit.get(CALC))
+        .link("lb", "b", OPS, pinned, OPS)
+        .link("la", "a", OPS, math(), OPS)
+        .build();
+    let compiled = graph.compile(&kit.contracts).expect("compiles");
+    let mut rt = RuntimeGraph::load(compiled, &kit.wasm, RuntimeConfig::default(), Perf)
+        .await
+        .expect("loads");
+    inject(&mut rt, "a", "x", Val::U32(5));
+    settle(&mut rt).await;
+    assert_eq!(read_u32(&rt, "a", "doubled"), 10, "`a` runs `math`");
+    assert!(
+        matches!(
+            rt.node_state(&id("b")).unwrap().fault_cause(),
+            Some(NodeFault::WasmTrap { .. })
+        ),
+        "`b` runs the trapping provider"
+    );
+}
+
+#[tokio::test]
+async fn an_unpinned_provider_matching_two_pinned_keys_is_ambiguous() {
+    let mut kit = Kit::new(&[CALC]);
+    for hash in ["ab", "cd"] {
+        let pinned: ComponentRef = format!("{}#{}", math(), hash.repeat(32)).parse().unwrap();
+        kit.wasm.insert(pinned, MATH.wasm);
+    }
+    let graph = kit
+        .builder("two-pins")
+        .add_node("a", kit.get(CALC))
+        .link("la", "a", OPS, math(), OPS)
+        .build();
+    let compiled = graph.compile(&kit.contracts).expect("compiles");
+    let err = RuntimeGraph::load(compiled, &kit.wasm, RuntimeConfig::default(), Perf)
+        .await
+        .err()
+        .expect("which bytes is not known");
+    assert!(
+        matches!(&err, LoadError::AmbiguousProvider { candidates, .. } if candidates.len() == 2),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn without_a_link_the_import_is_the_hosts() {
+    let kit = calc_kit();
+    let graph = || kit.builder("unlinked").add_node("n", kit.get(CALC)).build();
+    let compiled = graph().compile(&kit.contracts).expect("compiles");
+    assert_eq!(compiled.required_capabilities()[0].interface, OPS);
+    let err = RuntimeGraph::load(compiled, &kit.wasm, RuntimeConfig::default(), Perf)
+        .await
+        .err()
+        .expect("nothing provides `ops`");
+    assert!(
+        matches!(&err, LoadError::MissingCapability { capability, .. } if capability == OPS),
+        "{err}"
+    );
+
+    let compiled = graph().compile(&kit.contracts).expect("compiles");
+    let err = RuntimeGraph::load_with_host(
+        compiled,
+        &kit.wasm,
+        RuntimeConfig::default(),
+        Perf,
+        Plugins::new(),
+    )
+    .await
+    .err()
+    .expect("no plugin provides `ops`");
+    assert!(
+        matches!(&err, LoadError::MissingCapability { capability, .. } if capability == OPS),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn a_link_that_cannot_be_made_fails_the_load() {
+    let mut kit = Kit::new(&[CALC, ECHO]);
+    kit.wasm.insert(math(), MATH.wasm);
+    let load = async |provider: ComponentRef, export: &str| {
+        let graph = kit
+            .builder("bad-link")
+            .add_node("n", kit.get(CALC))
+            .link("l", "n", OPS, provider, export)
+            .build();
+        let compiled = graph.compile(&kit.contracts).expect("compiles");
+        RuntimeGraph::load(compiled, &kit.wasm, RuntimeConfig::default(), Perf)
+            .await
+            .err()
+            .expect("the link cannot be made")
+    };
+
+    let err = load(math(), "test:math/nope@0.1.0").await;
+    assert!(
+        matches!(&err, LoadError::BadLink { import, message, .. }
+            if import == OPS && message.contains("does not have an export")),
+        "{err}"
+    );
+    // `echo` exports only `node`, which is no `ops`.
+    let err = load(kit.get(ECHO), "node").await;
+    assert!(
+        matches!(&err, LoadError::BadLink { message, .. } if message.contains("cannot take `node`")),
+        "{err}"
+    );
+    let absent: ComponentRef = "test:absent/absent@0.1.0".parse().unwrap();
+    let err = load(absent.clone(), OPS).await;
+    assert!(
+        matches!(&err, LoadError::MissingWasm { component } if **component == absent),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn a_linked_node_is_prepared_with_its_links() {
+    let kit = calc_kit();
+    let contract = &kit.contracts[0];
+    let engine = RuntimeConfig::default().new_engine().unwrap();
+    let graph = || {
+        kit.builder("prepared")
+            .add_node("n", kit.get(CALC))
+            .link("l", "n", OPS, math(), OPS)
+            .build()
+            .compile(&kit.contracts)
+            .expect("compiles")
+    };
+    let load = async |prepared: PreparedComponent| {
+        RuntimeGraph::load_prepared(
+            graph(),
+            &[prepared],
+            RuntimeConfig::default(),
+            Perf,
+            witgraph_runtime::NoCapabilities,
+        )
+        .await
+    };
+
+    let bare = PreparedComponent::new(&engine, contract, CALC.wasm).unwrap();
+    let err = load(bare).await.err().expect("prepared without the link");
+    assert!(
+        matches!(&err, LoadError::ContractMismatch { message, .. }
+            if message.contains("not prepared with the links of node `n`")),
+        "{err}"
+    );
+
+    let provider = math();
+    let links = [LinkedProvider {
+        import: OPS,
+        provider: &provider,
+        bytes: MATH.wasm,
+        export: OPS,
+    }];
+    let linked = PreparedComponent::linked(&engine, contract, CALC.wasm, &links).unwrap();
+    let mut rt = load(linked).await.expect("prepared with the link");
+    inject(&mut rt, "n", "x", Val::U32(2));
+    settle(&mut rt).await;
+    assert_eq!(read_u32(&rt, "n", "doubled"), 4);
 }
 
 #[tokio::test]
@@ -873,7 +1390,7 @@ async fn an_engine_that_cannot_run_a_graph_is_rejected() {
         .err()
         .expect("the default engine meters no fuel");
     assert!(
-        matches!(err, RuntimeError::InvalidConfig { ref message } if message.contains("fuel")),
+        matches!(err, LoadError::Runtime(RuntimeError::InvalidConfig { ref message }) if message.contains("fuel")),
         "{err}"
     );
 }
@@ -1203,7 +1720,7 @@ async fn an_island_over_its_memory_limit_fails_to_instantiate() {
         .err()
         .expect("echo's memory is bigger than 4 KiB");
     assert!(
-        matches!(err, RuntimeError::Instantiation { ref message, .. } if message.contains("limit")),
+        matches!(err, LoadError::Instantiation { ref message, .. } if message.contains("limit")),
         "{err}"
     );
 }
@@ -1727,8 +2244,49 @@ async fn a_faulted_island_releases_its_resources() {
     assert!(rt.take_faults().is_empty(), "taken");
 }
 
+/// `prod` streaming records to `cons`: a stream the host cannot move, so
+/// the two share a Store.
+fn reading_pipeline(kit: &Kit) -> Graph {
+    kit.builder("readings")
+        .add_node("prod", kit.get(READING_PRODUCER))
+        .add_node("cons", kit.get(READING_CONSUMER))
+        .connect("s", port("prod", "items"), port("cons", "items"))
+        .build()
+}
+
 #[tokio::test]
-async fn a_trap_in_a_streaming_island_has_no_culprit() {
+async fn a_fault_in_a_member_s_own_store_is_pinned_on_it() {
+    let kit = Kit::new(&[STREAM_PRODUCER, STREAM_CONSUMER]);
+    let config = RuntimeConfig {
+        fuel_per_run: Some(5_000_000),
+        ..split()
+    };
+    let mut rt = kit.load(pipeline(&kit), config, Perf).await;
+    let _ = tokio::time::timeout(Duration::from_secs(30), rt.tick())
+        .await
+        .expect("fuel ends the endless generation");
+    // Split, a stream of `u32` is pumped between Stores, so each member has
+    // its own: the one whose Store ran out of fuel is known.
+    let faults = rt.take_faults();
+    let [report] = faults.as_slice() else {
+        panic!("one island faulted: {faults:?}");
+    };
+    assert!(
+        matches!(report.fault, NodeFault::FuelExhausted),
+        "{report:?}"
+    );
+    let culprit = report.culprit.clone().expect("the member is known");
+    assert!(culprit == id("prod") || culprit == id("cons"), "{culprit}");
+    // The island still faults as one.
+    for node in ["prod", "cons"] {
+        let state = rt.node_state(&id(node)).unwrap();
+        assert_eq!(state.phase(), NodePhase::Faulted, "{node}");
+        assert_eq!(state.culprit(), Some(&culprit), "{node}");
+    }
+}
+
+#[tokio::test]
+async fn by_default_an_island_is_one_store() {
     let kit = Kit::new(&[STREAM_PRODUCER, STREAM_CONSUMER]);
     let config = RuntimeConfig {
         fuel_per_run: Some(5_000_000),
@@ -1738,8 +2296,29 @@ async fn a_trap_in_a_streaming_island_has_no_culprit() {
     let _ = tokio::time::timeout(Duration::from_secs(30), rt.tick())
         .await
         .expect("fuel ends the endless generation");
+    // One Store, as if the stream could not be pumped: no member is singled
+    // out.
+    let faults = rt.take_faults();
+    assert!(
+        matches!(faults.as_slice(), [report] if report.culprit.is_none()
+            && matches!(report.fault, NodeFault::FuelExhausted)),
+        "{faults:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_trap_in_a_shared_store_has_no_culprit() {
+    let kit = Kit::new(&[READING_PRODUCER, READING_CONSUMER]);
+    let config = RuntimeConfig {
+        fuel_per_run: Some(5_000_000),
+        ..RuntimeConfig::default()
+    };
+    let mut rt = kit.load(reading_pipeline(&kit), config, Perf).await;
+    let _ = tokio::time::timeout(Duration::from_secs(30), rt.tick())
+        .await
+        .expect("fuel ends the endless generation");
     // The producer returned and writes from a task; the consumer is still
-    // in `run`. Either may have burned the fuel.
+    // in `run`. In one Store, either may have burned the fuel.
     for node in ["prod", "cons"] {
         assert_eq!(rt.node_state(&id(node)).unwrap().culprit(), None, "{node}");
     }
@@ -1749,6 +2328,67 @@ async fn a_trap_in_a_streaming_island_has_no_culprit() {
             && matches!(report.fault, NodeFault::FuelExhausted)),
         "{faults:?}"
     );
+}
+
+#[tokio::test]
+async fn split_members_share_a_store_only_for_streams_the_host_cannot_move() {
+    let kit = Kit::new(&[
+        STREAM_PRODUCER,
+        STREAM_CONSUMER,
+        READING_PRODUCER,
+        READING_CONSUMER,
+    ]);
+    let graph = kit
+        .builder("stores")
+        .add_node("numbers", kit.get(STREAM_PRODUCER))
+        .add_node("sum", kit.get(STREAM_CONSUMER))
+        .add_node("readings", kit.get(READING_PRODUCER))
+        .add_node("total", kit.get(READING_CONSUMER))
+        .connect("n", port("numbers", "items"), port("sum", "items"))
+        .connect("r", port("readings", "items"), port("total", "items"))
+        .build();
+    let compiled = graph.compile(&kit.contracts).expect("compiles");
+    assert_eq!(compiled.islands().len(), 2, "two stream islands");
+    let built = Arc::new(Mutex::new(Vec::new()));
+    let mut rt = RuntimeGraph::load_with_host(
+        compiled,
+        &kit.wasm,
+        split(),
+        Trace::new().with_stream_items(),
+        Counting {
+            built: built.clone(),
+        },
+    )
+    .await
+    .expect("loads");
+    // `u32` items are pumped between two Stores; records stay in one.
+    let mut stores = built.lock().unwrap().clone();
+    stores.sort();
+    assert_eq!(
+        stores,
+        [
+            vec![id("numbers")],
+            vec![id("readings"), id("total")],
+            vec![id("sum")],
+        ]
+    );
+
+    inject(&mut rt, "numbers", "burst-size", Val::U32(5));
+    inject(&mut rt, "readings", "burst-size", Val::U32(5));
+    settle(&mut rt).await;
+    for consumer in ["sum", "total"] {
+        assert_eq!(read_u32(&rt, consumer, "count"), 5, "{consumer}");
+        assert_eq!(read_u32(&rt, consumer, "total"), 10, "{consumer}");
+    }
+    // The host saw the pumped items pass, and only those.
+    let mut passed = 0;
+    for event in rt.mode().trace() {
+        if let TraceEvent::StreamItems { node, port, count } = event {
+            assert_eq!((node, port), (id("numbers"), "items".into()));
+            passed += count;
+        }
+    }
+    assert_eq!(passed, 5);
 }
 
 #[tokio::test]
@@ -2149,7 +2789,97 @@ async fn an_island_over_committing_a_resource_is_rejected() {
     );
 }
 
+/// Hands out island data until `panic_after` Stores were made, then
+/// panics.
+struct PanickingData {
+    made: std::sync::atomic::AtomicUsize,
+    panic_after: usize,
+}
+
+impl Host for PanickingData {
+    type Data = HostState;
+
+    fn link(
+        &self,
+        _: &NodeId,
+        _: &ComponentContract,
+        _: &mut wasmtime::component::Linker<HostState>,
+    ) -> wasmtime::Result<()> {
+        Ok(())
+    }
+
+    fn island_data(&self, _: &[NodeId], state: HostState) -> wasmtime::Result<HostState> {
+        let made = self.made.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        assert!(made < self.panic_after, "island data panics");
+        Ok(state)
+    }
+}
+
+#[tokio::test]
+async fn a_panic_making_island_data_on_a_rebuild_is_a_restart_fault() {
+    let kit = Kit::new(&[ECHO]);
+    let graph = kit.builder("e").add_node("e", kit.get(ECHO)).build();
+    let compiled = graph.compile(&kit.contracts).unwrap();
+    let host = PanickingData {
+        made: Default::default(),
+        panic_after: 1,
+    };
+    let mut rt =
+        RuntimeGraph::load_with_host(compiled, &kit.wasm, RuntimeConfig::default(), Perf, host)
+            .await
+            .expect("loads");
+    settle(&mut rt).await;
+    rt.cancel(&id("e")).unwrap();
+    rt.rerun(&id("e")).unwrap();
+    settle(&mut rt).await;
+    assert!(
+        matches!(
+            rt.node_state(&id("e")).unwrap().fault_cause(),
+            Some(NodeFault::Restart { .. })
+        ),
+        "{:?}",
+        rt.node_state(&id("e"))
+    );
+}
+
 // ---- Loading ----
+
+#[tokio::test]
+async fn a_node_finds_the_component_prepared_against_its_contract() {
+    use witgraph_runtime::graph::PreparedComponent;
+    let kit = Kit::new(&[ECHO]);
+    // Two revisions of one contract that differ only in a doc comment: one
+    // id, content hash included.
+    let documented = ComponentContract {
+        docs: Some("Another revision.".into()),
+        ..kit.contracts[0].clone()
+    };
+    let engine = RuntimeConfig::default().new_engine().unwrap();
+    let prepared = [&kit.contracts[0], &documented]
+        .map(|contract| PreparedComponent::new(&engine, contract, ECHO.wasm).unwrap());
+    for (contracts, order) in [
+        (std::slice::from_ref(&documented), [0, 1]),
+        (std::slice::from_ref(&documented), [1, 0]),
+        (&kit.contracts[..], [1, 0]),
+    ] {
+        let compiled = Graph::builder("e")
+            .add_component(&contracts[0])
+            .add_node("e", contracts[0].id.clone())
+            .build()
+            .compile(contracts)
+            .unwrap();
+        let prepared = order.map(|i| prepared[i].clone());
+        RuntimeGraph::load_prepared(
+            compiled,
+            &prepared,
+            RuntimeConfig::default(),
+            Perf,
+            witgraph_runtime::NoCapabilities,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{order:?}: {e}"));
+    }
+}
 
 #[tokio::test]
 async fn prepared_components_load_on_their_engine() {
@@ -2194,7 +2924,10 @@ async fn prepared_components_load_on_their_engine() {
     .await
     .err()
     .expect("prepared on another engine");
-    assert!(matches!(err, RuntimeError::InvalidConfig { .. }), "{err}");
+    assert!(
+        matches!(err, LoadError::Runtime(RuntimeError::InvalidConfig { .. })),
+        "{err}"
+    );
 
     let err = RuntimeGraph::load_prepared(
         graph().compile(&kit.contracts).unwrap(),
@@ -2206,7 +2939,7 @@ async fn prepared_components_load_on_their_engine() {
     .await
     .err()
     .expect("nothing prepared for `e`");
-    assert!(matches!(err, RuntimeError::MissingWasm { .. }), "{err}");
+    assert!(matches!(err, LoadError::MissingWasm { .. }), "{err}");
 }
 
 #[tokio::test]
@@ -2235,10 +2968,7 @@ async fn a_component_prepared_against_another_contract_is_rejected() {
     .await
     .err()
     .expect("prepared against another contract");
-    assert!(
-        matches!(err, RuntimeError::ContractMismatch { .. }),
-        "{err}"
-    );
+    assert!(matches!(err, LoadError::ContractMismatch { .. }), "{err}");
 }
 
 #[tokio::test]
@@ -2265,7 +2995,7 @@ async fn an_engine_without_component_model_maps_is_rejected() {
     .err()
     .expect("the engine cannot load a world importing a map");
     assert!(
-        matches!(err, RuntimeError::InvalidConfig { ref message } if message.contains("map")),
+        matches!(err, LoadError::Runtime(RuntimeError::InvalidConfig { ref message }) if message.contains("map")),
         "{err}"
     );
 }
@@ -2280,10 +3010,7 @@ async fn bytes_of_another_component_are_rejected() {
         .await
         .err()
         .expect("relay bytes do not implement echo");
-    assert!(
-        matches!(err, RuntimeError::ContractMismatch { .. }),
-        "{err}"
-    );
+    assert!(matches!(err, LoadError::ContractMismatch { .. }), "{err}");
 }
 
 #[tokio::test]
@@ -2295,7 +3022,7 @@ async fn missing_bytes_are_rejected() {
         .await
         .err()
         .expect("no bytes");
-    assert!(matches!(err, RuntimeError::MissingWasm { .. }), "{err}");
+    assert!(matches!(err, LoadError::MissingWasm { .. }), "{err}");
 }
 
 // ---- Snapshots ----
@@ -2696,6 +3423,7 @@ fn snapshot_round_trips_through_serde() {
             to: port("n", "in"),
             feedback: true,
         }],
+        links: Vec::new(),
         quiescent: false,
         phases: [(id("n"), NodePhase::Running)].into_iter().collect(),
         inputs: values("in", "1.5"),
