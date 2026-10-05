@@ -315,6 +315,14 @@ pub(crate) struct IslandWiring {
 
 /// Every island's [`IslandWiring`], in island order.
 pub(crate) fn node_wiring(compiled: &CompiledGraph, wiring: &Wiring<'_>) -> Vec<IslandWiring> {
+    // An island's wiring while it is collected: writers as sets, each
+    // once, listed when complete.
+    struct Collecting {
+        offset: usize,
+        preds: Vec<BTreeSet<usize>>,
+        feedback_sources: BTreeSet<usize>,
+        feedback_out: Vec<ConnectionId>,
+    }
     let mut position: HashMap<&NodeId, (usize, usize, usize)> = HashMap::new();
     let mut wired = Vec::with_capacity(compiled.islands().len());
     let mut next = 0;
@@ -322,21 +330,19 @@ pub(crate) fn node_wiring(compiled: &CompiledGraph, wiring: &Wiring<'_>) -> Vec<
         for (member, node) in members.iter().enumerate() {
             position.insert(node, (island, member, next + member));
         }
-        wired.push(IslandWiring {
+        wired.push(Collecting {
             offset: next,
-            preds: vec![Vec::new(); members.len()],
-            feedback_sources: Vec::new(),
+            preds: vec![BTreeSet::new(); members.len()],
+            feedback_sources: BTreeSet::new(),
             feedback_out: Vec::new(),
         });
         next += members.len();
     }
-    let mut seen: HashSet<(usize, usize, usize)> = HashSet::new();
     for conn in wiring.writer.values() {
         if let (Some(&(_, _, from)), Some(&(island, member, _))) =
             (position.get(&conn.from.node), position.get(&conn.to.node))
-            && seen.insert((island, member, from))
         {
-            wired[island].preds[member].push(from);
+            wired[island].preds[member].insert(from);
         }
     }
     for conn in &wiring.feedback {
@@ -344,10 +350,20 @@ pub(crate) fn node_wiring(compiled: &CompiledGraph, wiring: &Wiring<'_>) -> Vec<
             (position.get(&conn.from.node), position.get(&conn.to.node))
         {
             wired[source].feedback_out.push(conn.id.clone());
-            if !wired[island].feedback_sources.contains(&from) {
-                wired[island].feedback_sources.push(from);
-            }
+            wired[island].feedback_sources.insert(from);
         }
     }
     wired
+        .into_iter()
+        .map(|island| IslandWiring {
+            offset: island.offset,
+            preds: island
+                .preds
+                .into_iter()
+                .map(|writers| writers.into_iter().collect())
+                .collect(),
+            feedback_sources: island.feedback_sources.into_iter().collect(),
+            feedback_out: island.feedback_out,
+        })
+        .collect()
 }

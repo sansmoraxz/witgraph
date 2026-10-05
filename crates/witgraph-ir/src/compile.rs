@@ -97,15 +97,19 @@ pub fn resolve_contract<'a>(
     id: &ComponentRef,
     candidates: impl IntoIterator<Item = &'a ComponentContract>,
 ) -> Resolution<'a> {
-    let mut found: Vec<&ComponentContract> = Vec::new();
-    for candidate in candidates {
-        let copy = found.iter().any(|f| {
-            f.id == candidate.id && (f.id.content_hash.is_some() || same_but_docs(f, candidate))
-        });
-        if fits(id, &candidate.id) && !copy {
-            found.push(candidate);
+    // By id, the contracts found: one id is one content hash, or none on
+    // both, so copies are only among one id's.
+    let mut by_id: HashMap<&ComponentRef, Vec<&ComponentContract>> = HashMap::new();
+    for candidate in candidates.into_iter().filter(|c| fits(id, &c.id)) {
+        let same = by_id.entry(&candidate.id).or_default();
+        let copy = same
+            .iter()
+            .any(|f| candidate.id.content_hash.is_some() || same_but_docs(f, candidate));
+        if !copy {
+            same.push(candidate);
         }
     }
+    let found: Vec<&ComponentContract> = by_id.into_values().flatten().collect();
     match found.as_slice() {
         [] => Resolution::NotFound,
         [only] => Resolution::Found(only),
@@ -172,7 +176,8 @@ impl<S: BuildHasher> ContractSource for HashMap<ComponentRef, ComponentContract,
 /// one world, not the size of the source.
 #[derive(Debug, Clone, Default)]
 pub struct ContractIndex {
-    by_world: HashMap<(PackageRef, String), Vec<ComponentContract>>,
+    /// By package, then world: looked up by borrowing the id's parts.
+    by_world: HashMap<PackageRef, HashMap<String, Vec<ComponentContract>>>,
 }
 
 impl ContractIndex {
@@ -184,7 +189,9 @@ impl ContractIndex {
     /// Adds a contract.
     pub fn insert(&mut self, contract: ComponentContract) {
         self.by_world
-            .entry((contract.id.package.clone(), contract.id.world.clone()))
+            .entry(contract.id.package.clone())
+            .or_default()
+            .entry(contract.id.world.clone())
             .or_default()
             .push(contract);
     }
@@ -203,7 +210,8 @@ impl FromIterator<ComponentContract> for ContractIndex {
 impl ContractSource for ContractIndex {
     fn candidates(&self, id: &ComponentRef) -> Vec<&ComponentContract> {
         self.by_world
-            .get(&(id.package.clone(), id.world.clone()))
+            .get(&id.package)
+            .and_then(|worlds| worlds.get(id.world.as_str()))
             .into_iter()
             .flatten()
             .filter(|c| fits(id, &c.id))
@@ -447,7 +455,7 @@ impl CompiledGraph {
         let mut required: BTreeMap<(&str, Option<&str>), Items> = BTreeMap::new();
         // Nodes of one contract with the same imports linked contribute
         // the same: each such pair is walked once.
-        let mut seen: HashMap<usize, Vec<BTreeSet<&str>>> = HashMap::new();
+        let mut seen: HashSet<(usize, BTreeSet<&str>)> = HashSet::new();
         for (node, &index) in self.node_contract.iter().enumerate() {
             let linked: BTreeSet<&str> = self
                 .node_links
@@ -460,10 +468,11 @@ impl CompiledGraph {
             let Some(contract) = self.contracts.get(index) else {
                 continue;
             };
-            let walked = seen.entry(index).or_default();
-            if walked.contains(&linked) {
+            let pair = (index, linked);
+            if seen.contains(&pair) {
                 continue;
             }
+            let linked = &pair.1;
             for capability in &contract.capabilities {
                 // A link covers its import, and an import wit-component
                 // merges it into (a semver-compatible version of the same
@@ -475,11 +484,11 @@ impl CompiledGraph {
                 if covered {
                     continue;
                 }
-                let key = (
+                let slot = (
                     capability.interface.as_str(),
                     capability.implements.as_deref(),
                 );
-                let items = required.entry(key).or_default();
+                let items = required.entry(slot).or_default();
                 for (name, signature) in &capability.items {
                     items
                         .entry(name.clone())
@@ -487,7 +496,7 @@ impl CompiledGraph {
                         .insert(signature.clone());
                 }
             }
-            walked.push(linked);
+            seen.insert(pair);
         }
         required
             .into_iter()

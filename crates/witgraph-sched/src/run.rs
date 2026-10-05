@@ -231,9 +231,13 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
         };
         let latch: HashSet<ConnectionId> = self
             .feedback
-            .iter()
-            .filter(|(_, (to, _, _))| self.compiled.island_of(&to.node).is_some_and(settled))
-            .map(|(conn, _)| conn.clone())
+            .keys()
+            .filter(|conn| {
+                self.feedback_edges.get(*conn).is_some_and(|(_, edge)| {
+                    self.compiled.island_of(&edge.to.node).is_some_and(settled)
+                })
+            })
+            .cloned()
             .collect();
         self.latch_feedback(|conn| latch.contains(conn));
     }
@@ -278,11 +282,13 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
     /// it is dropped, and feedback into it from a generation in flight (or
     /// a replay owed) is stale, never overwriting it.
     pub(crate) fn note_host_write(&mut self, port: &PortRef) {
-        self.feedback.retain(|_, (to, _, _)| to != port);
         let Some(into) = self.feedback_into.get(port) else {
             return;
         };
         for (conn, source) in into {
+            // Buffered feedback is keyed by its connection, so what targets
+            // `port` is found without scanning the rest.
+            self.feedback.remove(conn);
             let slot = &mut self.slots[*source];
             if slot.state.is_running() {
                 slot.stale_feedback.insert(conn.clone());
@@ -606,10 +612,7 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
                         // its target: the host's value stands.
                         Route::Feedback => {
                             if !self.slots[island].stale_feedback.contains(&edge.id) {
-                                self.feedback.insert(
-                                    edge.id.clone(),
-                                    (edge.to.clone(), edge.unwrap_option, val.clone()),
-                                );
+                                self.feedback.insert(edge.id.clone(), val.clone());
                             }
                         }
                         // Consumed inside this generation; recorded, not a
@@ -704,9 +707,12 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
     pub(crate) fn stop_island(&mut self, index: usize, cause: StopCause) {
         self.dirty = true;
         self.slots[index].owed.clear();
-        let compiled = &self.compiled;
-        self.feedback
-            .retain(|_, (to, _, _)| compiled.island_of(&to.node) != Some(index));
+        let (compiled, edges) = (&self.compiled, &self.feedback_edges);
+        self.feedback.retain(|conn, _| {
+            edges
+                .get(conn)
+                .is_some_and(|(_, edge)| compiled.island_of(&edge.to.node) != Some(index))
+        });
         let keep = match self.slots[index].state.stop_cause() {
             Some(StopCause::Cancelled | StopCause::Shutdown) => true,
             Some(StopCause::Faulted(..)) => matches!(cause, StopCause::Shutdown),
@@ -732,11 +738,12 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
     /// keeping the others buffered. Returns whether any input changed.
     pub(crate) fn latch_feedback(&mut self, mut latch: impl FnMut(&ConnectionId) -> bool) -> bool {
         let mut changed = false;
-        for (conn, (to, unwrap_option, val)) in std::mem::take(&mut self.feedback) {
-            if latch(&conn) {
+        for (conn, val) in std::mem::take(&mut self.feedback) {
+            if !latch(&conn) {
+                self.feedback.insert(conn, val);
+            } else if let Some((_, edge)) = self.feedback_edges.get(&conn) {
+                let (to, unwrap_option) = (edge.to.clone(), edge.unwrap_option);
                 changed |= self.write_input(to, &val, unwrap_option);
-            } else {
-                self.feedback.insert(conn, (to, unwrap_option, val));
             }
         }
         changed

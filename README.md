@@ -44,7 +44,7 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-The workspace needs Rust 1.97 or newer. Building `test-components` builds
+The workspace needs Rust 1.99 or newer. Building `test-components` builds
 the guests listed in the `GUESTS` array of `test-fixtures/test-components/build.rs`
 for `wasm32-unknown-unknown` (a nested `cargo build` per guest) and encodes
 each as a component. A new directory under `guests/` is not picked up until

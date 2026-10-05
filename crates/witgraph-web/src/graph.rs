@@ -297,12 +297,15 @@ impl WebGraph {
             ))
         })?;
         // Among entries with one contract, compilation binds the first.
+        let mut first_of: HashMap<&ComponentRef, usize> = HashMap::new();
+        for (index, contract) in contracts.iter().enumerate() {
+            first_of.entry(&contract.id).or_insert(index);
+        }
         let mut node_components = HashMap::new();
         for node in compiled.nodes() {
-            let index = contracts
-                .iter()
-                .position(|contract| contract.id == node.contract.id)
-                .and_then(|index| u32::try_from(index).ok())
+            let index = first_of
+                .get(&node.contract.id)
+                .and_then(|&index| u32::try_from(index).ok())
                 .ok_or_else(|| error(format!("node `{}` has no component", node.node.id)))?;
             node_components.insert(node.node.id.clone(), index);
         }
