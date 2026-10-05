@@ -1,0 +1,19 @@
+package test:labelled@0.1.0;
+
+/// Reads one key from each of two stores: the same interface imported under
+/// two labels, which a host may back differently.
+world labelled {
+    import primary: test:kv/store@0.1.0;
+    import backup: test:kv/store@0.1.0;
+
+    export node: interface {
+        record inputs {
+            key: option<string>,
+        }
+        record outputs {
+            primary: string,
+            backup: string,
+        }
+        run: async func(inputs: inputs) -> outputs;
+    }
+}

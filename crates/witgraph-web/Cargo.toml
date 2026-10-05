@@ -1,0 +1,28 @@
+[package]
+name = "witgraph-web"
+description = "The witgraph scheduler for JavaScript hosts: a browser executor over jco-transpiled nodes"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# Everything here is for `wasm32`: on other targets the crate is empty.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+witgraph-ir = { workspace = true }
+witgraph-wit = { path = "../witgraph-wit" }
+witgraph-sched = { workspace = true }
+futures = "0.3"
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+wasm-bindgen = "=0.2.129"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"

@@ -5,7 +5,7 @@ use exports::node::{Guest, Inputs, Outputs};
 struct RelayPlus;
 
 impl Guest for RelayPlus {
-    fn run(inputs: Inputs) -> Outputs {
+    async fn run(inputs: Inputs) -> Outputs {
         Outputs {
             out: inputs
                 .in_

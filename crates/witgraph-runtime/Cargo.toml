@@ -13,10 +13,9 @@ workspace = true
 
 [dependencies]
 witgraph-ir = { workspace = true }
+witgraph-sched = { workspace = true }
 witgraph-wit = { path = "../witgraph-wit" }
-wit-parser = { workspace = true }
-semver = { workspace = true }
-wasmparser = { version = "0.258", default-features = false, features = ["std", "validate", "component-model", "features"] }
+wac-graph = "0.12"
 thiserror = { workspace = true }
 miette = { workspace = true }
 futures = "0.3"
@@ -24,9 +23,9 @@ wasmtime = { workspace = true, features = [
     "runtime", "cranelift", "component-model", "component-model-async", "async", "std",
     "wave", "parallel-compilation",
 ] }
-serde = { workspace = true, features = ["std"] }
 
 [dev-dependencies]
+wit-parser = { workspace = true }
 serde_json = { workspace = true }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time"] }
 test-components = { path = "../../test-fixtures/test-components" }

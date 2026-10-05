@@ -12,21 +12,25 @@ pub mod component;
 pub mod diagnostics;
 pub mod graph;
 pub mod id;
+pub mod interface;
+pub mod partition;
 pub mod port;
 mod topo;
+pub mod wave;
 
 pub use compile::{
     CompilationFailure, CompiledConnection, CompiledGraph, CompiledNode, ContractIndex,
     ContractSource, RequiredCapability, Resolution, resolve_contract,
 };
-pub use component::{Capability, ComponentContract, RunKind};
+pub use component::{Capability, ComponentContract};
 pub use diagnostics::{Diagnostic, Diagnostics, Location, Severity};
 pub use graph::{
-    Connection, Fraction, Graph, GraphBuilder, GraphMetadata, Node, ResourceClaim, UnknownNodeError,
+    Connection, Fraction, Graph, GraphBuilder, GraphMetadata, Link, Node, ResourceClaim,
+    UnknownNodeError,
 };
 pub use id::{
-    ComponentRef, ConnectionId, NodeId, PackageRef, ParseComponentRefError, PortName, PortRef,
-    ResourceId,
+    ComponentRef, ConnectionId, LinkId, NodeId, PackageRef, ParseComponentRefError, PortName,
+    PortRef, ResourceId,
 };
 pub use port::{NodeShape, PortDef, PortDirection, PortKind};
 pub use wasm_wave;

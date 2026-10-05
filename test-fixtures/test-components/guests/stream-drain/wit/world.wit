@@ -1,0 +1,15 @@
+package test:stream-drain@0.1.0;
+
+/// Returns at once and reads its input stream to the end from a task it
+/// spawned, so the reading outlives `run`.
+world stream-drain {
+    export node: interface {
+        record inputs {
+            items: stream<u32>,
+        }
+        record outputs {
+            started: bool,
+        }
+        run: async func(inputs: inputs) -> outputs;
+    }
+}

@@ -13,7 +13,7 @@ use std::hash::BuildHasher;
 
 use crate::component::ComponentContract;
 use crate::diagnostics::{Diagnostic, Diagnostics};
-use crate::graph::{Connection, Graph, Node};
+use crate::graph::{Connection, Graph, Link, Node};
 use crate::id::{ComponentRef, ConnectionId, NodeId, PackageRef, PortName, PortRef, ResourceId};
 use crate::port::{PortDef, PortDirection, PortKind};
 use crate::topo;
@@ -127,7 +127,6 @@ fn same_but_docs(a: &ComponentContract, b: &ComponentContract) -> bool {
             })
     };
     a.id == b.id
-        && a.run == b.run
         && a.capabilities == b.capabilities
         && ports(&a.inputs, &b.inputs)
         && ports(&a.outputs, &b.outputs)
@@ -212,14 +211,19 @@ impl ContractSource for ContractIndex {
     }
 }
 
-/// What the host must provide under one link name, across every component
-/// a graph instantiates. See [`CompiledGraph::required_capabilities`].
+/// What the host must provide under one link name, for one interface,
+/// across every component a graph instantiates. See
+/// [`CompiledGraph::required_capabilities`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RequiredCapability {
     /// The link name: a full interface id, an inline interface's import
-    /// name, or a `func:`- or `resource:`-prefixed root name (see
+    /// name, a `func:`- or `resource:`-prefixed root name, or a label (see
     /// [`Capability`](crate::Capability)).
     pub interface: String,
+    /// For a label, the full id of the interface it stands for; `None`
+    /// otherwise. Components that use one label for different interfaces
+    /// get an entry each.
+    pub implements: Option<String>,
     /// Every item some component imports under this name, mapped to each
     /// signature it is imported with. One signature is the norm; several
     /// mean components disagree, and the host must link those nodes
@@ -257,6 +261,9 @@ pub struct CompiledGraph {
     node_island: Vec<usize>,
     /// Per connection (by position): where its ends resolved.
     connection_ends: Vec<Ends>,
+    /// Per node (by position): the positions of its links in
+    /// `graph.links`, in declaration order.
+    node_links: Vec<Vec<usize>>,
     order: Vec<NodeId>,
     islands: Vec<Vec<NodeId>>,
     warnings: Diagnostics,
@@ -424,33 +431,82 @@ impl CompiledGraph {
     }
 
     /// What the host must provide for every component a node instantiates:
-    /// one entry per link name, sorted by it, with every item imported
-    /// under that name and each signature it is imported with. The result
-    /// depends only on which contracts the nodes instantiate, not on their
-    /// order.
+    /// one entry per link name and labelled interface, sorted by them, with
+    /// every item imported under that name and each signature it is
+    /// imported with. The result
+    /// depends only on which contracts the nodes instantiate and which of
+    /// their imports are linked, not on the nodes' order.
+    ///
+    /// An import a [`Link`] satisfies is not required of the host. What the
+    /// link's provider imports in turn is, but it is not listed here: the
+    /// graph does not hold providers' contracts, so it is known only when
+    /// the graph is loaded.
     pub fn required_capabilities(&self) -> Vec<RequiredCapability> {
-        let mut required: BTreeMap<&str, BTreeMap<String, BTreeSet<String>>> = BTreeMap::new();
-        let used: BTreeSet<usize> = self.node_contract.iter().copied().collect();
-        for capability in used
-            .into_iter()
-            .filter_map(|i| self.contracts.get(i))
-            .flat_map(|contract| &contract.capabilities)
-        {
-            let items = required.entry(&capability.interface).or_default();
-            for (name, signature) in &capability.items {
-                items
-                    .entry(name.clone())
-                    .or_default()
-                    .insert(signature.clone());
+        // By link name and labelled interface: each item's signatures.
+        type Items = BTreeMap<String, BTreeSet<String>>;
+        let mut required: BTreeMap<(&str, Option<&str>), Items> = BTreeMap::new();
+        // Nodes of one contract with the same imports linked contribute
+        // the same: each such pair is walked once.
+        let mut seen: HashMap<usize, Vec<BTreeSet<&str>>> = HashMap::new();
+        for (node, &index) in self.node_contract.iter().enumerate() {
+            let linked: BTreeSet<&str> = self
+                .node_links
+                .get(node)
+                .into_iter()
+                .flatten()
+                .filter_map(|&position| self.graph.links.get(position))
+                .map(|link| link.import.as_str())
+                .collect();
+            let Some(contract) = self.contracts.get(index) else {
+                continue;
+            };
+            let walked = seen.entry(index).or_default();
+            if walked.contains(&linked) {
+                continue;
             }
+            for capability in &contract.capabilities {
+                // A link covers its import, and an import wit-component
+                // merges it into (a semver-compatible version of the same
+                // interface), as loading does.
+                let covered = linked.iter().any(|import| {
+                    capability.is_interface()
+                        && crate::interface::semver_compatible(import, &capability.interface)
+                });
+                if covered {
+                    continue;
+                }
+                let key = (
+                    capability.interface.as_str(),
+                    capability.implements.as_deref(),
+                );
+                let items = required.entry(key).or_default();
+                for (name, signature) in &capability.items {
+                    items
+                        .entry(name.clone())
+                        .or_default()
+                        .insert(signature.clone());
+                }
+            }
+            walked.push(linked);
         }
         required
             .into_iter()
-            .map(|(interface, items)| RequiredCapability {
+            .map(|((interface, implements), items)| RequiredCapability {
                 interface: interface.to_string(),
+                implements: implements.map(str::to_string),
                 items,
             })
             .collect()
+    }
+
+    /// The links satisfying imports of `node`, in declaration order.
+    pub fn links_of<'a>(&'a self, node: &'a NodeId) -> impl Iterator<Item = &'a Link> {
+        self.node_index
+            .get(node)
+            .and_then(|&index| self.node_links.get(index))
+            .into_iter()
+            .flatten()
+            .filter_map(|&position| self.graph.links.get(position))
     }
 }
 
@@ -719,6 +775,66 @@ fn check_port_flags(table: &[Option<&ComponentContract>], diagnostics: &mut Diag
                     port: port.name.clone(),
                 });
             }
+        }
+    }
+}
+
+/// Checks every link: its id is unique, its node exists, and it names an
+/// interface import of the node's component that no earlier link already
+/// satisfies. Whether the provider's export fits the import is not known
+/// here: the graph does not hold the provider's contract, and loading
+/// checks it against the components themselves.
+fn check_links(
+    graph: &Graph,
+    node_ids: &HashSet<&NodeId>,
+    node_contracts: &HashMap<&NodeId, &ComponentContract>,
+    diagnostics: &mut Diagnostics,
+) {
+    let mut ids = HashSet::new();
+    // Per node, its links so far.
+    let mut linked: HashMap<&NodeId, Vec<&Link>> = HashMap::new();
+    for link in &graph.links {
+        if !ids.insert(&link.id) {
+            diagnostics.push(Diagnostic::DuplicateLinkId(link.id.clone()));
+        }
+        if !node_ids.contains(&link.node) {
+            diagnostics.push(Diagnostic::LinkUnknownNode {
+                link: link.id.clone(),
+                node: link.node.clone(),
+            });
+            continue;
+        }
+        // A node whose contract did not resolve is already diagnosed. The
+        // import is matched as loading matches it: by name, else a
+        // semver-compatible version, so the same link compiles against a
+        // contract lowered from WIT and one lowered from the bytes (where
+        // wit-component merged such versions into one import).
+        if let Some(contract) = node_contracts.get(&link.node)
+            && !crate::interface::resolve_import(&contract.capabilities, &link.import)
+                .is_some_and(|c| c.is_interface())
+        {
+            diagnostics.push(Diagnostic::UnknownImport {
+                link: link.id.clone(),
+                node: link.node.clone(),
+                import: link.import.clone(),
+            });
+            continue;
+        }
+        // The same import, or one a component merges it with (a
+        // semver-compatible version of the same interface): either way, one
+        // import of the built component.
+        let earlier = linked.entry(&link.node).or_default();
+        match earlier
+            .iter()
+            .find(|first| crate::interface::semver_compatible(&first.import, &link.import))
+        {
+            Some(first) => diagnostics.push(Diagnostic::ImportLinkedTwice {
+                node: link.node.clone(),
+                import: link.import.clone(),
+                first: first.id.clone(),
+                second: link.id.clone(),
+            }),
+            None => earlier.push(link),
         }
     }
 }
@@ -1065,20 +1181,9 @@ fn stream_islands(
     order: &[NodeId],
 ) -> Islands {
     let index: HashMap<&NodeId, usize> = order.iter().enumerate().map(|(i, n)| (n, i)).collect();
-    let mut parent: Vec<usize> = (0..order.len()).collect();
-    fn find(parent: &mut [usize], mut x: usize) -> usize {
-        while parent[x] != x {
-            parent[x] = parent[parent[x]];
-            x = parent[x];
-        }
-        x
-    }
-    fn union(parent: &mut [usize], a: usize, b: usize) {
-        let (ra, rb) = (find(parent, a), find(parent, b));
-        // The earlier topological position becomes the root, so a root is
-        // always its island's first member.
-        parent[ra.max(rb)] = ra.min(rb);
-    }
+    // A set's root is its smallest member: the earliest topological
+    // position, so a root is always its island's first member.
+    let mut parent = crate::partition::Partition::new(order.len());
     let edges: Vec<(usize, usize, bool)> = graph
         .connections
         .iter()
@@ -1096,11 +1201,11 @@ fn stream_islands(
         .collect();
     for &(a, b, is_async) in &edges {
         if is_async {
-            union(&mut parent, a, b);
+            parent.union(a, b);
         }
     }
 
-    let roots: Vec<usize> = (0..order.len()).map(|i| find(&mut parent, i)).collect();
+    let roots: Vec<usize> = (0..order.len()).map(|i| parent.find(i)).collect();
     let cycles = topo::cyclic_groups(
         order.len(),
         edges
@@ -1112,7 +1217,7 @@ fn stream_islands(
     for group in &cycles {
         if let [first, rest @ ..] = group.as_slice() {
             for &other in rest {
-                union(&mut parent, *first, other);
+                parent.union(*first, other);
             }
             merged_roots.push(*first);
         }
@@ -1121,7 +1226,7 @@ fn stream_islands(
     // Islands keyed by root (their first member's position), then numbered
     // in a topological order of the island DAG, earliest root first among
     // the ready ones.
-    let roots: Vec<usize> = (0..order.len()).map(|i| find(&mut parent, i)).collect();
+    let roots: Vec<usize> = (0..order.len()).map(|i| parent.find(i)).collect();
     let mut successors: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
     let mut indegree: BTreeMap<usize, usize> = roots.iter().map(|&r| (r, 0)).collect();
     for &(a, b, _) in &edges {
@@ -1158,7 +1263,7 @@ fn stream_islands(
     }
     let merged = merged_roots
         .into_iter()
-        .filter_map(|root| number.get(&find(&mut parent, root)).copied())
+        .filter_map(|root| number.get(&parent.find(root)).copied())
         .collect::<BTreeSet<_>>()
         .into_iter()
         .map(|island| islands[island].clone())
@@ -1225,6 +1330,7 @@ impl Graph {
         let (node_ids, node_contracts) = check_nodes(&self, &table, &mut diagnostics);
         check_port_flags(&table, &mut diagnostics);
         check_connection_ids(&self, &mut diagnostics);
+        check_links(&self, &node_ids, &node_contracts, &mut diagnostics);
         let endpoints =
             check_connection_endpoints(&self, &node_ids, &node_contracts, &mut diagnostics);
         let resolved = endpoints.resolved();
@@ -1300,12 +1406,19 @@ impl Graph {
                         })
                     })
                     .collect();
+                let mut node_links = vec![Vec::new(); self.nodes.len()];
+                for (position, link) in self.links.iter().enumerate() {
+                    if let Some(&node) = node_index.get(&link.node) {
+                        node_links[node].push(position);
+                    }
+                }
                 Ok(CompiledGraph {
                     contracts: resolved_contracts,
                     node_index,
                     node_contract,
                     node_island,
                     connection_ends,
+                    node_links,
                     graph: self,
                     order,
                     islands: islands.islands,
@@ -1370,6 +1483,13 @@ mod tests {
             self
         }
 
+        fn link(mut self, id: &str, node: &str, import: &str) -> Self {
+            self.builder = self
+                .builder
+                .link(id, node, import, cref("provider"), "demo:caps/clock");
+            self
+        }
+
         fn set_resource(
             mut self,
             node: &str,
@@ -1411,7 +1531,6 @@ mod tests {
             id: cref(world),
             inputs,
             outputs,
-            run: crate::component::RunKind::Sync,
             capabilities: capabilities.iter().map(|c| Capability::new(*c)).collect(),
             docs: None,
         }
@@ -3249,6 +3368,169 @@ mod tests {
             "every signature is listed"
         );
         assert!(log.conflicts());
+    }
+
+    #[test]
+    fn a_link_covers_the_imports_it_is_merged_with() {
+        let mut c = contract("merged", vec![], vec![port("out", PortKind::Value)], &[]);
+        let mut old = Capability::new("a:b/c@0.2.0");
+        old.items = BTreeMap::from([("f".to_string(), "func()".to_string())]);
+        let mut new = Capability::new("a:b/c@0.2.5");
+        new.items = BTreeMap::from([("g".to_string(), "func()".to_string())]);
+        let other = Capability::new("a:b/c@0.3.0");
+        c.capabilities = vec![old, new, other];
+        let required = builder("t")
+            .add_component(c)
+            .add_node("n", cref("merged"))
+            .link("l", "n", "a:b/c@0.2.0")
+            .build()
+            .compile()
+            .expect("valid graph")
+            .required_capabilities();
+        let names: Vec<&str> = required.iter().map(|r| r.interface.as_str()).collect();
+        assert_eq!(names, ["a:b/c@0.3.0"], "0.2.5 merges with the linked 0.2.0");
+
+        // Two links for what the component imports as one: refused.
+        let mut c = contract("twice", vec![], vec![port("out", PortKind::Value)], &[]);
+        c.capabilities = vec![
+            Capability::new("a:b/c@0.2.0"),
+            Capability::new("a:b/c@0.2.5"),
+        ];
+        let failure = builder("t")
+            .add_component(c)
+            .add_node("n", cref("twice"))
+            .link("l1", "n", "a:b/c@0.2.0")
+            .link("l2", "n", "a:b/c@0.2.5")
+            .build()
+            .compile()
+            .expect_err("one merged import, two links");
+        assert!(
+            failure
+                .diagnostics
+                .iter()
+                .any(|d| matches!(d, Diagnostic::ImportLinkedTwice { .. })),
+            "{failure:?}"
+        );
+    }
+
+    #[test]
+    fn a_link_names_an_import_as_the_wit_declares_it_whatever_the_bytes_merged() {
+        // Lowered from the bytes, where wit-component merged `@0.2.0` into
+        // `@0.2.5`: a link written against the WIT's `@0.2.0` still names
+        // that import.
+        let mut c = contract("bytes", vec![], vec![port("out", PortKind::Value)], &[]);
+        c.capabilities = vec![Capability::new("a:b/c@0.2.5")];
+        let required = builder("t")
+            .add_component(c)
+            .add_node("n", cref("bytes"))
+            .link("l", "n", "a:b/c@0.2.0")
+            .build()
+            .compile()
+            .expect("the link names the merged import")
+            .required_capabilities();
+        assert!(required.is_empty(), "{required:?}");
+    }
+
+    #[test]
+    fn one_label_for_two_interfaces_is_two_entries() {
+        let with = |world: &str, implements: &str, item: &str| {
+            let mut c = contract(world, vec![], vec![port("out", PortKind::Value)], &[]);
+            let mut capability = Capability::new("primary");
+            capability.implements = Some(implements.to_string());
+            capability.items = BTreeMap::from([(item.to_string(), "func()".to_string())]);
+            c.capabilities = vec![capability];
+            c
+        };
+        let required = builder("t")
+            .add_component(with("a", "demo:caps/kv", "get"))
+            .add_component(with("b", "demo:caps/clock", "get"))
+            .add_node("a", cref("a"))
+            .add_node("b", cref("b"))
+            .build()
+            .compile()
+            .expect("valid graph")
+            .required_capabilities();
+        let found: Vec<(&str, Option<&str>)> = required
+            .iter()
+            .map(|r| (r.interface.as_str(), r.implements.as_deref()))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                ("primary", Some("demo:caps/clock")),
+                ("primary", Some("demo:caps/kv")),
+            ]
+        );
+        assert!(required.iter().all(|r| !r.conflicts()));
+    }
+
+    #[test]
+    fn a_linked_import_is_not_required_of_the_host() {
+        let graph = builder("t")
+            .add_component(source())
+            .add_node("a", cref("source"))
+            .add_node("b", cref("source"))
+            .link("l", "a", "demo:caps/clock")
+            .build();
+        let compiled = graph.compile().expect("valid graph");
+        let names = |required: Vec<RequiredCapability>| -> Vec<String> {
+            required.into_iter().map(|r| r.interface).collect()
+        };
+        assert_eq!(
+            names(compiled.required_capabilities()),
+            ["demo:caps/clock", "demo:caps/log"],
+            "`b` still imports the clock from the host"
+        );
+        let (a, b) = (NodeId::from("a"), NodeId::from("b"));
+        assert_eq!(compiled.links_of(&a).count(), 1);
+        assert_eq!(compiled.links_of(&b).count(), 0);
+
+        let both = builder("t")
+            .add_component(source())
+            .add_node("a", cref("source"))
+            .link("l", "a", "demo:caps/clock")
+            .build()
+            .compile()
+            .expect("valid graph");
+        assert_eq!(names(both.required_capabilities()), ["demo:caps/log"]);
+    }
+
+    #[test]
+    fn links_are_checked() {
+        let mut bare = contract("bare", vec![], vec![port("out", PortKind::Value)], &[]);
+        bare.capabilities = vec![Capability::new("func:blink"), Capability::new("config")];
+        let failure = builder("t")
+            .add_component(source())
+            .add_component(bare)
+            .add_node("a", cref("source"))
+            .add_node("b", cref("bare"))
+            .link("ok", "a", "demo:caps/clock")
+            .link("ok", "b", "config")
+            .link("ghost", "nobody", "demo:caps/clock")
+            .link("typo", "a", "demo:caps/clok")
+            .link("func", "b", "func:blink")
+            .link("again", "a", "demo:caps/clock")
+            .build()
+            .compile()
+            .expect_err("bad links");
+        let found: Vec<String> = failure
+            .diagnostics
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            found,
+            [
+                "duplicate link id `ok`",
+                "link `ghost` references unknown node `nobody`",
+                "link `typo`: node `a` has no linkable import `demo:caps/clok`",
+                "link `func`: node `b` has no linkable import `func:blink`",
+                "link `again` links import `demo:caps/clock` of node `a`, which `ok` already links",
+            ]
+        );
+        assert!(failure.diagnostics.iter().all(|d| {
+            d.is_error() && matches!(d.location(), crate::diagnostics::Location::Link(_))
+        }));
     }
 
     #[test]

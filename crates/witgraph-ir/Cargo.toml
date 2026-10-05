@@ -23,6 +23,7 @@ wasm-wave = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
+wac-types = "0.12"
 
 [features]
 default = ["serde"]

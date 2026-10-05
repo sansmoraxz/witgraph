@@ -12,28 +12,36 @@ use witgraph_ir::{Capability, ComponentContract, PortDef, PortDirection, Type};
 /// The identity is purely structural: package, world, version, docs, and
 /// declared type names are all excluded, so any two contracts with the same
 /// port, `run` and capability shapes hash identically. A capability's shape
-/// is its link name plus every item's signature. Ports, capabilities and
+/// is its link name, the interface a label stands for, and every item's
+/// signature. Ports, capabilities and
 /// items are sorted, so declaration order doesn't matter either.
 /// Variable-length strings (port names, rendered types, capabilities) are
 /// Debug-quoted so no crafted name can forge another line's field boundary.
 ///
 /// Payload types use this module's own canonical encoding ([`encode_type`]),
 /// never wasm-wave's `Display`, so a dependency upgrade cannot shift hashes.
-/// The `Display` renderings of [`witgraph_ir::PortKind`] and
-/// [`witgraph_ir::RunKind`] are part of the identity too: changing those
-/// spellings changes every hash. The leading
+/// The `Display` rendering of [`witgraph_ir::PortKind`] is part of the
+/// identity too: changing its spellings changes every hash. The leading
 /// `witgraph-contract v…` line versions the encoding itself, so a deliberate
 /// format change shifts hashes explicitly rather than colliding with old
 /// ones.
 fn canonical(contract: &ComponentContract) -> String {
+    // Still v3: an `implements` line appears only for a labelled import,
+    // which no v3 contract could have, so every other contract keeps its
+    // hash.
     let mut out = String::from("witgraph-contract v3\n");
-    let _ = writeln!(out, "run {}", contract.run);
+    // Every node's `run` is async now; the line stays so v3 hashes do not
+    // shift.
+    out.push_str("run async\n");
     write_ports(&mut out, PortDirection::Input, &contract.inputs);
     write_ports(&mut out, PortDirection::Output, &contract.outputs);
     let mut capabilities: Vec<&Capability> = contract.capabilities.iter().collect();
     capabilities.sort_unstable();
     for capability in capabilities {
         let _ = writeln!(out, "capability {:?}", capability.interface);
+        if let Some(interface) = &capability.implements {
+            let _ = writeln!(out, "implements {interface:?}");
+        }
         for (name, signature) in &capability.items {
             let _ = writeln!(out, "item {name:?} {signature:?}");
         }
@@ -377,14 +385,13 @@ pub fn content_hash(contract: &ComponentContract) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use witgraph_ir::{PortKind, RunKind};
+    use witgraph_ir::PortKind;
 
     fn contract(port_name: &str) -> ComponentContract {
         ComponentContract {
             id: "demo:test/w@0.1.0".parse().unwrap(),
             inputs: vec![PortDef::new(port_name, PortKind::Value, Type::F64)],
             outputs: vec![],
-            run: RunKind::Sync,
             capabilities: vec![],
             docs: None,
         }
@@ -408,14 +415,11 @@ mod tests {
     }
 
     #[test]
-    fn kind_and_run_change_identity() {
+    fn kind_changes_identity() {
         let plain = contract("in");
         let mut streamed = contract("in");
         streamed.inputs[0].kind = PortKind::Stream;
-        let mut r#async = contract("in");
-        r#async.run = RunKind::Async;
         assert_ne!(content_hash(&plain), content_hash(&streamed));
-        assert_ne!(content_hash(&plain), content_hash(&r#async));
     }
 
     #[test]
@@ -462,7 +466,7 @@ mod tests {
         c.outputs = vec![PortDef::new("out", PortKind::Stream, Type::U32)];
         assert_eq!(
             canonical(&c),
-            "witgraph-contract v3\nrun sync\ninput \"in\" value false \"f64\"\noutput \"out\" stream false \"u32\"\n"
+            "witgraph-contract v3\nrun async\ninput \"in\" value false \"f64\"\noutput \"out\" stream false \"u32\"\n"
         );
     }
 

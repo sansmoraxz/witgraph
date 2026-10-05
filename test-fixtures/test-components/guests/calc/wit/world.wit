@@ -1,0 +1,23 @@
+package test:calc@0.1.0;
+
+/// Computes through `test:math/ops`, which a link or the host provides.
+world calc {
+    import test:math/ops@0.1.0;
+
+    export node: interface {
+        record inputs {
+            x: option<u32>,
+        }
+        record outputs {
+            /// `ops.double(x)`: a sync call.
+            doubled: u32,
+            /// `ops.slow-double(x)`: an async call.
+            slow: u32,
+            /// The sum of `ops.count(x)`'s stream.
+            total: u32,
+            /// `ops.calls()` afterwards.
+            calls: u32,
+        }
+        run: async func(inputs: inputs) -> outputs;
+    }
+}

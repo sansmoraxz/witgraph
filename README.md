@@ -18,8 +18,21 @@ wasmtime using the component model's native `stream<T>` and `future<T>`.
 - **`witgraph-wit`** — loads `.wit` sources with `wit-parser`, lowers
   component worlds into contracts, computes content hashes, and generates
   the editor-facing metadata catalog.
+- **`witgraph-sched`** — the scheduler, with no engine in it: ticks,
+  generations, latched Values, feedback, faults and snapshots, driven over
+  an `Executor` that runs the nodes. It builds for `wasm32` too, so the
+  same graphs can run under the same rules on a JavaScript host.
 - **`witgraph-runtime`** — `RuntimeGraph`, the last typestate: a compiled
-  graph loaded with component bytes and run on wasmtime.
+  graph loaded with component bytes and run on wasmtime. It is
+  `witgraph-sched` over a wasmtime executor.
+- **`witgraph-web`** — `witgraph-sched` for JavaScript hosts, bound with
+  `wasm-bindgen`: nodes are JavaScript functions, values cross in jco's
+  representation.
+- **`packages/witgraph-loader`** (TypeScript) — runs a graph in a browser
+  or Node: transpiles each node's component with jco, instantiates it, and
+  drives it under `witgraph-web`, with hooks for debugging and simulation.
+- **`witgraph-source`** — resolves the component bytes a graph runs from
+  files and OCI registries, pinned by digest.
 - **`test-components`** (not published) — guest components used by the
   runtime tests.
 
@@ -44,6 +57,7 @@ Toolchain pins, kept consistent with each other:
 | wasmtime | 49.0.1 |
 | wit-parser, wit-component, wasm-wave | 0.258 (the wasm-tools release wasmtime 49 is built on) |
 | wit-bindgen (guests) | 0.61.0, with `async-spawn` |
+| wac-graph | 0.12 (on wasm-tools 0.258), for links |
 
 ## Components
 
@@ -108,16 +122,16 @@ effective (expanded) size reaches 1,000,000. Types no world reaches are not
 checked. wit-parser accepts all of these, but no component can contain
 them. Lowering errors name the world as `package/world@version`.
 
-A world may not import or export a named interface under a label
-(`import primary: clock;`, `export node: contract;`, `export primary:
-node;`), nor carry `@external-id`: components encode those with an
-extension the runtime does not enable. Names within an imported or
-exported interface may not differ only in letter case.
+A world may not export a named interface under a label (`export node:
+contract;`, `export primary: node;`), import the built-in
+`witgraph:runtime/host` under one, nor carry `@external-id`. Names within
+an imported or exported interface may not differ only in letter case.
 
 ### `run`
 
-`run` is either a `func` (sync) or an `async func`. Its signature must
-match the records the node declares:
+`run` must be an `async func`: nodes are async only, and a plain `func`
+is rejected when the WIT is lowered. Its signature must match the records
+the node declares:
 - it takes exactly `(inputs: inputs)` when an `inputs` record exists, and no
   parameters otherwise;
 - it returns `outputs` when an `outputs` record exists, and nothing
@@ -125,7 +139,7 @@ match the records the node declares:
 
 No other function may appear in `node`.
 
-An async `run` may await its inputs before returning. For example, a
+`run` may await its inputs before returning. For example, a
 consumer can read a whole stream and then return a total as a Value output.
 To produce a stream, return its reader from `run` and write from a spawned
 task. The consumer's `run` cannot start until the producer's `run` has
@@ -147,6 +161,11 @@ is named after what a component imports:
 - **Resources declared in the world itself** (`resource r;`) count, as
   `resource:r`, with their constructor, methods and statics as its items.
   The host links `r` and its functions at the `Linker`'s root.
+- **Labelled imports** (`import primary: clock;`) count, under the label
+  (`primary`), and record the interface the label stands for
+  (`Capability::implements`). The host links the label as a `Linker`
+  instance. A world may import one interface under several labels, so a
+  host can back each differently.
 - **Type-only imports** are structural and don't count. An interface the
   world imports only because `node` uses one of its types is still
   imported whole, so its functions count: the guest can call them.
@@ -164,7 +183,8 @@ a signature is named by its interface's id at its semver track (`@1`,
 A world's capabilities are an upper bound on what a component built from it
 imports: the component imports only the items its code uses.
 `CompiledGraph::required_capabilities` aggregates the capabilities of every
-component in a graph: one entry per link name, sorted; each item maps to
+component in a graph: one entry per link name (and, for a label, per
+interface it stands for), sorted; each item maps to
 every signature it is imported with (more than one means components
 disagree).
 
@@ -174,7 +194,7 @@ component imports everything the world declares.
 
 ### Guests in Rust
 
-With wit-bindgen 0.61, a sync node is a plain function from inputs to outputs:
+With wit-bindgen 0.61, a node is an `async fn` from inputs to outputs:
 
 ```rust
 wit_bindgen::generate!({ path: "wit", world: "echo" });
@@ -184,7 +204,7 @@ use exports::node::{Guest, Inputs, Outputs};
 struct Echo;
 
 impl Guest for Echo {
-    fn run(inputs: Inputs) -> Outputs {
+    async fn run(inputs: Inputs) -> Outputs {
         Outputs { out: inputs.in_.unwrap_or(0.0) }
     }
 }
@@ -206,7 +226,7 @@ wit/
 wit_bindgen::generate!({ path: "wit", world: "busy-loop", generate_all });
 ```
 
-An async node returns its stream reader and writes from a spawned task:
+A producer returns its stream reader and writes from a spawned task:
 
 ```rust
 impl Guest for Producer {
@@ -234,7 +254,9 @@ A `Graph` is plain, serializable data:
 - a component table of `ComponentRef`s (`namespace:name/world@version` plus
   a content hash);
 - nodes, each referencing a component, with optional resource claims;
-- connections from output ports to input ports.
+- connections from output ports to input ports;
+- links, each satisfying one import of a node with another component's
+  export (see [Links](#links)).
 
 A graph never stores contracts. `Graph::compile(&contracts)` resolves the
 component table through a `ContractSource` (a slice, `Vec`, or `HashMap` of
@@ -248,6 +270,12 @@ lowers every component world in it into a contract; `load_lowered(path)`
 also keeps each world's named types, for the editor catalog. A syntax
 error, in the source or a dependency, is `LoadError::Parse`; resolution
 errors carry their `file:line`.
+
+`witgraph_wit::lower_component(bytes, &id)` lowers the WIT embedded in an
+encoded component instead, so a graph can compile from component artifacts
+alone. A component does not record the package and world it was built from,
+so the contract takes them from `id`. Its capabilities are the imports the
+component's code uses, which can be fewer than its WIT source declares.
 
 A `CompiledGraph` exposes `graph()`, `contracts()`, `contract_for(node)`,
 `warnings()`, `topological_order()`, `depth_map()`, `islands()`,
@@ -301,6 +329,40 @@ first member's position.
   - A feedback connection that is on no cycle, and does not keep two
     islands apart (see [Islands](#islands)), gets a warning.
 
+### Links
+
+A capability is something the host provides. A **link** provides it from
+another component instead: it names a node, one of its interface imports
+(as the node's contract names the capability: an interface id, an inline
+import name or a label), a provider component and the provider's export.
+
+```rust
+let graph = Graph::builder("g")
+    .add_component(&calc)
+    .add_node("n", calc.id.clone())
+    .link("l", "n", "test:math/ops@0.1.0", math_ref, "test:math/ops@0.1.0")
+    .build();
+```
+
+- A provider is an ordinary component; it need not be a node, and the graph
+  holds no contract for it.
+- When the graph is loaded, each provider is composed into its node's
+  component (with `wac-graph`), so the node calls it directly: sync and
+  async functions, resources, streams and futures all cross a link.
+- Each node gets a provider instance of its own, which lives and is rebuilt
+  with the node's island. Links of one node naming the same provider share
+  that instance.
+- What the provider itself imports becomes a capability of the node, asked
+  of the host at load.
+- Compilation checks that the node exists, that it has that interface
+  import (a bare function or a world resource cannot be linked), and that
+  an import is linked once. Whether the export fits the import is checked
+  at load, from the components themselves.
+- `required_capabilities` leaves out linked imports. It cannot list what
+  providers import: that is known only at load.
+
+Links are not supported by the JavaScript executor yet.
+
 ### Component identity
 
 A component is identified by `namespace:name/world@version` plus a sha-256
@@ -308,7 +370,7 @@ content hash of its lowered contract.
 
 The hash covers the `run` kind, the sorted ports (direction, name, kind,
 optionality and payload type) and the sorted capabilities with their items'
-signatures. It does not cover the package, world, version, doc comments or
+signatures and, for a labelled import, the interface it stands for. It does not cover the package, world, version, doc comments or
 type names, so any two contracts with the same shape hash identically.
 Capabilities are named by the full id of what the world imports, version
 included: that is the dependency's identity, not the component's, so an
@@ -320,8 +382,8 @@ wasm-wave's display format.
 ### Editor catalog
 
 `witgraph_wit::metadata::generate_catalog` produces a JSON-serializable
-catalog (schema version 4) of components, ports, capabilities and named
-types, for editors. Each entry's `id` is the pinned ref (`…@ver#hash`).
+catalog (schema version 5) of components, ports, capabilities (with the
+interface a label stands for) and named types, for editors. Each entry's `id` is the pinned ref (`…@ver#hash`).
 
 ## Runtime
 
@@ -356,6 +418,40 @@ is the ref of its resolved contract, or a ref without a content hash, which
 matches by package (version included) and world. Only components some node
 instantiates need bytes.
 
+The bytes can come from anywhere. `witgraph-source` resolves them from a
+list of sources kept beside the graph (plain serde data), one per
+component: a file, or an OCI artifact holding one WebAssembly layer.
+
+```rust
+let sources = vec![
+    ComponentSource::oci(sensor, "ghcr.io/demo/sensor:0.1.0").pinned(digest),
+    ComponentSource::file(alarm, "components/alarm.wasm"),
+];
+let components = Resolver::new().base(dir).cache(cache_dir).resolve(&sources).await?;
+let rt = RuntimeGraph::load(compiled, &components.wasm(), config, Perf).await?;
+```
+
+- A source may pin a digest (`sha256:<hex>` of the component's bytes);
+  other bytes are a `DigestMismatch`, whatever the source.
+- With a cache directory, a pulled component is kept under its digest, and
+  a pinned source already in the cache is not pulled again. An unpinned
+  tag is always pulled. Caching is best effort: a cache that cannot be
+  written does not fail the resolve.
+- `Resolver::auth(registry, credentials)` sets one registry's credentials,
+  which no other registry is sent; `insecure_registries` reaches
+  a local registry over plain HTTP.
+- A file source must stay under `Resolver::base` (no absolute path, no
+  `..`): an `OutsideBase` error otherwise, unless
+  `allow_paths_outside_base` says a source list is trusted.
+- A component over `Resolver::max_component_bytes` (256 MiB by default) is
+  a `TooLarge`, refused before it is read whole. Sources with the same
+  location and pin are fetched once.
+
+A node with links also needs its providers' bytes, under their refs.
+`PreparedComponent::linked(engine, contract, bytes, &links)` prepares such
+a node from `LinkedProvider`s; `load_prepared` matches a prepared component
+to a node by contract and links.
+
 For each component, loading:
 1. decodes the WIT embedded in the bytes;
 2. lowers it, which must yield exactly one `node` world;
@@ -365,7 +461,8 @@ For each component, loading:
    code uses). An interface may be imported at a semver-compatible version
    of the declared one (wit-component merges such imports to the newest),
    the way wasmtime's linker matches it;
-4. instantiates every node, island by island, finding `run` under the name
+4. composes in the providers the node's links name, checking each link;
+5. instantiates every node, island by island, finding `run` under the name
    the bytes export `node` as.
 
 Bytes whose WIT cannot be decoded are a `BadComponent`, whatever goes wrong
@@ -375,7 +472,7 @@ checked against the newest compatible declaration, which is what wasmtime's
 linker resolves it to. Each node's component is linked once
 (`InstancePre`); rebuilds reuse that.
 
-Steps 1 to 3 and compiling are the slow part of a load, and run
+Steps 1 to 4 and compiling are the slow part of a load, and run
 synchronously. `PreparedComponent::new(engine, contract, bytes)` does them
 on their own, so an embedder can run them off its executor
 (`spawn_blocking`, say) and keep the result to load the same component
@@ -397,25 +494,67 @@ takes the embedder's `Host`:
 - `Host::link(node, contract, linker)` adds a node's capability imports to
   its wasmtime `Linker`. It runs once per node, after the built-in
   `witgraph:runtime/host` interface is added.
-- `Host::island_data(members, state)` creates the data of an island's
-  Store, when the island is built and every time it is rebuilt. The data
-  type (`Host::Data`) is the embedder's, so capability state lives per
-  island and hosts that need a particular data type (WASI, `bindgen!`) can
-  be linked. It must keep the `HostState` it is handed (which enforces the
-  island's memory and item limits) and hand it back through `IslandData`.
+- `Host::island_data(members, state)` creates the data of one Store, for
+  the members instantiated in it, when their island is built and every
+  time it is rebuilt. An island has one Store or several (see
+  [Islands](#islands)), so state a host keeps in it is per Store: per
+  island unless `RuntimeConfig::split_islands` is set. The data type
+  (`Host::Data`) is the embedder's, so capability state lives per Store
+  and hosts that need a particular data type (WASI, `bindgen!`) can be
+  linked. It must keep the `HostState` it is handed (which enforces the
+  Store's memory and item limits) and hand it back through `IslandData`.
   An error fails the load (`Instantiation`) or the rebuild (`Restart`).
+
+- `Host::check(node, capability)` says whether the host can provide a
+  capability. It is asked for every capability every node's component
+  imports (what its bytes import, which can be fewer than its world
+  declares) before anything is linked, and by `load_with_host` before
+  anything is compiled, so a gap fails the load by name, early. The default
+  reports none.
 
 `load` is `load_with_host` with `NoCapabilities`.
 
-Loading fails with a `RuntimeError`:
+#### Capability plugins
+
+`Plugins` is a `Host` assembled from `CapabilityPlugin`s. Each plugin has
+an `id()`, declares what it `provides()` (capability names, asked once when the
+plugin is added; an interface id also serves every older
+semver-compatible version, never a newer one), and links one capability
+into a node's linker on request (`link(node, capability, linker)`, under
+`capability.link_name()`: an interface's id, inline name or label, or a bare
+function's or world resource's own name at the linker's root).
+
+```rust
+let host = Plugins::new().with(Clock)?.with(Store("primary"))?.with(Store("backup"))?;
+let rt = RuntimeGraph::load_with_host(compiled, &wasm, config, Perf, host).await?;
+```
+
+Each capability a node imports is routed to one plugin:
+- a labelled import whose label is a plugin's id goes to that plugin, which
+  must provide the interface the label stands for;
+- anything else goes to the one plugin providing it. None is a
+  `MissingCapability`; several are an `AmbiguousCapability`, which a label
+  naming one of them resolves.
+
+Island Store data is `PluginData` by default: witgraph's `HostState` plus
+`Extensions`, a map holding one value per type, where plugins sharing a
+Store keep their state for that Store (an island split into several
+Stores has one `Extensions` in each). `Plugins::with_data` takes a data
+factory for plugins that need a data type of their own.
+
+Loading fails with a `LoadError` (`witgraph_runtime::LoadError`); scheduler errors, such as `InvalidConfig`, come wrapped in `LoadError::Runtime`:
 
 | Error | Cause |
 |---|---|
-| `MissingWasm` | No bytes for a component. |
+| `MissingWasm` | No bytes for a component, or for a provider a link names. |
+| `AmbiguousProvider` | A link names its provider without a hash, and several pinned keys of the WASM map match it. |
 | `BadComponent` | The bytes are not a valid component, import or export something no node can (a core module, a nested component, a function type), don't embed exactly one `node` world, or fail to compile. |
-| `ContractMismatch` | The bytes have other ports or another `run` kind than the compiled contract, or import a capability item it does not declare with that signature. |
+| `ContractMismatch` | The bytes have other ports or another `run` kind than the compiled contract, or import a capability item it does not declare with that signature; or a component was prepared with other links than its node's. |
+| `BadLink` | A link cannot be made: the provider has no such export, the export does not fit the import, or the node and its providers do not compose. |
+| `MissingCapability` | A node imports a capability the host reports it cannot provide (`Host::check`; with `Plugins`, no plugin provides it at the import's version or a newer compatible one; with `NoCapabilities`, any import with items). |
+| `AmbiguousCapability` | Several plugins provide a capability a node imports, and no label picks one. |
 | `Instantiation` | A node failed to link or instantiate (a missing capability import, a trapping start function, an island over its memory limit), or `Host::island_data` failed. |
-| `InvalidConfig` | A `RuntimeConfig` limit is zero, `memory_reservation` is too large to round to pages, components were prepared on another engine, or the engine cannot run a graph: no fuel metering, component-model async, concurrency, `map`, `error-context` or fixed-length-list support, epoch interruption on, or shared memories on. |
+| `Runtime(InvalidConfig)` | A `RuntimeConfig` limit is zero, `memory_reservation` is too large to round to pages, components were prepared on another engine, or the engine cannot run a graph: no fuel metering, component-model async, concurrency, `map`, `error-context`, fixed-length-list or labelled-import support, epoch interruption on, or shared memories on. A plugin id registered twice is one too (`Plugins::with` returns it as a plain `RuntimeError`). |
 
 `RuntimeConfig` fields and defaults:
 
@@ -424,9 +563,10 @@ Loading fails with a `RuntimeError`:
 | `max_steps_per_tick` | 10,000 | Most generations one tick may start: a bound on one tick's work, not a loop detector. |
 | `yield_interval` | 100,000 | Fuel an island burns before yielding to the executor (at least 1). |
 | `fuel_per_run` | `None` | Fuel budget reset before every `run`; `None` is effectively unlimited. |
-| `max_island_memory` | 1 GiB | Linear memory and tables an island's instances may hold in total; `None` is unlimited. |
+| `max_island_memory` | 1 GiB | Linear memory and tables the instances of an island may hold in total, across all its Stores; `None` is unlimited. |
 | `hostcall_fuel` | 128 MiB | Host memory the values copied out of a guest in one call may take (each value element costs about 48 bytes). |
 | `memory_reservation` | `None` | Address space each linear memory reserves up front, in whole pages (`0` reserves none); `None` keeps wasmtime's default. Only used when the runtime makes the engine. |
+| `split_islands` | `false` | Give members joined only by streams of scalars or strings a Store each, pumping the items across: they interleave, a fault in a Store of one member names it as the culprit (a memory-limit fault excepted), and pumped items are traced, but `Host::island_data` and the fuel budget become per Store. `false` keeps every island in one Store. |
 | `engine` | `None` | The wasmtime engine to use: one from `RuntimeConfig::new_engine`, or another graph's `engine()`, so graphs share it. `None` uses the prepared components' engine, or makes one. |
 
 A loaded graph also exposes `node_state(node)` (`UnknownNode` for a node
@@ -439,10 +579,23 @@ exactly the versions it was built with.
 ### Islands
 
 Nodes joined by stream or future connections form an **island**
-(`CompiledGraph::islands`). Every member of an island is instantiated in one
-wasmtime Store, so stream and future handles pass directly from a
-producer's `run` result into the consumer's `run` arguments. A node with no
-stream or future connection is an island of its own.
+(`CompiledGraph::islands`): the unit that runs a generation, faults and is
+rebuilt together. A node with no stream or future connection is an island
+of its own.
+
+A stream or future handle belongs to the wasmtime Store it was made in. By
+default an island is one Store, and every handle passes directly from the
+producer's `run` result into the consumer's `run` arguments. With
+`RuntimeConfig::split_islands`, inside an island:
+- members joined by a stream of records, lists or any other compound
+  payload, by a stream without a payload, or by a future, are instantiated
+  in **one Store**, and the handle passes directly from the producer's
+  `run` result into the consumer's `run` arguments;
+- every other member has **a Store of its own**. A stream of a scalar or
+  `string` payload between two Stores is pumped by the host: items are
+  read out of the producer's Store and written into a new stream in the
+  consumer's, a few chunks at a time, so a slow reader still holds the
+  writer back and a dropped reader still stops it.
 
 Islands form a DAG. When a non-feedback path leaves an island and re-enters
 it through other islands (a stream island whose Value output, through a
@@ -454,17 +607,20 @@ member of a merged island runs in each of its generations, whichever input
 changed. `CompiledGraph::islands` lists islands in a topological order of
 that DAG.
 
-The host only handles Values: it latches them and delivers them between
-islands. A stream or future output with no consumer is closed as soon as its
-`run` returns, so the guest's writes fail instead of blocking.
+The host latches Values and delivers them between islands. A stream or
+future output with no consumer is closed as soon as its `run` returns, so
+the guest's writes fail instead of blocking.
 
-Islands have limits, because wasmtime isolates and schedules per Store:
-- **Shared fate.** A trap in any member faults the whole island; a trap
-  poisons the Store.
-- **No interleaving within an island.** A busy member starves its siblings.
-  Separate islands do interleave, through `yield_interval`.
-- **The host never sees stream or future items.** It cannot read, trace,
-  copy or tee them.
+Wasmtime isolates and schedules per Store, so what members share depends on
+whether they share one:
+- **Shared fate.** A fault in any member faults the whole island and every
+  Store of it. Within one Store a trap cannot be pinned on a member.
+- **Interleaving.** Members in one Store do not interleave: a busy member
+  starves its siblings there. Separate Stores, of one island or of several,
+  do interleave, through `yield_interval`.
+- **Stream items.** The host sees the items of a stream it pumps between
+  Stores (it reports how many passed: `TraceEvent::StreamItems`). Items of
+  a stream inside one Store, and every future, pass guest to guest unseen.
 
 ### Generations and ticks
 
@@ -602,9 +758,12 @@ A node's phase is a projection of its island's state. `node_state(node)`
 returns a `NodeState` view with `phase()`, `fault_cause()`, `culprit()`,
 `id()` and `shape()`. `culprit()` names the member that caused its island's
 fault when it is known: the one that called `fatal` or failed to rebuild,
-or the island's only member. In a larger island a trap cannot be pinned on
-one member (one that returned may still run a task it spawned), so it has
-none.
+or the only member of the Store that faulted. In a Store of several members
+a trap cannot be pinned on one (one that returned may still run a task it
+spawned), so it has none; every island is one Store unless
+`split_islands` is set. Nor has a memory-limit fault in an island of
+several Stores: they share the limit, and the Store that crossed it need
+not hold most of it.
 
 | Island | Node phase |
 |---|---|
@@ -689,31 +848,33 @@ capacity 1.0.
 
 ### Sandboxing
 
-Every island Store meters fuel:
-- **`yield_interval`** (default 100,000): the island yields to the executor
-  after burning this much fuel, so a busy island cannot starve other
-  islands.
+Every Store of an island meters fuel:
+- **`yield_interval`** (default 100,000): the Store yields to the executor
+  after burning this much fuel, so busy members cannot starve other
+  Stores.
 - **`fuel_per_run`** (default `None`, effectively unlimited): before every
-  `run` call, the island's fuel is reset to this budget. An island that
-  burns it before its next `run` starts faults with
+  `run` call, the fuel of the member's Store is reset to this budget. A
+  Store that burns it before its next `run` starts faults its island with
   `NodeFault::FuelExhausted`. Instantiation (a guest's `_initialize`) does
   not spend it.
 
-The budget is shared by everything running in the island, spawned tasks
+The budget is shared by everything running in the Store, spawned tasks
 included. An endless streaming generation therefore exhausts any finite
 budget eventually. Give endless islands `None`, or a budget sized for how
 long they should live.
 
-Every island Store is also limited:
+Every island is also limited:
 - **`max_island_memory`** (default 1 GiB): the linear memory and tables
-  (8 bytes per element) all of the island's instances may hold together.
-  Growing past it faults the island (`MemoryLimit`), and an island that
-  needs more than it at instantiation fails to load. A growth past a
+  (8 bytes per element) all the instances of an island may hold together,
+  across all its Stores. Growing past it faults the island
+  (`MemoryLimit`), and an island that needs more than it at instantiation
+  fails to load. A growth past a
   memory's own declared maximum is refused without being charged. Nothing
   granted is refunded (wasmtime reports growth failures it never asked
   about, so a refund could be forged).
-- **Item counts:** an island Store may hold at most 64 core instances, 16
-  memories and 16 tables per member. Every memory reserves address space
+- **Item counts:** a Store may hold at most 64 core instances, 16
+  memories and 16 tables per component its members instantiate (a node,
+  and each provider composed into it). Every memory reserves address space
   whatever its size, so a crafted component cannot exhaust the process's
   address space with empty memories.
 - **`hostcall_fuel`** (default 128 MiB): wasmtime's per-call budget for the
@@ -743,7 +904,7 @@ included. It captures:
   generation is queued, and which of its feedback connections a newer host
   write overrides (`stale_feedback`);
 - the component ref (id and content hash) of every node, and the graph's
-  connections;
+  connections and links;
 - a `quiescent` flag: no generation in flight (a restored replay not
   started yet is listed under its island, but is not in flight). It and
   the phases are informational: `restore` does not apply them.
@@ -754,7 +915,8 @@ included. It captures:
 - **Preconditions.** No island may be running (`NotQuiescent`): the graph
   is freshly loaded, shut down, or every running island was just
   cancelled. It must have exactly the snapshot's nodes (each with a phase),
-  components and connections. Islands are matched by their set of members,
+  components, connections and links (each link's id, node, import, provider
+  and export). Islands are matched by their set of members,
   in any order. An island that does not exist or is listed twice, a replay
   naming a node outside its island, a feedback value for a connection that
   is not a feedback connection, or stale feedback that is not a feedback
@@ -794,10 +956,108 @@ restored.
   awaiting the current tick; between ticks, nothing runs.
 - **One fuel budget.** `fuel_per_run` applies to every island alike.
 - **Merged islands share a fate.** Islands merged to keep the island graph
-  a DAG share one Store, fault together, do not interleave, and sum their
-  resource claims (an island over 1.0 fails to load).
+  a DAG fault together and sum their resource claims (an island over 1.0
+  fails to load).
+- **One Store per island by default.** With `split_islands`, only streams
+  of scalars and strings are pumped between Stores; futures and compound
+  streams still keep members together.
 - **One task at a time.** A `RuntimeGraph` is `Send` but not `Sync`: every
   call takes it by `&mut` (or `&` for reads) from the task that owns it.
+
+### Other executors
+
+Everything under [Generations and ticks](#generations-and-ticks) through
+[Snapshots](#snapshots) is `witgraph_sched::Scheduler<M, X>`, generic over
+an `Executor`. An executor says what a value is (`Executor::Value`, with
+type checks and WAVE text per port), builds its islands, and runs a
+generation in one when asked (`run`, `rebuild_and_run`), reporting each
+member's `run` start and return. Inside an island every executor shares
+the same loop (`witgraph_sched::drive`): members are called in dependency
+order through a `NodeCaller`, and each output goes to the members that read
+it.
+
+`RuntimeGraph` is that scheduler over wasmtime, where an island is a Store
+and a value is a `Val`. Fuel, memory limits, capabilities and `fatal`
+belong to that executor, not to the scheduler.
+
+### In a browser
+
+`witgraph-web` is the scheduler over a JavaScript executor, and
+`packages/witgraph-loader` wraps it: each node's component is transpiled
+with jco and instantiated on its own, and every call to a node's `run`
+goes through the loader. The graph ticks, latches, feeds back, faults and
+snapshots as it does on wasmtime, and a snapshot has the same format.
+
+```ts
+const session = await Session.load({
+  graph,                       // the graph, as JSON
+  components,                  // [{ id: 'demo:graph/sensor@0.1.0', bytes, wit? }]
+  capabilities: (node, capability) =>
+    capability.interface === 'demo:caps/clock@0.1.0' ? { now: () => 0n } : undefined,
+  mocks: { sensor: () => ({ latest: { value: 1, timestamp: 0n } }) },
+  beforeRun: async (node, inputs) => { /* a breakpoint: the run waits */ },
+  onStreamItem: ({ node, port, item }) => console.log(node, port, item),
+});
+session.graph.inject('scale', 'factor', 10);
+await session.tick();                          // one iteration: stepping is ticking
+session.graph.readOutput('scale', 'out');
+session.graph.takeTrace();                     // the same events as `Trace`
+```
+
+- **Values** cross in jco's representation: records are objects with
+  `lowerCamelCase` keys, 64-bit integers are `BigInt`s, numeric lists are
+  typed arrays, and `option<T>` is the value or `undefined`, unless `T` is
+  itself an option of that kind, in which case it is `{ tag: 'none' }` or
+  `{ tag: 'some', val }` (so `option<option<u32>>` is tagged, and the
+  option around that is plain again). `injectWave` and `readOutputWave`
+  take and give WAVE text. A stream is an async iterable and a future a
+  thenable. Values compare as on wasmtime (every NaN equals every other;
+  `-0` is not `0`).
+- **Contracts.** Without `wit`, a component's contract is lowered from its
+  bytes, whose content hash counts only the imports its code uses. With
+  `wit` (the WIT source text it was built from, one document), the bytes
+  are checked against that source, as on wasmtime, and the graph may pin
+  the content hashes of a catalog lowered from it. Each node runs the
+  bytes of the entry its contract was resolved from. Contracts and
+  transpiled components are kept by the SHA-256 of the bytes, so reloading
+  a graph does not redo them.
+- **Capabilities.** `capabilities(node, capability)` is asked for each
+  import of a node, every time it is instantiated, with the capability of
+  its contract a wasmtime host is asked for: `interface` is the full
+  interface id, version included, or the label of a labelled import, with
+  `implements` the interface the label stands for. It returns the
+  implementation, as jco expects it. `witgraph:runtime/host` is built in.
+- **Debugging and simulation.** `beforeRun` and `afterRun` see each call
+  and may hold it by returning a promise; while a call is held,
+  `readOutput`, `readOutputWave`, `nodeState` and `takeTrace` report the
+  tick so far (the other methods throw until it ends, and another tick
+  rejects at once). `onStreamItem` sees every chunk of a stream between
+  nodes as its reader takes it (what it throws is logged, not passed on);
+  `mocks` replaces a node with a function (own properties only). Hooks
+  and mocks are called as methods of their objects.
+- **Differences from wasmtime.** There is no fuel or memory limit, so a
+  node that spins blocks its thread. A generation ends when every `run`
+  has returned, without waiting for work a node keeps doing afterwards (a
+  stream writer), which wasmtime waits for. Each node is an instance of its
+  own, so a failed call is always pinned on its node (wasmtime names no
+  culprit for a fault in a Store several members share). A future output
+  nothing reads is read and dropped, since jco's futures cannot be closed:
+  its writer's write succeeds, where on wasmtime it fails. Nodes are
+  async, so the browser needs JSPI.
+- **Lifetime.** Call `session.dispose()` when done with a session: the
+  scheduler holds the session's callbacks, so a dropped session is never
+  collected. A tick running when the session is disposed ends as
+  `interrupted`, and the runs it holds are abandoned.
+- **Without a session.** `describeComponent` and `jsName` need the
+  module initialised: `await init(wasm)` first (`Session.load` does it
+  too).
+
+Build the scheduler into the package with `npm run build:wasm` (it needs
+`wasm-bindgen-cli` 0.2.129 and the `wasm32-unknown-unknown` target), and
+test it with `npm test` after `cargo build -p test-components`;
+`npm run typecheck` checks the source. The package's source is
+TypeScript: Node runs it directly, a browser needs it bundled. It is private (not published): it imports the `pkg/` build
+output, which is not checked in.
 
 ### Instrumentation
 
@@ -808,4 +1068,10 @@ restored.
   `GenerationStarted`, `RunStarted`, `RunReturned`, `GenerationFinished`,
   `GenerationStopped` (faulted, cancelled, or dropped with the graph),
   `PhaseTransition`,
-  `Fault`, `Cancelled` and `Restarted`.
+  `Fault`, `Cancelled`, `Restarted`, and with
+  `Trace::new().with_stream_items()` also `StreamItems` (how many items of
+  a pumped stream passed, with `split_islands`: one event per chunk, for as
+  long as the stream runs). Items pass as soon as the stream exists, so
+  the first can be reported before the producer's `RunReturned` and the
+  reader's `RunStarted`; they belong to the generation they are reported
+  in.

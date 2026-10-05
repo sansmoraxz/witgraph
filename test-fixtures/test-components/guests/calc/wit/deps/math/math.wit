@@ -1,0 +1,13 @@
+package test:math@0.1.0;
+
+/// Arithmetic a node can link instead of asking its host for it.
+interface ops {
+    /// `x * 2`. Counts its calls.
+    double: func(x: u32) -> u32;
+    /// `x * 2`, after yielding once.
+    slow-double: async func(x: u32) -> u32;
+    /// Streams 0, 1, .. `n - 1`.
+    count: async func(n: u32) -> stream<u32>;
+    /// How many times `double` was called on this instance.
+    calls: func() -> u32;
+}

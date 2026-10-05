@@ -9,6 +9,6 @@ world echo {
         record outputs {
             out: f64,
         }
-        run: func(inputs: inputs) -> outputs;
+        run: async func(inputs: inputs) -> outputs;
     }
 }

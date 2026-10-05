@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/witgraph-ir", "crates/witgraph-wit", "crates/witgraph-runtime", "test-fixtures/test-components"]
+members = ["crates/witgraph-ir", "crates/witgraph-wit", "crates/witgraph-sched", "crates/witgraph-runtime", "crates/witgraph-web", "crates/witgraph-source", "test-fixtures/test-components"]
 
 [workspace.package]
 version = "0.1.0"
@@ -28,6 +28,7 @@ unimplemented = "deny"
 
 [workspace.dependencies]
 witgraph-ir = { path = "crates/witgraph-ir" }
+witgraph-sched = { path = "crates/witgraph-sched" }
 witgraph-runtime = { path = "crates/witgraph-runtime" }
 semver = { version = "1.0", default-features = false }
 thiserror = { version = "2.0", default-features = false }
