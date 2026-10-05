@@ -1,6 +1,6 @@
 [package]
 name = "witgraph-runtime"
-description = "Event-driven WASM graph runtime for witgraph"
+description = "Component-model graph runtime for witgraph"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,24 +11,24 @@ readme.workspace = true
 [lints]
 workspace = true
 
-[features]
-default = []
-compact-encoding = ["dep:postcard"]
-
 [dependencies]
 witgraph-ir = { workspace = true }
+witgraph-wit = { path = "../witgraph-wit" }
+wit-parser = { workspace = true }
+semver = { workspace = true }
+wasmparser = { version = "0.258", default-features = false, features = ["std", "validate", "component-model", "features"] }
 thiserror = { workspace = true }
 miette = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-postcard = { version = "1", default-features = false, features = ["alloc"], optional = true }
-wasmtime = { version = "47", default-features = false, features = [
-    "runtime", "cranelift", "component-model", "component-model-async", "async", "std"
+futures = "0.3"
+wasmtime = { workspace = true, features = [
+    "runtime", "cranelift", "component-model", "component-model-async", "async", "std",
+    "wave", "parallel-compilation",
 ] }
+serde = { workspace = true, features = ["std"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt", "macros"] }
-test-components = { path = "../test-components" }
-wasmtime = { version = "47", default-features = false, features = ["component-model"] }
-rumqttd = "0.20"
-rumqttc = "0.25"
+serde_json = { workspace = true }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time"] }
+test-components = { path = "../../test-fixtures/test-components" }
+wit-component = { workspace = true, features = ["dummy-module"] }
+wat = "1"

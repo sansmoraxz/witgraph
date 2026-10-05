@@ -1,0 +1,22 @@
+package test:busy-loop@0.1.0;
+
+/// Misbehaves on request: spins forever, traps, or calls `fatal`.
+world busy-loop {
+    import witgraph:runtime/host@0.1.0;
+
+    export node: interface {
+        enum action {
+            finish,
+            spin,
+            trap,
+            fatal,
+        }
+        record inputs {
+            action: option<action>,
+        }
+        record outputs {
+            done: u32,
+        }
+        run: async func(inputs: inputs) -> outputs;
+    }
+}

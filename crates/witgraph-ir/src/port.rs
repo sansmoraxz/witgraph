@@ -1,28 +1,26 @@
 //! Port definitions and semantics.
 
+use crate::Type;
 use crate::id::PortName;
-use crate::types::Type;
 
-/// The delivery semantics of a port.
+/// The delivery semantics of a port, derived from the WIT field type.
 ///
-/// Compatibility is exact-kind-match only: no coercion between kinds
-/// (Event never connects to Stream and vice versa), no numeric widening,
-/// no option-lifting, no record width subtyping.
+/// Compatibility is exact-kind-match only: no coercion between kinds, no
+/// numeric widening, no option-lifting, no record width subtyping.
 ///
-/// Displays as the lowercase kind name (`value`, `event`, `stream`,
-/// `future`) for diagnostics.
+/// Displays as the lowercase kind name (`value`, `stream`, `future`) for
+/// diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::Display)]
 #[strum(serialize_all = "lowercase")]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "lowercase"))]
 pub enum PortKind {
-    /// Latched, continuous: always readable, last-write-wins.
+    /// Passed by value: an input is read when the node's `run` starts, an
+    /// output is latched when `run` returns.
     Value,
-    /// Discrete occurrences; the consumer observes each occurrence once.
-    Event,
-    /// Ordered, back-pressured sequence with end-of-stream.
+    /// A WIT `stream<T>`: ordered, back-pressured sequence with end-of-stream.
     Stream,
-    /// Exactly one resolution.
+    /// A WIT `future<T>`: exactly one resolution.
     Future,
 }
 
@@ -32,31 +30,24 @@ impl PortKind {
         self == other
     }
 
-    /// [`Sync`](ConsumptionMode::Sync) for `Value`; async for the rest.
-    pub fn consumption_mode(self) -> ConsumptionMode {
-        match self {
-            PortKind::Value => ConsumptionMode::Sync,
-            PortKind::Event | PortKind::Stream | PortKind::Future => ConsumptionMode::Async,
-        }
+    /// Whether the kind is carried by a component-model async handle
+    /// (`stream` or `future`).
+    pub fn is_async(self) -> bool {
+        matches!(self, PortKind::Stream | PortKind::Future)
     }
 }
 
-/// How a node consumes its inputs.
-///
-/// Derived per node from its input ports: any undrained Stream/Event/Future
-/// input colors the node async, and its Value inputs act as latched
-/// parameters sampled at each activation; all-Value (or no) inputs make it
-/// sync. Drained inputs (see [`PortDef::drained`]) complete before the
-/// node's first activation and never color it async.
+/// How a node participates in execution, derived from its ports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "lowercase"))]
-pub enum ConsumptionMode {
-    /// A total function over latched inputs: `Value`s and the completed
-    /// totals of drained inputs.
-    Sync,
-    /// Driven by stream/event/future arrivals.
-    Async,
+pub enum NodeShape {
+    /// Every port is a Value: the node re-runs whenever an input value
+    /// changes.
+    Reactive,
+    /// At least one input or output is a Stream or Future: the node runs
+    /// once per generation and its streams are its live channel.
+    Streaming,
 }
 
 /// Which side of a component a port sits on.
@@ -75,63 +66,72 @@ pub enum PortDirection {
 }
 
 /// One typed port on a component contract.
+///
+/// Contracts are always re-derived from WIT, so ports are not serializable.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct PortDef {
     /// The port's WIT kebab-case name.
     pub name: PortName,
     /// The port's delivery semantics.
     pub kind: PortKind,
-    /// The payload type carried by the port.
-    #[cfg_attr(feature = "serde", serde(rename = "type"))]
-    pub ty: Type,
-    /// Input ports only: the port may be left unconnected. An unconnected
-    /// optional Value reads as absent; an unconnected optional Event, Stream,
-    /// or Future never delivers (and never colors an activation); an
-    /// unconnected optional drained input latches an absent total without
-    /// waiting.
-    #[cfg_attr(
-        feature = "serde",
-        serde(default, skip_serializing_if = "core::ops::Not::not")
-    )]
+    /// The payload type carried by the port. `None` only for a bare
+    /// `stream` or `future`, which carries no payload.
+    pub ty: Option<Type>,
+    /// Value input ports only: the port may be left unconnected, in which
+    /// case it reads as absent (`none`) until a runtime writes a value.
     pub optional: bool,
-    /// Input ports only: consumed to completion before the node's first
-    /// activation, then latched as the completed total. Only Stream and
-    /// Future inputs can be drained — Values and Events have no completion.
-    #[cfg_attr(
-        feature = "serde",
-        serde(default, skip_serializing_if = "core::ops::Not::not")
-    )]
-    pub drained: bool,
     /// Doc comment from the WIT field, if any.
-    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub docs: Option<String>,
 }
 
 impl PortDef {
-    /// A required, undocumented port.
+    /// A required, undocumented port carrying `ty`.
     pub fn new(name: impl Into<PortName>, kind: PortKind, ty: Type) -> Self {
         Self {
             name: name.into(),
             kind,
-            ty,
+            ty: Some(ty),
             optional: false,
-            drained: false,
             docs: None,
         }
     }
 
-    /// Marks the port as safe to leave unconnected (inputs only).
+    /// A required, undocumented port with no payload (a bare `stream` or
+    /// `future`).
+    pub fn unit(name: impl Into<PortName>, kind: PortKind) -> Self {
+        Self {
+            name: name.into(),
+            kind,
+            ty: None,
+            optional: false,
+            docs: None,
+        }
+    }
+
+    /// WIT-syntax rendering of the payload type; `_` when there is none.
+    pub fn type_display(&self) -> String {
+        self.ty
+            .as_ref()
+            .map_or_else(|| "_".into(), ToString::to_string)
+    }
+
+    /// Marks the port as safe to leave unconnected (Value inputs only).
     pub fn optional(mut self) -> Self {
         self.optional = true;
         self
     }
 
-    /// Marks the input as drained: consumed to completion before the node's
-    /// first activation.
-    pub fn drained(mut self) -> Self {
-        self.drained = true;
-        self
+    /// Whether this Value output, of type `option<T>`, feeds `input`, an
+    /// optional Value input of payload `T`: the option passes straight
+    /// through (`none` reads as `none`, `some(x)` as `x`). Equal types are
+    /// the ordinary case and do not count.
+    pub fn unwraps_into(&self, input: &PortDef) -> bool {
+        self.kind == PortKind::Value
+            && input.kind == PortKind::Value
+            && input.optional
+            && self.ty != input.ty
+            && self.ty.is_some()
+            && self.ty == input.ty.clone().map(Type::option)
     }
 }
 
@@ -141,12 +141,7 @@ mod tests {
 
     #[test]
     fn kinds_only_match_themselves() {
-        let kinds = [
-            PortKind::Value,
-            PortKind::Event,
-            PortKind::Stream,
-            PortKind::Future,
-        ];
+        let kinds = [PortKind::Value, PortKind::Stream, PortKind::Future];
         for a in kinds {
             for b in kinds {
                 assert_eq!(a.compatible(b), a == b);
@@ -159,7 +154,6 @@ mod tests {
     #[test]
     fn display_spellings_are_pinned() {
         assert_eq!(PortKind::Value.to_string(), "value");
-        assert_eq!(PortKind::Event.to_string(), "event");
         assert_eq!(PortKind::Stream.to_string(), "stream");
         assert_eq!(PortKind::Future.to_string(), "future");
         assert_eq!(PortDirection::Input.to_string(), "input");
@@ -167,10 +161,18 @@ mod tests {
     }
 
     #[test]
-    fn consumption_modes() {
-        assert_eq!(PortKind::Value.consumption_mode(), ConsumptionMode::Sync);
-        assert_eq!(PortKind::Event.consumption_mode(), ConsumptionMode::Async);
-        assert_eq!(PortKind::Stream.consumption_mode(), ConsumptionMode::Async);
-        assert_eq!(PortKind::Future.consumption_mode(), ConsumptionMode::Async);
+    fn payload_display() {
+        assert_eq!(
+            PortDef::new("a", PortKind::Value, Type::F64).type_display(),
+            "f64"
+        );
+        assert_eq!(PortDef::unit("t", PortKind::Stream).type_display(), "_");
+    }
+
+    #[test]
+    fn async_kinds() {
+        assert!(!PortKind::Value.is_async());
+        assert!(PortKind::Stream.is_async());
+        assert!(PortKind::Future.is_async());
     }
 }

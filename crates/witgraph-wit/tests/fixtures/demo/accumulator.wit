@@ -12,5 +12,7 @@ world accumulator {
         record outputs {
             state-out: f64,
         }
+
+        run: func(inputs: inputs) -> outputs;
     }
 }

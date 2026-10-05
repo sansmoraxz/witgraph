@@ -1,0 +1,13 @@
+package test:mqtt-node@0.1.0;
+
+/// Streams every message from the host's feed until it is exhausted.
+world mqtt-node {
+    import test:mqtt/source@0.1.0;
+
+    export node: interface {
+        record outputs {
+            messages: stream<u32>,
+        }
+        run: async func() -> outputs;
+    }
+}

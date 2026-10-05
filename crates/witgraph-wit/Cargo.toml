@@ -13,9 +13,13 @@ workspace = true
 
 [dependencies]
 witgraph-ir = { workspace = true }
+wasm-wave = { workspace = true, features = ["wit"] }
 wit-parser = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true, features = ["std"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+
+[dev-dependencies]
+wit-component = { workspace = true, features = ["dummy-module"] }

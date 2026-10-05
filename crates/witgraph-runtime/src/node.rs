@@ -1,107 +1,114 @@
-//! Node lifecycle state machine.
+//! A node's lifecycle state, projected from its island.
 //!
-//! Each node in a runtime graph has a [`NodePhase`] that tracks where it
-//! is in its lifecycle. [`NodeState`] bundles the phase with the node's
-//! identity and bookkeeping.
+//! Every node of an island starts, finishes, faults and is cancelled
+//! together, so a node has no state machine of its own: the island carries
+//! the lifecycle (a typestate in the crate-private `island` module), and
+//! [`NodeState`] is a read-only view of where the node's island is.
+//!
+//! | island phase               | node phase                         |
+//! |----------------------------|------------------------------------|
+//! | loaded or restored, not run | [`Pending`](NodePhase::Pending)   |
+//! | generation in flight       | [`Running`](NodePhase::Running)     |
+//! | generation finished        | [`Idle`](NodePhase::Idle)           |
+//! | stopped by a fault         | [`Faulted`](NodePhase::Faulted)     |
+//! | stopped by cancel/shutdown | [`Cancelled`](NodePhase::Cancelled) |
+//!
+//! `Running` covers the entire generation, including guest work that
+//! continues after the node's own `run` has returned (a stream writer,
+//! say). A stopped island is rebuilt at the start of its next generation,
+//! so its nodes go straight to `Running`.
 
-use witgraph_ir::{ConsumptionMode, NodeId};
+use witgraph_ir::{NodeId, NodeShape};
 
-/// The lifecycle phase of a node.
-///
-/// Transitions:
-/// - `Created` -> `Draining` (if the node has drained inputs)
-/// - `Created` -> `Ready` (if no drained inputs)
-/// - `Draining` -> `Ready` (all drained inputs completed)
-/// - `Ready` -> `Running` (scheduler activates the node)
-/// - `Running` -> `Ready` (activation returns `Continue`)
-/// - `Running` -> `Suspended` (async node waiting for input)
-/// - `Running` -> `Completed` (activation returns `Completed`)
-/// - `Running` -> `Faulted` (trap or error during activation)
-/// - `Suspended` -> `Running` (new input arrives)
-/// - `Completed` and `Faulted` are terminal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+use crate::error::NodeFault;
+
+/// Where a node is in its lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum NodePhase {
-    /// Allocated but not yet initialized.
-    Created,
-    /// Drained inputs are being consumed to completion.
-    Draining,
-    /// Waiting for an activation trigger.
-    Ready,
-    /// Currently inside `activate()`.
+    /// Its island has not run since the graph was loaded, or since a
+    /// restore.
+    Pending,
+    /// Its island's generation is in flight.
     Running,
-    /// Async node waiting for a stream, event, or future.
-    Suspended,
-    /// Finished successfully.
-    Completed,
-    /// Unrecoverable error.
+    /// Its island finished its last generation; it runs again when an
+    /// input changes.
+    Idle,
+    /// Its island faulted. Restartable: new input, or
+    /// [`rerun`](crate::RuntimeGraph::rerun), rebuilds the island.
     Faulted,
-    /// Cancelled by the host.
+    /// Its island was cancelled or shut down. Restartable: new input, or
+    /// [`rerun`](crate::RuntimeGraph::rerun), rebuilds the island.
     Cancelled,
 }
 
 impl NodePhase {
-    /// Returns `true` if this phase is a terminal state.
-    pub fn is_terminal(self) -> bool {
-        matches!(self, NodePhase::Completed | NodePhase::Faulted | NodePhase::Cancelled)
-    }
-
-    /// Returns `true` if the given transition is valid per the lifecycle
-    /// state machine.
-    pub fn can_transition_to(self, target: NodePhase) -> bool {
-        matches!(
-            (self, target),
-            (NodePhase::Created, NodePhase::Draining)
-                | (NodePhase::Created, NodePhase::Ready)
-                | (NodePhase::Created, NodePhase::Faulted)
-                | (NodePhase::Draining, NodePhase::Running)
-                | (NodePhase::Draining, NodePhase::Ready)
-                | (NodePhase::Draining, NodePhase::Faulted)
-                | (NodePhase::Ready, NodePhase::Running)
-                | (NodePhase::Ready, NodePhase::Faulted)
-                | (NodePhase::Running, NodePhase::Ready)
-                | (NodePhase::Running, NodePhase::Suspended)
-                | (NodePhase::Running, NodePhase::Completed)
-                | (NodePhase::Running, NodePhase::Faulted)
-                | (NodePhase::Suspended, NodePhase::Running)
-                | (NodePhase::Suspended, NodePhase::Faulted)
-                | (NodePhase::Created, NodePhase::Cancelled)
-                | (NodePhase::Draining, NodePhase::Cancelled)
-                | (NodePhase::Ready, NodePhase::Cancelled)
-                | (NodePhase::Running, NodePhase::Cancelled)
-                | (NodePhase::Suspended, NodePhase::Cancelled)
-        )
+    /// Returns `true` for [`Faulted`](Self::Faulted) and
+    /// [`Cancelled`](Self::Cancelled): the island was stopped and is rebuilt
+    /// before it runs again. An island stopped by a restore has no Store
+    /// either, but reads as [`Pending`](Self::Pending).
+    pub fn is_stopped(self) -> bool {
+        matches!(self, NodePhase::Faulted | NodePhase::Cancelled)
     }
 }
 
-/// The runtime state of a single node.
+/// A node's lifecycle state: a read-only view of its island's state at the
+/// moment it was taken.
 #[derive(Debug, Clone)]
 pub struct NodeState {
-    /// The node's identity.
-    pub id: NodeId,
-    /// The node's current lifecycle phase.
-    pub phase: NodePhase,
-    /// How the node consumes its inputs.
-    pub mode: ConsumptionMode,
-    /// The number of drained inputs still awaiting completion.
-    pub pending_drains: usize,
-    /// Whether the node's `init()` export has been called.
-    pub initialized: bool,
+    id: NodeId,
+    shape: NodeShape,
+    phase: NodePhase,
+    fault: Option<NodeFault>,
+    culprit: Option<NodeId>,
 }
 
 impl NodeState {
-    /// Creates a new node state with the given identity and consumption
-    /// mode.
-    ///
-    /// Starts in [`NodePhase::Created`] with no pending drains and no
-    /// version history.
-    pub fn new(id: NodeId, mode: ConsumptionMode) -> Self {
+    pub(crate) fn new(
+        id: NodeId,
+        shape: NodeShape,
+        phase: NodePhase,
+        fault: Option<NodeFault>,
+        culprit: Option<NodeId>,
+    ) -> Self {
         Self {
             id,
-            phase: NodePhase::Created,
-            mode,
-            pending_drains: 0,
-            initialized: false,
+            shape,
+            phase,
+            fault,
+            culprit,
         }
+    }
+
+    /// The node's identity.
+    pub fn id(&self) -> &NodeId {
+        &self.id
+    }
+
+    /// How the node takes part in execution, derived from its ports.
+    pub fn shape(&self) -> NodeShape {
+        self.shape
+    }
+
+    /// The phase the node is in.
+    pub fn phase(&self) -> NodePhase {
+        self.phase
+    }
+
+    /// Why the node's island faulted, if the node is
+    /// [`Faulted`](NodePhase::Faulted). Every member of the island carries
+    /// the same fault; see [`culprit`](Self::culprit) for which one caused
+    /// it.
+    pub fn fault_cause(&self) -> Option<&NodeFault> {
+        self.fault.as_ref()
+    }
+
+    /// The member of the node's island that caused its fault, when that is
+    /// known: the node that called `fatal`, the one that failed to
+    /// instantiate on a rebuild, or the only member whose `run` had
+    /// started and not returned.
+    pub fn culprit(&self) -> Option<&NodeId> {
+        self.culprit.as_ref()
     }
 }
 
@@ -110,90 +117,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn created_transitions() {
-        assert!(NodePhase::Created.can_transition_to(NodePhase::Draining));
-        assert!(NodePhase::Created.can_transition_to(NodePhase::Ready));
-        assert!(NodePhase::Created.can_transition_to(NodePhase::Faulted));
-        assert!(!NodePhase::Created.can_transition_to(NodePhase::Running));
-        assert!(!NodePhase::Created.can_transition_to(NodePhase::Completed));
-    }
-
-    #[test]
-    fn draining_transitions() {
-        assert!(NodePhase::Draining.can_transition_to(NodePhase::Running));
-        assert!(NodePhase::Draining.can_transition_to(NodePhase::Ready));
-        assert!(NodePhase::Draining.can_transition_to(NodePhase::Faulted));
-        assert!(!NodePhase::Draining.can_transition_to(NodePhase::Completed));
-    }
-
-    #[test]
-    fn ready_transitions() {
-        assert!(NodePhase::Ready.can_transition_to(NodePhase::Running));
-        assert!(NodePhase::Ready.can_transition_to(NodePhase::Faulted));
-        assert!(!NodePhase::Ready.can_transition_to(NodePhase::Completed));
-        assert!(!NodePhase::Ready.can_transition_to(NodePhase::Ready));
-    }
-
-    #[test]
-    fn running_transitions() {
-        assert!(NodePhase::Running.can_transition_to(NodePhase::Ready));
-        assert!(NodePhase::Running.can_transition_to(NodePhase::Suspended));
-        assert!(NodePhase::Running.can_transition_to(NodePhase::Completed));
-        assert!(NodePhase::Running.can_transition_to(NodePhase::Faulted));
-        assert!(!NodePhase::Running.can_transition_to(NodePhase::Created));
-        assert!(!NodePhase::Running.can_transition_to(NodePhase::Draining));
-    }
-
-    #[test]
-    fn suspended_transitions() {
-        assert!(NodePhase::Suspended.can_transition_to(NodePhase::Running));
-        assert!(NodePhase::Suspended.can_transition_to(NodePhase::Faulted));
-        assert!(!NodePhase::Suspended.can_transition_to(NodePhase::Ready));
-        assert!(!NodePhase::Suspended.can_transition_to(NodePhase::Completed));
-    }
-
-    #[test]
-    fn cancelled_transitions() {
-        for source in [
-            NodePhase::Created,
-            NodePhase::Draining,
-            NodePhase::Ready,
-            NodePhase::Running,
-            NodePhase::Suspended,
-        ] {
-            assert!(source.can_transition_to(NodePhase::Cancelled));
+    fn stopped_phases() {
+        assert!(NodePhase::Faulted.is_stopped());
+        assert!(NodePhase::Cancelled.is_stopped());
+        for phase in [NodePhase::Pending, NodePhase::Running, NodePhase::Idle] {
+            assert!(!phase.is_stopped());
         }
     }
 
     #[test]
-    fn terminal_states() {
-        assert!(NodePhase::Completed.is_terminal());
-        assert!(NodePhase::Faulted.is_terminal());
-        assert!(NodePhase::Cancelled.is_terminal());
-        assert!(!NodePhase::Ready.is_terminal());
-        assert!(!NodePhase::Running.is_terminal());
-
-        for target in [
-            NodePhase::Created,
-            NodePhase::Draining,
-            NodePhase::Ready,
-            NodePhase::Running,
-            NodePhase::Suspended,
-            NodePhase::Completed,
+    fn a_view_carries_its_fault() {
+        let state = NodeState::new(
+            "n".into(),
+            NodeShape::Reactive,
             NodePhase::Faulted,
-            NodePhase::Cancelled,
-        ] {
-            assert!(!NodePhase::Completed.can_transition_to(target));
-            assert!(!NodePhase::Faulted.can_transition_to(target));
-            assert!(!NodePhase::Cancelled.can_transition_to(target));
-        }
-    }
-
-    #[test]
-    fn new_node_state() {
-        let state = NodeState::new("sensor".into(), ConsumptionMode::Sync);
-        assert_eq!(state.phase, NodePhase::Created);
-        assert_eq!(state.pending_drains, 0);
-        assert!(!state.initialized);
+            Some(NodeFault::FuelExhausted),
+            Some("n".into()),
+        );
+        assert_eq!(state.id(), &NodeId::from("n"));
+        assert_eq!(state.phase(), NodePhase::Faulted);
+        assert!(matches!(
+            state.fault_cause(),
+            Some(NodeFault::FuelExhausted)
+        ));
     }
 }

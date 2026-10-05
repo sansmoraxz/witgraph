@@ -1,0 +1,7 @@
+package test:mqtt@0.1.0;
+
+/// A message feed provided by the host.
+interface source {
+    /// The next message, or none once the feed is exhausted.
+    next-message: func() -> option<u32>;
+}

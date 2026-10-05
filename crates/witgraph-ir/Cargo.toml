@@ -19,6 +19,7 @@ nutype = { workspace = true }
 petgraph = { workspace = true }
 strum = { workspace = true }
 serde = { workspace = true, optional = true }
+wasm-wave = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

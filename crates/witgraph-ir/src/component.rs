@@ -1,90 +1,117 @@
 //! Component contracts and capability requirements.
 
+use std::collections::BTreeMap;
+
 use crate::id::ComponentRef;
-use crate::port::{ConsumptionMode, PortDef};
-use crate::types::Type;
+use crate::port::{NodeShape, PortDef};
 
 /// A capability a component requires from its host.
 ///
-/// A component's WIT world's imported functions and function-carrying
-/// interfaces are its capabilities: each is "something the host must
-/// provide". Type-only imports (bare types, function-less interfaces) are
-/// structural, not capabilities. Named interface imports render in full id
-/// form (`wasi:clocks/monotonic-clock@0.2.3`); anonymous inline interface
-/// imports render world-scoped (`demo:graph/world.import-name@0.1.0`); bare
-/// function imports are prefixed `func:`.
+/// A component's WIT world's imported functions, its imported interfaces
+/// that carry functions or declare resources, and the resources it declares
+/// itself are its capabilities: each is "something the host must provide".
+/// Type-only imports (bare types, interfaces with neither) are structural,
+/// not capabilities, and neither is the built-in `witgraph:runtime/host`
+/// interface.
+///
+/// A capability is named after what the component imports:
+/// - a named interface by its full id (`wasi:clocks/monotonic-clock@0.2.3`);
+/// - an anonymous inline interface by its import name (`config`);
+/// - a bare function by its import name prefixed `func:` (`func:blink`;
+///   the host links `blink` at its linker's root);
+/// - a resource declared in the world by its name prefixed `resource:`
+///   (`resource:r`; the host links `r`, its constructor, methods and static
+///   functions at the root), with those functions as its items.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Capability {
-    /// Full interface id, or a `func:`-prefixed bare function import name.
+    /// Full interface id, inline interface import name, `func:`-prefixed
+    /// bare function import name, or `resource:`-prefixed world resource
+    /// name.
     pub interface: String,
+    /// What the host implements for it: each function (`[method]`,
+    /// `[static]` and `[constructor]` ones included) and resource, by name,
+    /// mapped to a canonical rendering of its signature (`resource` for a
+    /// resource). A bare function import has one item, under its own name.
+    /// Part of the content hash, so two revisions whose capabilities differ
+    /// only in signature hash differently.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "BTreeMap::is_empty")
+    )]
+    pub items: BTreeMap<String, String>,
 }
 
 impl Capability {
-    /// A capability on the given interface id.
+    /// A capability on the given interface id, with no items recorded.
     pub fn new(interface: impl Into<String>) -> Self {
         Self {
             interface: interface.into(),
+            items: BTreeMap::new(),
         }
     }
 }
 
-/// A named type declared in a component's WIT, kept for diagnostics and
-/// metadata rendering. Names are not part of [`Type`] — equality stays
-/// structural.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// How the component's `run` export is declared.
+///
+/// Displays as `sync` / `async`; the content hash embeds this rendering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::Display)]
+#[strum(serialize_all = "lowercase")]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct TypeDecl {
-    /// The WIT-declared type name.
-    pub name: String,
-    /// The structural type the name resolves to.
-    pub ty: Type,
-    /// Doc comment from the WIT declaration, if any.
-    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
-    pub docs: Option<String>,
+#[cfg_attr(feature = "serde", serde(rename_all = "lowercase"))]
+pub enum RunKind {
+    /// `run: func(...)`.
+    Sync,
+    /// `run: async func(...)`.
+    Async,
 }
 
 /// The public contract of a WIT-defined component.
+///
+/// Never serialized: a graph stores only [`ComponentRef`]s, and contracts are
+/// re-derived from WIT (see [`ContractSource`](crate::ContractSource)).
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ComponentContract {
     /// The component's version identity.
     pub id: ComponentRef,
-    /// The component's input ports.
+    /// The component's input ports (fields of its `inputs` record).
     pub inputs: Vec<PortDef>,
-    /// The component's output ports.
+    /// The component's output ports (fields of its `outputs` record).
     pub outputs: Vec<PortDef>,
+    /// Whether `run` is a plain or an `async` function.
+    pub run: RunKind,
     /// What the component requires from its host (its world imports).
     pub capabilities: Vec<Capability>,
-    /// Named WIT types, for diagnostics and metadata rendering.
-    pub type_names: Vec<TypeDecl>,
     /// Doc comment from the WIT world, if any.
-    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub docs: Option<String>,
 }
 
+impl From<&ComponentContract> for ComponentRef {
+    fn from(contract: &ComponentContract) -> Self {
+        contract.id.clone()
+    }
+}
+
+impl From<ComponentContract> for ComponentRef {
+    fn from(contract: ComponentContract) -> Self {
+        contract.id
+    }
+}
+
 impl ComponentContract {
-    /// The node's effective consumption mode.
-    ///
-    /// Derived from the input ports: [`Async`](ConsumptionMode::Async) iff
-    /// any undrained input is `Stream`/`Event`/`Future`, otherwise
-    /// [`Sync`](ConsumptionMode::Sync) (a node with no inputs is a total
-    /// function over zero inputs). Drained inputs complete before the node's
-    /// first activation and are delivered as latched totals, so they never
-    /// color the node async.
-    ///
-    /// The `drained` flags are taken at face value: on an uncompiled contract
-    /// a drained Value or Event input (rejected at compilation as
-    /// undrainable) is still treated as non-coloring here.
-    pub fn consumption_mode(&self) -> ConsumptionMode {
+    /// The node's execution shape: [`Streaming`](NodeShape::Streaming) iff
+    /// any input or output port is a Stream or Future, otherwise
+    /// [`Reactive`](NodeShape::Reactive).
+    pub fn shape(&self) -> NodeShape {
         if self
             .inputs
             .iter()
-            .any(|input| !input.drained && input.kind.consumption_mode() == ConsumptionMode::Async)
+            .chain(&self.outputs)
+            .any(|port| port.kind.is_async())
         {
-            ConsumptionMode::Async
+            NodeShape::Streaming
         } else {
-            ConsumptionMode::Sync
+            NodeShape::Reactive
         }
     }
 }
@@ -92,10 +119,11 @@ impl ComponentContract {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Type;
     use crate::id::PackageRef;
     use crate::port::PortKind;
 
-    fn contract(inputs: Vec<PortDef>) -> ComponentContract {
+    fn contract(inputs: Vec<PortDef>, outputs: Vec<PortDef>) -> ComponentContract {
         ComponentContract {
             id: ComponentRef {
                 package: PackageRef {
@@ -107,61 +135,43 @@ mod tests {
                 content_hash: None,
             },
             inputs,
-            outputs: vec![],
+            outputs,
+            run: RunKind::Sync,
             capabilities: vec![],
-            type_names: vec![],
             docs: None,
         }
     }
 
     #[test]
-    fn consumption_mode_from_inputs() {
-        use crate::types::Type;
+    fn shape_from_ports() {
+        let reactive = contract(
+            vec![PortDef::new("a", PortKind::Value, Type::F64)],
+            vec![PortDef::new("b", PortKind::Value, Type::U32)],
+        );
+        assert_eq!(reactive.shape(), NodeShape::Reactive);
 
-        let sync = contract(vec![
-            PortDef::new("a", PortKind::Value, Type::F64),
-            PortDef::new("b", PortKind::Value, Type::U32),
-        ]);
-        assert_eq!(sync.consumption_mode(), ConsumptionMode::Sync);
+        let streaming_in = contract(
+            vec![
+                PortDef::new("a", PortKind::Value, Type::F64),
+                PortDef::new("b", PortKind::Stream, Type::U32),
+            ],
+            vec![],
+        );
+        assert_eq!(streaming_in.shape(), NodeShape::Streaming);
 
-        let r#async = contract(vec![
-            PortDef::new("a", PortKind::Stream, Type::F64),
-            PortDef::new("b", PortKind::Event, Type::U32),
-        ]);
-        assert_eq!(r#async.consumption_mode(), ConsumptionMode::Async);
-
-        let mixed = contract(vec![
-            PortDef::new("a", PortKind::Value, Type::F64),
-            PortDef::new("b", PortKind::Stream, Type::U32),
-        ]);
+        let streaming_out = contract(vec![], vec![PortDef::new("f", PortKind::Future, Type::U32)]);
         assert_eq!(
-            mixed.consumption_mode(),
-            ConsumptionMode::Async,
-            "any async input colors the node async; values are latched params"
+            streaming_out.shape(),
+            NodeShape::Streaming,
+            "an async output alone makes the node streaming"
         );
 
-        let no_inputs = contract(vec![]);
-        assert_eq!(no_inputs.consumption_mode(), ConsumptionMode::Sync);
+        assert_eq!(contract(vec![], vec![]).shape(), NodeShape::Reactive);
     }
 
     #[test]
-    fn drained_inputs_never_color_async() {
-        use crate::types::Type;
-
-        let all_drained = contract(vec![
-            PortDef::new("a", PortKind::Stream, Type::F64).drained(),
-            PortDef::new("b", PortKind::Future, Type::U32).drained(),
-        ]);
-        assert_eq!(all_drained.consumption_mode(), ConsumptionMode::Sync);
-
-        let mixed = contract(vec![
-            PortDef::new("a", PortKind::Stream, Type::F64).drained(),
-            PortDef::new("b", PortKind::Stream, Type::U32),
-        ]);
-        assert_eq!(
-            mixed.consumption_mode(),
-            ConsumptionMode::Async,
-            "an undrained async input still colors the node async"
-        );
+    fn run_kind_spellings_are_pinned() {
+        assert_eq!(RunKind::Sync.to_string(), "sync");
+        assert_eq!(RunKind::Async.to_string(), "async");
     }
 }

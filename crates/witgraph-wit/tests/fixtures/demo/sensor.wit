@@ -17,15 +17,14 @@ world sensor {
         }
 
         record outputs {
-            /// Latched most recent reading.
+            /// The first reading, available as soon as `run` returns.
             latest: reading,
             /// Ordered stream of all readings.
             samples: stream<reading>,
+            /// One item each time a reading crosses the configured threshold.
+            threshold-crossed: stream<f64>,
         }
 
-        record output-events {
-            /// Fires when a reading crosses the configured threshold.
-            threshold-crossed: f64,
-        }
+        run: async func(inputs: inputs) -> outputs;
     }
 }
