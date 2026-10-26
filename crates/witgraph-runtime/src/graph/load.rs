@@ -4,13 +4,13 @@
 use std::borrow::Cow;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use wasmtime::Engine;
 use wasmtime::component::{Component, Type};
 use witgraph_ir::{
     Capability, CompiledConnection, CompiledGraph, ComponentContract, ComponentRef, NodeId,
-    PortDef, PortKind, PortRef,
+    PackageRef, PortDef, PortKind, PortRef,
 };
 use witgraph_sched::{RunShape, Scheduler};
 use witgraph_wit::lower::Lowered;
@@ -369,6 +369,7 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
             None => config.new_engine()?,
         };
         validate_engine(&engine)?;
+        let wasm = WasmIndex::new(wasm);
         let missing = |id: &ComponentRef| LoadError::MissingWasm {
             component: Box::new(id.clone()),
         };
@@ -376,34 +377,35 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
         // component with other links are other compositions. Each
         // contract's bytes are verified once, whatever their links.
         let mut checked: Vec<Checked<'_>> = Vec::new();
-        // Per contract: each set of links already checked, and where.
-        let mut index_of: HashMap<&ComponentRef, Vec<(Vec<LinkKey>, usize)>> = HashMap::new();
+        // Each contract and set of links already checked, and where.
+        let mut index_of: HashMap<(&ComponentRef, Vec<LinkKey>), usize> = HashMap::new();
         let mut verified: HashMap<&ComponentRef, (&[u8], Lowered)> = HashMap::new();
         let mut decodable = HashSet::new();
         let mut of_node = Vec::with_capacity(compiled.graph().nodes.len());
         for node in &compiled.graph().nodes {
             let contract = contract_of(&compiled, &node.id)?;
-            let keys = link_keys(&compiled, &node.id);
-            let known = index_of.entry(&contract.id).or_default();
-            if let Some((_, index)) = known.iter().find(|(links, _)| *links == keys) {
-                of_node.push((&node.id, *index));
+            let key = (&contract.id, link_keys(&compiled, &node.id));
+            if let Some(&index) = index_of.get(&key) {
+                of_node.push((&node.id, index));
                 continue;
             }
             let (bytes, lowered) = match verified.entry(&contract.id) {
                 Entry::Occupied(entry) => entry.into_mut(),
                 Entry::Vacant(entry) => {
-                    let bytes =
-                        find_bytes(wasm, &contract.id).ok_or_else(|| missing(&contract.id))?;
+                    let bytes = wasm
+                        .component(&contract.id)
+                        .ok_or_else(|| missing(&contract.id))?;
                     entry.insert((bytes, verify(contract, bytes)?))
                 }
             };
             // A link whose import the bytes never use is left out, so its
             // provider need not be there.
-            let links = keys
+            let links = key
+                .1
                 .iter()
                 .map(|(import, provider, export)| {
                     let bytes = match imported_as(lowered, import) {
-                        Some(_) => provider_bytes(wasm, provider)?,
+                        Some(_) => wasm.provider(provider)?,
                         None => &[][..],
                     };
                     Ok(LinkedProvider {
@@ -422,10 +424,7 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
                 &mut decodable,
             )?);
             let index = checked.len() - 1;
-            index_of
-                .entry(&contract.id)
-                .or_default()
-                .push((keys, index));
+            index_of.insert(key, index);
             of_node.push((&node.id, index));
         }
         // Before the slow part: a host that cannot run the graph fails
@@ -862,54 +861,93 @@ pub(super) fn contract_of<'a>(
         .ok_or_else(|| RuntimeError::UnknownNode { node: node.clone() })
 }
 
-/// The bytes of a link's provider. A provider has no contract for a hash
-/// to name, so a pinned ref takes only its own key. An unpinned one takes
-/// its own key, else the one pinned key of its world: several are
-/// [`LoadError::AmbiguousProvider`],
-/// none [`LoadError::MissingWasm`].
-fn provider_bytes<'a>(
-    wasm: &HashMap<ComponentRef, &'a [u8]>,
-    provider: &ComponentRef,
-) -> Result<&'a [u8], LoadError> {
-    let missing = || LoadError::MissingWasm {
-        component: Box::new(provider.clone()),
-    };
-    if provider.content_hash.is_some() {
-        return wasm.get(provider).copied().ok_or_else(missing);
-    }
-    // Unpinned: its own key, else the one pinned key of its world.
-    if let Some(bytes) = wasm.get(provider) {
-        return Ok(bytes);
-    }
-    let mut pinned: Vec<(&ComponentRef, &[u8])> = wasm
-        .iter()
-        .filter(|(key, _)| key.matches(provider))
-        .map(|(key, bytes)| (key, *bytes))
-        .collect();
-    match pinned.len() {
-        0 => Err(missing()),
-        1 => Ok(pinned.remove(0).1),
-        _ => {
-            let mut candidates: Vec<ComponentRef> =
-                pinned.into_iter().map(|(key, _)| key.clone()).collect();
-            candidates.sort();
-            Err(LoadError::AmbiguousProvider {
-                provider: Box::new(provider.clone()),
-                candidates,
-            })
-        }
-    }
+/// The keys given for one world, with their bytes.
+type World<'w, 'a> = Vec<(&'w ComponentRef, &'a [u8])>;
+
+/// The given bytes, looked up by exact key and, on a miss, by package
+/// (version included) and world: a miss costs the keys of that one world,
+/// not every key given. The index for misses is built on the first one.
+struct WasmIndex<'w, 'a> {
+    wasm: &'w HashMap<ComponentRef, &'a [u8]>,
+    by_world: OnceLock<HashMap<&'w PackageRef, HashMap<&'w str, World<'w, 'a>>>>,
 }
 
-/// The bytes for a component: keyed by its full ref, or by a ref without
-/// a content hash that matches it (same package, version included, and
-/// world).
-fn find_bytes<'a>(wasm: &HashMap<ComponentRef, &'a [u8]>, id: &ComponentRef) -> Option<&'a [u8]> {
-    wasm.get(id).copied().or_else(|| {
-        wasm.iter()
-            .find(|(key, _)| key.content_hash.is_none() && key.matches(id))
-            .map(|(_, bytes)| *bytes)
-    })
+impl<'w, 'a> WasmIndex<'w, 'a> {
+    fn new(wasm: &'w HashMap<ComponentRef, &'a [u8]>) -> Self {
+        Self {
+            wasm,
+            by_world: OnceLock::new(),
+        }
+    }
+
+    /// The keys of `id`'s world, with their bytes.
+    fn world(&self, id: &ComponentRef) -> &[(&'w ComponentRef, &'a [u8])] {
+        let wasm = self.wasm;
+        self.by_world
+            .get_or_init(|| {
+                let mut by_world: HashMap<_, HashMap<_, World<'w, 'a>>> = HashMap::new();
+                for (key, &bytes) in wasm {
+                    by_world
+                        .entry(&key.package)
+                        .or_default()
+                        .entry(key.world.as_str())
+                        .or_default()
+                        .push((key, bytes));
+                }
+                by_world
+            })
+            .get(&id.package)
+            .and_then(|worlds| worlds.get(id.world.as_str()))
+            .map_or(&[], Vec::as_slice)
+    }
+
+    /// The bytes keyed by exactly `id`.
+    fn get(&self, id: &ComponentRef) -> Option<&'a [u8]> {
+        self.wasm.get(id).copied()
+    }
+
+    /// The bytes for a component: keyed by its full ref, or by a ref
+    /// without a content hash that matches it (same package, version
+    /// included, and world).
+    fn component(&self, id: &ComponentRef) -> Option<&'a [u8]> {
+        self.get(id).or_else(|| {
+            self.world(id)
+                .iter()
+                .find(|(key, _)| key.content_hash.is_none())
+                .map(|(_, bytes)| *bytes)
+        })
+    }
+
+    /// The bytes of a link's provider. A provider has no contract for a
+    /// hash to name, so a pinned ref takes only its own key. An unpinned
+    /// one takes its own key, else the one pinned key of its world:
+    /// several are [`LoadError::AmbiguousProvider`], none
+    /// [`LoadError::MissingWasm`].
+    fn provider(&self, provider: &ComponentRef) -> Result<&'a [u8], LoadError> {
+        let missing = || LoadError::MissingWasm {
+            component: Box::new(provider.clone()),
+        };
+        if let Some(bytes) = self.get(provider) {
+            return Ok(bytes);
+        }
+        if provider.content_hash.is_some() {
+            return Err(missing());
+        }
+        // Its own key is not there, so every key of its world is pinned.
+        match self.world(provider) {
+            [] => Err(missing()),
+            [(_, bytes)] => Ok(bytes),
+            pinned => {
+                let mut candidates: Vec<ComponentRef> =
+                    pinned.iter().map(|(key, _)| (*key).clone()).collect();
+                candidates.sort();
+                Err(LoadError::AmbiguousProvider {
+                    provider: Box::new(provider.clone()),
+                    candidates,
+                })
+            }
+        }
+    }
 }
 
 /// Checks that `bytes` implement `contract`

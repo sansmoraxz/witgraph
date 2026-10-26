@@ -126,10 +126,6 @@ pub(crate) enum Route {
     External,
 }
 
-/// A buffered feedback write: the target, whether it unwraps an option,
-/// and the value as the source produced it.
-pub(crate) type FeedbackWrite<V> = (PortRef, bool, Arc<V>);
-
 /// One island: its static wiring, its lifecycle, and the work it owes.
 pub(crate) struct Slot<X: Executor> {
     pub(crate) plan: Arc<IslandPlan>,
@@ -198,8 +194,10 @@ pub struct Scheduler<M: RuntimeMode, X: Executor> {
     /// connection: the one writer [`inject`](Self::inject) may not compete
     /// with.
     pub(crate) connected: HashMap<PortRef, ConnectionId>,
-    /// Feedback writes waiting for the end-of-iteration latch.
-    pub(crate) feedback: BTreeMap<ConnectionId, FeedbackWrite<X::Value>>,
+    /// Feedback writes waiting for the end-of-iteration latch: the value
+    /// as the source produced it, by connection. Where it goes is the
+    /// connection's [`Edge`] in [`feedback_edges`](Self::feedback_edges).
+    pub(crate) feedback: BTreeMap<ConnectionId, Arc<X::Value>>,
     /// The latest fault of each island not yet taken by
     /// [`take_faults`](Self::take_faults).
     pub(crate) faults: BTreeMap<usize, FaultReport>,

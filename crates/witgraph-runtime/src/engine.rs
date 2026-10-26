@@ -132,7 +132,7 @@ impl IslandMemory {
     pub(crate) fn charge(&self, bytes: usize) -> Result<(), MemoryLimitExceeded> {
         let limit = self.limit;
         self.used
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
                 let requested = used.saturating_add(bytes);
                 limit
                     .is_none_or(|limit| requested <= limit)
@@ -150,7 +150,7 @@ impl IslandMemory {
     pub(crate) fn release(&self, bytes: usize) {
         let _ = self
             .used
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
                 Some(used.saturating_sub(bytes))
             });
     }
@@ -1069,8 +1069,10 @@ impl<D: IslandData> Served<'_, D> {
             .await?
             .into_iter()
             .map(|(name, val)| {
+                // Moved, not copied: the name keys `plan.outputs` as is.
+                let name = PortName::from(name);
                 let value = self.output(member, slot, plan, &name, val)?;
-                Ok((name, value))
+                Ok((name.into_inner(), value))
             })
             .collect()
     }
@@ -1081,12 +1083,10 @@ impl<D: IslandData> Served<'_, D> {
         member: usize,
         slot: usize,
         plan: &MemberPlan,
-        name: &str,
+        name: &PortName,
         val: Val,
     ) -> wasmtime::Result<CellValue> {
-        // Found by name without allocating a key: a member has few outputs.
-        let Some((port, output)) = plan.outputs.iter().find(|(port, _)| port.as_str() == name)
-        else {
+        let Some((port, output)) = plan.outputs.get_key_value(name) else {
             return Ok(CellValue::Local(val));
         };
         if output.kind == PortKind::Value {
@@ -1109,7 +1109,7 @@ impl<D: IslandData> Served<'_, D> {
                 let element = self
                     .streams
                     .get(slot)
-                    .and_then(|streams| streams.get(name))
+                    .and_then(|streams| streams.get(name.as_str()))
                     .ok_or_else(|| {
                         wasmtime::format_err!("stream `{}.{name}` has no element type", plan.node)
                     })?;

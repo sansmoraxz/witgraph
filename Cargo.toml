@@ -5,7 +5,7 @@ members = ["crates/witgraph-ir", "crates/witgraph-wit", "crates/witgraph-sched",
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.97"
+rust-version = "1.99"
 license = "BSD-3-Clause"
 repository = "https://github.com/sansmoraxz/witgraph"
 readme = "README.md"

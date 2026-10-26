@@ -119,7 +119,7 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
         let feedback = self
             .feedback
             .iter()
-            .map(|(conn, (_, _, val))| (conn.clone(), wave(val)))
+            .map(|(conn, val)| (conn.clone(), wave(val)))
             .collect();
         let mut islands = Vec::new();
         for slot in &self.slots {
@@ -264,13 +264,13 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
         let outputs = parse_values(&snapshot.outputs, PortDirection::Output)?;
         let mut feedback = BTreeMap::new();
         for (conn, text) in &snapshot.feedback {
-            let (from, edge) = self.feedback_edges.get(conn).ok_or_else(|| {
+            let (from, _) = self.feedback_edges.get(conn).ok_or_else(|| {
                 mismatch(format!(
                     "`{conn}` is not a feedback connection of this graph"
                 ))
             })?;
             let val = parse(from, PortDirection::Output, text)?;
-            feedback.insert(conn.clone(), (edge.to.clone(), edge.unwrap_option, val));
+            feedback.insert(conn.clone(), val);
         }
         let mut work: HashMap<usize, OwedWork<X::Value>> = HashMap::new();
         for island in &snapshot.islands {
