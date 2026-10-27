@@ -42,7 +42,7 @@ serde_json = "1.0"
 sha2 = "0.10"
 # wasmtime and the wasm-tools crates move together: wasmtime 49 is built on
 # wasm-tools 0.258, and guests use the matching wit-bindgen 0.61.
-wasmtime = { version = "49.0.1", default-features = false }
+wasmtime = { version = "50.0.0", default-features = false }
 wit-parser = "0.258"
 wit-component = "0.258"
 wasm-wave = { version = "0.258", default-features = false, features = ["std"] }
