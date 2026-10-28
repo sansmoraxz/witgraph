@@ -999,6 +999,7 @@ fn trapping_math() -> &'static [u8] {
         &resolve,
         world,
         wit_component::StringEncoding::UTF8,
+        false,
     )
     .unwrap();
     let bytes = wit_component::ComponentEncoder::default()
@@ -1763,6 +1764,7 @@ fn pipeline_and_busy(kit: &Kit) -> Graph {
         component: kit.get(BUSY_LOOP),
         label: None,
         resources: Default::default(),
+        attrs: Default::default(),
     });
     graph
 }
@@ -2011,6 +2013,7 @@ async fn shutdown_cancels_everything() {
         component: kit.get(ECHO),
         label: None,
         resources: Default::default(),
+        attrs: Default::default(),
     });
     let mut rt = kit
         .load(graph, RuntimeConfig::default(), Trace::new())
@@ -3422,6 +3425,7 @@ fn snapshot_round_trips_through_serde() {
             from: port("n", "out"),
             to: port("n", "in"),
             feedback: true,
+            attrs: Default::default(),
         }],
         links: Vec::new(),
         quiescent: false,

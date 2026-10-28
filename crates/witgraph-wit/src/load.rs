@@ -349,7 +349,7 @@ mod tests {
                  world libnode { export node: interface { record outputs { out: u32 } run: async func() -> outputs; } }\n",
             )
             .unwrap();
-        let encoded = wit_component::encode(&lib, lib_id).unwrap();
+        let encoded = wit_component::encode(&lib, lib_id, false).unwrap();
         let dir = TempDir::new("wasm-dep");
         std::fs::create_dir_all(dir.join("deps")).unwrap();
         std::fs::write(dir.join("deps/lib.wasm"), encoded).unwrap();
