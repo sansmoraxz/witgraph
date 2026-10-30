@@ -1,0 +1,14 @@
+package test:future-reader@0.1.0;
+
+/// Reads a future and outputs the resolved value.
+world future-reader {
+    export node: interface {
+        record inputs {
+            data: future<u32>,
+        }
+        record outputs {
+            value: u32,
+        }
+        run: async func(inputs: inputs) -> outputs;
+    }
+}

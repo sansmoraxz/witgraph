@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::{env, fs};
 
-const GUESTS: [&str; 19] = [
+const GUESTS: [&str; 20] = [
     "echo",
     "configurable",
     "relay",
@@ -11,6 +11,7 @@ const GUESTS: [&str; 19] = [
     "stream-relay",
     "stream-drain",
     "future-writer",
+    "future-reader",
     "mqtt-node",
     "busy-loop",
     "maybe",
