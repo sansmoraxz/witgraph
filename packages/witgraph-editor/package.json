@@ -1,0 +1,22 @@
+{
+  "name": "witgraph-editor",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Framework-agnostic Web Components for interactive WIT graph editing, execution, and debugging",
+  "license": "BSD-3-Clause",
+  "type": "module",
+  "exports": "./src/index.ts",
+  "scripts": {
+    "test": "node --test test/",
+    "typecheck": "tsc -p ."
+  },
+  "dependencies": {
+    "echarts": "^6.1.0",
+    "elkjs": "^0.12.0",
+    "lucide": "^1.62.0",
+    "witgraph-loader": "workspace:*"
+  },
+  "devDependencies": {
+    "typescript": "^7.0.2"
+  }
+}

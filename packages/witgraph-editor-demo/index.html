@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WIT Graph Editor &mdash; Demo</title>
+  <link rel="stylesheet" href="./src/styles.css" />
+  <style>
+    #app {
+      display: grid;
+      height: 100vh;
+      width: 100vw;
+      grid-template-columns: var(--left-w, 250px) 4px 1fr 4px var(--right-w, 300px);
+      grid-template-rows: auto 1fr 4px var(--bottom-h, 200px);
+    }
+    witgraph-controls { grid-column: 1 / -1; grid-row: 1; }
+    witgraph-catalog   { grid-column: 1; grid-row: 2; min-height: 0; }
+    .resize-left       { grid-column: 2; grid-row: 2; cursor: col-resize; background: #313244; }
+    .resize-left:hover, .resize-left.active { background: #89b4fa; }
+    witgraph-canvas    { grid-column: 3; grid-row: 2; min-height: 0; position: relative; }
+    .resize-right      { grid-column: 4; grid-row: 2; cursor: col-resize; background: #313244; }
+    .resize-right:hover, .resize-right.active { background: #89b4fa; }
+    witgraph-inspector { grid-column: 5; grid-row: 2; min-height: 0; }
+    .resize-bottom     { grid-column: 1 / -1; grid-row: 3; cursor: row-resize; background: #313244; }
+    .resize-bottom:hover, .resize-bottom.active { background: #89b4fa; }
+    witgraph-timeline  { grid-column: 1 / -1; grid-row: 4; }
+  </style>
+</head>
+<body class="bg-wg-bg text-wg-text font-sans text-sm overflow-hidden m-0 p-0">
+  <div id="app">
+    <witgraph-controls></witgraph-controls>
+    <witgraph-catalog></witgraph-catalog>
+    <div class="resize-left" data-resize="left"></div>
+    <witgraph-canvas></witgraph-canvas>
+    <div class="resize-right" data-resize="right"></div>
+    <witgraph-inspector></witgraph-inspector>
+    <div class="resize-bottom" data-resize="bottom"></div>
+    <witgraph-timeline></witgraph-timeline>
+
+    <div id="status" class="z-10 px-4 py-2.5 bg-wg-surface border border-wg-surface-hover rounded-md text-xs leading-relaxed text-wg-text transition-opacity"
+         style="grid-column: 3; grid-row: 2; align-self: end; justify-self: center; margin-bottom: 8px; pointer-events: none; max-width: calc(100% - 16px);">
+      Initializing...
+    </div>
+  </div>
+
+  <script>
+    // Resizable sidebar/panel handles
+    document.querySelectorAll('[data-resize]').forEach(handle => {
+      let startPos = 0, startSize = 0;
+      const app = document.getElementById('app');
+      const dir = handle.dataset.resize;
+
+      handle.addEventListener('pointerdown', e => {
+        e.preventDefault();
+        handle.setPointerCapture(e.pointerId);
+        handle.classList.add('active');
+        const cs = getComputedStyle(app);
+        if (dir === 'left') {
+          startPos = e.clientX;
+          startSize = parseInt(cs.getPropertyValue('--left-w') || '250');
+        } else if (dir === 'right') {
+          startPos = e.clientX;
+          startSize = parseInt(cs.getPropertyValue('--right-w') || '300');
+        } else {
+          startPos = e.clientY;
+          startSize = parseInt(cs.getPropertyValue('--bottom-h') || '200');
+        }
+
+        const onMove = ev => {
+          if (dir === 'left') {
+            const w = Math.max(150, Math.min(500, startSize + (ev.clientX - startPos)));
+            app.style.setProperty('--left-w', w + 'px');
+          } else if (dir === 'right') {
+            const w = Math.max(200, Math.min(600, startSize - (ev.clientX - startPos)));
+            app.style.setProperty('--right-w', w + 'px');
+          } else {
+            const h = Math.max(100, Math.min(500, startSize - (ev.clientY - startPos)));
+            app.style.setProperty('--bottom-h', h + 'px');
+          }
+        };
+
+        const onUp = ev => {
+          handle.releasePointerCapture(ev.pointerId);
+          handle.classList.remove('active');
+          handle.removeEventListener('pointermove', onMove);
+          handle.removeEventListener('pointerup', onUp);
+        };
+
+        handle.addEventListener('pointermove', onMove);
+        handle.addEventListener('pointerup', onUp);
+      });
+    });
+  </script>
+  <script type="module" src="./src/main.ts"></script>
+</body>
+</html>
