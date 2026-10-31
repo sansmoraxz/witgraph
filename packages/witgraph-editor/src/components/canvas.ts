@@ -10,60 +10,67 @@ import * as echarts from 'echarts';
 const SVG_NS = 'http://www.w3.org/2000/svg';
 
 const SVG_CSS = `
-  :host { display: block; width: 100%; height: 100%; overflow: hidden; background-color: #1e1e2e; }
+  :host { display: block; width: 100%; height: 100%; overflow: hidden; background-color: var(--wg-bg);
+    --_node-radius: var(--wg-node-radius, 8px);
+    --_port-radius: var(--wg-port-radius, 6px); }
   svg { width: 100%; height: 100%; user-select: none; -webkit-user-select: none; }
   .node-group text { user-select: none; }
   .port-label, .node-label { pointer-events: none; }
 
+  /* SVG defs — gradient and pattern driven by theme */
+  #dot-grid circle { fill: var(--wg-surface); }
+  #node-gradient stop:first-child { stop-color: var(--wg-node-grad-top); }
+  #node-gradient stop:last-child { stop-color: var(--wg-node-grad-bottom); }
+
   /* Node styling — solid with depth */
   .node-group { cursor: grab; filter: drop-shadow(0 2px 4px rgba(0,0,0,0.3)); transition: filter 0.15s; }
   .node-group:hover { filter: drop-shadow(0 3px 8px rgba(0,0,0,0.4)); }
-  .node-group.selected { filter: drop-shadow(0 0 8px rgba(137,180,250,0.5)) drop-shadow(0 2px 4px rgba(0,0,0,0.3)); }
-  .node-group.selected .node-body { stroke: #89b4fa; stroke-width: 2; }
-  .node-body { fill: url(#node-gradient); stroke: #45475a; stroke-width: 1; rx: 8px; }
-  .node-header { rx: 8px; }
-  .node-header.pending { fill: #fab387; }
-  .node-header.running { fill: #89b4fa; }
-  .node-header.idle { fill: #a6e3a1; }
-  .node-header.faulted { fill: #f38ba8; }
-  .node-header.cancelled { fill: #f9e2af; }
-  .node-label { fill: #1e1e2e; font-weight: 700; font-size: 11px; text-anchor: middle;
+  .node-group.selected { filter: drop-shadow(0 0 8px color-mix(in srgb, var(--wg-primary) 50%, transparent)) drop-shadow(0 2px 4px rgba(0,0,0,0.3)); }
+  .node-group.selected .node-body { stroke: var(--wg-primary); stroke-width: 2; }
+  .node-body { fill: url(#node-gradient); stroke: var(--wg-surface-hover); stroke-width: 1; rx: var(--_node-radius); }
+  .node-header { rx: var(--_node-radius); }
+  .node-header.pending { fill: var(--wg-phase-pending); }
+  .node-header.running { fill: var(--wg-phase-running); }
+  .node-header.idle { fill: var(--wg-phase-idle); }
+  .node-header.faulted { fill: var(--wg-phase-faulted); }
+  .node-header.cancelled { fill: var(--wg-phase-cancelled); }
+  .node-label { fill: var(--wg-bg); font-weight: 700; font-size: 11px; text-anchor: middle;
     dominant-baseline: central; pointer-events: none; letter-spacing: 0.02em;
     overflow: hidden; text-overflow: ellipsis; }
 
   /* Ports — larger with ring */
-  .port { cursor: pointer; stroke: #1e1e2e; stroke-width: 2; transition: r 0.1s, stroke 0.1s; }
-  .port-value { fill: #89b4fa; }
-  .port-stream { fill: #cba6f7; }
-  .port-future { fill: #f9e2af; }
-  .port:hover { r: 8; stroke: #cdd6f4; stroke-width: 2; }
-  .port-drop-target { r: 9; stroke: #a6e3a1; stroke-width: 2.5; }
-  .port-label { fill: #cdd6f4; font-size: 10px; pointer-events: none; font-weight: 500; }
+  .port { cursor: pointer; stroke: var(--wg-bg); stroke-width: 2; transition: r 0.1s, stroke 0.1s; }
+  .port-value { fill: var(--wg-port-value); }
+  .port-stream { fill: var(--wg-port-stream); }
+  .port-future { fill: var(--wg-port-future); }
+  .port:hover { r: 8; stroke: var(--wg-text); stroke-width: 2; }
+  .port-drop-target { r: 9; stroke: var(--wg-success); stroke-width: 2.5; }
+  .port-label { fill: var(--wg-text); font-size: 10px; pointer-events: none; font-weight: 500; }
 
   /* Edges — colored by type */
   .edge { fill: none; stroke-width: 2.5; stroke-linecap: round; transition: stroke-width 0.1s, filter 0.15s; }
-  .edge-value { stroke: #89b4fa; }
-  .edge-stream { stroke: #cba6f7; }
-  .edge-future { stroke: #f9e2af; }
-  .edge-default { stroke: #6c7086; }
+  .edge-value { stroke: var(--wg-port-value); }
+  .edge-stream { stroke: var(--wg-port-stream); }
+  .edge-future { stroke: var(--wg-port-future); }
+  .edge-default { stroke: var(--wg-text-muted); }
   .edge-feedback { stroke-dasharray: 8 4; }
-  .edge.selected { stroke-width: 3.5; filter: drop-shadow(0 0 4px rgba(137,180,250,0.4)); }
+  .edge.selected { stroke-width: 3.5; filter: drop-shadow(0 0 4px color-mix(in srgb, var(--wg-primary) 40%, transparent)); }
   .edge-hit { fill: none; stroke: transparent; stroke-width: 14; pointer-events: stroke; cursor: pointer; }
-  .edge-hit:hover + .edge { stroke-width: 3; filter: drop-shadow(0 0 3px rgba(137,180,250,0.3)); }
+  .edge-hit:hover + .edge { stroke-width: 3; filter: drop-shadow(0 0 3px color-mix(in srgb, var(--wg-primary) 30%, transparent)); }
 
   /* Breakpoint — pin icon */
-  .breakpoint { fill: #f38ba8; filter: drop-shadow(0 0 3px rgba(243,139,168,0.5)); }
+  .breakpoint { fill: var(--wg-error); filter: drop-shadow(0 0 3px color-mix(in srgb, var(--wg-error) 50%, transparent)); }
 
   /* Temp edge for connection drawing */
-  .temp-edge { fill: none; stroke: #89b4fa; stroke-width: 2; stroke-dasharray: 6 4;
+  .temp-edge { fill: none; stroke: var(--wg-primary); stroke-width: 2; stroke-dasharray: 6 4;
     pointer-events: none; opacity: 0.8; }
 
   /* Expand button */
-  .expand-btn { cursor: pointer; fill: #cdd6f4; font-size: 11px; pointer-events: all; opacity: 0.6; }
+  .expand-btn { cursor: pointer; fill: var(--wg-text); font-size: 11px; pointer-events: all; opacity: 0.6; }
   .expand-btn:hover { opacity: 1; }
 
   /* Chart container */
-  .chart-container { background: #313244; border-radius: 0 0 8px 8px; }
+  .chart-container { background: var(--wg-surface); border-radius: 0 0 var(--_node-radius) var(--_node-radius); }
 `;
 
 const PHASES = ['pending', 'running', 'idle', 'faulted', 'cancelled'] as const;
@@ -91,6 +98,10 @@ export class WitgraphCanvas extends HTMLElement {
   #lastClickX = 0;
   #lastClickY = 0;
 
+  #resolveColor(varName: string, fallback: string): string {
+    return getComputedStyle(this).getPropertyValue(varName).trim() || fallback;
+  }
+
   #onStateChanged = () => this.#render();
 
   connectedCallback(): void {
@@ -110,7 +121,6 @@ export class WitgraphCanvas extends HTMLElement {
     dot.setAttribute('cx', '10');
     dot.setAttribute('cy', '10');
     dot.setAttribute('r', '1');
-    dot.setAttribute('fill', '#313244');
     pattern.appendChild(dot);
     defs.appendChild(pattern);
 
@@ -122,10 +132,8 @@ export class WitgraphCanvas extends HTMLElement {
     grad.setAttribute('y2', '1');
     const stop1 = document.createElementNS(SVG_NS, 'stop');
     stop1.setAttribute('offset', '0%');
-    stop1.setAttribute('stop-color', '#3b3c56');
     const stop2 = document.createElementNS(SVG_NS, 'stop');
     stop2.setAttribute('offset', '100%');
-    stop2.setAttribute('stop-color', '#2a2b3d');
     grad.append(stop1, stop2);
     defs.appendChild(grad);
     this.#svg.appendChild(defs);
@@ -372,13 +380,18 @@ export class WitgraphCanvas extends HTMLElement {
         const ticks = history.map((h) => h.tick);
         const values = history.map((h) => { const n = parseFloat(h.wave); return isNaN(n) ? 0 : n; });
 
+        const cTextDim = this.#resolveColor('--wg-text-dim', '#a6adc8');
+        const cMuted = this.#resolveColor('--wg-text-muted', '#6c7086');
+        const cHover = this.#resolveColor('--wg-surface-hover', '#45475a');
+        const cSurface = this.#resolveColor('--wg-surface', '#313244');
+        const cPrimary = this.#resolveColor('--wg-primary', '#89b4fa');
         chart.setOption({
           animation: false,
           grid: { top: 18, right: 6, bottom: 18, left: 30 },
-          title: { text: port.name, textStyle: { fontSize: 9, color: '#a6adc8' }, left: 4, top: 0 },
-          xAxis: { type: 'category', data: ticks, axisLabel: { fontSize: 8, color: '#6c7086' }, axisLine: { lineStyle: { color: '#45475a' } } },
-          yAxis: { type: 'value', axisLabel: { fontSize: 8, color: '#6c7086' }, splitLine: { lineStyle: { color: '#313244' } }, axisLine: { lineStyle: { color: '#45475a' } } },
-          series: [{ type: 'line', data: values, smooth: true, symbol: 'circle', symbolSize: 3, lineStyle: { color: '#89b4fa', width: 1.5 }, itemStyle: { color: '#89b4fa' }, areaStyle: { color: 'rgba(137,180,250,0.1)' } }],
+          title: { text: port.name, textStyle: { fontSize: 9, color: cTextDim }, left: 4, top: 0 },
+          xAxis: { type: 'category', data: ticks, axisLabel: { fontSize: 8, color: cMuted }, axisLine: { lineStyle: { color: cHover } } },
+          yAxis: { type: 'value', axisLabel: { fontSize: 8, color: cMuted }, splitLine: { lineStyle: { color: cSurface } }, axisLine: { lineStyle: { color: cHover } } },
+          series: [{ type: 'line', data: values, smooth: true, symbol: 'circle', symbolSize: 3, lineStyle: { color: cPrimary, width: 1.5 }, itemStyle: { color: cPrimary }, areaStyle: { color: `color-mix(in srgb, ${cPrimary} 10%, transparent)` } }],
         });
       }
     }

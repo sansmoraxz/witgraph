@@ -7,6 +7,8 @@ export type {
   EditorEvent,
   OutputSnapshot,
   BreakpointState,
+  CapabilityInfo,
+  SavedSnapshot,
   GraphJson,
   GraphJsonNode,
   GraphJsonConnection,

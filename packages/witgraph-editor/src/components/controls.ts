@@ -2,7 +2,7 @@ import { adoptStyles } from './shared-styles.ts';
 import type { EditorController } from '../controller/editor-controller.ts';
 import type { EditorMode } from '../controller/types.ts';
 import { createElement } from 'lucide';
-import { Play, StepForward, Square, RotateCcw, Circle, FastForward, LayoutGrid, Undo2, Redo2, Upload, Download, Package } from 'lucide';
+import { Play, StepForward, Square, RotateCcw, Circle, FastForward, LayoutGrid, Undo2, Redo2, Upload, Download, Package, Camera, History } from 'lucide';
 
 const MODE_LABELS: Record<EditorMode, string> = {
   idle: 'Idle', running: 'Running…', paused: 'Paused', error: 'Error',
@@ -14,42 +14,44 @@ const MODE_BG: Record<EditorMode, string> = {
 };
 
 const EXTRA_CSS = `
-  :host { display: block; }
+  :host { display: block;
+    --_btn-radius: var(--wg-btn-radius, 4px);
+    --_group-radius: var(--wg-group-radius, 6px); }
   .toolbar { display: flex; align-items: center; gap: 4px; padding: 6px 10px;
-    background: #313244; border-bottom: 1px solid #1e1e2e; }
-  .btn-group { display: inline-flex; gap: 2px; background: rgba(30,30,46,0.5);
-    padding: 2px; border-radius: 6px; }
+    background: var(--wg-surface); border-bottom: 1px solid var(--wg-bg); }
+  .btn-group { display: inline-flex; gap: 2px; background: color-mix(in srgb, var(--wg-bg) 50%, transparent);
+    padding: 2px; border-radius: var(--_group-radius); }
   .btn { display: inline-flex; align-items: center; gap: 4px;
-    background: transparent; color: #cdd6f4; border: none; border-radius: 4px;
+    background: transparent; color: var(--wg-text); border: none; border-radius: var(--_btn-radius);
     padding: 5px 10px; cursor: pointer; font-family: system-ui, sans-serif;
     font-size: 0.6875rem; font-weight: 500; white-space: nowrap;
     transition: all 0.12s ease; user-select: none; }
   .btn svg { width: 14px; height: 14px; stroke-width: 2; }
-  .btn:hover:not(:disabled) { background: #45475a; }
-  .btn:active:not(:disabled) { background: #585b70; transform: scale(0.97); }
+  .btn:hover:not(:disabled) { background: var(--wg-surface-hover); }
+  .btn:active:not(:disabled) { background: var(--wg-overlay); transform: scale(0.97); }
   .btn:disabled { opacity: 0.3; cursor: not-allowed; }
-  .btn-primary { background: #89b4fa; color: #1e1e2e; font-weight: 600; }
-  .btn-primary:hover:not(:disabled) { background: #74c7ec; }
-  .btn-primary svg { stroke: #1e1e2e; }
-  .btn-danger { color: #f38ba8; }
-  .btn-danger:hover:not(:disabled) { background: rgba(243,139,168,0.15); }
-  .btn-danger svg { stroke: #f38ba8; }
-  .btn-warn { color: #fab387; }
-  .btn-warn:hover:not(:disabled) { background: rgba(250,179,135,0.15); }
-  .btn-warn svg { stroke: #fab387; }
-  .sep { width: 1px; height: 24px; background: #45475a; margin: 0 4px; flex-shrink: 0; }
-  .badge { padding: 4px 10px; border-radius: 6px; font-size: 0.6875rem;
-    font-weight: 700; color: #1e1e2e; white-space: nowrap; }
+  .btn-primary { background: var(--wg-primary); color: var(--wg-bg); font-weight: 600; }
+  .btn-primary:hover:not(:disabled) { background: var(--wg-primary-hover); }
+  .btn-primary svg { stroke: var(--wg-bg); }
+  .btn-danger { color: var(--wg-error); }
+  .btn-danger:hover:not(:disabled) { background: color-mix(in srgb, var(--wg-error) 15%, transparent); }
+  .btn-danger svg { stroke: var(--wg-error); }
+  .btn-warn { color: var(--wg-warning); }
+  .btn-warn:hover:not(:disabled) { background: color-mix(in srgb, var(--wg-warning) 15%, transparent); }
+  .btn-warn svg { stroke: var(--wg-warning); }
+  .sep { width: 1px; height: 24px; background: var(--wg-surface-hover); margin: 0 4px; flex-shrink: 0; }
+  .badge { padding: 4px 10px; border-radius: var(--_group-radius); font-size: 0.6875rem;
+    font-weight: 700; color: var(--wg-bg); white-space: nowrap; }
   .duration { font-weight: 400; opacity: 0.7; margin-left: 4px; font-size: 0.625rem; }
   .spacer { flex: 1; }
   .icon-only svg { width: 16px; height: 16px; }
   .icon-only { padding: 5px 7px; }
   .delay-group { display: inline-flex; align-items: center; gap: 4px;
-    background: rgba(30,30,46,0.5); padding: 2px 8px; border-radius: 6px; }
-  .delay-label { color: #a6adc8; font-size: 0.625rem; font-weight: 500;
+    background: color-mix(in srgb, var(--wg-bg) 50%, transparent); padding: 2px 8px; border-radius: var(--_group-radius); }
+  .delay-label { color: var(--wg-text-dim); font-size: 0.625rem; font-weight: 500;
     white-space: nowrap; user-select: none; }
-  .delay-slider { width: 80px; height: 4px; accent-color: #89b4fa; cursor: pointer; }
-  .delay-value { color: #cdd6f4; font-size: 0.625rem; font-weight: 600;
+  .delay-slider { width: 80px; height: 4px; accent-color: var(--wg-primary); cursor: pointer; }
+  .delay-value { color: var(--wg-text); font-size: 0.625rem; font-weight: 600;
     min-width: 32px; text-align: right; font-variant-numeric: tabular-nums; }
 `;
 
@@ -57,6 +59,7 @@ const ICONS: Record<string, unknown[]> = {
   play: Play, 'step-forward': StepForward, square: Square, 'rotate-ccw': RotateCcw,
   circle: Circle, 'fast-forward': FastForward, 'layout-grid': LayoutGrid,
   'undo-2': Undo2, 'redo-2': Redo2, upload: Upload, download: Download, package: Package,
+  camera: Camera, history: History,
 };
 
 function iconEl(name: string): SVGSVGElement | null {
@@ -77,6 +80,8 @@ export class WitgraphControls extends HTMLElement {
   #btnBreakpoint!: HTMLButtonElement;
   #btnResume!: HTMLButtonElement;
   #btnLayout!: HTMLButtonElement;
+  #btnSnapSave!: HTMLButtonElement;
+  #btnSnapRestore!: HTMLButtonElement;
   #badge!: HTMLSpanElement;
   #durationSpan!: HTMLSpanElement;
 
@@ -132,6 +137,13 @@ export class WitgraphControls extends HTMLElement {
     this.#btnRedo = mkBtn('redo icon-only', 'Redo (Ctrl+Y)', 'redo-2');
     this.#btnLayout = mkBtn('layout', 'Auto Layout', 'layout-grid', 'Layout');
     group(this.#btnUndo, this.#btnRedo, this.#btnLayout);
+
+    sep();
+
+    // Simulation group
+    this.#btnSnapSave = mkBtn('snap-save', 'Save snapshot', 'camera', 'Save');
+    this.#btnSnapRestore = mkBtn('snap-restore', 'Restore last snapshot', 'history', 'Restore');
+    group(this.#btnSnapSave, this.#btnSnapRestore);
 
     sep();
 
@@ -202,6 +214,15 @@ export class WitgraphControls extends HTMLElement {
     });
     this.#btnResume.addEventListener('click', () => this.#controller?.resumeBreakpoint());
     this.#btnLayout.addEventListener('click', () => this.#controller?.autoLayout());
+    this.#btnSnapSave.addEventListener('click', () => {
+      try { this.#controller?.saveSnapshot(); } catch {}
+    });
+    this.#btnSnapRestore.addEventListener('click', () => {
+      const snaps = this.#controller?.savedSnapshots ?? [];
+      if (snaps.length > 0) {
+        try { this.#controller?.restoreNamedSnapshot(snaps[snaps.length - 1].name); } catch {}
+      }
+    });
 
     this.#render();
   }
@@ -233,6 +254,8 @@ export class WitgraphControls extends HTMLElement {
     this.#btnLayout.disabled = mode === 'running';
     this.#btnUndo.disabled = !(this.#controller?.canUndo ?? false);
     this.#btnRedo.disabled = !(this.#controller?.canRedo ?? false);
+    this.#btnSnapSave.disabled = !this.#controller || mode === 'running';
+    this.#btnSnapRestore.disabled = !this.#controller || (this.#controller.savedSnapshots.length === 0) || mode === 'running';
 
     let badgeText = MODE_LABELS[mode];
     if (mode === 'idle' && this.#controller?.lastRunDurationMs != null) {

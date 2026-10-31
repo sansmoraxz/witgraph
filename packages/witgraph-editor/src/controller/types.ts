@@ -1,4 +1,4 @@
-import type { ComponentSource, Capability, PortValues, Wasm } from 'witgraph-loader';
+import type { ComponentSource, Capability, Contract, PortValues, Wasm } from 'witgraph-loader';
 
 // ---------------------------------------------------------------------------
 // Editor state
@@ -160,6 +160,27 @@ export interface GraphJson {
   nodes: GraphJsonNode[];
   connections: GraphJsonConnection[];
   links?: GraphJsonLink[];
+}
+
+// ---------------------------------------------------------------------------
+// Capabilities and mocks
+// ---------------------------------------------------------------------------
+
+/** Info about one capability a node's component imports, with satisfaction status. */
+export interface CapabilityInfo {
+  /** Full interface id, e.g. `test:math/ops@0.1.0`. */
+  interface: string;
+  /** For a labelled import, the interface the label stands for. */
+  implements?: string;
+  /** Whether the host provides an implementation for this capability. */
+  satisfied: boolean;
+}
+
+/** A saved simulation snapshot. */
+export interface SavedSnapshot {
+  name: string;
+  data: string;
+  timestamp: number;
 }
 
 // ---------------------------------------------------------------------------

@@ -6,34 +6,34 @@ function eventColor(event: string): string {
   switch (event) {
     case 'run-started':
     case 'run-returned':
-      return '#89b4fa';
+      return 'var(--wg-primary)';
     case 'phase-transition':
-      return '#89b4fa';
+      return 'var(--wg-primary)';
     case 'fault':
     case 'error':
-      return '#f38ba8';
+      return 'var(--wg-error)';
     case 'cancelled':
     case 'generation-stopped':
-      return '#f9e2af';
+      return 'var(--wg-accent)';
     case 'restarted':
-      return '#fab387';
+      return 'var(--wg-warning)';
     case 'compile-ok':
-      return '#a6e3a1';
+      return 'var(--wg-success)';
     default:
-      return '#a6adc8';
+      return 'var(--wg-text-dim)';
   }
 }
 
 const EXTRA_CSS = `
   :host { display: block; height: 100%; overflow: hidden; }
-  .event { padding: 3px 8px; border-left: 3px solid #a6adc8; margin-bottom: 2px; }
-  .event-error { background: rgba(243, 139, 168, 0.1); border-radius: 3px; }
-  .event-error .ev-name { color: #f38ba8; }
-  .event-error .ev-detail { color: #f38ba8; opacity: 0.9; }
+  .event { padding: 3px 8px; border-left: 3px solid var(--wg-text-dim); margin-bottom: 2px; }
+  .event-error { background: color-mix(in srgb, var(--wg-error) 10%, transparent); border-radius: 3px; }
+  .event-error .ev-name { color: var(--wg-error); }
+  .event-error .ev-detail { color: var(--wg-error); opacity: 0.9; }
   .events-wrap::-webkit-scrollbar { width: 6px; }
-  .events-wrap::-webkit-scrollbar-track { background: #1e1e2e; }
-  .events-wrap::-webkit-scrollbar-thumb { background: #45475a; border-radius: 3px; }
-  .events-wrap::-webkit-scrollbar-thumb:hover { background: #585b70; }
+  .events-wrap::-webkit-scrollbar-track { background: var(--wg-bg); }
+  .events-wrap::-webkit-scrollbar-thumb { background: var(--wg-surface-hover); border-radius: 3px; }
+  .events-wrap::-webkit-scrollbar-thumb:hover { background: var(--wg-overlay); }
 `;
 
 export class WitgraphTimeline extends HTMLElement {

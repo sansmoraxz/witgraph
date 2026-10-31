@@ -18,14 +18,16 @@ const KIND_BORDER: Record<string, string> = {
 const BTN = 'bg-wg-surface text-wg-text border border-wg-text-dim rounded px-2 py-1 cursor-pointer text-xs hover:bg-wg-surface-hover transition-all shadow-sm';
 
 const EXTRA_CSS = `
-  :host { display: block; height: 100%; overflow-y: auto; overflow-x: hidden; background-color: #1e1e2e; }
+  :host { display: block; height: 100%; overflow-y: auto; overflow-x: hidden; background-color: var(--wg-bg);
+    --_input-radius: var(--wg-input-radius, 4px);
+    --_toggle-radius: var(--wg-toggle-radius, 10px); }
   :host::-webkit-scrollbar { width: 6px; }
-  :host::-webkit-scrollbar-track { background: #1e1e2e; }
-  :host::-webkit-scrollbar-thumb { background: #45475a; border-radius: 3px; }
-  :host::-webkit-scrollbar-thumb:hover { background: #585b70; }
+  :host::-webkit-scrollbar-track { background: var(--wg-bg); }
+  :host::-webkit-scrollbar-thumb { background: var(--wg-surface-hover); border-radius: 3px; }
+  :host::-webkit-scrollbar-thumb:hover { background: var(--wg-overlay); }
   select, input[type="text"], input[type="checkbox"], textarea {
-    background-color: #1e1e2e; color: #cdd6f4;
-    border: 1px solid #45475a; border-radius: 4px;
+    background-color: var(--wg-bg); color: var(--wg-text);
+    border: 1px solid var(--wg-surface-hover); border-radius: var(--_input-radius);
     padding: 4px 6px; font-size: 11px;
     font-family: system-ui, sans-serif;
   }
@@ -33,23 +35,23 @@ const EXTRA_CSS = `
     background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%23a6adc8' stroke-width='2'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
     background-repeat: no-repeat; background-position: right 6px center; padding-right: 22px;
   }
-  select:focus, input:focus, textarea:focus { border-color: #89b4fa; outline: none; }
-  input[type="checkbox"] { accent-color: #89b4fa; width: 14px; height: 14px; cursor: pointer; padding: 0; }
-  .fault-bg { background: rgba(243, 139, 168, 0.08); border-left: 2px solid #f38ba8; }
-  .bp-bg { background: rgba(250, 179, 135, 0.08); border-left: 2px solid #fab387; }
+  select:focus, input:focus, textarea:focus { border-color: var(--wg-primary); outline: none; }
+  input[type="checkbox"] { accent-color: var(--wg-primary); width: 14px; height: 14px; cursor: pointer; padding: 0; }
+  .fault-bg { background: color-mix(in srgb, var(--wg-error) 8%, transparent); border-left: 2px solid var(--wg-error); }
+  .bp-bg { background: color-mix(in srgb, var(--wg-warning) 8%, transparent); border-left: 2px solid var(--wg-warning); }
   .port-val { white-space: pre-wrap; word-break: break-all; }
-  .focus-ring:focus { border-color: #89b4fa; outline: none; box-shadow: 0 0 0 2px rgba(137,180,250,0.25); }
-  .section-accent { border-left: 2px solid #89b4fa; padding-left: 8px; }
-  .section-accent-in { border-left-color: #89b4fa; }
-  .section-accent-out { border-left-color: #a6e3a1; }
+  .focus-ring:focus { border-color: var(--wg-primary); outline: none; box-shadow: 0 0 0 2px color-mix(in srgb, var(--wg-primary) 25%, transparent); }
+  .section-accent { border-left: 2px solid var(--wg-primary); padding-left: 8px; }
+  .section-accent-in { border-left-color: var(--wg-primary); }
+  .section-accent-out { border-left-color: var(--wg-success); }
   .port-card { transition: background-color 0.1s; }
-  .port-card:hover { background-color: rgba(49,50,68,0.8); }
-  .arrow { color: #6c7086; font-size: 1.5rem; line-height: 1; }
-  .toggle-track { position: relative; width: 36px; height: 20px; border-radius: 10px;
-    background: #45475a; cursor: pointer; transition: background 0.2s; }
-  .toggle-track.on { background: #89b4fa; }
+  .port-card:hover { background-color: color-mix(in srgb, var(--wg-surface) 80%, transparent); }
+  .arrow { color: var(--wg-text-muted); font-size: 1.5rem; line-height: 1; }
+  .toggle-track { position: relative; width: 36px; height: 20px; border-radius: var(--_toggle-radius);
+    background: var(--wg-surface-hover); cursor: pointer; transition: background 0.2s; }
+  .toggle-track.on { background: var(--wg-primary); }
   .toggle-knob { position: absolute; top: 2px; left: 2px; width: 16px; height: 16px;
-    border-radius: 50%; background: #cdd6f4; transition: left 0.2s; }
+    border-radius: 50%; background: var(--wg-text); transition: left 0.2s; }
   .toggle-track.on .toggle-knob { left: 18px; }
 `;
 
@@ -172,10 +174,47 @@ export class WitgraphInspector extends HTMLElement {
       (k) => this.#controller?.removeGraphAttr(k),
     ));
 
+    // Snapshots
+    wrap.appendChild(this.#buildSnapshotsSection());
+
     // Hint
     wrap.appendChild(this.#el('div', 'text-xs text-wg-text-dim mt-3 text-center', 'Select a node or edge to inspect its details'));
 
     return wrap;
+  }
+
+  #buildSnapshotsSection(): HTMLElement {
+    const section = this.#el('div', 'mb-3');
+    const snaps = this.#controller?.savedSnapshots ?? [];
+    section.appendChild(this.#el('div', 'font-semibold mb-1.5 text-wg-text border-b border-wg-surface pb-1',
+      `Snapshots (${snaps.length})`));
+
+    if (snaps.length === 0) {
+      section.appendChild(this.#el('div', 'text-xs text-wg-text-dim italic p-2', 'No snapshots saved. Use the Save button in the toolbar.'));
+    } else {
+      for (const snap of snaps) {
+        const row = this.#el('div', 'flex items-center gap-2 p-2 bg-wg-surface-50 rounded-md mb-1 hover:bg-wg-surface-hover transition-all');
+        const info = this.#el('div', 'flex-1 min-h-0');
+        info.appendChild(this.#el('div', 'font-semibold text-xs truncate', snap.name));
+        const timeStr = new Date(snap.timestamp).toLocaleTimeString();
+        info.appendChild(this.#el('div', 'text-2xs text-wg-text-dim', timeStr));
+        row.appendChild(info);
+
+        const restoreBtn = this.#el('button', 'bg-wg-surface text-wg-text border border-wg-text-dim rounded px-2 py-0.5 cursor-pointer text-2xs hover:bg-wg-surface-hover transition-all', 'Restore');
+        restoreBtn.addEventListener('click', () => {
+          try { this.#controller?.restoreNamedSnapshot(snap.name); }
+          catch {}
+        });
+        row.appendChild(restoreBtn);
+
+        const delBtn = this.#el('button', 'text-wg-error cursor-pointer text-xs', '×');
+        delBtn.addEventListener('click', () => this.#controller?.deleteSnapshot(snap.name));
+        row.appendChild(delBtn);
+        section.appendChild(row);
+      }
+    }
+
+    return section;
   }
 
   #buildAttrsEditor(
@@ -313,6 +352,15 @@ export class WitgraphInspector extends HTMLElement {
     if (node.outputs.length > 0)
       wrap.appendChild(this.#buildPortSection('Outputs', node.outputs, node, 'output'));
 
+    // Capabilities
+    const caps = this.#controller?.nodeCapabilities(node.id) ?? [];
+    if (caps.length > 0) {
+      wrap.appendChild(this.#buildCapabilitiesSection(caps));
+    }
+
+    // Mock mode
+    wrap.appendChild(this.#buildMockSection(node));
+
     // Custom attrs
     const gNode = ((this.#controller?.graphJson as Record<string, unknown>)?.nodes as Array<{ id: string; attrs?: Record<string, string> }>)
       ?.find((n) => n.id === node.id);
@@ -324,6 +372,75 @@ export class WitgraphInspector extends HTMLElement {
     }
 
     return wrap;
+  }
+
+  #buildCapabilitiesSection(caps: readonly { interface: string; implements?: string; satisfied: boolean }[]): HTMLElement {
+    const section = this.#el('div', '');
+    const header = this.#el('div', 'section-accent font-semibold text-sm mb-2');
+    header.textContent = `Capabilities (${caps.length})`;
+    section.appendChild(header);
+
+    for (const cap of caps) {
+      const row = this.#el('div', 'flex items-center gap-2 p-2 bg-wg-surface-50 rounded-md mb-1');
+      const status = this.#el('span', `text-sm ${cap.satisfied ? 'text-wg-success' : 'text-wg-error'}`, cap.satisfied ? '✓' : '✗');
+      row.appendChild(status);
+      const nameEl = this.#el('div', 'flex-1 min-h-0');
+      nameEl.appendChild(this.#el('div', 'font-mono text-xs truncate', cap.interface));
+      if (cap.implements) {
+        nameEl.appendChild(this.#el('div', 'font-mono text-2xs text-wg-text-dim truncate', `→ ${cap.implements}`));
+      }
+      row.appendChild(nameEl);
+      const badge = this.#el('span', `text-2xs font-semibold px-1.5 py-0.5 rounded ${cap.satisfied ? 'bg-wg-primary-10 text-wg-success' : 'bg-wg-error-10 text-wg-error'}`,
+        cap.satisfied ? 'provided' : 'missing');
+      row.appendChild(badge);
+      section.appendChild(row);
+    }
+
+    return section;
+  }
+
+  #buildMockSection(node: NodeVisual): HTMLElement {
+    const section = this.#el('div', '');
+    const header = this.#el('div', 'flex items-center gap-2 mb-2');
+    header.appendChild(this.#el('span', 'section-accent font-semibold text-sm', 'Mock Mode'));
+
+    const isMocked = this.#controller?.isMocked(node.id) ?? false;
+    const track = this.#el('div', `toggle-track ${isMocked ? 'on' : ''}`);
+    track.appendChild(this.#el('div', 'toggle-knob'));
+    track.addEventListener('click', () => this.#controller?.toggleMock(node.id));
+    header.appendChild(track);
+    section.appendChild(header);
+
+    if (isMocked) {
+      section.appendChild(this.#el('div', 'text-2xs text-wg-text-dim mb-2 italic', 'WASM execution replaced — configure mock outputs below'));
+      const mockOutputs = this.#controller?.getMockOutputs(node.id) ?? new Map();
+      for (const port of node.outputs) {
+        const card = this.#el('div', 'p-2 bg-wg-surface-50 rounded-md mb-1.5');
+        const topRow = this.#el('div', 'flex items-center gap-1.5 mb-1');
+        topRow.appendChild(this.#el('span', 'font-semibold text-xs', port.name));
+        topRow.appendChild(this.#el('span', 'text-wg-text-dim font-mono text-2xs', port.typeDisplay));
+        card.appendChild(topRow);
+
+        const form = this.#el('div', 'flex gap-1.5 items-center');
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.className = 'focus-ring flex-1 bg-wg-bg text-wg-text border border-wg-text-dim rounded px-2 py-1 font-mono text-xs';
+        input.style.minWidth = '0';
+        input.placeholder = 'WAVE value…';
+        input.value = mockOutputs.get(port.name) ?? '';
+
+        const setBtn = this.#el('button', 'bg-wg-surface text-wg-text border border-wg-text-dim rounded px-2 py-1 cursor-pointer text-xs hover:bg-wg-surface-hover transition-all shadow-sm', 'Set');
+        setBtn.addEventListener('click', () => {
+          if (input.value) this.#controller?.setMockOutput(node.id, port.name, input.value);
+          else this.#controller?.clearMockOutput(node.id, port.name);
+        });
+        form.append(input, setBtn);
+        card.appendChild(form);
+        section.appendChild(card);
+      }
+    }
+
+    return section;
   }
 
   #buildPortSection(title: string, ports: PortVisual[], node: NodeVisual, direction: 'input' | 'output'): HTMLElement {

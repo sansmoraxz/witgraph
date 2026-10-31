@@ -8,13 +8,13 @@ const KIND_BG: Record<string, string> = {
 };
 
 const EXTRA_CSS = `
-  :host { display: block; height: 100%; overflow-y: auto; overflow-x: hidden; background-color: #1e1e2e; }
+  :host { display: block; height: 100%; overflow-y: auto; overflow-x: hidden; background-color: var(--wg-bg); }
   :host::-webkit-scrollbar { width: 6px; }
-  :host::-webkit-scrollbar-track { background: #1e1e2e; }
-  :host::-webkit-scrollbar-thumb { background: #45475a; border-radius: 3px; }
-  :host::-webkit-scrollbar-thumb:hover { background: #585b70; }
+  :host::-webkit-scrollbar-track { background: var(--wg-bg); }
+  :host::-webkit-scrollbar-thumb { background: var(--wg-surface-hover); border-radius: 3px; }
+  :host::-webkit-scrollbar-thumb:hover { background: var(--wg-overlay); }
   .card { transition: border-color 0.15s, background-color 0.15s, box-shadow 0.15s; }
-  .card:hover { border-color: #89b4fa; background-color: #45475a; box-shadow: 0 2px 8px rgba(0,0,0,0.35); }
+  .card:hover { border-color: var(--wg-primary); background-color: var(--wg-surface-hover); box-shadow: 0 2px 8px rgba(0,0,0,0.35); }
   .drag-hint { opacity: 0; transition: opacity 0.15s; }
   .card:hover .drag-hint { opacity: 1; }
   .port-list { display: grid; grid-template-columns: 1fr 1fr; gap: 2px; }

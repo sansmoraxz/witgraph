@@ -15,7 +15,10 @@ import type {
   GraphJsonPortRef,
   BreakpointState,
   OutputSnapshot,
+  CapabilityInfo,
+  SavedSnapshot,
 } from './types.ts';
+import type { Capability, Contract, PortValues } from 'witgraph-loader';
 import { autoLayout, type LayoutNode, type LayoutEdge } from './layout.ts';
 import { NODE_WIDTH, computeNodeHeight } from '../components/styles.ts';
 
@@ -53,6 +56,12 @@ export class EditorController extends EventTarget {
   #compileError: string | null = null;
   #tickDelayMs = 0;
 
+  // -- Mock & capability state ------------------------------------------------
+  #capabilityInfo = new Map<string, CapabilityInfo[]>();
+
+  // -- Simulation state -------------------------------------------------------
+  #savedSnapshots: SavedSnapshot[] = [];
+
   // -- Getters ----------------------------------------------------------------
 
   get mode(): EditorMode { return this.#mode; }
@@ -83,6 +92,7 @@ export class EditorController extends EventTarget {
   get canUndo(): boolean { return this.#undoStack.length > 0; }
   get canRedo(): boolean { return this.#redoStack.length > 0; }
   get hasClipboard(): boolean { return this.#clipboard !== null; }
+  get savedSnapshots(): readonly SavedSnapshot[] { return this.#savedSnapshots; }
 
   outputHistory(node: string, port: string): readonly OutputSnapshot[] {
     return this.#outputHistory.get(node)?.get(port) ?? [];
@@ -446,6 +456,8 @@ export class EditorController extends EventTarget {
     this.#undoStack.length = 0;
     this.#redoStack.length = 0;
     this.#clipboard = null;
+    this.#capabilityInfo.clear();
+    this.#savedSnapshots = [];
   }
 
   async reset(): Promise<void> {
@@ -724,6 +736,84 @@ export class EditorController extends EventTarget {
     return this.#injectedValues.get(node)?.get(port);
   }
 
+  // -- Mock management --------------------------------------------------------
+
+  isMocked(nodeId: string): boolean {
+    const graphNode = this.#graphJson?.nodes.find((n) => n.id === nodeId);
+    return graphNode?.attrs?.['mock.enabled'] === 'true';
+  }
+
+  toggleMock(nodeId: string): void {
+    const graphNode = this.#graphJson?.nodes.find((n) => n.id === nodeId);
+    if (!graphNode) return;
+    if (!graphNode.attrs) graphNode.attrs = {};
+    if (graphNode.attrs['mock.enabled'] === 'true') {
+      delete graphNode.attrs['mock.enabled'];
+    } else {
+      graphNode.attrs['mock.enabled'] = 'true';
+    }
+    void this.#reloadAfterEdit();
+  }
+
+  setMockOutput(nodeId: string, port: string, wave: string): void {
+    const graphNode = this.#graphJson?.nodes.find((n) => n.id === nodeId);
+    if (!graphNode) return;
+    if (!graphNode.attrs) graphNode.attrs = {};
+    graphNode.attrs[`mock.${port}`] = wave;
+    if (this.isMocked(nodeId)) void this.#reloadAfterEdit();
+    else this.#dispatch('state-changed');
+  }
+
+  clearMockOutput(nodeId: string, port: string): void {
+    const graphNode = this.#graphJson?.nodes.find((n) => n.id === nodeId);
+    if (graphNode?.attrs) {
+      delete graphNode.attrs[`mock.${port}`];
+    }
+    if (this.isMocked(nodeId)) void this.#reloadAfterEdit();
+    else this.#dispatch('state-changed');
+  }
+
+  getMockOutputs(nodeId: string): ReadonlyMap<string, string> {
+    const result = new Map<string, string>();
+    const graphNode = this.#graphJson?.nodes.find((n) => n.id === nodeId);
+    if (!graphNode?.attrs) return result;
+    for (const [key, value] of Object.entries(graphNode.attrs)) {
+      if (key.startsWith('mock.') && key !== 'mock.enabled') {
+        result.set(key.slice('mock.'.length), value);
+      }
+    }
+    return result;
+  }
+
+  // -- Capability info --------------------------------------------------------
+
+  nodeCapabilities(nodeId: string): readonly CapabilityInfo[] {
+    return this.#capabilityInfo.get(nodeId) ?? [];
+  }
+
+  // -- Simulation / Snapshots -------------------------------------------------
+
+  saveSnapshot(name?: string): void {
+    if (!this.#session) throw new Error('no session loaded');
+    const data = this.#session.graph.snapshot();
+    const snapName = name ?? `snap-${this.#savedSnapshots.length + 1}`;
+    this.#savedSnapshots.push({ name: snapName, data, timestamp: Date.now() });
+    this.#dispatch('state-changed');
+  }
+
+  restoreNamedSnapshot(name: string): void {
+    const snap = this.#savedSnapshots.find((s) => s.name === name);
+    if (!snap) throw new Error(`no snapshot named "${name}"`);
+    if (!this.#session) throw new Error('no session loaded');
+    this.#session.graph.restore(snap.data);
+    this.#pollState();
+  }
+
+  deleteSnapshot(name: string): void {
+    this.#savedSnapshots = this.#savedSnapshots.filter((s) => s.name !== name);
+    this.#dispatch('state-changed');
+  }
+
   // -- Selection --------------------------------------------------------------
 
   select(nodeId: string | null): void {
@@ -928,12 +1018,35 @@ export class EditorController extends EventTarget {
   async #createSession(graph: GraphJson): Promise<void> {
     if (!this.#originalOptions) throw new Error('no options');
 
+    // Build mocks: merge caller-supplied mocks with attr-driven mocks
+    const callerMocks = this.#originalOptions.mocks ?? {};
+    const attrMocks: Record<string, (inputs: PortValues) => PortValues> = {};
+    for (const gNode of graph.nodes) {
+      if (gNode.attrs?.['mock.enabled'] !== 'true') continue;
+      if (Object.hasOwn(callerMocks, gNode.id)) continue; // caller takes precedence
+      const outputs: Record<string, string> = {};
+      for (const [key, value] of Object.entries(gNode.attrs)) {
+        if (key.startsWith('mock.') && key !== 'mock.enabled') {
+          outputs[key.slice('mock.'.length)] = value;
+        }
+      }
+      attrMocks[gNode.id] = () => {
+        const result: PortValues = {};
+        for (const [port, wave] of Object.entries(outputs)) {
+          // Pass WAVE text through as-is; the scheduler resolves it
+          result[port] = wave;
+        }
+        return result;
+      };
+    }
+    const mocks = { ...attrMocks, ...callerMocks };
+
     const sessionOptions: SessionOptions = {
       graph: graph,
       components: this.#originalOptions.components,
       wasm: this.#originalOptions.wasm,
       capabilities: this.#originalOptions.capabilities,
-      mocks: this.#originalOptions.mocks,
+      mocks: Object.keys(mocks).length > 0 ? mocks : undefined,
 
       beforeRun: (node, inputs): void | Promise<void> => {
         if (this.#breakpoints.has(node)) {
@@ -963,6 +1076,29 @@ export class EditorController extends EventTarget {
     this.#dirty = false;
     this.#buildVisuals();
     this.#restoreInjections(graph);
+    this.#collectCapabilities();
+  }
+
+  #collectCapabilities(): void {
+    this.#capabilityInfo.clear();
+    if (!this.#session) return;
+    const capabilitiesFn = this.#originalOptions?.capabilities;
+    for (const [nodeId, contract] of this.#session.contracts) {
+      if (!contract.capabilities || contract.capabilities.length === 0) continue;
+      const infos: CapabilityInfo[] = contract.capabilities.map((cap) => {
+        // A capability is satisfied when the capabilities callback exists
+        // and doesn't throw for this node. We can't cheaply test the return
+        // value without instantiating, so mark satisfied when a callback is
+        // provided — the session load would have thrown if it returned undefined.
+        const satisfied = capabilitiesFn !== undefined;
+        return {
+          interface: cap.name,
+          implements: cap.implements,
+          satisfied,
+        };
+      });
+      this.#capabilityInfo.set(nodeId, infos);
+    }
   }
 
   #restoreInjections(graph: GraphJson): void {

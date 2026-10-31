@@ -9,20 +9,20 @@ export interface MenuItem {
 const MENU_CSS = `
   .ctx-menu {
     position: absolute; z-index: 100; min-width: 170px;
-    background: #313244; border: 1px solid #45475a; border-radius: 6px;
+    background: var(--wg-surface); border: 1px solid var(--wg-surface-hover); border-radius: 6px;
     box-shadow: 0 4px 16px rgba(0,0,0,0.5); padding: 4px 0;
     font-family: system-ui, -apple-system, sans-serif; font-size: 12px;
-    color: #cdd6f4;
+    color: var(--wg-text);
   }
   .ctx-item {
     display: flex; justify-content: space-between; align-items: center;
     padding: 5px 12px; cursor: pointer; gap: 16px;
   }
-  .ctx-item:hover { background: #45475a; }
+  .ctx-item:hover { background: var(--wg-surface-hover); }
   .ctx-item.disabled { opacity: 0.4; cursor: not-allowed; }
   .ctx-item.disabled:hover { background: transparent; }
-  .ctx-shortcut { color: #6c7086; font-size: 11px; }
-  .ctx-sep { height: 1px; background: #45475a; margin: 4px 8px; }
+  .ctx-shortcut { color: var(--wg-text-muted); font-size: 11px; }
+  .ctx-sep { height: 1px; background: var(--wg-surface-hover); margin: 4px 8px; }
 `;
 
 export class ContextMenu {
