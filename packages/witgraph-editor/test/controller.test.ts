@@ -184,6 +184,8 @@ test('select dispatches event', async () => {
 
   controller.select('a');
   assert.equal(controller.selectedNode, 'a');
+  // state-changed is dispatched via queueMicrotask — await it
+  await new Promise<void>((r) => queueMicrotask(r));
   assert.ok(changed, 'state-changed event should have fired');
 });
 

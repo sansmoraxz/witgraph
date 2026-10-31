@@ -98,13 +98,14 @@ export class WitgraphCanvas extends HTMLElement {
   #lastClickX = 0;
   #lastClickY = 0;
 
-  #resolveColor(varName: string, fallback: string): string {
-    return getComputedStyle(this).getPropertyValue(varName).trim() || fallback;
+  #resolveColor(varName: string): string {
+    return getComputedStyle(this).getPropertyValue(varName).trim();
   }
 
   #onStateChanged = () => this.#render();
 
   connectedCallback(): void {
+    if (this.shadowRoot) return;
     const shadow = this.attachShadow({ mode: 'open' });
     adoptStyles(shadow, SVG_CSS);
 
@@ -175,6 +176,8 @@ export class WitgraphCanvas extends HTMLElement {
     this.#controller?.removeEventListener('state-changed', this.#onStateChanged);
     for (const cleanup of this.#dragCleanups.values()) cleanup();
     this.#dragCleanups.clear();
+    for (const chart of this.#chartInstances.values()) chart.dispose();
+    this.#chartInstances.clear();
   }
 
   set controller(ctrl: EditorController) {
@@ -380,11 +383,11 @@ export class WitgraphCanvas extends HTMLElement {
         const ticks = history.map((h) => h.tick);
         const values = history.map((h) => { const n = parseFloat(h.wave); return isNaN(n) ? 0 : n; });
 
-        const cTextDim = this.#resolveColor('--wg-text-dim', '#a6adc8');
-        const cMuted = this.#resolveColor('--wg-text-muted', '#6c7086');
-        const cHover = this.#resolveColor('--wg-surface-hover', '#45475a');
-        const cSurface = this.#resolveColor('--wg-surface', '#313244');
-        const cPrimary = this.#resolveColor('--wg-primary', '#89b4fa');
+        const cTextDim = this.#resolveColor('--wg-text-dim');
+        const cMuted = this.#resolveColor('--wg-text-muted');
+        const cHover = this.#resolveColor('--wg-surface-hover');
+        const cSurface = this.#resolveColor('--wg-surface');
+        const cPrimary = this.#resolveColor('--wg-primary');
         chart.setOption({
           animation: false,
           grid: { top: 18, right: 6, bottom: 18, left: 30 },
@@ -764,4 +767,4 @@ export class WitgraphCanvas extends HTMLElement {
   }
 }
 
-customElements.define('witgraph-canvas', WitgraphCanvas);
+if (!customElements.get('witgraph-canvas')) customElements.define('witgraph-canvas', WitgraphCanvas);

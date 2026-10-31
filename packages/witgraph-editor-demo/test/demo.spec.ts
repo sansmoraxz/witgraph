@@ -26,10 +26,10 @@ test.describe('WIT Graph Editor Demo', () => {
     await expect(page.locator('witgraph-catalog')).toBeAttached();
   });
 
-  test('canvas renders 8 nodes and 6 edges', async ({ page }) => {
+  test('canvas renders 12 nodes and 7 edges', async ({ page }) => {
     const canvas = page.locator('witgraph-canvas');
-    await expect(canvas.locator('svg .node-group')).toHaveCount(8);
-    await expect(canvas.locator('svg path.edge')).toHaveCount(6);
+    await expect(canvas.locator('svg .node-group')).toHaveCount(12);
+    await expect(canvas.locator('svg path.edge')).toHaveCount(7);
   });
 
   test('relay-a is pre-selected in inspector', async ({ page }) => {
@@ -63,12 +63,12 @@ test.describe('WIT Graph Editor Demo', () => {
   test('auto-layout produces distinct positions', async ({ page }) => {
     const groups = page.locator('witgraph-canvas').locator('.node-group');
     const count = await groups.count();
-    expect(count).toBe(8);
+    expect(count).toBe(12);
     const transforms = new Set<string>();
     for (let i = 0; i < count; i++) {
       transforms.add(await groups.nth(i).getAttribute('transform') ?? '');
     }
-    expect(transforms.size).toBe(8);
+    expect(transforms.size).toBe(12);
   });
 
   test('catalog shows components', async ({ page }) => {

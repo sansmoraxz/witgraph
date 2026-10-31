@@ -86,6 +86,7 @@ export class WitgraphControls extends HTMLElement {
   #durationSpan!: HTMLSpanElement;
 
   connectedCallback(): void {
+    if (this.shadowRoot) return;
     const shadow = this.attachShadow({ mode: 'open' });
     adoptStyles(shadow, EXTRA_CSS);
 
@@ -176,7 +177,7 @@ export class WitgraphControls extends HTMLElement {
     delaySlider.max = '2000';
     delaySlider.step = '50';
     delaySlider.value = '0';
-    delaySlider.title = 'Artificial delay between ticks (ms)';
+    delaySlider.title = 'Artificial delay per node execution (ms)';
     const delayValue = document.createElement('span');
     delayValue.className = 'delay-value';
     delayValue.textContent = '0ms';
@@ -195,6 +196,7 @@ export class WitgraphControls extends HTMLElement {
 
     this.#badge = document.createElement('span');
     this.#badge.className = 'badge';
+    this.#badge.appendChild(document.createTextNode(''));
     this.#durationSpan = document.createElement('span');
     this.#durationSpan.className = 'duration';
     this.#badge.appendChild(this.#durationSpan);
@@ -272,4 +274,4 @@ export class WitgraphControls extends HTMLElement {
   }
 }
 
-customElements.define('witgraph-controls', WitgraphControls);
+if (!customElements.get('witgraph-controls')) customElements.define('witgraph-controls', WitgraphControls);

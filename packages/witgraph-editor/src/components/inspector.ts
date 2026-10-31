@@ -286,7 +286,7 @@ export class WitgraphInspector extends HTMLElement {
     const idInput = document.createElement('input');
     idInput.type = 'text';
     idInput.value = node.id;
-    idInput.className = 'focus-ring flex-1 bg-wg-surface text-wg-text border border-wg-text-dim rounded-md px-2 py-1 font-mono text-sm';
+    idInput.className = 'node-id focus-ring flex-1 bg-wg-surface text-wg-text border border-wg-text-dim rounded-md px-2 py-1 font-mono text-sm';
     idInput.style.minWidth = '0';
     idInput.addEventListener('change', () => {
       const newId = idInput.value.trim();
@@ -662,4 +662,4 @@ export class WitgraphInspector extends HTMLElement {
   }
 }
 
-customElements.define('witgraph-inspector', WitgraphInspector);
+if (!customElements.get('witgraph-inspector')) customElements.define('witgraph-inspector', WitgraphInspector);

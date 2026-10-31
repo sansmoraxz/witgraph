@@ -145,4 +145,4 @@ export class WitgraphCatalog extends HTMLElement {
   }
 }
 
-customElements.define('witgraph-catalog', WitgraphCatalog);
+if (!customElements.get('witgraph-catalog')) customElements.define('witgraph-catalog', WitgraphCatalog);

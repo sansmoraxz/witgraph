@@ -1,4 +1,4 @@
-import { Session, type SessionOptions } from 'witgraph-loader';
+import { Session, describeComponent, type SessionOptions, type Contract, type Capability, type PortValues } from 'witgraph-loader';
 import type {
   EditorMode,
   NodeVisual,
@@ -18,7 +18,6 @@ import type {
   CapabilityInfo,
   SavedSnapshot,
 } from './types.ts';
-import type { Capability, Contract, PortValues } from 'witgraph-loader';
 import { autoLayout, type LayoutNode, type LayoutEdge } from './layout.ts';
 import { NODE_WIDTH, computeNodeHeight } from '../components/styles.ts';
 
@@ -52,9 +51,10 @@ export class EditorController extends EventTarget {
 
   #undoStack: EditorCommand[] = [];
   #redoStack: EditorCommand[] = [];
-  #clipboard: { nodes: GraphJsonNode[]; edges: GraphJsonConnection[] } | null = null;
+  #clipboard: { nodes: GraphJsonNode[]; edges: GraphJsonConnection[]; ports: Map<string, { inputs: PortVisual[]; outputs: PortVisual[] }> } | null = null;
   #compileError: string | null = null;
   #tickDelayMs = 0;
+  #componentContracts = new Map<number, Contract>();
 
   // -- Mock & capability state ------------------------------------------------
   #capabilityInfo = new Map<string, CapabilityInfo[]>();
@@ -109,8 +109,8 @@ export class EditorController extends EventTarget {
       const compIdx = this.#graphJson?.components.findIndex((c) => {
         const ref = graphNode.component as Record<string, unknown>;
         const candidate = c as Record<string, unknown>;
-        return EditorController.#shallowEqual(candidate, ref)
-          || EditorController.#shallowEqual(candidate, ref, 'content_hash');
+        return EditorController.#deepEqual(candidate, ref)
+          || EditorController.#deepEqual(candidate, ref, new Set(['content_hash']));
       });
       if (compIdx === undefined || compIdx < 0 || seen.has(compIdx)) continue;
       seen.add(compIdx);
@@ -124,26 +124,42 @@ export class EditorController extends EventTarget {
       });
     }
 
-    // Also include components not yet used by any node
+    // Also include components not yet used by any node — derive ports
+    // from the component's WIT contract so the catalog and paste show them.
     for (let i = 0; i < this.#originalOptions.components.length; i++) {
       if (seen.has(i)) continue;
+      const comp = this.#originalOptions.components[i];
+      let contract = this.#componentContracts.get(i);
+      if (!contract) {
+        try {
+          contract = describeComponent(comp.id, comp.bytes);
+          this.#componentContracts.set(i, contract);
+        } catch { /* component bytes may be invalid */ }
+      }
+      const toPortVisual = (p: { name: string; kind: string; type_display: string; optional: boolean; docs?: string }): PortVisual => ({
+        name: p.name, kind: p.kind as PortVisual['kind'], typeDisplay: p.type_display, optional: p.optional, docs: p.docs,
+      });
       result.push({
-        id: this.#originalOptions.components[i].id,
+        id: comp.id,
         index: i,
-        inputs: [],
-        outputs: [],
+        inputs: (contract?.inputs ?? []).map(toPortVisual),
+        outputs: (contract?.outputs ?? []).map(toPortVisual),
       });
     }
 
     return result;
   }
 
-  static #shallowEqual(a: Record<string, unknown>, b: Record<string, unknown>, ...ignore: string[]): boolean {
-    const skip = new Set(ignore);
-    const keysA = Object.keys(a).filter((k) => !skip.has(k));
-    const keysB = Object.keys(b).filter((k) => !skip.has(k));
+  static #deepEqual(a: unknown, b: unknown, ignore: Set<string> = new Set()): boolean {
+    if (a === b) return true;
+    if (a == null || b == null) return false;
+    if (typeof a !== 'object' || typeof b !== 'object') return false;
+    const objA = a as Record<string, unknown>;
+    const objB = b as Record<string, unknown>;
+    const keysA = Object.keys(objA).filter((k) => !ignore.has(k));
+    const keysB = Object.keys(objB).filter((k) => !ignore.has(k));
     if (keysA.length !== keysB.length) return false;
-    return keysA.every((k) => b[k] === a[k]);
+    return keysA.every((k) => EditorController.#deepEqual(objA[k], objB[k]));
   }
 
   addNodeFromCatalog(componentIndex: number, x: number, y: number): void {
@@ -242,6 +258,12 @@ export class EditorController extends EventTarget {
     if (this.#breakpoints.has(oldId)) {
       this.#breakpoints.delete(oldId);
       this.#breakpoints.add(newId);
+    }
+    // Update output history
+    const history = this.#outputHistory.get(oldId);
+    if (history) {
+      this.#outputHistory.delete(oldId);
+      this.#outputHistory.set(newId, history);
     }
     // Update selection
     if (this.#selectedNode === oldId) this.#selectedNode = newId;
@@ -458,12 +480,22 @@ export class EditorController extends EventTarget {
     this.#clipboard = null;
     this.#capabilityInfo.clear();
     this.#savedSnapshots = [];
+    this.#compileError = null;
+    this.#lastRunDurationMs = null;
+    this.#lastRunTicks = 0;
+    this.#componentContracts.clear();
   }
 
   async reset(): Promise<void> {
-    const options = this.#originalOptions;
+    if (!this.#originalOptions) return;
+    const emptyGraph: GraphJson = {
+      metadata: { name: this.#graphJson?.metadata.name ?? 'untitled', description: this.#graphJson?.metadata.description },
+      components: this.#graphJson?.components ?? [],
+      nodes: [],
+      connections: [],
+    };
     this.dispose();
-    if (options) await this.load(options);
+    await this.load({ ...this.#originalOptions!, graph: emptyGraph });
   }
 
   // -- Execution --------------------------------------------------------------
@@ -558,13 +590,18 @@ export class EditorController extends EventTarget {
     this.#mode = 'running';
     this.#dispatch('state-changed');
 
+    const startTime = performance.now();
     try {
       await this.#session.tick();
       this.#tickCount++;
       this.#pollState();
-    } catch {
+    } catch (err) {
       this.#mode = 'error';
+      const msg = err instanceof Error ? err.message : String(err);
+      this.#pushError(`Step failed: ${msg}`);
     }
+    this.#lastRunDurationMs = performance.now() - startTime;
+    this.#lastRunTicks = 1;
 
     if ((this.#mode as EditorMode) !== 'paused') {
       this.#mode = 'idle';
@@ -642,9 +679,15 @@ export class EditorController extends EventTarget {
     if (!nodeId || !this.#graphJson) return;
     const graphNode = this.#graphJson.nodes.find((n) => n.id === nodeId);
     if (!graphNode) return;
+    const visual = this.#nodes.get(nodeId);
+    const ports = new Map<string, { inputs: PortVisual[]; outputs: PortVisual[] }>();
+    if (visual) {
+      ports.set(nodeId, { inputs: structuredClone(visual.inputs), outputs: structuredClone(visual.outputs) });
+    }
     this.#clipboard = {
       nodes: [structuredClone(graphNode)],
       edges: [],
+      ports,
     };
   }
 
@@ -662,9 +705,13 @@ export class EditorController extends EventTarget {
       const compRef = node.component;
       const source = this.componentSources.find((s) => {
         const graphComp = this.#graphJson!.components[s.index] as Record<string, unknown> | undefined;
-        return graphComp && EditorController.#shallowEqual(graphComp, compRef as Record<string, unknown>);
+        return graphComp && EditorController.#deepEqual(graphComp, compRef as Record<string, unknown>);
       });
       if (!source) continue;
+      // Prefer ports from the catalog source; fall back to ports saved in clipboard
+      const savedPorts = this.#clipboard.ports.get(node.id);
+      const inputs = source.inputs.length > 0 ? source.inputs : (savedPorts?.inputs ?? []);
+      const outputs = source.outputs.length > 0 ? source.outputs : (savedPorts?.outputs ?? []);
       const newNode: GraphJsonNode = {
         ...structuredClone(node),
         id: newId,
@@ -673,9 +720,9 @@ export class EditorController extends EventTarget {
       this.#graphJson.nodes.push(newNode);
       this.#nodes.set(newId, {
         id: newId, x, y, width: NODE_WIDTH,
-        height: computeNodeHeight(source.inputs.length, source.outputs.length),
+        height: computeNodeHeight(inputs.length, outputs.length),
         label: newNode.label ?? newId, phase: 'pending', breakpoint: false, expanded: false,
-        inputs: [...source.inputs], outputs: [...source.outputs],
+        inputs: [...inputs], outputs: [...outputs],
       });
       x += 30;
       y += 30;
@@ -1269,25 +1316,35 @@ export class EditorController extends EventTarget {
   }
 
   #reloading = false;
+  #pendingReload = false;
   async #reloadAfterEdit(): Promise<void> {
     this.#dirty = true;
-    if (this.#reloading) return;
+    if (this.#reloading) {
+      this.#pendingReload = true;
+      return;
+    }
     this.#reloading = true;
-    const hadError = this.#compileError !== null;
     try {
-      await this.#reload();
-      this.#compileError = null;
-      if (hadError) {
-        this.#traceEvents.push({ event: 'compile-ok', timestamp: performance.now(), message: 'Graph compiles successfully' });
-        this.#dispatch('trace-event');
+      const hadError = this.#compileError !== null;
+      try {
+        await this.#reload();
+        this.#compileError = null;
+        if (hadError) {
+          this.#traceEvents.push({ event: 'compile-ok', timestamp: performance.now(), message: 'Graph compiles successfully' });
+          this.#dispatch('trace-event');
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        this.#compileError = msg;
+        this.#pushError(`Graph reload failed: ${msg}`);
       }
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      this.#compileError = msg;
-      this.#pushError(`Graph reload failed: ${msg}`);
     } finally {
       this.#reloading = false;
     }
     this.#dispatch('state-changed');
+    if (this.#pendingReload) {
+      this.#pendingReload = false;
+      void this.#reloadAfterEdit();
+    }
   }
 }

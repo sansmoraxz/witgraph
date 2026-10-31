@@ -45,6 +45,7 @@ export class WitgraphTimeline extends HTMLElement {
   #onStateChanged = () => this.#appendNew();
 
   connectedCallback(): void {
+    if (this.shadowRoot) return;
     const shadow = this.attachShadow({ mode: 'open' });
     adoptStyles(shadow, EXTRA_CSS);
 
@@ -137,4 +138,4 @@ export class WitgraphTimeline extends HTMLElement {
   }
 }
 
-customElements.define('witgraph-timeline', WitgraphTimeline);
+if (!customElements.get('witgraph-timeline')) customElements.define('witgraph-timeline', WitgraphTimeline);
