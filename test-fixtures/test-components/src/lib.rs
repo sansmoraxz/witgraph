@@ -59,8 +59,12 @@ pub const STREAM_DRAIN: Guest = guest!("STREAM_DRAIN_WASM", "stream-drain");
 pub const FUTURE_WRITER: Guest = guest!("FUTURE_WRITER_WASM", "future-writer");
 
 /// Imports the `test:mqtt/source` capability and streams its
-/// messages on `messages: stream<u32>` until the feed is exhausted.
+/// messages on `messages: stream<list<u8>>` until the feed is exhausted.
 pub const MQTT_NODE: Guest = guest!("MQTT_NODE_WASM", "mqtt-node");
+
+/// `items: stream<list<u8>>` → `count: u32`, `total-bytes: u32`.
+/// Counts messages and sums their lengths.
+pub const BYTES_CONSUMER: Guest = guest!("BYTES_CONSUMER_WASM", "bytes-consumer");
 
 /// `action: option<enum { finish, spin, trap, fatal }>` (default
 /// `finish`) → `done: u32`.

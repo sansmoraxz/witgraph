@@ -7,7 +7,7 @@ struct MqttNode;
 
 impl Guest for MqttNode {
     async fn run() -> Outputs {
-        let (mut tx, rx) = wit_stream::new::<u32>();
+        let (mut tx, rx) = wit_stream::new::<Vec<u8>>();
         wit_bindgen::spawn_local(async move {
             while let Some(message) = source::next_message() {
                 if tx.write_one(message).await.is_some() {

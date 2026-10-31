@@ -1,0 +1,17 @@
+package test:bytes-consumer@0.1.0;
+
+/// Counts messages and total bytes from a byte-buffer stream.
+world bytes-consumer {
+    export node: interface {
+        record inputs {
+            items: stream<list<u8>>,
+        }
+        record outputs {
+            /// Number of messages received.
+            count: u32,
+            /// Sum of all message lengths.
+            total-bytes: u32,
+        }
+        run: async func(inputs: inputs) -> outputs;
+    }
+}
