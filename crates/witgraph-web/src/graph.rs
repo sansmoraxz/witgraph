@@ -20,7 +20,7 @@ use witgraph_sched::{
 use crate::executor::{Callbacks, Js, OutputPort, Shared};
 use crate::link::{self, Composed};
 use crate::live::{Live, LiveMode, LiveState};
-use crate::value::{WebValue, from_js, set, to_js};
+use crate::value::{Data, WebValue, from_js, set};
 use witgraph_ir::wasm_wave::value::Type;
 // The built-in interface, unversioned: as jco names the import.
 use witgraph_wit::lower::HOST_INTERFACE;
@@ -596,7 +596,11 @@ impl WebGraph {
         // JavaScript (a getter), and that into this graph.
         let value = from_js(&value, &ty).map_err(error)?;
         self.idle()?
-            .inject(&node, &port, WebValue::Data(Rc::new(value)))
+            .inject(
+                &node,
+                &port,
+                WebValue::Data(Rc::new(Data::from_value(value, ty))),
+            )
             .map_err(error)
     }
 
@@ -657,11 +661,12 @@ impl WebGraph {
 
     /// The latched value of a Value output port, in jco's JavaScript
     /// representation; `undefined` before the node has run. While a tick
-    /// runs, the latest value a `run` of it returned.
+    /// runs, the latest value a `run` of it returned. The value is the one
+    /// the node's consumers are given, not a copy: it must not be changed.
     #[wasm_bindgen(js_name = readOutput)]
     pub fn read_output(&self, node: &str, port: &str) -> Result<JsValue, JsError> {
         Ok(match self.output(node, port)? {
-            Some((WebValue::Data(value), ty)) => to_js(&value, &ty),
+            Some((WebValue::Data(data), _)) => data.js().clone(),
             _ => JsValue::UNDEFINED,
         })
     }
@@ -671,7 +676,7 @@ impl WebGraph {
     #[wasm_bindgen(js_name = readOutputWave)]
     pub fn read_output_wave(&self, node: &str, port: &str) -> Result<Option<String>, JsError> {
         Ok(self.output(node, port)?.and_then(|(value, _)| match value {
-            WebValue::Data(value) => Some(crate::value::to_wave(&value)),
+            WebValue::Data(data) => data.wave().ok(),
             WebValue::Handle(_) => None,
         }))
     }

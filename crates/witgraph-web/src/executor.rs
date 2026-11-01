@@ -10,7 +10,6 @@ use js_sys::{Array, Function, Object, Promise, Reflect};
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 use witgraph_ir::wasm_wave::value::Type;
-use witgraph_ir::wasm_wave::wasm::{WasmTypeKind, WasmValue};
 use witgraph_ir::{NodeId, PortDirection, PortKind, PortName, PortRef};
 use witgraph_sched::plan::IslandPlan;
 use witgraph_sched::{
@@ -19,8 +18,7 @@ use witgraph_sched::{
 };
 
 use crate::value::{
-    WebValue, check_type, describe, from_js, none_to_js, parse_wave, set_field, some_to_js, to_js,
-    to_wave, with_key,
+    Data, WebValue, check_type, describe, none_to_js, parse_wave, set_field, some_js, with_key,
 };
 
 /// One output port of a node: its kind and, for a Value port, its type.
@@ -159,9 +157,10 @@ impl NodeCaller<WebValue> for Members<'_> {
             let ty = self.shared.input_types.get(&field.port);
             let js = match args.next().flatten() {
                 Some(WebValue::Handle(js)) => js,
-                Some(WebValue::Data(value)) => match ty {
-                    Some(ty) if field.optional => some_to_js(&value, ty),
-                    Some(ty) => to_js(&value, ty),
+                // Passed on as it is: a guest's output converts nothing.
+                Some(WebValue::Data(data)) => match ty {
+                    Some(ty) if field.optional => some_js(&data, ty),
+                    Some(_) => data.js().clone(),
                     None => JsValue::UNDEFINED,
                 },
                 // `drive` has checked that every required input has one.
@@ -190,7 +189,7 @@ impl NodeCaller<WebValue> for Members<'_> {
                 .unwrap_or(JsValue::UNDEFINED);
             let value = match (port.kind, &port.ty) {
                 (PortKind::Value, Some(ty)) => {
-                    WebValue::Data(Rc::new(from_js(&js, ty).map_err(|e| {
+                    WebValue::Data(Rc::new(Data::from_output(js, ty.clone()).map_err(|e| {
                         fail(format!("`{node}` returned a bad `{}`: {e}", port.name))
                     })?))
                 }
@@ -333,15 +332,14 @@ impl Executor for Js {
 
     fn option_payload(value: &WebValue) -> OptionPayload<'_, WebValue> {
         match value {
-            WebValue::Data(data) if data.kind() == WasmTypeKind::Option => {
-                match data.unwrap_option() {
-                    Some(payload) => OptionPayload::Some(Cow::Owned(WebValue::Data(Rc::new(
-                        payload.into_owned(),
-                    )))),
-                    None => OptionPayload::None,
+            WebValue::Data(data) => match data.option_payload() {
+                Ok(Some(payload)) => {
+                    OptionPayload::Some(Cow::Owned(WebValue::Data(Rc::new(payload))))
                 }
-            }
-            _ => OptionPayload::NotOption,
+                Ok(None) => OptionPayload::None,
+                Err(()) => OptionPayload::NotOption,
+            },
+            WebValue::Handle(_) => OptionPayload::NotOption,
         }
     }
 
@@ -356,17 +354,18 @@ impl Executor for Js {
         let WebValue::Data(data) = value else {
             return Err("a stream or future is not a Value".into());
         };
-        check_type(&data, ty)?;
+        check_type(data.value()?, ty)?;
         Ok(WebValue::Data(data))
     }
 
     fn parse_wave(&self, ty: &Type, text: &str) -> Result<WebValue, String> {
-        parse_wave(ty, text).map(|value| WebValue::Data(Rc::new(value)))
+        parse_wave(ty, text)
+            .map(|value| WebValue::Data(Rc::new(Data::from_value(value, ty.clone()))))
     }
 
     fn to_wave(&self, value: &WebValue) -> String {
         match value {
-            WebValue::Data(value) => to_wave(value),
+            WebValue::Data(data) => data.wave().unwrap_or_default(),
             WebValue::Handle(_) => String::new(),
         }
     }
