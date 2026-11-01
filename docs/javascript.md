@@ -67,6 +67,12 @@ the TypeScript and let `init` fetch the module from beside the script.
   readers as it is, not copied or converted, and `readOutput` returns that
   same value: don't change it.
 
+- **Large values.** WAVE text of a value (`readOutputWave`, `snapshot`) is
+  refused, with an error naming the value, when it would not fit the
+  scheduler's memory. Should the scheduler's WebAssembly module trap anyway,
+  `session.broken` says in which call, and every call after throws that: load
+  the graph again in a new session.
+
 Call `session.dispose()` when you're done with a session. It closes the
 streams the nodes still have open, so a node writing one in the background
 stops instead of running on, and a generation the scheduler abandons (on a

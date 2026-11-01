@@ -22,6 +22,7 @@ import {
   type SessionOptions,
   type StreamItem,
   WebGraph,
+  watchTraps,
 } from '../src/index.ts';
 
 const root = new URL('../../../', import.meta.url);
@@ -1228,6 +1229,81 @@ test('the list loop jco generates is there to be replaced', async () => {
   );
   assert.notEqual(fastListLift(source), source);
   assert.equal(fastListLift('nothing to replace'), 'nothing to replace');
+});
+
+test('a value too large to convert is refused, naming it, and the session goes on', async () => {
+  const session = await load(
+    [
+      ['source', 'blob-source'],
+      ['sink', 'blob-sink'],
+    ],
+    [['c', 'source.blob', 'sink.blob']],
+  );
+  const size = 64 * 1024 * 1024;
+  session.graph.inject('source', 'size', size);
+  await session.settle();
+  // As WAVE text it would not fit the scheduler's 32-bit memory.
+  assert.throws(
+    () => session.graph.readOutputWave('source', 'blob'),
+    /`source\.blob`: too large to convert/,
+  );
+  // A snapshot names the first such value it meets: the output, or the
+  // sink's latched input holding the same bytes.
+  assert.throws(() => session.graph.snapshot(), /`(source|sink)\.blob`: too large to convert/);
+  // Nothing trapped: the session is as it was.
+  assert.equal(session.broken, undefined);
+  assert.equal((session.graph.readOutput('source', 'blob') as Uint8Array).length, size);
+  assert.equal(session.graph.readOutputWave('sink', 'len'), String(size));
+  session.graph.inject('source', 'size', 3);
+  await session.settle();
+  assert.equal(session.graph.readOutputWave('source', 'blob'), '[0, 1, 2]');
+  assert.ok(session.graph.snapshot().length > 0);
+});
+
+test('a trap of the scheduler breaks the session, naming the call', async () => {
+  const state: { broken?: Error } = {};
+  const graph = watchTraps(
+    {
+      readOutputWave(node: string, port: string): string {
+        throw new WebAssembly.RuntimeError(`unreachable (${node}.${port})`);
+      },
+      readOutput: () => 3,
+      parse: () => {
+        throw new Error('not a trap');
+      },
+      tick: async () => {
+        throw new WebAssembly.RuntimeError('unreachable');
+      },
+    },
+    state,
+  );
+  // Other errors pass through, and leave the session as it is.
+  assert.throws(() => graph.parse(), /^Error: not a trap$/);
+  assert.equal(graph.readOutput(), 3);
+  assert.throws(
+    () => graph.readOutputWave('source', 'blob'),
+    /the scheduler stopped in `readOutputWave\("source", "blob"\)` \(unreachable \(source\.blob\)\): the session can no longer be used/,
+  );
+  // Every call after throws the same.
+  assert.equal(state.broken?.cause instanceof WebAssembly.RuntimeError, true);
+  assert.throws(
+    () => graph.readOutput(),
+    (e) => e === state.broken,
+  );
+
+  const other: { broken?: Error } = {};
+  await assert.rejects(
+    watchTraps(
+      {
+        tick: async () => {
+          throw new WebAssembly.RuntimeError('unreachable');
+        },
+      },
+      other,
+    ).tick(),
+    /stopped in `tick\(\)`/,
+  );
+  assert.ok(other.broken);
 });
 
 test('a hook sees what a future resolves to, and its reader still gets it', async () => {

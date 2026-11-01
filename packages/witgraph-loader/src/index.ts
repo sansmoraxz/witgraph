@@ -309,13 +309,15 @@ export class Session {
   /** Per node, the stream outputs of its runs still open. */
   #streams = new Map<string, Set<Tap>>();
   #disposed = false;
+  /** Set once the scheduler's module trapped: see {@link broken}. */
+  #trapped: { broken?: Error } = {};
 
   private constructor(
     graph: WebGraph,
     options: SessionOptions,
     components: Map<string, NodeComponent>,
   ) {
-    this.graph = graph;
+    this.graph = watchTraps(graph, this.#trapped);
     this.#options = options;
     this.#components = components;
     // The contracts the graph was loaded with: lowered once, by `WebGraph.load`.
@@ -395,7 +397,19 @@ export class Session {
     this.#disposed = true;
     for (const node of [...this.#streams.keys()]) this.#close(node);
     this.#instances.clear();
-    this.graph.free();
+    // A graph the scheduler trapped in is still held by the call that
+    // trapped: freeing it throws. Its memory stays with the module.
+    if (!this.#trapped.broken) this.graph.free();
+  }
+
+  /**
+   * Why the session can no longer be used, once the scheduler's
+   * WebAssembly module has trapped (run out of memory, say): an error
+   * naming the call it trapped in. Every call to {@link graph} throws it
+   * from then on. Load the graph again in a new session.
+   */
+  get broken(): Error | undefined {
+    return this.#trapped.broken;
   }
 
   /**
@@ -552,6 +566,53 @@ function closeUnread(value: any): void {
       () => {},
     );
   }
+}
+
+/**
+ * `graph`, every method call of which is watched for a trap of the
+ * scheduler's WebAssembly module (`WebAssembly.RuntimeError`: out of
+ * memory, say). A trap stops the scheduler mid-call, skipping the code
+ * that would let go of what the call held, the graph among it: every later
+ * call would fail on that. So the first trap is recorded in `state` as an
+ * error naming the call, and it is thrown for the trap and for every call
+ * after. Other errors pass through as they are.
+ */
+export function watchTraps<T extends object>(graph: T, state: { broken?: Error }): T {
+  const show = (arg: unknown) =>
+    typeof arg === 'string'
+      ? JSON.stringify(arg)
+      : typeof arg === 'number'
+        ? String(arg)
+        : typeof arg;
+  return new Proxy(graph, {
+    get(target, key) {
+      const member: unknown = Reflect.get(target, key, target);
+      if (typeof member !== 'function') return member;
+      return (...args: unknown[]) => {
+        if (state.broken) throw state.broken;
+        const seen = (error: unknown) => {
+          if (!(error instanceof WebAssembly.RuntimeError)) return error;
+          state.broken = new Error(
+            `the scheduler stopped in \`${String(key)}(${args.map(show).join(', ')})\` ` +
+              `(${error.message}): the session can no longer be used; load the graph again`,
+            { cause: error },
+          );
+          return state.broken;
+        };
+        try {
+          const result: unknown = member.apply(target, args);
+          if (result instanceof Promise) {
+            return result.catch((error: unknown) => {
+              throw seen(error);
+            });
+          }
+          return result;
+        } catch (error) {
+          throw seen(error);
+        }
+      };
+    },
+  });
 }
 
 /** A component's `node` export: inline, or a named `…/node` interface. */
