@@ -59,7 +59,6 @@ Call `session.dispose()` when you're done with a session.
 - No fuel or memory limits, so a node that spins blocks the thread.
 - A generation ends when every `run` has returned, without waiting for
   background work such as a stream writer.
-- Links aren't supported yet.
 - Nodes are async, so the browser needs JSPI.
 
 ## Building
@@ -67,4 +66,5 @@ Call `session.dispose()` when you're done with a session.
 `pnpm build:wasm` builds the scheduler into the package (it needs
 `wasm-bindgen-cli` and the `wasm32-unknown-unknown` target), `pnpm test` runs
 the tests after `cargo build -p test-components`, and `pnpm typecheck`
-checks the source. The package is private and isn't published.
+checks the source. `pnpm build` also compiles the TypeScript into `dist/`, which
+is what gets published.

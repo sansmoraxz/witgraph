@@ -23,6 +23,11 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 wasmparser = { workspace = true, features = ["std", "validate", "component-model", "features"] }
+wac-graph = { workspace = true, optional = true }
+
+[features]
+# Composing a node with the providers its links name (`compose`).
+compose = ["dep:wac-graph"]
 
 [dev-dependencies]
 wat = "1"

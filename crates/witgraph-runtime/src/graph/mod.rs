@@ -10,7 +10,6 @@
 //! runs the generation in the island's Store. The scheduling model, with
 //! its invariants, is described in [`witgraph_sched::scheduler`].
 
-mod compose;
 pub(crate) mod load;
 
 use std::future::Future;
@@ -20,10 +19,10 @@ use wasmtime::component::{Type, Val};
 use witgraph_ir::{CompiledGraph, NodeId, PortDirection, PortName};
 use witgraph_sched::{Scheduler, Snapshot};
 
-pub use self::compose::LinkedProvider;
 pub use self::load::PreparedComponent;
 use crate::engine::{self, Host, NoCapabilities, StoreSettings, Wasmtime};
 use witgraph_sched::{FaultReport, NodeState, Perf, RuntimeError, RuntimeMode, TickResult};
+pub use witgraph_wit::compose::LinkedProvider;
 
 /// Configuration for a runtime graph.
 #[derive(Debug, Clone)]

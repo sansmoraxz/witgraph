@@ -21,7 +21,7 @@ crate-type = ["cdylib", "rlib"]
 # Everything here is for `wasm32`: on other targets the crate is empty.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 witgraph-ir = { workspace = true }
-witgraph-wit = { workspace = true }
+witgraph-wit = { workspace = true, features = ["compose"] }
 witgraph-sched = { workspace = true }
 futures = "0.3"
 serde = { workspace = true }

@@ -18,6 +18,7 @@ use witgraph_sched::{
 };
 
 use crate::executor::{Callbacks, Js, OutputPort, Shared};
+use crate::link::{self, Composed};
 use crate::live::{Live, LiveMode, LiveState};
 use crate::value::{WebValue, from_js, set, to_js};
 use witgraph_ir::wasm_wave::value::Type;
@@ -56,7 +57,7 @@ thread_local! {
         const { RefCell::new(Vec::new()) };
 }
 
-fn error(message: impl std::fmt::Display) -> JsError {
+pub(crate) fn error(message: impl std::fmt::Display) -> JsError {
     JsError::new(&message.to_string())
 }
 
@@ -161,7 +162,7 @@ fn lower(id: &str, bytes: &[u8], wit: Option<&str>) -> Result<ComponentContract,
 }
 
 /// `bytes` as lower-case hex.
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
@@ -209,6 +210,11 @@ pub struct WebGraph {
     components: HashMap<NodeId, u32>,
     /// Per `components` entry, the SHA-256 of its bytes, in hex.
     digests: Vec<String>,
+    /// The nodes' components with their links composed in.
+    composed: Vec<Composed>,
+    /// Per node with links that apply, the index in `composed` of what it
+    /// runs.
+    composed_of: HashMap<NodeId, usize>,
     /// Dropped with the graph, which completes `freed`.
     _alive: oneshot::Sender<()>,
     /// Completes once the graph is freed: a tick still running then ends.
@@ -247,14 +253,6 @@ impl WebGraph {
     /// A graph that does not compile throws with every diagnostic.
     pub fn load(graph: &str, components: Array, callbacks: JsValue) -> Result<WebGraph, JsError> {
         let graph: Graph = serde_json::from_str(graph).map_err(error)?;
-        if let Some(link) = graph.links.first() {
-            // Composing a provider into a node is the wasmtime runtime's so
-            // far; here every node is transpiled as it is.
-            return Err(error(format!(
-                "link `{}`: links are not supported on a JavaScript host yet",
-                link.id
-            )));
-        }
         let callbacks = Callbacks {
             run: function(&callbacks, "run")?
                 .ok_or_else(|| error("`callbacks.run` is required"))?,
@@ -264,8 +262,11 @@ impl WebGraph {
             abandon: function(&callbacks, "abandon")?,
         };
         let mut contracts = Vec::new();
+        // Per contract, the `components` entry it came from.
+        let mut contract_entry = Vec::new();
+        let mut entries: Vec<(ComponentRef, Vec<u8>)> = Vec::new();
         let mut digests = Vec::new();
-        for entry in components.iter() {
+        for (index, entry) in components.iter().enumerate() {
             let id = Reflect::get(&entry, &text("id"))
                 .ok()
                 .and_then(|id| id.as_string())
@@ -282,8 +283,18 @@ impl WebGraph {
                 .ok()
                 .and_then(|wit| wit.as_string());
             let digest: [u8; 32] = Sha256::digest(&bytes).into();
-            contracts.push(contract(&id, &bytes, digest, wit.as_deref())?);
+            let component: ComponentRef = id.parse().map_err(error)?;
+            // A provider is not a node: it has no `node` export, so no
+            // contract. An entry that only links name is composed in, not
+            // lowered as a node.
+            let provider_only = graph.links.iter().any(|l| l.provider.matches(&component))
+                && !graph.components.iter().any(|c| c.matches(&component));
+            if !provider_only {
+                contracts.push(contract(&id, &bytes, digest, wit.as_deref())?);
+                contract_entry.push(index);
+            }
             digests.push(hex(&digest));
+            entries.push((component, bytes));
         }
         let compiled = graph.compile(&contracts).map_err(|failure| {
             let diagnostics: Vec<String> = failure
@@ -305,10 +316,11 @@ impl WebGraph {
         for node in compiled.nodes() {
             let index = first_of
                 .get(&node.contract.id)
-                .and_then(|&index| u32::try_from(index).ok())
+                .and_then(|&index| u32::try_from(contract_entry[index]).ok())
                 .ok_or_else(|| error(format!("node `{}` has no component", node.node.id)))?;
             node_components.insert(node.node.id.clone(), index);
         }
+        let linked = link::compose_links(&compiled, &entries, &node_components)?;
 
         let mut shared = Shared {
             callbacks,
@@ -374,6 +386,8 @@ impl WebGraph {
             shared,
             components: node_components,
             digests,
+            composed: linked.composed,
+            composed_of: linked.of_node,
             _alive: alive,
             freed: freed.shared(),
         })
@@ -453,9 +467,11 @@ impl WebGraph {
         Ref::filter_map(self.sched.try_borrow().ok()?, Option::as_ref).ok()
     }
 
-    /// The `components` entry node `node` runs: `{ index, sha256 }`, its
-    /// position in the array `load` was given and the SHA-256 of its bytes
-    /// (hex).
+    /// The `components` entry node `node` runs: `{ index, sha256, bytes? }`,
+    /// its position in the array `load` was given and the SHA-256 of its
+    /// bytes (hex). A node whose links apply runs those bytes with its
+    /// providers composed in: `bytes` are the composed component and
+    /// `sha256` theirs, and `index` is still the node's own entry.
     pub fn component(&self, node: &str) -> Result<JsValue, JsError> {
         let index = *self
             .components
@@ -467,7 +483,18 @@ impl WebGraph {
             .ok_or_else(|| error(format!("unknown node `{node}`")))?;
         let object = Object::new();
         set(&object, "index", &JsValue::from(index));
-        set(&object, "sha256", &text(digest));
+        match self.composed_of.get(&NodeId::from(node)) {
+            Some(&at) => {
+                let composed = &self.composed[at];
+                set(&object, "sha256", &text(&composed.sha256));
+                set(
+                    &object,
+                    "bytes",
+                    &Uint8Array::from(composed.bytes.as_slice()),
+                );
+            }
+            None => set(&object, "sha256", &text(digest)),
+        }
         Ok(object.into())
     }
 
@@ -484,12 +511,17 @@ impl WebGraph {
             .compiled()
             .contract_for(&node.into())
             .ok_or_else(|| error(format!("unknown node `{node}`")))?;
+        // A composed node imports what its providers do as well, and not
+        // what they satisfy.
+        let capabilities = match self.composed_of.get(&NodeId::from(node)) {
+            Some(&at) => &self.composed[at].capabilities,
+            None => &contract.capabilities,
+        };
         names
             .iter()
             .map(|name| {
                 let named = |by: fn(&str) -> &str| -> Vec<_> {
-                    contract
-                        .capabilities
+                    capabilities
                         .iter()
                         .filter(|c| by(c.link_name()) == name)
                         .collect()

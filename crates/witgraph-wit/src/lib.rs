@@ -1,5 +1,7 @@
 //! WIT loading and lowering into the witgraph IR.
 
+#[cfg(feature = "compose")]
+pub mod compose;
 pub mod hash;
 pub mod load;
 pub mod lower;

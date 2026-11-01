@@ -16,8 +16,7 @@ workspace = true
 [dependencies]
 witgraph-ir = { workspace = true }
 witgraph-sched = { workspace = true }
-witgraph-wit = { workspace = true }
-wac-graph = { workspace = true }
+witgraph-wit = { workspace = true, features = ["compose"] }
 thiserror = { workspace = true }
 miette = { workspace = true }
 futures = "0.3"
