@@ -42,7 +42,8 @@ pub enum RuntimeError {
         node: NodeId,
     },
     /// A referenced port is not a Value input (for [`inject`] and
-    /// [`clear_input`]) or Value output (for [`read_output`]) of the node.
+    /// [`clear_input`]) or Value or handle output (for [`read_output`]) of
+    /// the node.
     ///
     /// [`inject`]: crate::Scheduler::inject
     /// [`clear_input`]: crate::Scheduler::clear_input

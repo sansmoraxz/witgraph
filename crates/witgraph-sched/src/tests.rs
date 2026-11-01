@@ -9,8 +9,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use futures::FutureExt;
 use futures::executor::block_on;
 use witgraph_ir::{
-    ComponentContract, ComponentRef, Graph, NodeId, PortDef, PortDirection, PortKind, PortName,
-    PortRef, Type,
+    ComponentContract, ComponentRef, Graph, HandleType, NodeId, PortDef, PortDirection, PortKind,
+    PortName, PortRef, Type,
 };
 
 use crate::executor::{
@@ -46,7 +46,12 @@ impl NodeCaller<u32> for Members<'_> {
             futures::future::pending::<()>().await;
         }
         let sum = args.iter().flatten().sum::<u32>() + 1;
-        Ok(vec![("out".into(), sum)])
+        let plan = &self.generation.plan.members[member];
+        Ok(plan
+            .outputs
+            .keys()
+            .map(|port| (port.to_string(), sum))
+            .collect())
     }
 
     fn close(&self, _: u32) -> Result<(), String> {
@@ -276,4 +281,137 @@ fn a_failed_rebuild_frees_downstream_in_the_same_tick() {
         sched.node_state(&a).unwrap().fault_cause(),
         Some(NodeFault::Restart { message }) if message.contains("no data")
     ));
+}
+
+fn tensor() -> HandleType {
+    HandleType {
+        interface: "test:data/tensor@0.1.0".into(),
+        resource: "tensor".into(),
+    }
+}
+
+/// `make`: `add: option<u32>` → `t: own<tensor>`; `take`: `t:
+/// borrow<tensor>` → `out: u32`; loaded as `a → b` (`a.t` into `b.t`). The
+/// adders' `u32`s stand in for handles.
+fn load_handles() -> Scheduler<Perf, Adders> {
+    let contract = |world: &str, inputs, outputs| ComponentContract {
+        id: ComponentRef {
+            content_hash: Some("bb".into()),
+            ..(format!("test:nodes/{world}@0.1.0").parse().unwrap())
+        },
+        inputs,
+        outputs,
+        capabilities: vec![],
+        docs: None,
+    };
+    let make = contract(
+        "make",
+        vec![PortDef::new("add", PortKind::Value, Type::U32).optional()],
+        vec![PortDef::handle("t", tensor())],
+    );
+    let take = contract(
+        "take",
+        vec![PortDef::handle("t", tensor())],
+        vec![PortDef::new("out", PortKind::Value, Type::U32)],
+    );
+    let contracts = [make.clone(), take.clone()];
+    let compiled = Graph::builder("t")
+        .add_component(&make)
+        .add_component(&take)
+        .add_node("a", make.id.clone())
+        .add_node("b", take.id.clone())
+        .connect("ab", PortRef::new("a", "t"), PortRef::new("b", "t"))
+        .build()
+        .compile(&contracts)
+        .unwrap();
+    // Only Value ports have a type.
+    let ports = HashSet::from([
+        (PortRef::new("a", "add"), PortDirection::Input),
+        (PortRef::new("b", "out"), PortDirection::Output),
+    ]);
+    let islands = compiled
+        .islands()
+        .iter()
+        .map(|members| {
+            let shapes = members
+                .iter()
+                .map(|node| RunShape {
+                    inputs: Some(vec![if node.as_str() == "a" { "add" } else { "t" }.into()]),
+                    has_result: true,
+                })
+                .collect();
+            ((), shapes)
+        })
+        .collect();
+    let executor = Adders {
+        held: None,
+        fail_rebuilds: Arc::new(AtomicBool::new(false)),
+        ports,
+    };
+    Scheduler::new(compiled, Perf, executor, islands, 100).unwrap()
+}
+
+#[test]
+fn handles_are_delivered_and_read_like_values() {
+    let mut sched = load_handles();
+    assert_eq!(
+        sched.compiled().islands().len(),
+        2,
+        "a handle, unlike a stream, does not join islands"
+    );
+    sched.inject(&"a".into(), &"add".into(), 3).unwrap();
+    settle(&mut sched);
+    assert_eq!(
+        sched.read_output(&"a".into(), &"t".into()).unwrap(),
+        Some(4)
+    );
+    assert_eq!(out(&sched, "b"), Some(5));
+    assert!(
+        matches!(
+            sched.inject(&"b".into(), &"t".into(), 1),
+            Err(crate::RuntimeError::NotAValuePort { .. })
+        ),
+        "a handle is not text the host can write"
+    );
+}
+
+#[test]
+fn snapshots_leave_handles_out_and_rerun_their_producers() {
+    let mut sched = load_handles();
+    sched.inject(&"a".into(), &"add".into(), 3).unwrap();
+    settle(&mut sched);
+    let snapshot = sched.snapshot().unwrap();
+    let ports = |values: &crate::PortValues| -> Vec<String> {
+        values
+            .iter()
+            .flat_map(|(node, ports)| ports.keys().map(move |port| format!("{node}.{port}")))
+            .collect()
+    };
+    assert_eq!(ports(&snapshot.inputs), ["a.add"]);
+    assert_eq!(ports(&snapshot.outputs), ["b.out"]);
+    let queued: Vec<&[NodeId]> = snapshot
+        .islands
+        .iter()
+        .filter(|island| island.queued)
+        .map(|island| island.members.as_slice())
+        .collect();
+    assert_eq!(
+        queued,
+        [&[NodeId::from("a")][..]],
+        "the producer owes a run"
+    );
+
+    let mut restored = load_handles();
+    restored.restore(&snapshot).unwrap();
+    assert_eq!(
+        restored.read_output(&"a".into(), &"t".into()).unwrap(),
+        None
+    );
+    settle(&mut restored);
+    assert_eq!(
+        restored.read_output(&"a".into(), &"t".into()).unwrap(),
+        Some(4),
+        "the producer made its handle anew"
+    );
+    assert_eq!(out(&restored, "b"), Some(5));
 }

@@ -336,11 +336,11 @@ pub type OptionPayloadFn<V> = for<'a> fn(&'a V) -> OptionPayload<'a, V>;
 /// - A member's `run` is called once every in-island producer it reads
 ///   from has returned. Its arguments are those producers' fresh outputs
 ///   plus `args`, the host-supplied external Value inputs.
-/// - A Value output is cloned to each in-island consumer; a stream or
-///   future output is moved to its one consumer, or closed when it has
-///   none.
+/// - A Value or handle output is cloned to each in-island consumer; a
+///   stream or future output is moved to its one consumer, or closed when
+///   it has none.
 /// - Each start and return is reported through `send`; a return carries
-///   the member's Value outputs.
+///   the member's Value and handle outputs.
 /// - A connection that unwraps an option delivers what `option_payload`
 ///   says.
 pub async fn drive<V, C>(
@@ -388,7 +388,7 @@ where
                 continue;
             };
             match output.kind {
-                PortKind::Value => {
+                PortKind::Value | PortKind::Handle => {
                     for consumer in &output.consumers {
                         let delivered = if consumer.unwrap_option {
                             option_payload(&val).delivered(&val)

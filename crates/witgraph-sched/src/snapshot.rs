@@ -4,7 +4,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use witgraph_ir::{
-    ComponentRef, Connection, ConnectionId, Link, NodeId, PortDirection, PortName, PortRef,
+    ComponentRef, Connection, ConnectionId, Link, NodeId, PortDirection, PortKind, PortName,
+    PortRef,
 };
 
 use crate::error::RuntimeError;
@@ -31,6 +32,12 @@ pub type PortValues = BTreeMap<NodeId, BTreeMap<PortName, String>>;
 /// generation that was in flight, which recreates its streams from the
 /// recorded inputs; the result matches the original only if the guests are
 /// deterministic.
+///
+/// Nor do they store handles, which are the host's and not text: a latched
+/// handle is left out, and the island that produced it is recorded as
+/// queued, so after a restore it runs again and makes a new one. A
+/// generation in flight that started with a handle is recorded as queued
+/// instead of replayed: it runs once its producers have delivered.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Snapshot {
@@ -117,6 +124,9 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
     /// recorded inputs; the result matches the original only if the guests are
     /// deterministic.
     ///
+    /// Handles are left out, and the islands that produced them owe a run
+    /// (see [`Snapshot`]).
+    ///
     /// Fails, naming it, on a value the executor cannot write as WAVE text.
     pub fn snapshot(&self) -> Result<Snapshot, SnapshotError> {
         let wave = |val: &X::Value, at: &dyn Fn() -> String| {
@@ -124,25 +134,42 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
                 .to_wave(val)
                 .map_err(|message| SnapshotError { at: at(), message })
         };
+        // A handle is the host's, not text: it is left out, and the island
+        // that produced it owes a run, which makes a new one.
+        let producers: BTreeSet<usize> = self
+            .outputs
+            .keys()
+            .filter(|port| self.is_handle(port, PortDirection::Output))
+            .filter_map(|port| self.compiled.island_of(&port.node))
+            .collect();
         // Latched values as WAVE text, by node and port.
-        let port_values =
-            |map: &HashMap<PortRef, Arc<X::Value>>| -> Result<PortValues, SnapshotError> {
-                let mut out = PortValues::new();
-                for (port, val) in map {
-                    let text = wave(val, &|| format!("`{}.{}`", port.node, port.port))?;
-                    out.entry(port.node.clone())
-                        .or_default()
-                        .insert(port.port.clone(), text);
-                }
-                Ok(out)
-            };
+        let port_values = |map: &HashMap<PortRef, Arc<X::Value>>,
+                           direction: PortDirection|
+         -> Result<PortValues, SnapshotError> {
+            let mut out = PortValues::new();
+            for (port, val) in map
+                .iter()
+                .filter(|(port, _)| !self.is_handle(port, direction))
+            {
+                let text = wave(val, &|| format!("`{}.{}`", port.node, port.port))?;
+                out.entry(port.node.clone())
+                    .or_default()
+                    .insert(port.port.clone(), text);
+            }
+            Ok(out)
+        };
         let feedback = self
             .feedback
             .iter()
+            .filter(|(conn, _)| {
+                self.feedback_edges
+                    .get(*conn)
+                    .is_none_or(|(from, _)| !self.is_handle(from, PortDirection::Output))
+            })
             .map(|(conn, val)| Ok((conn.clone(), wave(val, &|| format!("feedback `{conn}`"))?)))
             .collect::<Result<_, SnapshotError>>()?;
         let mut islands = Vec::new();
-        for slot in &self.slots {
+        for (index, slot) in self.slots.iter().enumerate() {
             // In flight, or a restored replay not started yet: its inputs,
             // and what it must not feed back.
             let started = match (slot.state.started_with(), slot.owed.replay()) {
@@ -150,6 +177,23 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
                 (None, Some(replay)) => Some((&replay.inputs, &replay.stale)),
                 (None, None) => None,
             };
+            // One that started with a handle cannot be replayed: it owes a
+            // run instead, on the handles its producers make anew.
+            let with_handle = started.is_some_and(|(inputs, _)| {
+                slot.plan
+                    .members
+                    .iter()
+                    .zip(inputs)
+                    .any(|(member, fields)| {
+                        member
+                            .inputs
+                            .iter()
+                            .flatten()
+                            .zip(fields)
+                            .any(|(field, val)| field.kind == PortKind::Handle && val.is_some())
+                    })
+            });
+            let started = started.filter(|_| !with_handle);
             let running = started.map(|(inputs, _)| {
                 let mut by_member = PortValues::new();
                 for (member, fields) in slot.plan.members.iter().zip(inputs) {
@@ -166,7 +210,7 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
             });
             let running = running.transpose()?;
             let stale_feedback = started.map(|(_, stale)| stale.clone()).unwrap_or_default();
-            let queued = slot.owed.has_latched();
+            let queued = slot.owed.has_latched() || with_handle || producers.contains(&index);
             if running.is_some() || queued {
                 islands.push(IslandSnapshot {
                     members: slot.plan.sorted_members(),
@@ -192,8 +236,8 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
                         .map(move |m| (m.node.clone(), phase))
                 })
                 .collect(),
-            inputs: port_values(&self.inputs)?,
-            outputs: port_values(&self.outputs)?,
+            inputs: port_values(&self.inputs, PortDirection::Input)?,
+            outputs: port_values(&self.outputs, PortDirection::Output)?,
             feedback,
             islands,
         })
@@ -361,6 +405,21 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
         }
         self.dirty = true;
         Ok(())
+    }
+
+    /// Whether `port` is a handle port of that direction.
+    fn is_handle(&self, port: &PortRef, direction: PortDirection) -> bool {
+        self.compiled
+            .contract_for(&port.node)
+            .is_some_and(|contract| {
+                let ports = match direction {
+                    PortDirection::Input => &contract.inputs,
+                    PortDirection::Output => &contract.outputs,
+                };
+                ports
+                    .iter()
+                    .any(|p| p.name == port.port && p.kind == PortKind::Handle)
+            })
     }
 
     /// Parses a replay's recorded inputs for island `index`: only external
