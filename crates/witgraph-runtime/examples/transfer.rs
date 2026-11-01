@@ -60,7 +60,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .compile(&contracts)
             .map_err(|e| format!("{e:?}"))?;
         // Lifting a `list<u8>` costs about 48 bytes of hostcall fuel a
-        // byte: the default (128 MiB) stops a 4 MiB list leaving a node.
+        // byte: the default (4 GiB) stops a list of ~85 MiB leaving a node.
         let config = RuntimeConfig {
             hostcall_fuel: usize::MAX / 2,
             ..RuntimeConfig::default()

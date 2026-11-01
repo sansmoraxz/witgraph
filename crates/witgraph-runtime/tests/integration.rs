@@ -6,9 +6,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use test_components::{
-    BUSY_LOOP, BYTES_CONSUMER, CALC, CONFIGURABLE, ECHO, EDGE_DETECT, FRAME_GRAYSCALE,
-    FRAME_INVERT, FUTURE_WRITER, Guest, LABELLED, MATH, MAYBE, MQTT_NODE, NAMED_ECHO,
-    READING_CONSUMER, READING_PRODUCER, RELAY, RELAY_PLUS, RELAY_WIDE, STREAM_CONSUMER,
+    BLOB_SINK, BLOB_SOURCE, BUSY_LOOP, BYTES_CONSUMER, CALC, CONFIGURABLE, ECHO, EDGE_DETECT,
+    FRAME_GRAYSCALE, FRAME_INVERT, FUTURE_WRITER, Guest, LABELLED, MATH, MAYBE, MQTT_NODE,
+    NAMED_ECHO, READING_CONSUMER, READING_PRODUCER, RELAY, RELAY_PLUS, RELAY_WIDE, STREAM_CONSUMER,
     STREAM_DRAIN, STREAM_PRODUCER, STREAM_RELAY, VIDEO_SINK, VIDEO_SOURCE,
 };
 use wasmtime::StoreContextMut;
@@ -2886,6 +2886,23 @@ async fn a_tiny_hostcall_budget_faults_a_run_that_returns_a_record() {
         matches!(fault, Some(NodeFault::HostcallFuelExhausted)),
         "{fault:?}"
     );
+}
+
+#[tokio::test]
+async fn by_default_a_list_of_megabytes_leaves_a_node() {
+    // Lifting a `list<u8>` is charged ~48 bytes of hostcall fuel a byte: a
+    // default of 128 MiB stopped one of 4 MiB.
+    let kit = Kit::new(&[BLOB_SOURCE, BLOB_SINK]);
+    let graph = kit
+        .builder("blob")
+        .add_node("source", kit.get(BLOB_SOURCE))
+        .add_node("sink", kit.get(BLOB_SINK))
+        .connect("c", port("source", "blob"), port("sink", "blob"))
+        .build();
+    let mut rt = kit.load(graph, RuntimeConfig::default(), Perf).await;
+    inject(&mut rt, "source", "size", Val::U32(4 << 20));
+    settle(&mut rt).await;
+    assert_eq!(read_u32(&rt, "sink", "len"), 4 << 20);
 }
 
 #[tokio::test]

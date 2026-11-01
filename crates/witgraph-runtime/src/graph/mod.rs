@@ -70,9 +70,13 @@ pub struct RuntimeConfig {
     /// an island. Going over faults the island
     /// ([`NodeFault::HostcallFuelExhausted`](crate::NodeFault::HostcallFuelExhausted)).
     /// Values passed *into* a guest are not charged. It bounds each lifted
-    /// value, not the host's copies of it: a Value output is copied once
-    /// for the host and once more for each in-island consumer, and every
-    /// generation start copies its external inputs.
+    /// value, not the host's copies of it: the runtime keeps a Value packed
+    /// (a list of numbers at its own size) and shared, and makes it into
+    /// wasmtime's values again for each call that takes it.
+    ///
+    /// The default, 4 GiB (everything a 32-bit host addresses, on one),
+    /// lets a `list<u8>` of about 85 MiB leave a node; lower it to bound
+    /// what one call may make the host allocate.
     pub hostcall_fuel: usize,
     /// How much address space each linear memory reserves up front, rounded
     /// up to whole 64 KiB pages (`0` reserves nothing). `None` keeps
@@ -117,7 +121,8 @@ impl Default for RuntimeConfig {
             yield_interval: 100_000,
             fuel_per_run: None,
             max_island_memory: Some(1 << 30),
-            hostcall_fuel: 128 << 20,
+            // 4 GiB, or all of a 32-bit host's address space.
+            hostcall_fuel: usize::try_from(4u64 << 30).unwrap_or(usize::MAX),
             memory_reservation: None,
             engine: None,
             split_islands: false,
