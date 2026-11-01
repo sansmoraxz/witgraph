@@ -146,3 +146,16 @@ pub const VIDEO_SINK: Guest = guest!("VIDEO_SINK_WASM", "video-sink");
 /// Faults, saying why, when the host has no accelerator. Previews `edges`
 /// as `image`.
 pub const EDGE_DETECT: Guest = guest!("EDGE_DETECT_WASM", "edge-detect");
+
+/// `size: option<u32>`, `seed: option<u32>` (both default 0) →
+/// `blob: list<u8>`, `size` bytes of `(i + seed) % 256`. For measuring how
+/// data moves.
+pub const BLOB_SOURCE: Guest = guest!("BLOB_SOURCE_WASM", "blob-source");
+
+/// `blob: list<u8>` → `blob: list<u8>`, unchanged. For measuring how data
+/// moves.
+pub const BLOB_RELAY: Guest = guest!("BLOB_RELAY_WASM", "blob-relay");
+
+/// `blob: list<u8>` → `len: u32`, `last: u8` (0 for none). For measuring how
+/// data moves.
+pub const BLOB_SINK: Guest = guest!("BLOB_SINK_WASM", "blob-sink");
