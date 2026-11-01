@@ -37,6 +37,15 @@
     <div class="resize-bottom" data-resize="bottom"></div>
     <witgraph-timeline></witgraph-timeline>
 
+    <label class="z-10 px-2 py-1 bg-wg-surface border border-wg-surface-hover rounded-md text-xs text-wg-text flex items-center gap-2"
+           style="grid-column: 3; grid-row: 2; align-self: start; justify-self: end; margin: 8px;">
+      Graph
+      <select id="graph-picker" class="bg-wg-bg text-wg-text border border-wg-surface-hover rounded px-1 py-0.5 text-xs">
+        <option value="port-kinds">All port kinds</option>
+        <option value="video">Video pipeline</option>
+      </select>
+    </label>
+
     <div id="status" class="z-10 px-4 py-2.5 bg-wg-surface border border-wg-surface-hover rounded-md text-xs leading-relaxed text-wg-text transition-opacity"
          style="grid-column: 3; grid-row: 2; align-self: end; justify-self: center; margin-bottom: 8px; pointer-events: none; max-width: calc(100% - 16px);">
       Initializing...

@@ -29,6 +29,10 @@ const GUESTS = [
   'calc',
   'mqtt-node',
   'bytes-consumer',
+  'video-source',
+  'frame-grayscale',
+  'frame-invert',
+  'video-sink',
 ];
 
 // Resolve the cargo target directory via `cargo metadata`.

@@ -2,7 +2,8 @@
  * WIT Graph Editor — Demo
  *
  * Showcases all port kinds (Value, Stream, Future), external capabilities,
- * and mock support — running real WASM components via jco.
+ * and mock support — running real WASM components via jco. `?graph=video`
+ * loads a video pipeline instead, each node previewing the frames it emits.
  *
  * Prerequisites:
  *   cargo build -p test-components
@@ -88,25 +89,60 @@ const bytesConsumerRef = {
   world: 'bytes-consumer',
 };
 
-// -- Graph definition ---------------------------------------------------------
+const videoSourceRef = {
+  package: { namespace: 'test', name: 'video-source', version: '0.1.0' },
+  world: 'video-source',
+};
 
-const graph: GraphJson = {
+const frameGrayscaleRef = {
+  package: { namespace: 'test', name: 'frame-grayscale', version: '0.1.0' },
+  world: 'frame-grayscale',
+};
+
+const frameInvertRef = {
+  package: { namespace: 'test', name: 'frame-invert', version: '0.1.0' },
+  world: 'frame-invert',
+};
+
+const videoSinkRef = {
+  package: { namespace: 'test', name: 'video-sink', version: '0.1.0' },
+  world: 'video-sink',
+};
+
+// -- Graph definitions --------------------------------------------------------
+
+/**
+ * Every component, in the order of every graph's component table: each
+ * graph has them all, so the catalog offers them all whichever is loaded.
+ */
+const GUESTS = [
+  'relay',
+  'stream-producer',
+  'stream-consumer',
+  'future-writer',
+  'future-reader',
+  'configurable',
+  'calc',
+  'mqtt-node',
+  'bytes-consumer',
+  'video-source',
+  'frame-grayscale',
+  'frame-invert',
+  'video-sink',
+];
+
+const allComponents = GUESTS.map((guest) => ({
+  package: { namespace: 'test', name: guest, version: '0.1.0' },
+  world: guest,
+}));
+
+const portKinds: GraphJson = {
   metadata: {
     name: 'demo-all-port-kinds',
     description:
-      'Showcasing Value, Stream, Future, external capabilities, and mock support with real WASM components.',
+      'Showcasing Value, Stream, Future, external capabilities, mock support and in-node previews with real WASM components.',
   },
-  components: [
-    relayRef,
-    streamProducerRef,
-    streamConsumerRef,
-    futureWriterRef,
-    futureReaderRef,
-    configurableRef,
-    calcRef,
-    mqttNodeRef,
-    bytesConsumerRef,
-  ],
+  components: allComponents,
   nodes: [
     // Value chain island
     {
@@ -143,6 +179,16 @@ const graph: GraphJson = {
     { id: 'mqtt', component: mqttNodeRef, label: 'MQTT Sensor' },
     // Bytes consumer (receives mqtt stream)
     { id: 'mqtt-sink', component: bytesConsumerRef, label: 'Msg Counter' },
+    // Video island: frames streamed through a filter, each node previewing them
+    {
+      id: 'camera',
+      component: videoSourceRef,
+      label: 'Camera',
+      attrs: { 'inject.fps': '20' },
+    },
+    { id: 'grayscale', component: frameGrayscaleRef, label: 'Grayscale' },
+    { id: 'invert', component: frameInvertRef, label: 'Invert' },
+    { id: 'video-sink', component: videoSinkRef, label: 'Frame Sink' },
   ],
   connections: [
     {
@@ -173,7 +219,98 @@ const graph: GraphJson = {
       from: { node: 'mqtt', port: 'messages' },
       to: { node: 'mqtt-sink', port: 'items' },
     },
+    {
+      id: 'camera-to-grayscale',
+      from: { node: 'camera', port: 'frames' },
+      to: { node: 'grayscale', port: 'frames' },
+    },
+    {
+      id: 'grayscale-to-invert',
+      from: { node: 'grayscale', port: 'frames' },
+      to: { node: 'invert', port: 'frames' },
+    },
+    {
+      id: 'invert-to-sink',
+      from: { node: 'invert', port: 'frames' },
+      to: { node: 'video-sink', port: 'frames' },
+    },
   ],
+};
+
+/**
+ * Two cameras streaming frames through image filters. Each component names
+ * the viewer for its `frames` output in a `witgraph-viewer` custom section,
+ * so every node but the sinks previews its frames as they stream.
+ */
+const video: GraphJson = {
+  metadata: {
+    name: 'demo-video-pipeline',
+    description: 'Frames streamed from a camera through grayscale and invert filters.',
+  },
+  components: allComponents,
+  nodes: [
+    {
+      id: 'camera',
+      component: videoSourceRef,
+      label: 'Camera',
+      attrs: { 'inject.fps': '15' },
+    },
+    { id: 'gray', component: frameGrayscaleRef, label: 'Grayscale' },
+    { id: 'gray-invert', component: frameInvertRef, label: 'Invert' },
+    { id: 'gray-sink', component: videoSinkRef, label: 'Sink' },
+    {
+      id: 'camera-b',
+      component: videoSourceRef,
+      label: 'Camera B',
+      attrs: { 'inject.fps': '10' },
+    },
+    { id: 'invert', component: frameInvertRef, label: 'Invert' },
+    { id: 'sink', component: videoSinkRef, label: 'Sink' },
+  ],
+  connections: [
+    {
+      id: 'camera-gray',
+      from: { node: 'camera', port: 'frames' },
+      to: { node: 'gray', port: 'frames' },
+    },
+    {
+      id: 'gray-invert',
+      from: { node: 'gray', port: 'frames' },
+      to: { node: 'gray-invert', port: 'frames' },
+    },
+    {
+      id: 'gray-invert-sink',
+      from: { node: 'gray-invert', port: 'frames' },
+      to: { node: 'gray-sink', port: 'frames' },
+    },
+    {
+      id: 'camera-b-invert',
+      from: { node: 'camera-b', port: 'frames' },
+      to: { node: 'invert', port: 'frames' },
+    },
+    {
+      id: 'invert-sink',
+      from: { node: 'invert', port: 'frames' },
+      to: { node: 'sink', port: 'frames' },
+    },
+  ],
+};
+
+/** A graph the demo can load, and the node to select. */
+interface Demo {
+  graph: GraphJson;
+  select: string;
+}
+
+const demos: Record<string, Demo> = {
+  'port-kinds': {
+    graph: portKinds,
+    select: 'relay-a',
+  },
+  video: {
+    graph: video,
+    select: 'gray',
+  },
 };
 
 // -- External capabilities (JS implementations for host-provided imports) -----
@@ -214,11 +351,17 @@ function mqttSource() {
   };
 }
 
+/** Implements `test:video/clock@0.1.0` for the `video-source` component. */
+const clock = {
+  sleep: (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
+};
+
 /** Per-node capability instances (fresh state per instantiation). */
 const capInstances = new Map<string, Record<string, object>>();
 
 function capabilities(node: string, capability: Capability): object | undefined {
   const iface = capability.implements ?? capability.interface;
+  if (iface.startsWith('test:video/clock')) return clock;
   if (iface.startsWith('test:math/ops')) {
     let instances = capInstances.get(node);
     if (!instances) {
@@ -250,43 +393,36 @@ async function fetchWasm(name: string): Promise<Uint8Array> {
   return new Uint8Array(await resp.arrayBuffer());
 }
 
+/** The demo the page's `?graph=` names, the port kinds one by default. */
+function chosenDemo(): [string, Demo] {
+  const name = new URLSearchParams(location.search).get('graph') ?? 'port-kinds';
+  return name in demos ? [name, demos[name]] : ['port-kinds', demos['port-kinds']];
+}
+
+/** The graph picker: choosing another loads the page with it. */
+function setUpPicker(current: string): void {
+  const picker = document.getElementById('graph-picker') as HTMLSelectElement | null;
+  if (!picker) return;
+  picker.value = current;
+  picker.addEventListener('change', () => {
+    const url = new URL(location.href);
+    url.searchParams.set('graph', picker.value);
+    location.assign(url);
+  });
+}
+
 async function loadDemo(): Promise<void> {
+  const [name, demo] = chosenDemo();
+  setUpPicker(name);
   statusEl.textContent = 'Fetching test components...';
 
   try {
-    const [
-      relayBytes,
-      prodBytes,
-      consBytes,
-      writerBytes,
-      readerBytes,
-      configurableBytes,
-      calcBytes,
-      mqttBytes,
-      bytesConsumerBytes,
-    ] = await Promise.all([
-      fetchWasm('relay'),
-      fetchWasm('stream-producer'),
-      fetchWasm('stream-consumer'),
-      fetchWasm('future-writer'),
-      fetchWasm('future-reader'),
-      fetchWasm('configurable'),
-      fetchWasm('calc'),
-      fetchWasm('mqtt-node'),
-      fetchWasm('bytes-consumer'),
-    ]);
-
-    const components: ComponentSource[] = [
-      { id: 'test:relay/relay@0.1.0', bytes: relayBytes },
-      { id: 'test:stream-producer/stream-producer@0.1.0', bytes: prodBytes },
-      { id: 'test:stream-consumer/stream-consumer@0.1.0', bytes: consBytes },
-      { id: 'test:future-writer/future-writer@0.1.0', bytes: writerBytes },
-      { id: 'test:future-reader/future-reader@0.1.0', bytes: readerBytes },
-      { id: 'test:configurable/configurable@0.1.0', bytes: configurableBytes },
-      { id: 'test:calc/calc@0.1.0', bytes: calcBytes },
-      { id: 'test:mqtt-node/mqtt-node@0.1.0', bytes: mqttBytes },
-      { id: 'test:bytes-consumer/bytes-consumer@0.1.0', bytes: bytesConsumerBytes },
-    ];
+    const components: ComponentSource[] = await Promise.all(
+      GUESTS.map(async (guest) => ({
+        id: `test:${guest}/${guest}@0.1.0`,
+        bytes: await fetchWasm(guest),
+      })),
+    );
 
     statusEl.textContent = 'Loading graph (initialising runtime, transpiling components)...';
 
@@ -300,12 +436,12 @@ async function loadDemo(): Promise<void> {
     }
     const wasm = new Uint8Array(await wasmResp.arrayBuffer());
 
-    await controller.load({ graph, components, wasm, capabilities });
+    await controller.load({ graph: demo.graph, components, wasm, capabilities });
 
     statusEl.textContent = 'Computing layout...';
     await controller.autoLayout();
 
-    controller.select('relay-a');
+    controller.select(demo.select);
 
     controller.addEventListener('state-changed', updateStatus);
     updateStatus();
