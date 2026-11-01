@@ -1180,9 +1180,20 @@ export class EditorController extends EventTarget {
 
   // -- Simulation / Snapshots -------------------------------------------------
 
+  /**
+   * Saves the graph's state under `name`. A state that cannot be written
+   * (a value too large to convert, say) is reported in the trace, naming
+   * the value, and nothing is saved.
+   */
   saveSnapshot(name?: string): void {
     if (!this.#session) throw new Error('no session loaded');
-    const data = this.#session.graph.snapshot();
+    let data: string;
+    try {
+      data = this.#session.graph.snapshot();
+    } catch (err) {
+      this.#pushError(`Snapshot failed: ${err instanceof Error ? err.message : String(err)}`);
+      return;
+    }
     const snapName = name ?? `snap-${this.#savedSnapshots.length + 1}`;
     this.#savedSnapshots.push({ name: snapName, data, timestamp: Date.now() });
     this.#dispatch('state-changed');

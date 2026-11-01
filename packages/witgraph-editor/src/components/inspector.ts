@@ -167,7 +167,11 @@ export class WitgraphInspector extends HTMLElement {
     const value = this.#controller?.latestOutput(node, port);
     if (value === undefined) return '-';
     if (weight(value) > MAX_WAVE_BYTES) return `${summarize(value)} (too large to show as WAVE)`;
-    return this.#controller?.readOutputWave(node, port) ?? '-';
+    try {
+      return this.#controller?.readOutputWave(node, port) ?? '-';
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error);
+    }
   }
 
   #el(tag: string, cls: string, text?: string): HTMLElement {
