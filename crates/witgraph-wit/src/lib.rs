@@ -7,6 +7,7 @@ pub mod load;
 pub mod lower;
 pub mod metadata;
 pub mod verify;
+pub mod viewer;
 
 pub use witgraph_ir as ir;
 
@@ -138,6 +139,11 @@ pub fn contract_from_str(
 /// so its content hash can differ from the hash of the contract lowered
 /// from that source.
 ///
+/// The outputs the component's `witgraph-viewer` section names get their
+/// [`viewer`](witgraph_ir::PortDef::viewer). A hint that is wrong (one
+/// naming an output the component does not have, say) is skipped, and
+/// noted in [`warnings`](lower::Lowered::warnings).
+///
 /// See [`load::load_component`] on untrusted bytes; a panic lowering what
 /// it decoded is contained the same way.
 pub fn lower_component(
@@ -158,6 +164,11 @@ pub fn lower_component(
                 content_hash,
                 ..id.clone()
             };
+            let hints = viewer::read(bytes);
+            lowered.warnings = hints.problems;
+            lowered
+                .warnings
+                .extend(viewer::apply(&mut lowered.contract, &hints.hints));
             Ok(lowered)
         }
         found => Err(Error::NotOneNode { found }),

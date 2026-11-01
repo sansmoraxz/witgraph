@@ -53,7 +53,7 @@ struct ContractKey {
 thread_local! {
     /// The contracts the latest loads made, latest last: an editor that
     /// reloads its graph on every edit lowers each component once.
-    static CONTRACTS: RefCell<Vec<(ContractKey, ComponentContract)>> =
+    static CONTRACTS: RefCell<Vec<(ContractKey, Lowered)>> =
         const { RefCell::new(Vec::new()) };
 }
 
@@ -95,6 +95,14 @@ fn json(value: &impl serde::Serialize) -> Result<JsValue, JsError> {
     js_sys::JSON::parse(&json).map_err(|_| error("a value did not convert from JSON"))
 }
 
+/// A component's contract, and what was wrong with it but did not stop it
+/// lowering (see [`witgraph_wit::lower::Lowered::warnings`]).
+#[derive(Clone)]
+struct Lowered {
+    contract: ComponentContract,
+    warnings: Vec<String>,
+}
+
 /// The contract of component `id` with encoded `bytes` (whose SHA-256 is
 /// `digest`) and, if given, the WIT source it was built from: as a load
 /// made it before, else lowered now.
@@ -103,7 +111,7 @@ fn contract(
     bytes: &[u8],
     digest: [u8; 32],
     wit: Option<&str>,
-) -> Result<ComponentContract, JsError> {
+) -> Result<Lowered, JsError> {
     let key = ContractKey {
         bytes: digest,
         wit: wit.map(|wit| Sha256::digest(wit).into()),
@@ -130,22 +138,33 @@ fn contract(
 }
 
 /// The contract of component `id`: from its WIT source, against which the
-/// bytes are checked, or else lowered from the bytes.
-fn lower(id: &str, bytes: &[u8], wit: Option<&str>) -> Result<ComponentContract, JsError> {
+/// bytes are checked, or else lowered from the bytes. Either way its
+/// outputs' viewers are the bytes' (WIT text declares none).
+fn lower(id: &str, bytes: &[u8], wit: Option<&str>) -> Result<Lowered, JsError> {
     let id: ComponentRef = id.parse().map_err(error)?;
     match wit {
         Some(wit) => {
             let name = format!("{id}.wit");
-            let contract = witgraph_wit::contract_from_str(&name, wit, &id)
+            let mut contract = witgraph_wit::contract_from_str(&name, wit, &id)
                 .map_err(|e| error(format!("the WIT of `{id}`: {e}")))?;
-            witgraph_wit::verify::verify_component(&contract, bytes)
+            let found = witgraph_wit::verify::verify_component(&contract, bytes)
                 .map_err(|e| error(format!("component `{id}`: {e}")))?;
-            Ok(contract)
+            for port in &mut contract.outputs {
+                port.viewer = found
+                    .contract
+                    .outputs
+                    .iter()
+                    .find(|p| p.name == port.name)
+                    .and_then(|p| p.viewer.clone());
+            }
+            Ok(Lowered {
+                contract,
+                warnings: found.warnings,
+            })
         }
         None => {
-            let contract = witgraph_wit::lower_component(bytes, &id)
-                .map_err(error)?
-                .contract;
+            let lowered = witgraph_wit::lower_component(bytes, &id).map_err(error)?;
+            let contract = lowered.contract;
             // Without WIT, the bytes' own hash is all there is: a pin
             // naming another is other bytes than these.
             if let (Some(pinned), Some(own)) = (&id.content_hash, &contract.id.content_hash)
@@ -156,7 +175,10 @@ fn lower(id: &str, bytes: &[u8], wit: Option<&str>) -> Result<ComponentContract,
                      against the source the pin names"
                 )));
             }
-            Ok(contract)
+            Ok(Lowered {
+                contract,
+                warnings: lowered.warnings,
+            })
         }
     }
 }
@@ -173,9 +195,9 @@ fn unversioned(name: &str) -> &str {
 }
 
 /// Lowers the WIT embedded in an encoded component and describes it as the
-/// editor catalog does (`{ id, package, world, content_hash, run, inputs,
+/// editor catalog does (`{ id, package, world, content_hash, docs, inputs,
 /// outputs, capabilities, types }`, a port being `{ name, kind,
-/// type_display, optional }`). `id` names the component
+/// type_display, optional, docs?, viewer? }`). `id` names the component
 /// (`namespace:name/world@version`); the result's `id` carries the content
 /// hash computed from the bytes.
 #[wasm_bindgen(js_name = describeComponent)]
@@ -215,6 +237,8 @@ pub struct WebGraph {
     /// Per node with links that apply, the index in `composed` of what it
     /// runs.
     composed_of: HashMap<NodeId, usize>,
+    /// What was wrong with the components but did not stop the load.
+    warnings: Vec<String>,
     /// Dropped with the graph, which completes `freed`.
     _alive: oneshot::Sender<()>,
     /// Completes once the graph is freed: a tick still running then ends.
@@ -262,6 +286,7 @@ impl WebGraph {
             abandon: function(&callbacks, "abandon")?,
         };
         let mut contracts = Vec::new();
+        let mut warnings = Vec::new();
         // Per contract, the `components` entry it came from.
         let mut contract_entry = Vec::new();
         let mut entries: Vec<(ComponentRef, Vec<u8>)> = Vec::new();
@@ -290,7 +315,14 @@ impl WebGraph {
             let provider_only = graph.links.iter().any(|l| l.provider.matches(&component))
                 && !graph.components.iter().any(|c| c.matches(&component));
             if !provider_only {
-                contracts.push(contract(&id, &bytes, digest, wit.as_deref())?);
+                let lowered = contract(&id, &bytes, digest, wit.as_deref())?;
+                warnings.extend(
+                    lowered
+                        .warnings
+                        .into_iter()
+                        .map(|w| format!("component `{id}`: {w}")),
+                );
+                contracts.push(lowered.contract);
                 contract_entry.push(index);
             }
             digests.push(hex(&digest));
@@ -388,6 +420,7 @@ impl WebGraph {
             digests,
             composed: linked.composed,
             composed_of: linked.of_node,
+            warnings,
             _alive: alive,
             freed: freed.shared(),
         })
@@ -724,6 +757,13 @@ impl WebGraph {
             .contract_for(&node.into())
             .ok_or_else(|| error(format!("unknown node `{node}`")))?;
         describe(&witgraph_wit::metadata::ComponentMeta::of(contract))
+    }
+
+    /// What was wrong with the components but did not stop the load, one
+    /// message each (a viewer hint naming an output the component does not
+    /// have, say): strings.
+    pub fn warnings(&self) -> Array {
+        self.warnings.iter().map(|w| JsValue::from_str(w)).collect()
     }
 
     /// The islands of the compiled graph: arrays of node ids, in island
