@@ -18,7 +18,8 @@ use witgraph_sched::{
 };
 
 use crate::value::{
-    Data, WebValue, check_type, describe, none_to_js, parse_wave, set_field, some_js, with_key,
+    Data, Resource, WebValue, check_type, describe, none_to_js, parse_wave, set_field, some_js,
+    with_key,
 };
 
 /// One output port of a node: its kind and, for a Value port, its type.
@@ -79,8 +80,8 @@ pub(crate) struct Shared {
     pub(crate) output_types: HashMap<PortRef, Type>,
     /// Every node's output ports.
     pub(crate) outputs: HashMap<NodeId, Vec<OutputPort>>,
-    /// Every Value output's latest value: the scheduler's latched outputs,
-    /// then each value a `run` returns. What `readOutput` reports while a
+    /// Every Value and handle output's latest value: the scheduler's
+    /// latched outputs, then each value a `run` returns. What `readOutput` reports while a
     /// tick holds the scheduler.
     pub(crate) latest: RefCell<HashMap<PortRef, WebValue>>,
     /// The outputs a `run` returned since `latest` was last made exact.
@@ -157,6 +158,8 @@ impl NodeCaller<WebValue> for Members<'_> {
             let ty = self.shared.input_types.get(&field.port);
             let js = match args.next().flatten() {
                 Some(WebValue::Handle(js)) => js,
+                // Lent: jco lowers it as the `borrow` the input is.
+                Some(WebValue::Resource(resource)) => resource.js().clone(),
                 // Passed on as it is: a guest's output converts nothing.
                 Some(WebValue::Data(data)) => match ty {
                     Some(ty) if field.optional => some_js(&data, ty),
@@ -193,6 +196,15 @@ impl NodeCaller<WebValue> for Members<'_> {
                         fail(format!("`{node}` returned a bad `{}`: {e}", port.name))
                     })?))
                 }
+                (PortKind::Handle, _) if js.is_object() => {
+                    WebValue::Resource(Rc::new(Resource::new(js)))
+                }
+                (PortKind::Handle, _) => {
+                    return Err(fail(format!(
+                        "`{node}` returned a bad `{}`: not a resource",
+                        port.name
+                    )));
+                }
                 _ => WebValue::Handle(js),
             };
             outputs.push((port.name.clone(), value));
@@ -200,7 +212,7 @@ impl NodeCaller<WebValue> for Members<'_> {
         let mut latest = self.shared.latest.borrow_mut();
         let mut touched = self.shared.touched.borrow_mut();
         for (port, value) in &outputs {
-            if let WebValue::Data(_) = value {
+            if let WebValue::Data(_) | WebValue::Resource(_) = value {
                 let port = PortRef::new(node.clone(), port.as_str());
                 latest.insert(port.clone(), value.clone());
                 touched.insert(port);
@@ -339,7 +351,7 @@ impl Executor for Js {
                 Ok(None) => OptionPayload::None,
                 Err(()) => OptionPayload::NotOption,
             },
-            WebValue::Handle(_) => OptionPayload::NotOption,
+            WebValue::Handle(_) | WebValue::Resource(_) => OptionPayload::NotOption,
         }
     }
 
@@ -352,7 +364,7 @@ impl Executor for Js {
 
     fn check_input(&self, ty: &Type, value: WebValue) -> Result<WebValue, String> {
         let WebValue::Data(data) = value else {
-            return Err("a stream or future is not a Value".into());
+            return Err("a stream, future or handle is not a Value".into());
         };
         check_type(data.value()?, ty)?;
         Ok(WebValue::Data(data))
@@ -367,6 +379,7 @@ impl Executor for Js {
         match value {
             WebValue::Data(data) => data.wave(),
             WebValue::Handle(_) => Err("a stream or future is not a Value".into()),
+            WebValue::Resource(_) => Err("a handle has no WAVE text".into()),
         }
     }
 }

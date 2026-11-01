@@ -21,7 +21,6 @@ use crate::executor::{Callbacks, Js, OutputPort, Shared};
 use crate::link::{self, Composed};
 use crate::live::{Live, LiveMode, LiveState};
 use crate::value::{Data, WebValue, from_js, set};
-use witgraph_ir::wasm_wave::value::Type;
 // The built-in interface, unversioned: as jco names the import.
 use witgraph_wit::lower::HOST_INTERFACE;
 
@@ -197,7 +196,7 @@ fn unversioned(name: &str) -> &str {
 /// Lowers the WIT embedded in an encoded component and describes it as the
 /// editor catalog does (`{ id, package, world, content_hash, docs, inputs,
 /// outputs, capabilities, types }`, a port being `{ name, kind,
-/// type_display, optional, docs?, viewer? }`). `id` names the component
+/// type_display, handle?, optional, docs?, viewer? }`). `id` names the component
 /// (`namespace:name/world@version`); the result's `id` carries the content
 /// hash computed from the bytes.
 #[wasm_bindgen(js_name = describeComponent)]
@@ -636,37 +635,41 @@ impl WebGraph {
         Ok(())
     }
 
-    /// The latched value of a Value output port, and its type: from the
+    /// The latched value of a Value or handle output port: from the
     /// scheduler, or, while a tick holds it, from the tick so far.
-    fn output(&self, node: &str, port: &str) -> Result<Option<(WebValue, Type)>, JsError> {
+    fn output(&self, node: &str, port: &str) -> Result<Option<WebValue>, JsError> {
         let port_ref = PortRef::new(node, port);
         // As the scheduler checks it, which a tick may be holding.
-        if !self.shared.outputs.contains_key(&port_ref.node) {
+        let Some(outputs) = self.shared.outputs.get(&port_ref.node) else {
             return Err(error(format!("unknown node `{node}`")));
+        };
+        if !outputs
+            .iter()
+            .any(|p| p.name == port && p.kind.is_latched())
+        {
+            return Err(error(format!(
+                "`{node}.{port}` is not a Value or handle output port"
+            )));
         }
-        let ty = self
-            .shared
-            .output_types
-            .get(&port_ref)
-            .cloned()
-            .ok_or_else(|| error(format!("`{node}.{port}` is not a Value output port")))?;
-        let value = match self.readable() {
+        Ok(match self.readable() {
             Some(sched) => sched
                 .read_output(&port_ref.node, &port_ref.port)
                 .map_err(error)?,
             None => self.shared.latest.borrow().get(&port_ref).cloned(),
-        };
-        Ok(value.map(|value| (value, ty)))
+        })
     }
 
     /// The latched value of a Value output port, in jco's JavaScript
-    /// representation; `undefined` before the node has run. While a tick
-    /// runs, the latest value a `run` of it returned. The value is the one
-    /// the node's consumers are given, not a copy: it must not be changed.
+    /// representation, or the object of a handle output port, as its maker
+    /// returned it; `undefined` before the node has run. While a tick runs,
+    /// the latest value a `run` of it returned. The value is the one the
+    /// node's consumers are given, not a copy: it must not be changed. A
+    /// handle's object is disposed once no latch holds it.
     #[wasm_bindgen(js_name = readOutput)]
     pub fn read_output(&self, node: &str, port: &str) -> Result<JsValue, JsError> {
         Ok(match self.output(node, port)? {
-            Some((WebValue::Data(data), _)) => data.js().clone(),
+            Some(WebValue::Data(data)) => data.js().clone(),
+            Some(WebValue::Resource(resource)) => resource.js().clone(),
             _ => JsValue::UNDEFINED,
         })
     }
@@ -674,14 +677,18 @@ impl WebGraph {
     /// The latched value of a Value output port as WAVE text; `undefined`
     /// before the node has run. While a tick runs, as `readOutput`. Throws,
     /// naming the port, for a value too large to convert (see
-    /// `readOutput` for the value itself).
+    /// `readOutput` for the value itself), and for a handle, which has no
+    /// text.
     #[wasm_bindgen(js_name = readOutputWave)]
     pub fn read_output_wave(&self, node: &str, port: &str) -> Result<Option<String>, JsError> {
         match self.output(node, port)? {
-            Some((WebValue::Data(data), _)) => data
+            Some(WebValue::Data(data)) => data
                 .wave()
                 .map(Some)
                 .map_err(|e| error(format!("`{node}.{port}`: {e}"))),
+            Some(WebValue::Resource(_)) => Err(error(format!(
+                "`{node}.{port}` is a handle: it has no WAVE text"
+            ))),
             _ => Ok(None),
         }
     }

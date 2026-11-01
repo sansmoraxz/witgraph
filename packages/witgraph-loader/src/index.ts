@@ -20,9 +20,15 @@ import initModule, {
 /** A port of a component, as the editor catalog describes one. */
 export interface Port {
   name: string;
-  kind: 'value' | 'stream' | 'future';
+  kind: 'value' | 'stream' | 'future' | 'handle';
   /** WIT-syntax rendering of the payload type, for display. */
   type_display: string;
+  /**
+   * Handle ports only: the resource the port carries, which a capability
+   * provides. An input borrows it for its `run`, an output hands it to the
+   * host, which disposes it (`[Symbol.dispose]()`) once nothing holds it.
+   */
+  handle?: { interface: string; resource: string };
   optional: boolean;
   docs?: string;
   /**
@@ -219,6 +225,17 @@ interface Transpiled {
   modules: Map<string, Promise<WebAssembly.Module>>;
   /** Its imports, as jco names them. */
   imports: string[];
+}
+
+/** Disposes a handle port's object, if it can be. */
+function dispose(object: unknown): void {
+  const free = (object as { [Symbol.dispose]?: () => void } | undefined)?.[Symbol.dispose];
+  if (typeof free !== 'function') return;
+  try {
+    free.call(object);
+  } catch (error) {
+    console.error('disposing a handle threw:', error);
+  }
 }
 
 /** A node's component, and what each of its imports is (`null`: the built-in host). */
@@ -556,6 +573,8 @@ export class Session {
       // stop now, rather than run on for nobody.
       for (const port of this.contracts.get(node)?.outputs ?? []) {
         if (port.kind === 'stream') closeUnread(outputs[camelCase(port.name)]);
+        // Nothing will hold it, so nothing else would dispose it.
+        if (port.kind === 'handle') dispose(outputs[camelCase(port.name)]);
       }
       return outputs;
     }

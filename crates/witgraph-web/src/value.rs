@@ -20,6 +20,45 @@ pub(crate) enum WebValue {
     /// A stream or future, as its producer returned it. Two handles are
     /// equal only when they are the same object.
     Handle(JsValue),
+    /// What a handle port carries: an object the host provides, which the
+    /// scheduler, its readers and the live view share. Equal only to
+    /// itself.
+    Resource(Rc<Resource>),
+}
+
+/// An object a handle port carries, as its maker returned it: the host's
+/// (whatever it holds, a buffer on a device, say) until no latch or view
+/// holds it any more, when its `[Symbol.dispose]()` is called, if it has
+/// one, so what it holds is freed then rather than when it is collected.
+#[derive(Debug)]
+pub(crate) struct Resource(JsValue);
+
+impl Resource {
+    pub(crate) fn new(js: JsValue) -> Self {
+        Self(js)
+    }
+
+    pub(crate) fn js(&self) -> &JsValue {
+        &self.0
+    }
+}
+
+impl Drop for Resource {
+    fn drop(&mut self) {
+        // `Symbol.dispose`, where the engine has it; else the symbol jco
+        // falls back to.
+        let symbol = js_sys::Reflect::get(&js_sys::global(), &"Symbol".into())
+            .and_then(|symbol| js_sys::Reflect::get(&symbol, &"dispose".into()))
+            .ok()
+            .filter(JsValue::is_symbol)
+            .unwrap_or_else(|| js_sys::Symbol::for_("dispose").into());
+        if let Ok(dispose) = js_sys::Reflect::get(&self.0, &symbol)
+            && let Some(dispose) = dispose.dyn_ref::<js_sys::Function>()
+        {
+            // Best effort: a provider's failure to free is its own.
+            let _ = dispose.call0(&self.0);
+        }
+    }
 }
 
 /// Values compare as on wasmtime: floats by their bits, except that every
@@ -29,6 +68,7 @@ impl PartialEq for WebValue {
         match (self, other) {
             (Self::Data(a), Self::Data(b)) => Rc::ptr_eq(a, b) || a.equals(b),
             (Self::Handle(a), Self::Handle(b)) => a == b,
+            (Self::Resource(a), Self::Resource(b)) => Rc::ptr_eq(a, b),
             _ => false,
         }
     }

@@ -74,6 +74,11 @@ const ids: Record<string, string> = {
   'blob-source': 'test:blob-source/blob-source@0.1.0',
   'blob-relay': 'test:blob-relay/blob-relay@0.1.0',
   'blob-sink': 'test:blob-sink/blob-sink@0.1.0',
+  'tensor-source': 'test:tensor-source/tensor-source@0.1.0',
+  'tensor-invert': 'test:tensor-invert/tensor-invert@0.1.0',
+  'tensor-copy-invert': 'test:tensor-copy-invert/tensor-copy-invert@0.1.0',
+  'tensor-sink': 'test:tensor-sink/tensor-sink@0.1.0',
+  'tensor-keep': 'test:tensor-keep/tensor-keep@0.1.0',
 };
 
 /** Components written in WAT here, by guest name, beside the built guests. */
@@ -318,7 +323,7 @@ test('values flow between nodes and equal inputs do not rerun', async () => {
   assert.throws(() => session.graph.inject('b', 'in', 'five'), /written by connection/);
   assert.throws(() => session.graph.inject('a', 'nope', 1), /not a Value input port/);
   assert.throws(() => session.graph.readOutput('x', 'out'), /unknown node `x`/);
-  assert.throws(() => session.graph.readOutput('a', 'nope'), /not a Value output port/);
+  assert.throws(() => session.graph.readOutput('a', 'nope'), /not a Value or handle output port/);
 });
 
 test('a stream passes between two nodes of an island, and a tap sees its items', async () => {
@@ -1464,4 +1469,134 @@ test('a node component is composed once per set of links', async () => {
 
 test('a link whose provider was not given fails the load by name', async () => {
   await assert.rejects(loadLinked(['n'], { providers: [] }), /test:math\/math@0\.1\.0/);
+});
+
+/**
+ * `test:data/tensor` in host memory, as every node imports it: one class,
+ * so a tensor one node makes is one another accepts. Counts how often each
+ * tensor is disposed.
+ */
+function cpuTensors() {
+  const disposed = new Map<object, number>();
+  const made: object[] = [];
+  class Tensor {
+    readonly #dtype: string;
+    readonly #shape: number[];
+    readonly #data: Uint8Array;
+    constructor(dtype: string, shape: ArrayLike<number>, data: Uint8Array) {
+      this.#dtype = dtype;
+      this.#shape = Array.from(shape);
+      this.#data = data;
+      made.push(this);
+    }
+    static fromBytes(dtype: string, shape: ArrayLike<number>, data: Uint8Array) {
+      return new Tensor(dtype, shape, data.slice());
+    }
+    dtype() {
+      return this.#dtype;
+    }
+    shape() {
+      return this.#shape;
+    }
+    read(offset: bigint, len: bigint) {
+      return this.#data.slice(Number(offset), Number(offset + len));
+    }
+    clone() {
+      // Its own object: jco disposes it when the guest drops it.
+      return new Tensor(this.#dtype, this.#shape, this.#data);
+    }
+    invert() {
+      return new Tensor(
+        this.#dtype,
+        this.#shape,
+        this.#data.map((b) => 255 - b),
+      );
+    }
+    conv3x3(): never {
+      throw new Error('not on the CPU');
+    }
+    [Symbol.dispose]() {
+      disposed.set(this, (disposed.get(this) ?? 0) + 1);
+    }
+  }
+  const live = () => made.filter((t) => !disposed.has(t)).length;
+  return { imports: { Tensor }, disposed, made, live };
+}
+
+test('tensors pass between nodes as the objects their makers returned, disposed once unheld', async () => {
+  const tensors = cpuTensors();
+  const session = await load(
+    [
+      ['src', 'tensor-source'],
+      ['inv', 'tensor-invert'],
+      ['copy', 'tensor-copy-invert'],
+      ['direct', 'tensor-sink'],
+      ['inv-sink', 'tensor-sink'],
+      ['copy-sink', 'tensor-sink'],
+    ],
+    [
+      ['a', 'src.tensor', 'inv.tensor'],
+      ['b', 'src.tensor', 'copy.tensor'],
+      ['c', 'src.tensor', 'direct.tensor'],
+      ['d', 'inv.tensor', 'inv-sink.tensor'],
+      ['e', 'copy.tensor', 'copy-sink.tensor'],
+    ],
+    {
+      capabilities: (_, capability) =>
+        capability.interface === 'test:data/tensor@0.1.0' ? tensors.imports : undefined,
+    },
+  );
+  const [input] = session.contracts.get('inv')?.inputs ?? [];
+  assert.equal(input?.kind, 'handle');
+  assert.deepEqual(input?.handle, {
+    interface: 'test:data/tensor@0.1.0',
+    resource: 'tensor',
+  });
+  await session.settle();
+
+  const bytes = 64 * 48 * 4;
+  const sum = session.graph.readOutput('direct', 'sum') as bigint;
+  assert.equal(session.graph.readOutput('direct', 'len'), BigInt(bytes));
+  const inverted = 255n * BigInt(bytes) - sum;
+  assert.equal(session.graph.readOutput('inv-sink', 'sum'), inverted, 'inverted by the host');
+  assert.equal(session.graph.readOutput('copy-sink', 'sum'), inverted, 'inverted by the guest');
+  const source = session.graph.readOutput('src', 'tensor');
+  assert.ok(source instanceof tensors.imports.Tensor, 'the object its maker returned');
+  assert.throws(() => session.graph.readOutputWave('src', 'tensor'), /has no WAVE text/);
+  assert.throws(() => session.graph.inject('inv', 'tensor', source), /not a Value input port/);
+  assert.equal(tensors.live(), 3, 'the source tensor and the two inverted ones');
+
+  session.graph.inject('src', 'seed', 7);
+  await session.settle();
+  assert.notEqual(session.graph.readOutput('direct', 'sum'), sum);
+  assert.equal(tensors.live(), 3, 'the old ones are disposed');
+  assert.ok(
+    [...tensors.disposed.values()].every((times) => times === 1),
+    'each once, borrows by readers never',
+  );
+  session.dispose();
+  sessions.splice(sessions.indexOf(session), 1);
+  assert.equal(tensors.live(), 0, 'a disposed session holds none');
+});
+
+test('a node keeps its own reference to a tensor across runs', async () => {
+  const tensors = cpuTensors();
+  const session = await load(
+    [
+      ['src', 'tensor-source'],
+      ['keep', 'tensor-keep'],
+    ],
+    [['a', 'src.tensor', 'keep.tensor']],
+    {
+      capabilities: (_, capability) =>
+        capability.interface === 'test:data/tensor@0.1.0' ? tensors.imports : undefined,
+    },
+  );
+  await session.settle();
+  assert.equal(session.graph.readOutput('keep', 'previous'), 0n);
+  session.graph.inject('src', 'seed', 1);
+  await session.settle();
+  assert.ok((session.graph.readOutput('keep', 'previous') as bigint) > 0n);
+  // The latched second tensor, and `keep`'s clone of it.
+  assert.equal(tensors.live(), 2);
 });
