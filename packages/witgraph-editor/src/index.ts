@@ -1,30 +1,29 @@
 export { EditorController } from './controller/editor-controller.ts';
 export type {
-  EditorMode,
-  NodeVisual,
-  EdgeVisual,
-  PortVisual,
-  EditorEvent,
-  OutputSnapshot,
   BreakpointState,
   CapabilityInfo,
-  SavedSnapshot,
-  GraphJson,
-  GraphJsonNode,
-  GraphJsonConnection,
-  GraphJsonPortRef,
+  EdgeVisual,
+  EditorEvent,
   EditorLoadOptions,
+  EditorMode,
+  GraphJson,
+  GraphJsonConnection,
+  GraphJsonNode,
+  GraphJsonPortRef,
+  NodeVisual,
+  OutputSnapshot,
+  PortVisual,
+  SavedSnapshot,
 } from './controller/types.ts';
 
 import { WitgraphCanvas } from './components/canvas.ts';
+import { WitgraphCatalog } from './components/catalog.ts';
 import { WitgraphControls } from './components/controls.ts';
 import { WitgraphInspector } from './components/inspector.ts';
 import { WitgraphTimeline } from './components/timeline.ts';
-import { WitgraphCatalog } from './components/catalog.ts';
-
-export { WitgraphCanvas, WitgraphControls, WitgraphInspector, WitgraphTimeline, WitgraphCatalog };
 
 export { autoLayout } from './controller/layout.ts';
+export { WitgraphCanvas, WitgraphCatalog, WitgraphControls, WitgraphInspector, WitgraphTimeline };
 
 const define = (name: string, ctor: CustomElementConstructor) =>
   customElements.get(name) || customElements.define(name, ctor);

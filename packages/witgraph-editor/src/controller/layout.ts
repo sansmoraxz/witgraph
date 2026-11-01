@@ -1,5 +1,5 @@
-import type { ELK as ELKInstance, ElkNode, ElkExtendedEdge, ElkPort } from 'elkjs/lib/elk-api.js';
 import ELKFactory from 'elkjs/lib/elk.bundled.js';
+import type { ELK as ELKInstance, ElkExtendedEdge, ElkNode, ElkPort } from 'elkjs/lib/elk-api.js';
 import { NODE_HEADER_HEIGHT } from '../components/styles.ts';
 
 export interface LayoutNode {

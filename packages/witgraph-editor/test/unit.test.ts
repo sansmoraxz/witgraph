@@ -1,7 +1,5 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-
-import { edgePath, portPosition } from '../src/util/svg.ts';
 import {
   computeNodeHeight,
   NODE_HEADER_HEIGHT,
@@ -9,6 +7,7 @@ import {
   PORT_SPACING,
 } from '../src/components/styles.ts';
 import { autoLayout } from '../src/controller/layout.ts';
+import { edgePath, portPosition } from '../src/util/svg.ts';
 
 // --- edgePath ----------------------------------------------------------------
 
@@ -59,9 +58,7 @@ test('portPosition single port is centered in the body area below header', () =>
 });
 
 test('portPosition multiple ports are evenly spaced in the body area', () => {
-  const positions = [0, 1, 2].map((i) =>
-    portPosition(0, 0, 180, 100, i, 3, 'input'),
-  );
+  const positions = [0, 1, 2].map((i) => portPosition(0, 0, 180, 100, i, 3, 'input'));
   // portAreaTop = 32, portAreaH = 68, y = 32 + 68*(i+1)/4
   const gap1 = positions[1].y - positions[0].y;
   const gap2 = positions[2].y - positions[1].y;
@@ -95,9 +92,7 @@ test('autoLayout two connected nodes: source is left of target', async () => {
     { id: 'a', width: 180, height: 100, inputs: [], outputs: [{ name: 'out' }] },
     { id: 'b', width: 180, height: 100, inputs: [{ name: 'in' }], outputs: [] },
   ];
-  const edges = [
-    { id: 'c', fromNode: 'a', fromPort: 'out', toNode: 'b', toPort: 'in' },
-  ];
+  const edges = [{ id: 'c', fromNode: 'a', fromPort: 'out', toNode: 'b', toPort: 'in' }];
   const positions = await autoLayout(nodes, edges);
   assert.equal(positions.size, 2);
   assert.ok(positions.get('a')!.x < positions.get('b')!.x, 'source should be left of target');
@@ -117,9 +112,7 @@ test('autoLayout positions are non-negative', async () => {
     { id: 'a', width: 180, height: 100, inputs: [], outputs: [{ name: 'out' }] },
     { id: 'b', width: 180, height: 100, inputs: [{ name: 'in' }], outputs: [] },
   ];
-  const edges = [
-    { id: 'c', fromNode: 'a', fromPort: 'out', toNode: 'b', toPort: 'in' },
-  ];
+  const edges = [{ id: 'c', fromNode: 'a', fromPort: 'out', toNode: 'b', toPort: 'in' }];
   const positions = await autoLayout(nodes, edges);
   for (const [, pos] of positions) {
     assert.ok(pos.x >= 0, 'x should be non-negative');

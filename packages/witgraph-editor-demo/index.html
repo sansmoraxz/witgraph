@@ -57,25 +57,25 @@
         const cs = getComputedStyle(app);
         if (dir === 'left') {
           startPos = e.clientX;
-          startSize = parseInt(cs.getPropertyValue('--left-w') || '250');
+          startSize = parseInt(cs.getPropertyValue('--left-w') || '250', 10);
         } else if (dir === 'right') {
           startPos = e.clientX;
-          startSize = parseInt(cs.getPropertyValue('--right-w') || '300');
+          startSize = parseInt(cs.getPropertyValue('--right-w') || '300', 10);
         } else {
           startPos = e.clientY;
-          startSize = parseInt(cs.getPropertyValue('--bottom-h') || '200');
+          startSize = parseInt(cs.getPropertyValue('--bottom-h') || '200', 10);
         }
 
         const onMove = ev => {
           if (dir === 'left') {
             const w = Math.max(150, Math.min(500, startSize + (ev.clientX - startPos)));
-            app.style.setProperty('--left-w', w + 'px');
+            app.style.setProperty('--left-w', `${w}px`);
           } else if (dir === 'right') {
             const w = Math.max(200, Math.min(600, startSize - (ev.clientX - startPos)));
-            app.style.setProperty('--right-w', w + 'px');
+            app.style.setProperty('--right-w', `${w}px`);
           } else {
             const h = Math.max(100, Math.min(500, startSize - (ev.clientY - startPos)));
-            app.style.setProperty('--bottom-h', h + 'px');
+            app.style.setProperty('--bottom-h', `${h}px`);
           }
         };
 

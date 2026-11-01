@@ -7,12 +7,14 @@ as they do on wasmtime, and snapshots have the same format.
 
 ```ts
 const session = await Session.load({
-  graph,                       // the graph, as JSON
-  components,                  // [{ id: 'demo:graph/sensor@0.1.0', bytes, wit? }]
+  graph, // the graph, as JSON
+  components, // [{ id: 'demo:graph/sensor@0.1.0', bytes, wit? }]
   capabilities: (node, capability) =>
     capability.interface === 'demo:caps/clock@0.1.0' ? { now: () => 0n } : undefined,
   mocks: { sensor: () => ({ latest: { value: 1, timestamp: 0n } }) },
-  beforeRun: async (node, inputs) => { /* a breakpoint: the run waits */ },
+  beforeRun: async (node, inputs) => {
+    /* a breakpoint: the run waits */
+  },
   onStreamItem: ({ node, port, item }) => console.log(node, port, item),
 });
 session.graph.inject('scale', 'factor', 10);

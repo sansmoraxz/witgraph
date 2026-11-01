@@ -1,4 +1,4 @@
-import type { ComponentSource, Capability, Contract, PortValues, Wasm } from 'witgraph-loader';
+import type { Capability, ComponentSource, PortValues, Wasm } from 'witgraph-loader';
 
 // ---------------------------------------------------------------------------
 // Editor state

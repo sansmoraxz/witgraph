@@ -1,11 +1,11 @@
-import { NODE_WIDTH, PORT_RADIUS, NODE_HEADER_HEIGHT } from './styles.ts';
-import { adoptStyles } from './shared-styles.ts';
-import type { EditorController } from '../controller/editor-controller.ts';
-import type { NodeVisual, EdgeVisual } from '../controller/types.ts';
-import { edgePath, portPosition } from '../util/svg.ts';
-import { makeDraggable } from '../util/drag.ts';
-import { ContextMenu, type MenuItem } from './context-menu.ts';
 import * as echarts from 'echarts';
+import type { EditorController } from '../controller/editor-controller.ts';
+import type { EdgeVisual, NodeVisual } from '../controller/types.ts';
+import { makeDraggable } from '../util/drag.ts';
+import { edgePath, portPosition } from '../util/svg.ts';
+import { ContextMenu, type MenuItem } from './context-menu.ts';
+import { adoptStyles } from './shared-styles.ts';
+import { NODE_HEADER_HEIGHT, PORT_RADIUS } from './styles.ts';
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
 
@@ -90,8 +90,6 @@ export class WitgraphCanvas extends HTMLElement {
   #panY = 0;
   #scale = 1;
   #didDrag = false;
-
-  #tempEdge: SVGPathElement | null = null;
   #connectFrom: { node: string; port: string; x: number; y: number } | null = null;
   #chartInstances = new Map<string, echarts.ECharts>();
   #contextMenu = new ContextMenu();
@@ -187,7 +185,9 @@ export class WitgraphCanvas extends HTMLElement {
     if (this.shadowRoot) this.#render();
   }
 
-  get controller(): EditorController | null { return this.#controller; }
+  get controller(): EditorController | null {
+    return this.#controller;
+  }
 
   #applyViewportTransform(): void {
     this.#viewport.setAttribute(
@@ -197,7 +197,8 @@ export class WitgraphCanvas extends HTMLElement {
   }
 
   #onBgPointerDown(e: PointerEvent): void {
-    if ((e.target as Element).closest('.node-group') || (e.target as Element).closest('.edge-hit')) return;
+    if ((e.target as Element).closest('.node-group') || (e.target as Element).closest('.edge-hit'))
+      return;
 
     const startX = e.clientX;
     const startY = e.clientY;
@@ -335,7 +336,10 @@ export class WitgraphCanvas extends HTMLElement {
         if (existing) {
           const key = `${id}:`;
           for (const [k, chart] of this.#chartInstances) {
-            if (k.startsWith(key)) { chart.dispose(); this.#chartInstances.delete(k); }
+            if (k.startsWith(key)) {
+              chart.dispose();
+              this.#chartInstances.delete(k);
+            }
           }
           existing.remove();
         }
@@ -375,13 +379,20 @@ export class WitgraphCanvas extends HTMLElement {
         }
 
         if (!chart) {
-          chart = echarts.init(container, undefined, { renderer: 'svg', width: node.width, height: chartH });
+          chart = echarts.init(container, undefined, {
+            renderer: 'svg',
+            width: node.width,
+            height: chartH,
+          });
           this.#chartInstances.set(chartKey, chart);
         }
 
         const history = this.#controller!.outputHistory(id, port.name);
         const ticks = history.map((h) => h.tick);
-        const values = history.map((h) => { const n = parseFloat(h.wave); return isNaN(n) ? 0 : n; });
+        const values = history.map((h) => {
+          const n = parseFloat(h.wave);
+          return Number.isNaN(n) ? 0 : n;
+        });
 
         const cTextDim = this.#resolveColor('--wg-text-dim');
         const cMuted = this.#resolveColor('--wg-text-muted');
@@ -392,9 +403,30 @@ export class WitgraphCanvas extends HTMLElement {
           animation: false,
           grid: { top: 18, right: 6, bottom: 18, left: 30 },
           title: { text: port.name, textStyle: { fontSize: 9, color: cTextDim }, left: 4, top: 0 },
-          xAxis: { type: 'category', data: ticks, axisLabel: { fontSize: 8, color: cMuted }, axisLine: { lineStyle: { color: cHover } } },
-          yAxis: { type: 'value', axisLabel: { fontSize: 8, color: cMuted }, splitLine: { lineStyle: { color: cSurface } }, axisLine: { lineStyle: { color: cHover } } },
-          series: [{ type: 'line', data: values, smooth: true, symbol: 'circle', symbolSize: 3, lineStyle: { color: cPrimary, width: 1.5 }, itemStyle: { color: cPrimary }, areaStyle: { color: `color-mix(in srgb, ${cPrimary} 10%, transparent)` } }],
+          xAxis: {
+            type: 'category',
+            data: ticks,
+            axisLabel: { fontSize: 8, color: cMuted },
+            axisLine: { lineStyle: { color: cHover } },
+          },
+          yAxis: {
+            type: 'value',
+            axisLabel: { fontSize: 8, color: cMuted },
+            splitLine: { lineStyle: { color: cSurface } },
+            axisLine: { lineStyle: { color: cHover } },
+          },
+          series: [
+            {
+              type: 'line',
+              data: values,
+              smooth: true,
+              symbol: 'circle',
+              symbolSize: 3,
+              lineStyle: { color: cPrimary, width: 1.5 },
+              itemStyle: { color: cPrimary },
+              areaStyle: { color: `color-mix(in srgb, ${cPrimary} 10%, transparent)` },
+            },
+          ],
         });
       }
     }
@@ -429,10 +461,12 @@ export class WitgraphCanvas extends HTMLElement {
     this.#appendPorts(g, node, 'output');
     if (node.breakpoint) g.appendChild(this.#makeBreakpoint(node.width));
 
-
     g.addEventListener('click', (e) => {
       e.stopPropagation();
-      if (this.#didDrag) { this.#didDrag = false; return; }
+      if (this.#didDrag) {
+        this.#didDrag = false;
+        return;
+      }
       this.#controller?.select(node.id);
     });
     return g;
@@ -443,7 +477,8 @@ export class WitgraphCanvas extends HTMLElement {
     for (let i = 0; i < ports.length; i++) {
       const port = ports[i];
       const localX = side === 'input' ? 0 : node.width;
-      const localY = NODE_HEADER_HEIGHT + ((node.height - NODE_HEADER_HEIGHT) * (i + 1)) / (ports.length + 1);
+      const localY =
+        NODE_HEADER_HEIGHT + ((node.height - NODE_HEADER_HEIGHT) * (i + 1)) / (ports.length + 1);
 
       const circle = document.createElementNS(SVG_NS, 'circle');
       circle.classList.add('port', `port-${port.kind}`);
@@ -480,11 +515,12 @@ export class WitgraphCanvas extends HTMLElement {
   }
 
   #makeBreakpoint(nodeWidth: number): SVGPolygonElement {
-    const cx = nodeWidth - 12, cy = NODE_HEADER_HEIGHT / 2, s = 5;
+    const cx = nodeWidth - 12,
+      cy = NODE_HEADER_HEIGHT / 2,
+      s = 5;
     const poly = document.createElementNS(SVG_NS, 'polygon');
     poly.classList.add('breakpoint');
-    poly.setAttribute('points',
-      `${cx},${cy - s} ${cx + s},${cy} ${cx},${cy + s} ${cx - s},${cy}`);
+    poly.setAttribute('points', `${cx},${cy - s} ${cx + s},${cy} ${cx},${cy + s} ${cx - s},${cy}`);
     return poly;
   }
 
@@ -504,8 +540,8 @@ export class WitgraphCanvas extends HTMLElement {
     const existingPorts = g.querySelectorAll('.port');
     const expectedPorts = node.inputs.length + node.outputs.length;
     if (existingPorts.length !== expectedPorts) {
-      g.querySelectorAll('.port').forEach((el) => el.remove());
-      g.querySelectorAll('.port-label').forEach((el) => el.remove());
+      for (const el of g.querySelectorAll('.port')) el.remove();
+      for (const el of g.querySelectorAll('.port-label')) el.remove();
       this.#appendPorts(g, node, 'input');
       this.#appendPorts(g, node, 'output');
     }
@@ -530,35 +566,51 @@ export class WitgraphCanvas extends HTMLElement {
     const fi = src.outputs.findIndex((p) => p.name === edge.fromPort);
     const ti = tgt.inputs.findIndex((p) => p.name === edge.toPort);
     if (fi < 0 || ti < 0) return null;
-    const from = portPosition(src.x, src.y, src.width, src.height, fi, src.outputs.length, 'output');
+    const from = portPosition(
+      src.x,
+      src.y,
+      src.width,
+      src.height,
+      fi,
+      src.outputs.length,
+      'output',
+    );
     const to = portPosition(tgt.x, tgt.y, tgt.width, tgt.height, ti, tgt.inputs.length, 'input');
     return edgePath(from.x, from.y, to.x, to.y);
   }
 
   #attachNodeDrag(nodeId: string, group: SVGGElement): void {
-    let origX = 0, origY = 0;
-    const cleanup = makeDraggable(group, {
-      onStart: () => {
-        const node = this.#controller?.nodes.get(nodeId);
-        if (node) { origX = node.x; origY = node.y; }
-        this.#didDrag = false;
+    let origX = 0,
+      origY = 0;
+    const cleanup = makeDraggable(
+      group,
+      {
+        onStart: () => {
+          const node = this.#controller?.nodes.get(nodeId);
+          if (node) {
+            origX = node.x;
+            origY = node.y;
+          }
+          this.#didDrag = false;
+        },
+        onMove: (dx, dy) => {
+          this.#didDrag = true;
+          const newX = origX + dx / this.#scale;
+          const newY = origY + dy / this.#scale;
+          this.#controller?.moveNode(nodeId, newX, newY);
+          group.setAttribute('transform', `translate(${newX},${newY})`);
+          this.#refreshEdgesFor(nodeId);
+        },
+        onEnd: () => {
+          this.#refreshEdgesFor(nodeId);
+          const node = this.#controller?.nodes.get(nodeId);
+          if (node && this.#didDrag) {
+            this.#controller?.commitMove(nodeId, origX, origY, node.x, node.y);
+          }
+        },
       },
-      onMove: (dx, dy) => {
-        this.#didDrag = true;
-        const newX = origX + dx / this.#scale;
-        const newY = origY + dy / this.#scale;
-        this.#controller?.moveNode(nodeId, newX, newY);
-        group.setAttribute('transform', `translate(${newX},${newY})`);
-        this.#refreshEdgesFor(nodeId);
-      },
-      onEnd: () => {
-        this.#refreshEdgesFor(nodeId);
-        const node = this.#controller?.nodes.get(nodeId);
-        if (node && this.#didDrag) {
-          this.#controller?.commitMove(nodeId, origX, origY, node.x, node.y);
-        }
-      },
-    }, '.port');
+      '.port',
+    );
     this.#dragCleanups.set(nodeId, cleanup);
   }
 
@@ -638,25 +690,58 @@ export class WitgraphCanvas extends HTMLElement {
         { label: 'Cut', shortcut: 'Ctrl+X', action: () => this.#controller!.cutSelected() },
         { label: 'Delete', shortcut: 'Del', action: () => this.#controller!.removeNode(nodeId) },
         { label: '', separator: true, action: () => {} },
-        { label: node?.breakpoint ? 'Remove Breakpoint' : 'Toggle Breakpoint', action: () => this.#controller!.toggleBreakpoint(nodeId) },
-        { label: node?.expanded ? 'Collapse Chart' : 'Expand Chart', action: () => this.#controller!.toggleExpanded(nodeId) },
+        {
+          label: node?.breakpoint ? 'Remove Breakpoint' : 'Toggle Breakpoint',
+          action: () => this.#controller!.toggleBreakpoint(nodeId),
+        },
+        {
+          label: node?.expanded ? 'Collapse Chart' : 'Expand Chart',
+          action: () => this.#controller!.toggleExpanded(nodeId),
+        },
       ];
     } else if (edgeHit) {
       const edgeId = edgeHit.getAttribute('data-edge-id') ?? '';
       this.#controller.selectEdge(edgeId);
       const edge = this.#controller.edges.find((e) => e.id === edgeId);
       items = [
-        { label: 'Delete Connection', shortcut: 'Del', action: () => this.#controller!.removeConnection(edgeId) },
-        { label: edge?.feedback ? 'Remove Feedback' : 'Mark as Feedback', action: () => this.#controller!.setConnectionFeedback(edgeId, !edge?.feedback) },
+        {
+          label: 'Delete Connection',
+          shortcut: 'Del',
+          action: () => this.#controller!.removeConnection(edgeId),
+        },
+        {
+          label: edge?.feedback ? 'Remove Feedback' : 'Mark as Feedback',
+          action: () => this.#controller!.setConnectionFeedback(edgeId, !edge?.feedback),
+        },
       ];
     } else {
       items = [
-        { label: 'Paste', shortcut: 'Ctrl+V', disabled: !this.#controller.hasClipboard, action: () => this.#controller!.paste(graphX, graphY) },
+        {
+          label: 'Paste',
+          shortcut: 'Ctrl+V',
+          disabled: !this.#controller.hasClipboard,
+          action: () => this.#controller!.paste(graphX, graphY),
+        },
         { label: '', separator: true, action: () => {} },
-        { label: 'Auto Layout', action: () => { void this.#controller!.autoLayout(); } },
+        {
+          label: 'Auto Layout',
+          action: () => {
+            void this.#controller!.autoLayout();
+          },
+        },
         { label: '', separator: true, action: () => {} },
-        { label: 'Undo', shortcut: 'Ctrl+Z', disabled: !this.#controller.canUndo, action: () => this.#controller!.undo() },
-        { label: 'Redo', shortcut: 'Ctrl+Y', disabled: !this.#controller.canRedo, action: () => this.#controller!.redo() },
+        {
+          label: 'Undo',
+          shortcut: 'Ctrl+Z',
+          disabled: !this.#controller.canUndo,
+          action: () => this.#controller!.undo(),
+        },
+        {
+          label: 'Redo',
+          shortcut: 'Ctrl+Y',
+          disabled: !this.#controller.canRedo,
+          action: () => this.#controller!.redo(),
+        },
       ];
     }
 
@@ -665,14 +750,20 @@ export class WitgraphCanvas extends HTMLElement {
 
   #connectSide: 'input' | 'output' = 'output';
 
-  #startConnection(nodeId: string, portName: string, side: 'input' | 'output', startX: number, startY: number, e: PointerEvent): void {
+  #startConnection(
+    nodeId: string,
+    portName: string,
+    side: 'input' | 'output',
+    startX: number,
+    startY: number,
+    e: PointerEvent,
+  ): void {
     this.#connectFrom = { node: nodeId, port: portName, x: startX, y: startY };
     this.#connectSide = side;
 
     const temp = document.createElementNS(SVG_NS, 'path');
     temp.classList.add('temp-edge');
     this.#viewport.appendChild(temp);
-    this.#tempEdge = temp;
 
     const svgRect = this.#svg.getBoundingClientRect();
     const toGraph = (clientX: number, clientY: number) => ({
@@ -697,17 +788,18 @@ export class WitgraphCanvas extends HTMLElement {
       this.#svg.removeEventListener('pointermove', onMove as EventListener);
       this.#svg.removeEventListener('pointerup', onUp as EventListener);
       temp.remove();
-      this.#tempEdge = null;
       this.#clearDropHighlights();
 
       const target = this.#findPortAt(ev);
       if (target && this.#connectFrom) {
-        const from = side === 'output'
-          ? { node: this.#connectFrom.node, port: this.#connectFrom.port }
-          : { node: target.node, port: target.port };
-        const to = side === 'output'
-          ? { node: target.node, port: target.port }
-          : { node: this.#connectFrom.node, port: this.#connectFrom.port };
+        const from =
+          side === 'output'
+            ? { node: this.#connectFrom.node, port: this.#connectFrom.port }
+            : { node: target.node, port: target.port };
+        const to =
+          side === 'output'
+            ? { node: target.node, port: target.port }
+            : { node: this.#connectFrom.node, port: this.#connectFrom.port };
         const id = `c-${from.node}-${from.port}-${to.node}-${to.port}`;
         const shiftHeld = ev.shiftKey;
         const wouldCycle = this.#wouldCreateCycle(from.node, to.node);
@@ -742,7 +834,7 @@ export class WitgraphCanvas extends HTMLElement {
 
   #findPortAt(ev: PointerEvent): { node: string; port: string } | null {
     const el = this.shadowRoot?.elementFromPoint(ev.clientX, ev.clientY);
-    if (!el || !el.classList.contains('port')) return null;
+    if (!el?.classList.contains('port')) return null;
     const targetSide = el.getAttribute('data-port-side');
     if (targetSide === this.#connectSide) return null;
     const node = el.getAttribute('data-port-node');
@@ -761,10 +853,11 @@ export class WitgraphCanvas extends HTMLElement {
   }
 
   #clearDropHighlights(): void {
-    this.shadowRoot?.querySelectorAll('.port-drop-target').forEach(
-      (el) => el.classList.remove('port-drop-target'),
-    );
+    for (const el of this.shadowRoot?.querySelectorAll('.port-drop-target') ?? []) {
+      el.classList.remove('port-drop-target');
+    }
   }
 }
 
-if (!customElements.get('witgraph-canvas')) customElements.define('witgraph-canvas', WitgraphCanvas);
+if (!customElements.get('witgraph-canvas'))
+  customElements.define('witgraph-canvas', WitgraphCanvas);

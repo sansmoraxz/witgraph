@@ -7,21 +7,28 @@
  *
  * Usage (from packages/witgraph-editor-demo):
  *   node setup.mjs
- *   # or: pnpm setup
+ *   # or: pnpm run setup
  */
 
 import { execSync } from 'node:child_process';
-import { existsSync, mkdirSync, copyFileSync, readdirSync, statSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { copyFileSync, existsSync, mkdirSync, readdirSync, statSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 process.chdir(__dirname);
 
 const GUESTS = [
-  'relay', 'echo', 'stream-producer', 'stream-consumer',
-  'future-writer', 'future-reader', 'configurable', 'calc',
-  'mqtt-node', 'bytes-consumer',
+  'relay',
+  'echo',
+  'stream-producer',
+  'stream-consumer',
+  'future-writer',
+  'future-reader',
+  'configurable',
+  'calc',
+  'mqtt-node',
+  'bytes-consumer',
 ];
 
 // Resolve the cargo target directory via `cargo metadata`.
@@ -33,7 +40,9 @@ try {
   });
   const match = raw.match(/"target_directory"\s*:\s*"([^"]+)"/);
   if (match) targetDir = match[1];
-} catch { /* handled below */ }
+} catch {
+  /* handled below */
+}
 
 if (!targetDir) {
   console.error('error: could not determine cargo target directory');
@@ -46,10 +55,17 @@ function findNewest(root, test) {
   let best = { path: '', mtime: 0 };
   function walk(dir) {
     let entries;
-    try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
     for (const entry of entries) {
       const full = join(dir, entry.name);
-      if (entry.isDirectory()) { walk(full); continue; }
+      if (entry.isDirectory()) {
+        walk(full);
+        continue;
+      }
       if (!test(full)) continue;
       const mt = statSync(full).mtimeMs;
       if (mt > best.mtime) best = { path: full, mtime: mt };

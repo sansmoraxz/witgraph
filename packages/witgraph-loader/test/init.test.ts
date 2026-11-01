@@ -10,7 +10,10 @@ import { describeComponent, init, jsName } from '../src/index.ts';
 
 test('describeComponent and jsName work once init has run, and say so before', async () => {
   assert.throws(() => jsName('burst-size'), /not initialised: call `init`/);
-  assert.throws(() => describeComponent('test:echo/echo@0.1.0', new Uint8Array()), /not initialised/);
+  assert.throws(
+    () => describeComponent('test:echo/echo@0.1.0', new Uint8Array()),
+    /not initialised/,
+  );
   await init(await readFile(new URL('../pkg/witgraph_web_bg.wasm', import.meta.url)));
   assert.equal(jsName('burst-size'), 'burstSize');
   // Not a component: the module itself answers.

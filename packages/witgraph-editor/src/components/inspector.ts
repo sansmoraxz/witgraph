@@ -1,21 +1,23 @@
-import { adoptStyles } from './shared-styles.ts';
 import type { EditorController } from '../controller/editor-controller.ts';
 import type { NodeVisual, PortVisual } from '../controller/types.ts';
+import { adoptStyles } from './shared-styles.ts';
 
 const PHASE_BG: Record<string, string> = {
-  pending: 'bg-wg-phase-pending', running: 'bg-wg-phase-running',
-  idle: 'bg-wg-phase-idle', faulted: 'bg-wg-phase-faulted', cancelled: 'bg-wg-phase-cancelled',
+  pending: 'bg-wg-phase-pending',
+  running: 'bg-wg-phase-running',
+  idle: 'bg-wg-phase-idle',
+  faulted: 'bg-wg-phase-faulted',
+  cancelled: 'bg-wg-phase-cancelled',
 };
 
 const KIND_BG: Record<string, string> = {
-  value: 'bg-wg-port-value', stream: 'bg-wg-port-stream', future: 'bg-wg-port-future',
+  value: 'bg-wg-port-value',
+  stream: 'bg-wg-port-stream',
+  future: 'bg-wg-port-future',
 };
 
-const KIND_BORDER: Record<string, string> = {
-  value: 'border-wg-port-value', stream: 'border-wg-port-stream', future: 'border-wg-port-future',
-};
-
-const BTN = 'bg-wg-surface text-wg-text border border-wg-text-dim rounded px-2 py-1 cursor-pointer text-xs hover:bg-wg-surface-hover transition-all shadow-sm';
+const BTN =
+  'bg-wg-surface text-wg-text border border-wg-text-dim rounded px-2 py-1 cursor-pointer text-xs hover:bg-wg-surface-hover transition-all shadow-sm';
 
 const EXTRA_CSS = `
   :host { display: block; height: 100%; overflow-y: auto; overflow-x: hidden; background-color: var(--wg-bg);
@@ -77,7 +79,9 @@ export class WitgraphInspector extends HTMLElement {
     this.render();
   }
 
-  connectedCallback(): void { this.render(); }
+  connectedCallback(): void {
+    this.render();
+  }
 
   disconnectedCallback(): void {
     this.#controller?.removeEventListener('state-changed', this.#onStateChanged);
@@ -89,18 +93,30 @@ export class WitgraphInspector extends HTMLElement {
     const old = root.querySelector('.inspector-root');
     if (old) old.remove();
 
-    if (!this.#controller) { root.appendChild(this.#buildGraphProperties()); return; }
+    if (!this.#controller) {
+      root.appendChild(this.#buildGraphProperties());
+      return;
+    }
 
     const edgeId = this.#controller.selectedEdge;
     if (edgeId) {
       const edge = this.#controller.edges.find((e) => e.id === edgeId);
-      if (edge) { root.appendChild(this.#buildEdgeInspector(edge)); return; }
+      if (edge) {
+        root.appendChild(this.#buildEdgeInspector(edge));
+        return;
+      }
     }
 
     const nodeId = this.#controller.selectedNode;
-    if (!nodeId) { root.appendChild(this.#buildGraphProperties()); return; }
+    if (!nodeId) {
+      root.appendChild(this.#buildGraphProperties());
+      return;
+    }
     const node = this.#controller.nodes.get(nodeId);
-    if (!node) { root.appendChild(this.#buildGraphProperties()); return; }
+    if (!node) {
+      root.appendChild(this.#buildGraphProperties());
+      return;
+    }
     root.appendChild(this.#buildInspector(node));
   }
 
@@ -114,9 +130,16 @@ export class WitgraphInspector extends HTMLElement {
   #buildGraphProperties(): HTMLDivElement {
     const wrap = this.#el('div', 'inspector-root p-3') as HTMLDivElement;
     const graph = this.#controller?.graphJson as Record<string, unknown> | undefined;
-    const meta = (graph?.metadata ?? {}) as { name?: string; description?: string; attrs?: Record<string, string> };
+    const meta = (graph?.metadata ?? {}) as {
+      name?: string;
+      description?: string;
+      attrs?: Record<string, string>;
+    };
 
-    const titleBar = this.#el('div', 'flex items-center gap-2 px-2 py-2 font-semibold bg-wg-surface rounded-md shadow-sm select-none mb-3');
+    const titleBar = this.#el(
+      'div',
+      'flex items-center gap-2 px-2 py-2 font-semibold bg-wg-surface rounded-md shadow-sm select-none mb-3',
+    );
     titleBar.appendChild(this.#el('span', 'text-lg', '\u{1F4CA}'));
     titleBar.appendChild(this.#el('span', '', 'Graph Properties'));
     wrap.appendChild(titleBar);
@@ -126,7 +149,8 @@ export class WitgraphInspector extends HTMLElement {
     nameRow.appendChild(this.#el('div', 'text-xs text-wg-text-dim mb-1', 'Name'));
     const nameInput = document.createElement('input');
     nameInput.type = 'text';
-    nameInput.className = 'label-input w-full bg-wg-surface text-wg-text border border-wg-text-dim rounded px-2 py-1 text-sm';
+    nameInput.className =
+      'label-input w-full bg-wg-surface text-wg-text border border-wg-text-dim rounded px-2 py-1 text-sm';
     nameInput.value = meta.name ?? '';
     nameInput.addEventListener('change', () => this.#controller?.setGraphName(nameInput.value));
     nameRow.appendChild(nameInput);
@@ -136,10 +160,13 @@ export class WitgraphInspector extends HTMLElement {
     const descRow = this.#el('div', 'mb-2');
     descRow.appendChild(this.#el('div', 'text-xs text-wg-text-dim mb-1', 'Description'));
     const descInput = document.createElement('textarea');
-    descInput.className = 'label-input w-full bg-wg-surface text-wg-text border border-wg-text-dim rounded px-2 py-1 text-sm';
+    descInput.className =
+      'label-input w-full bg-wg-surface text-wg-text border border-wg-text-dim rounded px-2 py-1 text-sm';
     descInput.rows = 3;
     descInput.value = meta.description ?? '';
-    descInput.addEventListener('change', () => this.#controller?.setGraphDescription(descInput.value));
+    descInput.addEventListener('change', () =>
+      this.#controller?.setGraphDescription(descInput.value),
+    );
     descRow.appendChild(descInput);
     wrap.appendChild(descRow);
 
@@ -149,7 +176,13 @@ export class WitgraphInspector extends HTMLElement {
     stats.appendChild(this.#el('div', 'text-sm', `${this.#controller?.nodes.size ?? 0} nodes`));
     stats.appendChild(this.#el('div', 'text-sm', `${this.#controller?.edges.length ?? 0} edges`));
     const islands = this.#controller?.islands ?? [];
-    stats.appendChild(this.#el('div', 'text-sm', `${islands.length} execution island${islands.length !== 1 ? 's' : ''}`));
+    stats.appendChild(
+      this.#el(
+        'div',
+        'text-sm',
+        `${islands.length} execution island${islands.length !== 1 ? 's' : ''}`,
+      ),
+    );
     if (islands.length > 0) {
       const islandList = this.#el('div', 'mt-1');
       islands.forEach((members, i) => {
@@ -160,25 +193,45 @@ export class WitgraphInspector extends HTMLElement {
         islandList.appendChild(row);
       });
       stats.appendChild(islandList);
-      stats.appendChild(this.#el('div', 'text-xs text-wg-text-dim mt-1',
-        'Islands group nodes sharing stream/future edges. Value-only nodes run independently.'));
+      stats.appendChild(
+        this.#el(
+          'div',
+          'text-xs text-wg-text-dim mt-1',
+          'Islands group nodes sharing stream/future edges. Value-only nodes run independently.',
+        ),
+      );
     }
     const compiles = this.#controller?.compiles;
-    stats.appendChild(this.#el('div', `text-sm mt-1 ${compiles ? 'text-wg-success' : 'text-wg-error'}`,
-      compiles ? 'Compiles' : `Error: ${this.#controller?.compileError ?? 'unknown'}`));
+    stats.appendChild(
+      this.#el(
+        'div',
+        `text-sm mt-1 ${compiles ? 'text-wg-success' : 'text-wg-error'}`,
+        compiles ? 'Compiles' : `Error: ${this.#controller?.compileError ?? 'unknown'}`,
+      ),
+    );
     wrap.appendChild(stats);
 
     // Custom attrs
-    wrap.appendChild(this.#buildAttrsEditor('Graph Attributes', meta.attrs ?? {},
-      (k, v) => this.#controller?.setGraphAttr(k, v),
-      (k) => this.#controller?.removeGraphAttr(k),
-    ));
+    wrap.appendChild(
+      this.#buildAttrsEditor(
+        'Graph Attributes',
+        meta.attrs ?? {},
+        (k, v) => this.#controller?.setGraphAttr(k, v),
+        (k) => this.#controller?.removeGraphAttr(k),
+      ),
+    );
 
     // Snapshots
     wrap.appendChild(this.#buildSnapshotsSection());
 
     // Hint
-    wrap.appendChild(this.#el('div', 'text-xs text-wg-text-dim mt-3 text-center', 'Select a node or edge to inspect its details'));
+    wrap.appendChild(
+      this.#el(
+        'div',
+        'text-xs text-wg-text-dim mt-3 text-center',
+        'Select a node or edge to inspect its details',
+      ),
+    );
 
     return wrap;
   }
@@ -186,24 +239,43 @@ export class WitgraphInspector extends HTMLElement {
   #buildSnapshotsSection(): HTMLElement {
     const section = this.#el('div', 'mb-3');
     const snaps = this.#controller?.savedSnapshots ?? [];
-    section.appendChild(this.#el('div', 'font-semibold mb-1.5 text-wg-text border-b border-wg-surface pb-1',
-      `Snapshots (${snaps.length})`));
+    section.appendChild(
+      this.#el(
+        'div',
+        'font-semibold mb-1.5 text-wg-text border-b border-wg-surface pb-1',
+        `Snapshots (${snaps.length})`,
+      ),
+    );
 
     if (snaps.length === 0) {
-      section.appendChild(this.#el('div', 'text-xs text-wg-text-dim italic p-2', 'No snapshots saved. Use the Save button in the toolbar.'));
+      section.appendChild(
+        this.#el(
+          'div',
+          'text-xs text-wg-text-dim italic p-2',
+          'No snapshots saved. Use the Save button in the toolbar.',
+        ),
+      );
     } else {
       for (const snap of snaps) {
-        const row = this.#el('div', 'flex items-center gap-2 p-2 bg-wg-surface-50 rounded-md mb-1 hover:bg-wg-surface-hover transition-all');
+        const row = this.#el(
+          'div',
+          'flex items-center gap-2 p-2 bg-wg-surface-50 rounded-md mb-1 hover:bg-wg-surface-hover transition-all',
+        );
         const info = this.#el('div', 'flex-1 min-h-0');
         info.appendChild(this.#el('div', 'font-semibold text-xs truncate', snap.name));
         const timeStr = new Date(snap.timestamp).toLocaleTimeString();
         info.appendChild(this.#el('div', 'text-2xs text-wg-text-dim', timeStr));
         row.appendChild(info);
 
-        const restoreBtn = this.#el('button', 'bg-wg-surface text-wg-text border border-wg-text-dim rounded px-2 py-0.5 cursor-pointer text-2xs hover:bg-wg-surface-hover transition-all', 'Restore');
+        const restoreBtn = this.#el(
+          'button',
+          'bg-wg-surface text-wg-text border border-wg-text-dim rounded px-2 py-0.5 cursor-pointer text-2xs hover:bg-wg-surface-hover transition-all',
+          'Restore',
+        );
         restoreBtn.addEventListener('click', () => {
-          try { this.#controller?.restoreNamedSnapshot(snap.name); }
-          catch {}
+          try {
+            this.#controller?.restoreNamedSnapshot(snap.name);
+          } catch {}
         });
         row.appendChild(restoreBtn);
 
@@ -224,17 +296,23 @@ export class WitgraphInspector extends HTMLElement {
     onRemove: (key: string) => void,
   ): HTMLElement {
     const section = this.#el('div', 'mb-3');
-    section.appendChild(this.#el('div', 'font-semibold mb-1.5 text-wg-text border-b border-wg-surface pb-1', title));
+    section.appendChild(
+      this.#el('div', 'font-semibold mb-1.5 text-wg-text border-b border-wg-surface pb-1', title),
+    );
 
-    const editorAttrs = Object.entries(attrs).filter(([k]) => !k.startsWith('editor.') && !k.startsWith('inject.'));
+    const editorAttrs = Object.entries(attrs).filter(
+      ([k]) => !k.startsWith('editor.') && !k.startsWith('inject.'),
+    );
     for (const [key, val] of editorAttrs) {
       const row = document.createElement('div');
-      row.style.cssText = 'display:grid; grid-template-columns:1fr 1fr 20px; gap:4px; margin-bottom:4px; align-items:center;';
+      row.style.cssText =
+        'display:grid; grid-template-columns:1fr 1fr 20px; gap:4px; margin-bottom:4px; align-items:center;';
       const keySpan = this.#el('span', 'text-xs font-mono text-wg-text-dim truncate', key);
       row.appendChild(keySpan);
       const valInput = document.createElement('input');
       valInput.type = 'text';
-      valInput.className = 'bg-wg-surface text-wg-text border border-wg-text-dim rounded px-1 py-0.5 font-mono text-xs';
+      valInput.className =
+        'bg-wg-surface text-wg-text border border-wg-text-dim rounded px-1 py-0.5 font-mono text-xs';
       valInput.style.minWidth = '0';
       valInput.value = val;
       valInput.addEventListener('change', () => onSet(key, valInput.value));
@@ -247,20 +325,31 @@ export class WitgraphInspector extends HTMLElement {
 
     // Add new attr
     const addRow = document.createElement('div');
-    addRow.style.cssText = 'display:grid; grid-template-columns:1fr 1fr 20px; gap:4px; margin-top:4px; align-items:center;';
+    addRow.style.cssText =
+      'display:grid; grid-template-columns:1fr 1fr 20px; gap:4px; margin-top:4px; align-items:center;';
     const keyInput = document.createElement('input');
     keyInput.type = 'text';
     keyInput.placeholder = 'key';
-    keyInput.className = 'bg-wg-surface text-wg-text border border-wg-text-dim rounded px-1 py-0.5 font-mono text-xs';
+    keyInput.className =
+      'bg-wg-surface text-wg-text border border-wg-text-dim rounded px-1 py-0.5 font-mono text-xs';
     keyInput.style.minWidth = '0';
     const valInput = document.createElement('input');
     valInput.type = 'text';
     valInput.placeholder = 'value';
-    valInput.className = 'bg-wg-surface text-wg-text border border-wg-text-dim rounded px-1 py-0.5 font-mono text-xs';
+    valInput.className =
+      'bg-wg-surface text-wg-text border border-wg-text-dim rounded px-1 py-0.5 font-mono text-xs';
     valInput.style.minWidth = '0';
-    const addBtn = this.#el('button', 'bg-wg-surface text-wg-text border border-wg-text-dim rounded cursor-pointer text-xs', '+');
+    const addBtn = this.#el(
+      'button',
+      'bg-wg-surface text-wg-text border border-wg-text-dim rounded cursor-pointer text-xs',
+      '+',
+    );
     addBtn.addEventListener('click', () => {
-      if (keyInput.value) { onSet(keyInput.value, valInput.value); keyInput.value = ''; valInput.value = ''; }
+      if (keyInput.value) {
+        onSet(keyInput.value, valInput.value);
+        keyInput.value = '';
+        valInput.value = '';
+      }
     });
     addRow.append(keyInput, valInput, addBtn);
     section.appendChild(addRow);
@@ -272,12 +361,19 @@ export class WitgraphInspector extends HTMLElement {
     const wrap = this.#el('div', 'inspector-root p-3 flex flex-col gap-3') as HTMLDivElement;
 
     // Header
-    const header = this.#el('div', 'flex items-center gap-2 px-2 py-2 font-semibold bg-wg-surface rounded-md shadow-sm select-none');
+    const header = this.#el(
+      'div',
+      'flex items-center gap-2 px-2 py-2 font-semibold bg-wg-surface rounded-md shadow-sm select-none',
+    );
     header.appendChild(this.#el('span', 'text-lg', '\u{1F4E6}'));
     header.appendChild(this.#el('span', 'flex-1', 'Node'));
-    header.appendChild(this.#el('span',
-      `px-2 py-1 rounded-md text-xs font-bold text-wg-bg shadow-sm ${PHASE_BG[node.phase] ?? ''}`,
-      node.phase.toUpperCase()));
+    header.appendChild(
+      this.#el(
+        'span',
+        `px-2 py-1 rounded-md text-xs font-bold text-wg-bg shadow-sm ${PHASE_BG[node.phase] ?? ''}`,
+        node.phase.toUpperCase(),
+      ),
+    );
     wrap.appendChild(header);
 
     // Editable node ID
@@ -286,7 +382,8 @@ export class WitgraphInspector extends HTMLElement {
     const idInput = document.createElement('input');
     idInput.type = 'text';
     idInput.value = node.id;
-    idInput.className = 'node-id focus-ring flex-1 bg-wg-surface text-wg-text border border-wg-text-dim rounded-md px-2 py-1 font-mono text-sm';
+    idInput.className =
+      'node-id focus-ring flex-1 bg-wg-surface text-wg-text border border-wg-text-dim rounded-md px-2 py-1 font-mono text-sm';
     idInput.style.minWidth = '0';
     idInput.addEventListener('change', () => {
       const newId = idInput.value.trim();
@@ -296,30 +393,47 @@ export class WitgraphInspector extends HTMLElement {
     wrap.appendChild(idRow);
 
     // Component info
-    const graphNode = ((this.#controller?.graphJson as Record<string, unknown>)?.nodes as Array<{ id: string; component: Record<string, unknown>; attrs?: Record<string, string> }>)
-      ?.find((n) => n.id === node.id);
+    const graphNode = (
+      (this.#controller?.graphJson as Record<string, unknown>)?.nodes as Array<{
+        id: string;
+        component: Record<string, unknown>;
+        attrs?: Record<string, string>;
+      }>
+    )?.find((n) => n.id === node.id);
     if (graphNode?.component) {
-      const comp = graphNode.component as { package?: { namespace?: string; name?: string; version?: string }; world?: string };
+      const comp = graphNode.component as {
+        package?: { namespace?: string; name?: string; version?: string };
+        world?: string;
+      };
       const compInfo = this.#el('div', 'p-2 bg-wg-surface rounded-md text-xs');
       compInfo.appendChild(this.#el('div', 'text-wg-text-dim mb-1', 'Component'));
       const compId = [
-        comp.package?.namespace, ':', comp.package?.name,
+        comp.package?.namespace,
+        ':',
+        comp.package?.name,
         comp.world ? `/${comp.world}` : '',
         comp.package?.version ? `@${comp.package.version}` : '',
-      ].filter(Boolean).join('');
+      ]
+        .filter(Boolean)
+        .join('');
       compInfo.appendChild(this.#el('div', 'font-mono text-wg-primary truncate', compId));
       wrap.appendChild(compInfo);
     }
 
     // Label editor
     const labelRow = this.#el('div', 'flex items-center gap-2');
-    labelRow.appendChild(this.#el('span', 'text-xs text-wg-text-dim font-semibold select-none', 'Label'));
+    labelRow.appendChild(
+      this.#el('span', 'text-xs text-wg-text-dim font-semibold select-none', 'Label'),
+    );
     const labelInput = document.createElement('input');
     labelInput.type = 'text';
-    labelInput.className = 'focus-ring flex-1 bg-wg-surface text-wg-text border border-wg-text-dim rounded-md px-2 py-1 text-sm';
+    labelInput.className =
+      'focus-ring flex-1 bg-wg-surface text-wg-text border border-wg-text-dim rounded-md px-2 py-1 text-sm';
     labelInput.value = node.label;
     labelInput.placeholder = 'Node label...';
-    labelInput.addEventListener('change', () => this.#controller?.setNodeLabel(node.id, labelInput.value));
+    labelInput.addEventListener('change', () =>
+      this.#controller?.setNodeLabel(node.id, labelInput.value),
+    );
     labelRow.appendChild(labelInput);
     wrap.appendChild(labelRow);
 
@@ -327,11 +441,19 @@ export class WitgraphInspector extends HTMLElement {
     const bp = this.#controller?.breakpointState;
     if (bp && bp.node === node.id) {
       const section = this.#el('div', 'bp-bg rounded-md p-3');
-      section.appendChild(this.#el('div', 'font-semibold text-wg-warning mb-2 text-sm', '⏸ Paused - Inputs'));
+      section.appendChild(
+        this.#el('div', 'font-semibold text-wg-warning mb-2 text-sm', '⏸ Paused - Inputs'),
+      );
       for (const [key, val] of Object.entries(bp.inputs)) {
         const entry = this.#el('div', 'flex items-center gap-2 font-mono text-xs py-0.5');
         entry.appendChild(this.#el('span', 'text-wg-text font-semibold', key));
-        entry.appendChild(this.#el('span', 'text-wg-primary bg-wg-primary-5 px-1.5 py-0.5 rounded', JSON.stringify(val)));
+        entry.appendChild(
+          this.#el(
+            'span',
+            'text-wg-primary bg-wg-primary-5 px-1.5 py-0.5 rounded',
+            JSON.stringify(val),
+          ),
+        );
         section.appendChild(entry);
       }
       wrap.appendChild(section);
@@ -340,9 +462,16 @@ export class WitgraphInspector extends HTMLElement {
     // Fault
     if (node.fault) {
       const fault = this.#el('div', 'fault-bg rounded-md p-3');
-      fault.appendChild(this.#el('div', 'font-semibold text-wg-error text-sm mb-1', `⚠ ${node.fault.kind}`));
-      fault.appendChild(this.#el('div', 'font-mono text-xs whitespace-pre-wrap text-wg-text', node.fault.message));
-      if (node.culprit) fault.appendChild(this.#el('div', 'text-wg-text-dim text-xs mt-1', `Culprit: ${node.culprit}`));
+      fault.appendChild(
+        this.#el('div', 'font-semibold text-wg-error text-sm mb-1', `⚠ ${node.fault.kind}`),
+      );
+      fault.appendChild(
+        this.#el('div', 'font-mono text-xs whitespace-pre-wrap text-wg-text', node.fault.message),
+      );
+      if (node.culprit)
+        fault.appendChild(
+          this.#el('div', 'text-wg-text-dim text-xs mt-1', `Culprit: ${node.culprit}`),
+        );
       wrap.appendChild(fault);
     }
 
@@ -362,19 +491,29 @@ export class WitgraphInspector extends HTMLElement {
     wrap.appendChild(this.#buildMockSection(node));
 
     // Custom attrs
-    const gNode = ((this.#controller?.graphJson as Record<string, unknown>)?.nodes as Array<{ id: string; attrs?: Record<string, string> }>)
-      ?.find((n) => n.id === node.id);
+    const gNode = (
+      (this.#controller?.graphJson as Record<string, unknown>)?.nodes as Array<{
+        id: string;
+        attrs?: Record<string, string>;
+      }>
+    )?.find((n) => n.id === node.id);
     if (gNode) {
-      wrap.appendChild(this.#buildAttrsEditor('Node Attributes', gNode.attrs ?? {},
-        (k, v) => this.#controller?.setNodeAttr(node.id, k, v),
-        (k) => this.#controller?.removeNodeAttr(node.id, k),
-      ));
+      wrap.appendChild(
+        this.#buildAttrsEditor(
+          'Node Attributes',
+          gNode.attrs ?? {},
+          (k, v) => this.#controller?.setNodeAttr(node.id, k, v),
+          (k) => this.#controller?.removeNodeAttr(node.id, k),
+        ),
+      );
     }
 
     return wrap;
   }
 
-  #buildCapabilitiesSection(caps: readonly { interface: string; implements?: string; satisfied: boolean }[]): HTMLElement {
+  #buildCapabilitiesSection(
+    caps: readonly { interface: string; implements?: string; satisfied: boolean }[],
+  ): HTMLElement {
     const section = this.#el('div', '');
     const header = this.#el('div', 'section-accent font-semibold text-sm mb-2');
     header.textContent = `Capabilities (${caps.length})`;
@@ -382,16 +521,25 @@ export class WitgraphInspector extends HTMLElement {
 
     for (const cap of caps) {
       const row = this.#el('div', 'flex items-center gap-2 p-2 bg-wg-surface-50 rounded-md mb-1');
-      const status = this.#el('span', `text-sm ${cap.satisfied ? 'text-wg-success' : 'text-wg-error'}`, cap.satisfied ? '✓' : '✗');
+      const status = this.#el(
+        'span',
+        `text-sm ${cap.satisfied ? 'text-wg-success' : 'text-wg-error'}`,
+        cap.satisfied ? '✓' : '✗',
+      );
       row.appendChild(status);
       const nameEl = this.#el('div', 'flex-1 min-h-0');
       nameEl.appendChild(this.#el('div', 'font-mono text-xs truncate', cap.interface));
       if (cap.implements) {
-        nameEl.appendChild(this.#el('div', 'font-mono text-2xs text-wg-text-dim truncate', `→ ${cap.implements}`));
+        nameEl.appendChild(
+          this.#el('div', 'font-mono text-2xs text-wg-text-dim truncate', `→ ${cap.implements}`),
+        );
       }
       row.appendChild(nameEl);
-      const badge = this.#el('span', `text-2xs font-semibold px-1.5 py-0.5 rounded ${cap.satisfied ? 'bg-wg-primary-10 text-wg-success' : 'bg-wg-error-10 text-wg-error'}`,
-        cap.satisfied ? 'provided' : 'missing');
+      const badge = this.#el(
+        'span',
+        `text-2xs font-semibold px-1.5 py-0.5 rounded ${cap.satisfied ? 'bg-wg-primary-10 text-wg-success' : 'bg-wg-error-10 text-wg-error'}`,
+        cap.satisfied ? 'provided' : 'missing',
+      );
       row.appendChild(badge);
       section.appendChild(row);
     }
@@ -412,24 +560,37 @@ export class WitgraphInspector extends HTMLElement {
     section.appendChild(header);
 
     if (isMocked) {
-      section.appendChild(this.#el('div', 'text-2xs text-wg-text-dim mb-2 italic', 'WASM execution replaced — configure mock outputs below'));
+      section.appendChild(
+        this.#el(
+          'div',
+          'text-2xs text-wg-text-dim mb-2 italic',
+          'WASM execution replaced — configure mock outputs below',
+        ),
+      );
       const mockOutputs = this.#controller?.getMockOutputs(node.id) ?? new Map();
       for (const port of node.outputs) {
         const card = this.#el('div', 'p-2 bg-wg-surface-50 rounded-md mb-1.5');
         const topRow = this.#el('div', 'flex items-center gap-1.5 mb-1');
         topRow.appendChild(this.#el('span', 'font-semibold text-xs', port.name));
-        topRow.appendChild(this.#el('span', 'text-wg-text-dim font-mono text-2xs', port.typeDisplay));
+        topRow.appendChild(
+          this.#el('span', 'text-wg-text-dim font-mono text-2xs', port.typeDisplay),
+        );
         card.appendChild(topRow);
 
         const form = this.#el('div', 'flex gap-1.5 items-center');
         const input = document.createElement('input');
         input.type = 'text';
-        input.className = 'focus-ring flex-1 bg-wg-bg text-wg-text border border-wg-text-dim rounded px-2 py-1 font-mono text-xs';
+        input.className =
+          'focus-ring flex-1 bg-wg-bg text-wg-text border border-wg-text-dim rounded px-2 py-1 font-mono text-xs';
         input.style.minWidth = '0';
         input.placeholder = 'WAVE value…';
         input.value = mockOutputs.get(port.name) ?? '';
 
-        const setBtn = this.#el('button', 'bg-wg-surface text-wg-text border border-wg-text-dim rounded px-2 py-1 cursor-pointer text-xs hover:bg-wg-surface-hover transition-all shadow-sm', 'Set');
+        const setBtn = this.#el(
+          'button',
+          'bg-wg-surface text-wg-text border border-wg-text-dim rounded px-2 py-1 cursor-pointer text-xs hover:bg-wg-surface-hover transition-all shadow-sm',
+          'Set',
+        );
         setBtn.addEventListener('click', () => {
           if (input.value) this.#controller?.setMockOutput(node.id, port.name, input.value);
           else this.#controller?.clearMockOutput(node.id, port.name);
@@ -443,28 +604,47 @@ export class WitgraphInspector extends HTMLElement {
     return section;
   }
 
-  #buildPortSection(title: string, ports: PortVisual[], node: NodeVisual, direction: 'input' | 'output'): HTMLElement {
+  #buildPortSection(
+    title: string,
+    ports: PortVisual[],
+    node: NodeVisual,
+    direction: 'input' | 'output',
+  ): HTMLElement {
     const section = this.#el('div', '');
-    const header = this.#el('div', `section-accent ${direction === 'input' ? 'section-accent-in' : 'section-accent-out'} font-semibold text-sm mb-2`);
+    const header = this.#el(
+      'div',
+      `section-accent ${direction === 'input' ? 'section-accent-in' : 'section-accent-out'} font-semibold text-sm mb-2`,
+    );
     header.textContent = `${title} (${ports.length})`;
     section.appendChild(header);
 
     for (const port of ports) {
       const card = this.#el('div', 'port-card bg-wg-surface-50 rounded-md p-2 mb-1.5 shadow-sm');
       const topRow = this.#el('div', 'flex items-center gap-1.5');
-      topRow.appendChild(this.#el('span',
-        `inline-block px-1.5 py-0.5 rounded text-2xs font-bold text-wg-bg uppercase ${KIND_BG[port.kind] ?? ''}`,
-        port.kind));
+      topRow.appendChild(
+        this.#el(
+          'span',
+          `inline-block px-1.5 py-0.5 rounded text-2xs font-bold text-wg-bg uppercase ${KIND_BG[port.kind] ?? ''}`,
+          port.kind,
+        ),
+      );
       topRow.appendChild(this.#el('span', 'font-semibold text-sm', port.name));
-      topRow.appendChild(this.#el('span', 'text-wg-text-dim font-mono text-2xs ml-1 truncate', port.typeDisplay));
+      topRow.appendChild(
+        this.#el('span', 'text-wg-text-dim font-mono text-2xs ml-1 truncate', port.typeDisplay),
+      );
       card.appendChild(topRow);
 
       if (direction === 'output') {
-        const pre = this.#el('pre', 'port-val font-mono text-xs mt-1.5 p-2 bg-wg-bg rounded-md text-wg-primary');
-        try { pre.textContent = this.#controller!.readOutputWave(node.id, port.name) ?? '-'; }
-        catch { pre.textContent = '-'; }
+        const pre = this.#el(
+          'pre',
+          'port-val font-mono text-xs mt-1.5 p-2 bg-wg-bg rounded-md text-wg-primary',
+        );
+        try {
+          pre.textContent = this.#controller!.readOutputWave(node.id, port.name) ?? '-';
+        } catch {
+          pre.textContent = '-';
+        }
         card.appendChild(pre);
-
       }
 
       if (direction === 'input') {
@@ -482,7 +662,8 @@ export class WitgraphInspector extends HTMLElement {
           for (const c of conns) {
             const row = this.#el('div', 'flex items-center gap-1 py-0.5');
             row.appendChild(this.#el('span', '', `→ ${c.toNode}.${c.toPort}`));
-            if (c.feedback) row.appendChild(this.#el('span', 'text-wg-warning text-2xs', '(feedback)'));
+            if (c.feedback)
+              row.appendChild(this.#el('span', 'text-wg-warning text-2xs', '(feedback)'));
             list.appendChild(row);
           }
           card.appendChild(list);
@@ -503,7 +684,8 @@ export class WitgraphInspector extends HTMLElement {
     row.appendChild(this.#el('span', 'text-2xs text-wg-text-dim', 'Source:'));
 
     const select = document.createElement('select');
-    select.className = 'flex-1 bg-wg-bg text-wg-text border border-wg-text-dim rounded px-1 py-0.5 font-mono text-xs';
+    select.className =
+      'flex-1 bg-wg-bg text-wg-text border border-wg-text-dim rounded px-1 py-0.5 font-mono text-xs';
     select.style.minWidth = '0';
 
     const noneOpt = document.createElement('option');
@@ -534,7 +716,9 @@ export class WitgraphInspector extends HTMLElement {
       fbCheck.checked = conn?.feedback ?? false;
       fbCheck.id = `fb-${node.id}-${port.name}`;
       if (conn) {
-        fbCheck.addEventListener('change', () => this.#controller?.setConnectionFeedback(conn.id, fbCheck!.checked));
+        fbCheck.addEventListener('change', () =>
+          this.#controller?.setConnectionFeedback(conn.id, fbCheck!.checked),
+        );
       }
       const fbLabel = document.createElement('label');
       fbLabel.htmlFor = fbCheck.id;
@@ -543,8 +727,13 @@ export class WitgraphInspector extends HTMLElement {
       fbRow.append(fbCheck, fbLabel);
       wrap.appendChild(fbRow);
     } else if (conn) {
-      wrap.appendChild(this.#el('div', 'text-2xs text-wg-text-dim mt-1 italic',
-        `${port.kind} ports cannot be feedback`));
+      wrap.appendChild(
+        this.#el(
+          'div',
+          'text-2xs text-wg-text-dim mt-1 italic',
+          `${port.kind} ports cannot be feedback`,
+        ),
+      );
     }
 
     select.addEventListener('change', () => {
@@ -576,7 +765,8 @@ export class WitgraphInspector extends HTMLElement {
     const form = this.#el('div', 'flex gap-1.5 items-center');
     const input = document.createElement('input');
     input.type = 'text';
-    input.className = 'focus-ring flex-1 bg-wg-bg text-wg-text border border-wg-text-dim rounded px-2 py-1 font-mono text-xs';
+    input.className =
+      'focus-ring flex-1 bg-wg-bg text-wg-text border border-wg-text-dim rounded px-2 py-1 font-mono text-xs';
     input.style.minWidth = '0';
     input.placeholder = 'WAVE value…';
     if (currentValue !== undefined) input.value = currentValue;
@@ -591,38 +781,64 @@ export class WitgraphInspector extends HTMLElement {
       try {
         this.#controller!.injectValue(node.id, port.name, input.value);
       } catch (err: unknown) {
-        const errEl = this.#el('div', 'inject-error text-wg-error text-xs mt-1 p-1 bg-wg-error-10 rounded', err instanceof Error ? err.message : String(err));
+        const errEl = this.#el(
+          'div',
+          'inject-error text-wg-error text-xs mt-1 p-1 bg-wg-error-10 rounded',
+          err instanceof Error ? err.message : String(err),
+        );
         form.parentElement!.appendChild(errEl);
       }
     });
 
     clearBtn.addEventListener('click', () => {
-      try { this.#controller!.clearInput(node.id, port.name); } catch {}
+      try {
+        this.#controller!.clearInput(node.id, port.name);
+      } catch {}
     });
 
     wrap.appendChild(form);
     return wrap;
   }
 
-  #buildEdgeInspector(edge: { id: string; fromNode: string; fromPort: string; toNode: string; toPort: string; feedback: boolean }): HTMLDivElement {
+  #buildEdgeInspector(edge: {
+    id: string;
+    fromNode: string;
+    fromPort: string;
+    toNode: string;
+    toPort: string;
+    feedback: boolean;
+  }): HTMLDivElement {
     const wrap = this.#el('div', 'inspector-root p-3 flex flex-col gap-3') as HTMLDivElement;
 
-    const edgeHeader = this.#el('div', 'flex items-center gap-2 px-2 py-2 font-semibold bg-wg-surface rounded-md shadow-sm select-none');
+    const edgeHeader = this.#el(
+      'div',
+      'flex items-center gap-2 px-2 py-2 font-semibold bg-wg-surface rounded-md shadow-sm select-none',
+    );
     edgeHeader.appendChild(this.#el('span', 'text-lg', '\u{1F517}'));
     edgeHeader.appendChild(this.#el('span', '', 'Edge'));
     wrap.appendChild(edgeHeader);
-    wrap.appendChild(this.#el('div', 'font-mono text-xs text-wg-text bg-wg-surface p-2 rounded-md shadow-sm truncate', edge.id));
+    wrap.appendChild(
+      this.#el(
+        'div',
+        'font-mono text-xs text-wg-text bg-wg-surface p-2 rounded-md shadow-sm truncate',
+        edge.id,
+      ),
+    );
 
     // From → To with arrow
     const flow = this.#el('div', 'flex items-center gap-3 p-3 bg-wg-surface rounded-md shadow-sm');
     const fromBox = this.#el('div', 'flex-1 text-center');
-    fromBox.appendChild(this.#el('div', 'text-2xs text-wg-text-dim uppercase font-semibold mb-0.5', 'From'));
+    fromBox.appendChild(
+      this.#el('div', 'text-2xs text-wg-text-dim uppercase font-semibold mb-0.5', 'From'),
+    );
     fromBox.appendChild(this.#el('div', 'font-bold text-sm', edge.fromNode));
     fromBox.appendChild(this.#el('div', 'font-mono text-xs text-wg-primary', edge.fromPort));
     flow.appendChild(fromBox);
     flow.appendChild(this.#el('div', 'arrow select-none', '→'));
     const toBox = this.#el('div', 'flex-1 text-center');
-    toBox.appendChild(this.#el('div', 'text-2xs text-wg-text-dim uppercase font-semibold mb-0.5', 'To'));
+    toBox.appendChild(
+      this.#el('div', 'text-2xs text-wg-text-dim uppercase font-semibold mb-0.5', 'To'),
+    );
     toBox.appendChild(this.#el('div', 'font-bold text-sm', edge.toNode));
     toBox.appendChild(this.#el('div', 'font-mono text-xs text-wg-primary', edge.toPort));
     flow.appendChild(toBox);
@@ -643,23 +859,37 @@ export class WitgraphInspector extends HTMLElement {
       fbRow.appendChild(track);
       const fbText = this.#el('div', '');
       fbText.appendChild(this.#el('div', 'text-sm font-semibold text-wg-text', 'Feedback'));
-      fbText.appendChild(this.#el('div', 'text-2xs text-wg-text-dim', 'Unit delay - delivers previous tick value'));
+      fbText.appendChild(
+        this.#el('div', 'text-2xs text-wg-text-dim', 'Unit delay - delivers previous tick value'),
+      );
       fbRow.appendChild(fbText);
       wrap.appendChild(fbRow);
     } else {
-      wrap.appendChild(this.#el('div', 'text-xs text-wg-text-dim italic p-2 bg-wg-surface rounded-md',
-        `${srcPort?.kind ?? 'unknown'} ports cannot be feedback`));
+      wrap.appendChild(
+        this.#el(
+          'div',
+          'text-xs text-wg-text-dim italic p-2 bg-wg-surface rounded-md',
+          `${srcPort?.kind ?? 'unknown'} ports cannot be feedback`,
+        ),
+      );
     }
 
     // Current value
     wrap.appendChild(this.#el('div', 'section-accent font-semibold text-sm', 'Current Value'));
-    const valEl = this.#el('pre', 'port-val font-mono text-xs p-2 bg-wg-surface rounded-md text-wg-primary shadow-sm');
-    try { valEl.textContent = this.#controller!.readOutputWave(edge.fromNode, edge.fromPort) ?? '-'; }
-    catch { valEl.textContent = '-'; }
+    const valEl = this.#el(
+      'pre',
+      'port-val font-mono text-xs p-2 bg-wg-surface rounded-md text-wg-primary shadow-sm',
+    );
+    try {
+      valEl.textContent = this.#controller!.readOutputWave(edge.fromNode, edge.fromPort) ?? '-';
+    } catch {
+      valEl.textContent = '-';
+    }
     wrap.appendChild(valEl);
 
     return wrap;
   }
 }
 
-if (!customElements.get('witgraph-inspector')) customElements.define('witgraph-inspector', WitgraphInspector);
+if (!customElements.get('witgraph-inspector'))
+  customElements.define('witgraph-inspector', WitgraphInspector);

@@ -1,25 +1,31 @@
-import { Session, describeComponent, type SessionOptions, type Contract, type Capability, type PortValues } from 'witgraph-loader';
+import {
+  type Contract,
+  describeComponent,
+  type PortValues,
+  Session,
+  type SessionOptions,
+} from 'witgraph-loader';
+import { computeNodeHeight, NODE_WIDTH } from '../components/styles.ts';
+import { autoLayout, type LayoutEdge, type LayoutNode } from './layout.ts';
 import type {
-  EditorMode,
-  NodeVisual,
-  EdgeVisual,
-  PortVisual,
-  TraceEntry,
-  FaultReport,
-  NodeState,
-  EditorLoadOptions,
-  EditorCommand,
-  GraphJson,
-  GraphJsonNode,
-  GraphJsonConnection,
-  GraphJsonPortRef,
   BreakpointState,
-  OutputSnapshot,
   CapabilityInfo,
+  EdgeVisual,
+  EditorCommand,
+  EditorLoadOptions,
+  EditorMode,
+  FaultReport,
+  GraphJson,
+  GraphJsonConnection,
+  GraphJsonNode,
+  GraphJsonPortRef,
+  NodeState,
+  NodeVisual,
+  OutputSnapshot,
+  PortVisual,
   SavedSnapshot,
+  TraceEntry,
 } from './types.ts';
-import { autoLayout, type LayoutNode, type LayoutEdge } from './layout.ts';
-import { NODE_WIDTH, computeNodeHeight } from '../components/styles.ts';
 
 const MAX_TRACE_ENTRIES = 1000;
 const MAX_TICKS_PER_RUN = 200;
@@ -51,7 +57,11 @@ export class EditorController extends EventTarget {
 
   #undoStack: EditorCommand[] = [];
   #redoStack: EditorCommand[] = [];
-  #clipboard: { nodes: GraphJsonNode[]; edges: GraphJsonConnection[]; ports: Map<string, { inputs: PortVisual[]; outputs: PortVisual[] }> } | null = null;
+  #clipboard: {
+    nodes: GraphJsonNode[];
+    edges: GraphJsonConnection[];
+    ports: Map<string, { inputs: PortVisual[]; outputs: PortVisual[] }>;
+  } | null = null;
   #compileError: string | null = null;
   #tickDelayMs = 0;
   #componentContracts = new Map<number, Contract>();
@@ -64,22 +74,52 @@ export class EditorController extends EventTarget {
 
   // -- Getters ----------------------------------------------------------------
 
-  get mode(): EditorMode { return this.#mode; }
-  get nodes(): ReadonlyMap<string, NodeVisual> { return this.#nodes; }
-  get edges(): readonly EdgeVisual[] { return this.#edges; }
-  get selectedNode(): string | null { return this.#selectedNode; }
-  get selectedEdge(): string | null { return this.#selectedEdge; }
-  get traceEvents(): readonly TraceEntry[] { return this.#traceEvents; }
-  get graphJson(): object { return this.#graphJson ?? {}; }
-  get pausedNode(): string | null { return this.#pausedNode; }
-  get breakpointState(): BreakpointState | null { return this.#breakpointState; }
-  get lastRunDurationMs(): number | null { return this.#lastRunDurationMs; }
-  get compileError(): string | null { return this.#compileError; }
-  get compiles(): boolean { return this.#compileError === null && this.#session !== null; }
-  get lastRunTicks(): number { return this.#lastRunTicks; }
+  get mode(): EditorMode {
+    return this.#mode;
+  }
+  get nodes(): ReadonlyMap<string, NodeVisual> {
+    return this.#nodes;
+  }
+  get edges(): readonly EdgeVisual[] {
+    return this.#edges;
+  }
+  get selectedNode(): string | null {
+    return this.#selectedNode;
+  }
+  get selectedEdge(): string | null {
+    return this.#selectedEdge;
+  }
+  get traceEvents(): readonly TraceEntry[] {
+    return this.#traceEvents;
+  }
+  get graphJson(): object {
+    return this.#graphJson ?? {};
+  }
+  get pausedNode(): string | null {
+    return this.#pausedNode;
+  }
+  get breakpointState(): BreakpointState | null {
+    return this.#breakpointState;
+  }
+  get lastRunDurationMs(): number | null {
+    return this.#lastRunDurationMs;
+  }
+  get compileError(): string | null {
+    return this.#compileError;
+  }
+  get compiles(): boolean {
+    return this.#compileError === null && this.#session !== null;
+  }
+  get lastRunTicks(): number {
+    return this.#lastRunTicks;
+  }
 
-  get tickDelayMs(): number { return this.#tickDelayMs; }
-  set tickDelayMs(ms: number) { this.#tickDelayMs = Math.max(0, ms); }
+  get tickDelayMs(): number {
+    return this.#tickDelayMs;
+  }
+  set tickDelayMs(ms: number) {
+    this.#tickDelayMs = Math.max(0, ms);
+  }
 
   get islands(): readonly string[][] {
     if (!this.#session) return [];
@@ -89,16 +129,29 @@ export class EditorController extends EventTarget {
       return [];
     }
   }
-  get canUndo(): boolean { return this.#undoStack.length > 0; }
-  get canRedo(): boolean { return this.#redoStack.length > 0; }
-  get hasClipboard(): boolean { return this.#clipboard !== null; }
-  get savedSnapshots(): readonly SavedSnapshot[] { return this.#savedSnapshots; }
+  get canUndo(): boolean {
+    return this.#undoStack.length > 0;
+  }
+  get canRedo(): boolean {
+    return this.#redoStack.length > 0;
+  }
+  get hasClipboard(): boolean {
+    return this.#clipboard !== null;
+  }
+  get savedSnapshots(): readonly SavedSnapshot[] {
+    return this.#savedSnapshots;
+  }
 
   outputHistory(node: string, port: string): readonly OutputSnapshot[] {
     return this.#outputHistory.get(node)?.get(port) ?? [];
   }
 
-  get componentSources(): readonly { id: string; index: number; inputs: PortVisual[]; outputs: PortVisual[] }[] {
+  get componentSources(): readonly {
+    id: string;
+    index: number;
+    inputs: PortVisual[];
+    outputs: PortVisual[];
+  }[] {
     if (!this.#session || !this.#originalOptions) return [];
     const result: { id: string; index: number; inputs: PortVisual[]; outputs: PortVisual[] }[] = [];
     const seen = new Set<number>();
@@ -109,8 +162,10 @@ export class EditorController extends EventTarget {
       const compIdx = this.#graphJson?.components.findIndex((c) => {
         const ref = graphNode.component as Record<string, unknown>;
         const candidate = c as Record<string, unknown>;
-        return EditorController.#deepEqual(candidate, ref)
-          || EditorController.#deepEqual(candidate, ref, new Set(['content_hash']));
+        return (
+          EditorController.#deepEqual(candidate, ref) ||
+          EditorController.#deepEqual(candidate, ref, new Set(['content_hash']))
+        );
       });
       if (compIdx === undefined || compIdx < 0 || seen.has(compIdx)) continue;
       seen.add(compIdx);
@@ -134,10 +189,22 @@ export class EditorController extends EventTarget {
         try {
           contract = describeComponent(comp.id, comp.bytes);
           this.#componentContracts.set(i, contract);
-        } catch { /* component bytes may be invalid */ }
+        } catch {
+          /* component bytes may be invalid */
+        }
       }
-      const toPortVisual = (p: { name: string; kind: string; type_display: string; optional: boolean; docs?: string }): PortVisual => ({
-        name: p.name, kind: p.kind as PortVisual['kind'], typeDisplay: p.type_display, optional: p.optional, docs: p.docs,
+      const toPortVisual = (p: {
+        name: string;
+        kind: string;
+        type_display: string;
+        optional: boolean;
+        docs?: string;
+      }): PortVisual => ({
+        name: p.name,
+        kind: p.kind as PortVisual['kind'],
+        typeDisplay: p.type_display,
+        optional: p.optional,
+        docs: p.docs,
       });
       result.push({
         id: comp.id,
@@ -183,9 +250,17 @@ export class EditorController extends EventTarget {
     };
     this.#graphJson.nodes.push(node);
     this.#nodes.set(id, {
-      id, x, y, width: NODE_WIDTH, height: computeNodeHeight(inputs.length, outputs.length),
-      label: id, phase: 'pending', breakpoint: false, expanded: false,
-      inputs: [...inputs], outputs: [...outputs],
+      id,
+      x,
+      y,
+      width: NODE_WIDTH,
+      height: computeNodeHeight(inputs.length, outputs.length),
+      label: id,
+      phase: 'pending',
+      breakpoint: false,
+      expanded: false,
+      inputs: [...inputs],
+      outputs: [...outputs],
     });
     this.#selectedNode = id;
     this.#selectedEdge = null;
@@ -323,7 +398,12 @@ export class EditorController extends EventTarget {
     return port?.kind === 'value';
   }
 
-  canConnect(fromNode: string, fromPort: string, toNode: string, toPort: string): { ok: boolean; reason?: string } {
+  canConnect(
+    fromNode: string,
+    fromPort: string,
+    toNode: string,
+    toPort: string,
+  ): { ok: boolean; reason?: string } {
     const srcNode = this.#nodes.get(fromNode);
     const tgtNode = this.#nodes.get(toNode);
     if (!srcNode) return { ok: false, reason: `unknown node '${fromNode}'` };
@@ -332,15 +412,23 @@ export class EditorController extends EventTarget {
     const tgtPort = tgtNode.inputs.find((p) => p.name === toPort);
     if (!srcPort) return { ok: false, reason: `'${fromNode}' has no output '${fromPort}'` };
     if (!tgtPort) return { ok: false, reason: `'${toNode}' has no input '${toPort}'` };
-    if (srcPort.kind !== tgtPort.kind) return { ok: false, reason: `kind mismatch: ${srcPort.kind} -> ${tgtPort.kind}` };
+    if (srcPort.kind !== tgtPort.kind)
+      return { ok: false, reason: `kind mismatch: ${srcPort.kind} -> ${tgtPort.kind}` };
     const duplicate = this.#edges.some(
-      (e) => e.fromNode === fromNode && e.fromPort === fromPort && e.toNode === toNode && e.toPort === toPort,
+      (e) =>
+        e.fromNode === fromNode &&
+        e.fromPort === fromPort &&
+        e.toNode === toNode &&
+        e.toPort === toPort,
     );
     if (duplicate) return { ok: false, reason: 'connection already exists' };
     return { ok: true };
   }
 
-  compatibleOutputsForInput(nodeId: string, portName: string): readonly { node: string; port: string; label: string; self: boolean }[] {
+  compatibleOutputsForInput(
+    nodeId: string,
+    portName: string,
+  ): readonly { node: string; port: string; label: string; self: boolean }[] {
     const tgtNode = this.#nodes.get(nodeId);
     const tgtPort = tgtNode?.inputs.find((p) => p.name === portName);
     if (!tgtPort) return [];
@@ -355,11 +443,22 @@ export class EditorController extends EventTarget {
     return result;
   }
 
-  connectInput(nodeId: string, portName: string, fromNode: string, fromPort: string, feedback = false): void {
+  connectInput(
+    nodeId: string,
+    portName: string,
+    fromNode: string,
+    fromPort: string,
+    feedback = false,
+  ): void {
     const existing = this.connectionForInput(nodeId, portName);
     if (existing) this.removeConnection(existing.id);
     const id = `c-${fromNode}-${fromPort}-${nodeId}-${portName}`;
-    this.addConnection(id, { node: fromNode, port: fromPort }, { node: nodeId, port: portName }, feedback);
+    this.addConnection(
+      id,
+      { node: fromNode, port: fromPort },
+      { node: nodeId, port: portName },
+      feedback,
+    );
   }
 
   disconnectInput(nodeId: string, portName: string): void {
@@ -400,7 +499,11 @@ export class EditorController extends EventTarget {
 
   async importBundle(json: string): Promise<void> {
     const prev = this.#originalOptions;
-    const bundle = JSON.parse(json) as { version: number; graph: GraphJson; components: { id: string; wit?: string; bytes: string }[] };
+    const bundle = JSON.parse(json) as {
+      version: number;
+      graph: GraphJson;
+      components: { id: string; wit?: string; bytes: string }[];
+    };
     const components = bundle.components.map((c) => {
       const binary = atob(c.bytes);
       const bytes = new Uint8Array(binary.length);
@@ -424,7 +527,10 @@ export class EditorController extends EventTarget {
     return new Promise((resolve) => {
       input.addEventListener('change', async () => {
         const file = input.files?.[0];
-        if (!file) { resolve(); return; }
+        if (!file) {
+          resolve();
+          return;
+        }
         try {
           const text = await file.text();
           const parsed = JSON.parse(text);
@@ -489,7 +595,10 @@ export class EditorController extends EventTarget {
   async reset(): Promise<void> {
     if (!this.#originalOptions) return;
     const emptyGraph: GraphJson = {
-      metadata: { name: this.#graphJson?.metadata.name ?? 'untitled', description: this.#graphJson?.metadata.description },
+      metadata: {
+        name: this.#graphJson?.metadata.name ?? 'untitled',
+        description: this.#graphJson?.metadata.description,
+      },
       components: this.#graphJson?.components ?? [],
       nodes: [],
       connections: [],
@@ -682,7 +791,10 @@ export class EditorController extends EventTarget {
     const visual = this.#nodes.get(nodeId);
     const ports = new Map<string, { inputs: PortVisual[]; outputs: PortVisual[] }>();
     if (visual) {
-      ports.set(nodeId, { inputs: structuredClone(visual.inputs), outputs: structuredClone(visual.outputs) });
+      ports.set(nodeId, {
+        inputs: structuredClone(visual.inputs),
+        outputs: structuredClone(visual.outputs),
+      });
     }
     this.#clipboard = {
       nodes: [structuredClone(graphNode)],
@@ -704,8 +816,12 @@ export class EditorController extends EventTarget {
       const newId = `${node.id}${suffix}`;
       const compRef = node.component;
       const source = this.componentSources.find((s) => {
-        const graphComp = this.#graphJson!.components[s.index] as Record<string, unknown> | undefined;
-        return graphComp && EditorController.#deepEqual(graphComp, compRef as Record<string, unknown>);
+        const graphComp = this.#graphJson!.components[s.index] as
+          | Record<string, unknown>
+          | undefined;
+        return (
+          graphComp && EditorController.#deepEqual(graphComp, compRef as Record<string, unknown>)
+        );
       });
       if (!source) continue;
       // Prefer ports from the catalog source; fall back to ports saved in clipboard
@@ -719,10 +835,17 @@ export class EditorController extends EventTarget {
       };
       this.#graphJson.nodes.push(newNode);
       this.#nodes.set(newId, {
-        id: newId, x, y, width: NODE_WIDTH,
+        id: newId,
+        x,
+        y,
+        width: NODE_WIDTH,
         height: computeNodeHeight(inputs.length, outputs.length),
-        label: newNode.label ?? newId, phase: 'pending', breakpoint: false, expanded: false,
-        inputs: [...inputs], outputs: [...outputs],
+        label: newNode.label ?? newId,
+        phase: 'pending',
+        breakpoint: false,
+        expanded: false,
+        inputs: [...inputs],
+        outputs: [...outputs],
       });
       x += 30;
       y += 30;
@@ -899,8 +1022,17 @@ export class EditorController extends EventTarget {
     };
     this.#graphJson.nodes.push(node);
     this.#nodes.set(id, {
-      id, x, y, width: NODE_WIDTH, height: computeNodeHeight(0, 0),
-      label: id, phase: 'pending', breakpoint: false, expanded: false, inputs: [], outputs: [],
+      id,
+      x,
+      y,
+      width: NODE_WIDTH,
+      height: computeNodeHeight(0, 0),
+      label: id,
+      phase: 'pending',
+      breakpoint: false,
+      expanded: false,
+      inputs: [],
+      outputs: [],
     });
     void this.#reloadAfterEdit();
   }
@@ -956,13 +1088,19 @@ export class EditorController extends EventTarget {
       this.#pushError('Feedback downgraded: only Value ports support feedback');
     }
     const conn: GraphJsonConnection = {
-      id, from: { node: from.node, port: from.port }, to: { node: to.node, port: to.port },
+      id,
+      from: { node: from.node, port: from.port },
+      to: { node: to.node, port: to.port },
       ...(feedback ? { feedback: true } : {}),
     };
     this.#graphJson.connections.push(conn);
     this.#edges.push({
-      id, fromNode: from.node, fromPort: from.port,
-      toNode: to.node, toPort: to.port, feedback,
+      id,
+      fromNode: from.node,
+      fromPort: from.port,
+      toNode: to.node,
+      toPort: to.port,
+      feedback,
     });
     this.#selectedEdge = id;
     this.#selectedNode = null;
@@ -1001,7 +1139,9 @@ export class EditorController extends EventTarget {
 
   // -- Serialization ----------------------------------------------------------
 
-  exportGraph(): string { return JSON.stringify(this.#graphJson, null, 2); }
+  exportGraph(): string {
+    return JSON.stringify(this.#graphJson, null, 2);
+  }
 
   downloadGraph(filename = 'graph.json'): void {
     const json = this.exportGraph();
@@ -1047,13 +1187,18 @@ export class EditorController extends EventTarget {
 
   async autoLayout(): Promise<void> {
     const layoutNodes: LayoutNode[] = [...this.#nodes.values()].map((n) => ({
-      id: n.id, width: n.width, height: n.height,
+      id: n.id,
+      width: n.width,
+      height: n.height,
       inputs: n.inputs.map((p) => ({ name: p.name })),
       outputs: n.outputs.map((p) => ({ name: p.name })),
     }));
     const layoutEdges: LayoutEdge[] = this.#edges.map((e) => ({
-      id: e.id, fromNode: e.fromNode, fromPort: e.fromPort,
-      toNode: e.toNode, toPort: e.toPort,
+      id: e.id,
+      fromNode: e.fromNode,
+      fromPort: e.fromPort,
+      toNode: e.toNode,
+      toPort: e.toPort,
     }));
     const positions = await autoLayout(layoutNodes, layoutEdges);
     for (const [id, pos] of positions) this.moveNode(id, pos.x, pos.y);
@@ -1107,7 +1252,10 @@ export class EditorController extends EventTarget {
         }
         if (this.#tickDelayMs > 0) {
           const visual = this.#nodes.get(node);
-          if (visual) { visual.phase = 'running'; this.#dispatch('state-changed'); }
+          if (visual) {
+            visual.phase = 'running';
+            this.#dispatch('state-changed');
+          }
           return new Promise<void>((resolve) => setTimeout(resolve, this.#tickDelayMs));
         }
       },
@@ -1175,12 +1323,18 @@ export class EditorController extends EventTarget {
     for (const graphNode of this.#graphJson.nodes) {
       const contract = contracts.get(graphNode.id);
       const inputs: PortVisual[] = (contract?.inputs ?? []).map((p) => ({
-        name: p.name, kind: p.kind, typeDisplay: p.type_display,
-        optional: p.optional, docs: p.docs,
+        name: p.name,
+        kind: p.kind,
+        typeDisplay: p.type_display,
+        optional: p.optional,
+        docs: p.docs,
       }));
       const outputs: PortVisual[] = (contract?.outputs ?? []).map((p) => ({
-        name: p.name, kind: p.kind, typeDisplay: p.type_display,
-        optional: p.optional, docs: p.docs,
+        name: p.name,
+        kind: p.kind,
+        typeDisplay: p.type_display,
+        optional: p.optional,
+        docs: p.docs,
       }));
 
       const x = parseFloat(graphNode.attrs?.['editor.x'] ?? '') || 0;
@@ -1189,10 +1343,17 @@ export class EditorController extends EventTarget {
       const height = computeNodeHeight(inputs.length, outputs.length);
 
       const nodeVisual: NodeVisual = {
-        id: graphNode.id, x, y, width, height,
+        id: graphNode.id,
+        x,
+        y,
+        width,
+        height,
         label: graphNode.label ?? graphNode.id,
-        phase: 'idle', breakpoint: this.#breakpoints.has(graphNode.id), expanded: false,
-        inputs, outputs,
+        phase: 'idle',
+        breakpoint: this.#breakpoints.has(graphNode.id),
+        expanded: false,
+        inputs,
+        outputs,
       };
 
       try {
@@ -1207,8 +1368,11 @@ export class EditorController extends EventTarget {
 
     for (const conn of this.#graphJson.connections) {
       this.#edges.push({
-        id: conn.id, fromNode: conn.from.node, fromPort: conn.from.port,
-        toNode: conn.to.node, toPort: conn.to.port,
+        id: conn.id,
+        fromNode: conn.from.node,
+        fromPort: conn.from.port,
+        toNode: conn.to.node,
+        toPort: conn.to.port,
         feedback: conn.feedback ?? false,
       });
     }
@@ -1218,9 +1382,10 @@ export class EditorController extends EventTarget {
     if (!this.#session) return;
 
     const now = performance.now();
-    const trace = (this.#session.graph.takeTrace() as TraceEntry[]).map(
-      (e) => ({ ...e, timestamp: e.timestamp ?? now }),
-    );
+    const trace = (this.#session.graph.takeTrace() as TraceEntry[]).map((e) => ({
+      ...e,
+      timestamp: e.timestamp ?? now,
+    }));
     if (trace.length > 0) {
       this.#traceEvents.push(...trace);
       if (this.#traceEvents.length > MAX_TRACE_ENTRIES) {
@@ -1330,7 +1495,11 @@ export class EditorController extends EventTarget {
         await this.#reload();
         this.#compileError = null;
         if (hadError) {
-          this.#traceEvents.push({ event: 'compile-ok', timestamp: performance.now(), message: 'Graph compiles successfully' });
+          this.#traceEvents.push({
+            event: 'compile-ok',
+            timestamp: performance.now(),
+            message: 'Graph compiles successfully',
+          });
           this.#dispatch('trace-event');
         }
       } catch (err) {

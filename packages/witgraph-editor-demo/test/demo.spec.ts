@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test';
+import { expect, test } from '@playwright/test';
 
 test.describe('WIT Graph Editor Demo', () => {
   test.beforeEach(async ({ page }) => {
@@ -66,15 +66,15 @@ test.describe('WIT Graph Editor Demo', () => {
     expect(count).toBe(12);
     const transforms = new Set<string>();
     for (let i = 0; i < count; i++) {
-      transforms.add(await groups.nth(i).getAttribute('transform') ?? '');
+      transforms.add((await groups.nth(i).getAttribute('transform')) ?? '');
     }
     expect(transforms.size).toBe(12);
   });
 
   test('catalog shows components', async ({ page }) => {
-    const text = await page.locator('witgraph-catalog').evaluate(
-      (el: HTMLElement) => el.shadowRoot?.textContent ?? '',
-    );
+    const text = await page
+      .locator('witgraph-catalog')
+      .evaluate((el: HTMLElement) => el.shadowRoot?.textContent ?? '');
     expect(text).toContain('Components');
   });
 
