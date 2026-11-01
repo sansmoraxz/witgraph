@@ -1,0 +1,66 @@
+@import "tailwindcss";
+
+/*
+ * Catppuccin Mocha theme for witgraph-editor components.
+ *
+ * The editor components use bare `var(--wg-*)` custom properties (no
+ * fallbacks) — the host app MUST provide a theme.  Copy and modify this
+ * block to create your own theme.
+ */
+:root {
+  /* ── Base ──────────────────────────────────────────────── */
+  --wg-bg: #1e1e2e;
+  --wg-surface: #313244;
+  --wg-surface-hover: #45475a;
+  --wg-overlay: #585b70;
+
+  /* ── Text ──────────────────────────────────────────────── */
+  --wg-text: #cdd6f4;
+  --wg-text-dim: #a6adc8;
+  --wg-text-muted: #6c7086;
+
+  /* ── Semantic ──────────────────────────────────────────── */
+  --wg-primary: #89b4fa;
+  --wg-primary-hover: #74c7ec;
+  --wg-error: #f38ba8;
+  --wg-success: #a6e3a1;
+  --wg-warning: #fab387;
+  --wg-accent: #f9e2af;
+  --wg-purple: #cba6f7;
+
+  /* ── Node phases ───────────────────────────────────────── */
+  --wg-phase-pending: #fab387;
+  --wg-phase-running: #89b4fa;
+  --wg-phase-idle: #a6e3a1;
+  --wg-phase-faulted: #f38ba8;
+  --wg-phase-cancelled: #f9e2af;
+
+  /* ── Port kinds ────────────────────────────────────────── */
+  --wg-port-value: #89b4fa;
+  --wg-port-stream: #cba6f7;
+  --wg-port-future: #f9e2af;
+
+  /* ── Canvas ────────────────────────────────────────────── */
+  --wg-node-grad-top: #3b3c56;
+  --wg-node-grad-bottom: #2a2b3d;
+
+  /* ── Sizing (optional — components have sensible defaults) */
+  --wg-node-radius: 8px;
+  --wg-port-radius: 6px;
+  --wg-btn-radius: 4px;
+  --wg-group-radius: 6px;
+  --wg-input-radius: 4px;
+  --wg-toggle-radius: 10px;
+}
+
+@theme {
+  --color-wg-bg: var(--wg-bg);
+  --color-wg-surface: var(--wg-surface);
+  --color-wg-surface-hover: var(--wg-surface-hover);
+  --color-wg-text: var(--wg-text);
+  --color-wg-text-dim: var(--wg-text-dim);
+  --color-wg-primary: var(--wg-primary);
+  --color-wg-error: var(--wg-error);
+  --color-wg-success: var(--wg-success);
+  --color-wg-warning: var(--wg-warning);
+}

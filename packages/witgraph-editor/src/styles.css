@@ -1,0 +1,30 @@
+@import "tailwindcss";
+
+/*
+ * This file is for consumers who use Tailwind alongside the editor
+ * components. It bridges the --wg-* custom properties to Tailwind's
+ * @theme so utility classes like `bg-wg-bg` work in the light DOM.
+ *
+ * The actual values must be provided by the host app — the editor
+ * package ships no default theme.
+ */
+
+@theme {
+  --color-wg-bg: var(--wg-bg);
+  --color-wg-surface: var(--wg-surface);
+  --color-wg-surface-hover: var(--wg-surface-hover);
+  --color-wg-text: var(--wg-text);
+  --color-wg-text-dim: var(--wg-text-dim);
+  --color-wg-primary: var(--wg-primary);
+  --color-wg-error: var(--wg-error);
+  --color-wg-success: var(--wg-success);
+  --color-wg-warning: var(--wg-warning);
+  --color-wg-phase-pending: var(--wg-phase-pending);
+  --color-wg-phase-running: var(--wg-phase-running);
+  --color-wg-phase-idle: var(--wg-phase-idle);
+  --color-wg-phase-faulted: var(--wg-phase-faulted);
+  --color-wg-phase-cancelled: var(--wg-phase-cancelled);
+  --color-wg-port-value: var(--wg-port-value);
+  --color-wg-port-stream: var(--wg-port-stream);
+  --color-wg-port-future: var(--wg-port-future);
+}

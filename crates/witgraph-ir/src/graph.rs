@@ -118,6 +118,15 @@ pub struct Node {
         serde(default, skip_serializing_if = "BTreeMap::is_empty")
     )]
     pub resources: BTreeMap<ResourceId, ResourceClaim>,
+    /// Editor-agnostic extension point: arbitrary key-value pairs that the
+    /// runtime ignores. An editor stores layout here (position, size,
+    /// collapsed state); other tools may add their own, namespaced by
+    /// convention (e.g. `editor.x`, `editor.y`).
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "BTreeMap::is_empty")
+    )]
+    pub attrs: BTreeMap<String, String>,
 }
 
 /// A directed edge from an output port to an input port.
@@ -139,6 +148,13 @@ pub struct Connection {
         serde(default, skip_serializing_if = "core::ops::Not::not")
     )]
     pub feedback: bool,
+    /// Editor-agnostic extension point: arbitrary key-value pairs that the
+    /// runtime ignores. An editor may store routing or visual metadata here.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "BTreeMap::is_empty")
+    )]
+    pub attrs: BTreeMap<String, String>,
 }
 
 /// Satisfies one of a node's imports with another component's export,
@@ -247,6 +263,7 @@ impl GraphBuilder {
             component,
             label: None,
             resources: BTreeMap::new(),
+            attrs: BTreeMap::new(),
         });
         self
     }
@@ -297,6 +314,7 @@ impl GraphBuilder {
             from,
             to,
             feedback,
+            attrs: BTreeMap::new(),
         });
         self
     }
@@ -400,9 +418,15 @@ mod tests {
             from: PortRef::new("a", "o"),
             to: PortRef::new("b", "i"),
             feedback: false,
+            attrs: BTreeMap::new(),
         };
         let json = serde_json::to_value(&conn).unwrap();
-        assert!(!json.as_object().unwrap().contains_key("feedback"));
+        let conn_obj = json.as_object().unwrap();
+        assert!(!conn_obj.contains_key("feedback"));
+        assert!(
+            !conn_obj.contains_key("attrs"),
+            "empty attrs omitted from connection wire format"
+        );
 
         let node = Node {
             id: "n".into(),
@@ -417,11 +441,17 @@ mod tests {
             },
             label: None,
             resources: BTreeMap::new(),
+            attrs: BTreeMap::new(),
         };
         let json = serde_json::to_value(&node).unwrap();
+        let node_obj = json.as_object().unwrap();
         assert!(
-            !json.as_object().unwrap().contains_key("resources"),
+            !node_obj.contains_key("resources"),
             "empty resources omitted from wire format"
+        );
+        assert!(
+            !node_obj.contains_key("attrs"),
+            "empty attrs omitted from node wire format"
         );
     }
 

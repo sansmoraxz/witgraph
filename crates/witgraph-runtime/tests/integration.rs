@@ -6,9 +6,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use test_components::{
-    BUSY_LOOP, CALC, CONFIGURABLE, ECHO, FUTURE_WRITER, Guest, LABELLED, MATH, MAYBE, MQTT_NODE,
-    NAMED_ECHO, READING_CONSUMER, READING_PRODUCER, RELAY, RELAY_PLUS, RELAY_WIDE, STREAM_CONSUMER,
-    STREAM_DRAIN, STREAM_PRODUCER, STREAM_RELAY,
+    BUSY_LOOP, BYTES_CONSUMER, CALC, CONFIGURABLE, ECHO, FUTURE_WRITER, Guest, LABELLED, MATH,
+    MAYBE, MQTT_NODE, NAMED_ECHO, READING_CONSUMER, READING_PRODUCER, RELAY, RELAY_PLUS,
+    RELAY_WIDE, STREAM_CONSUMER, STREAM_DRAIN, STREAM_PRODUCER, STREAM_RELAY,
 };
 use wasmtime::StoreContextMut;
 use witgraph_ir::{
@@ -81,9 +81,9 @@ impl Kit {
 }
 
 /// Provides `test:mqtt/source` to the nodes that import it, all reading
-/// one shared feed.
+/// one shared feed of byte messages.
 struct Mqtt {
-    feed: Arc<Mutex<VecDeque<u32>>>,
+    feed: Arc<Mutex<VecDeque<Vec<u8>>>>,
 }
 
 impl Host for Mqtt {
@@ -114,7 +114,7 @@ impl Host for Mqtt {
     }
 }
 
-fn mqtt(feed: Arc<Mutex<VecDeque<u32>>>) -> Mqtt {
+fn mqtt(feed: Arc<Mutex<VecDeque<Vec<u8>>>>) -> Mqtt {
     Mqtt { feed }
 }
 
@@ -744,16 +744,18 @@ async fn a_future_output_nothing_reads_is_closed() {
 
 #[tokio::test]
 async fn capability_import_feeds_a_stream() {
-    let kit = Kit::new(&[MQTT_NODE, STREAM_CONSUMER]);
+    let kit = Kit::new(&[MQTT_NODE, BYTES_CONSUMER]);
     let graph = kit
         .builder("mqtt")
         .add_node("mqtt", kit.get(MQTT_NODE))
-        .add_node("cons", kit.get(STREAM_CONSUMER))
+        .add_node("cons", kit.get(BYTES_CONSUMER))
         .connect("s", port("mqtt", "messages"), port("cons", "items"))
         .build();
     let compiled = graph.compile(&kit.contracts).expect("compiles");
     assert_eq!(compiled.required_capabilities().len(), 1);
-    let feed = Arc::new(Mutex::new(VecDeque::from([3u32, 4, 5, 6, 7])));
+    let feed = Arc::new(Mutex::new(VecDeque::from([
+        vec![3u8, 4], vec![5], vec![6, 7, 8], vec![9], vec![10],
+    ])));
     let mut rt = RuntimeGraph::load_with_host(
         compiled,
         &kit.wasm,
@@ -765,7 +767,7 @@ async fn capability_import_feeds_a_stream() {
     .expect("loads with the capability");
     settle(&mut rt).await;
     assert_eq!(read_u32(&rt, "cons", "count"), 5);
-    assert_eq!(read_u32(&rt, "cons", "total"), 25);
+    assert_eq!(read_u32(&rt, "cons", "total-bytes"), 8);
     assert!(feed.lock().unwrap().is_empty());
 }
 
@@ -999,6 +1001,7 @@ fn trapping_math() -> &'static [u8] {
         &resolve,
         world,
         wit_component::StringEncoding::UTF8,
+        false,
     )
     .unwrap();
     let bytes = wit_component::ComponentEncoder::default()
@@ -1186,6 +1189,7 @@ async fn wide_graph_full_flow() {
         STREAM_PRODUCER,
         STREAM_CONSUMER,
         MQTT_NODE,
+        BYTES_CONSUMER,
     ]);
     let graph = kit
         .builder("wide")
@@ -1205,15 +1209,15 @@ async fn wide_graph_full_flow() {
         .connect("t1", port("cons", "total"), port("plus", "in"))
         .connect("f1", port("plus", "out"), port("sink_a", "in"))
         .connect("f2", port("plus", "out"), port("sink_b", "in"))
-        // mqtt → consumer
+        // mqtt → bytes-consumer
         .add_node("mqtt", kit.get(MQTT_NODE))
-        .add_node("count", kit.get(STREAM_CONSUMER))
+        .add_node("count", kit.get(BYTES_CONSUMER))
         .connect("m1", port("mqtt", "messages"), port("count", "items"))
         .build();
     let compiled = graph.compile(&kit.contracts).expect("compiles");
     // cfg, echo_a, echo_b, {prod, cons}, plus, sink_a, sink_b, {mqtt, count}
     assert_eq!(compiled.islands().len(), 8);
-    let feed = Arc::new(Mutex::new((0..4u32).collect::<VecDeque<_>>()));
+    let feed = Arc::new(Mutex::new((0..4u32).map(|i| vec![i as u8]).collect::<VecDeque<_>>()));
     let mut rt = RuntimeGraph::load_with_host(
         compiled,
         &kit.wasm,
@@ -1237,7 +1241,7 @@ async fn wide_graph_full_flow() {
     assert_eq!(read_u32(&rt, "cons", "total"), 28, "sum(0..8)");
     assert_eq!(read_u32(&rt, "sink_a", "out"), 29);
     assert_eq!(read_u32(&rt, "sink_b", "out"), 29);
-    assert_eq!(read_u32(&rt, "count", "count"), 4);
+    assert_eq!(read_u32(&rt, "count", "count"), 4, "4 byte messages from mqtt feed");
     let trace = rt.mode().trace();
     assert!(faults(&trace).is_empty(), "{:?}", faults(&trace));
     assert_eq!(
@@ -1763,6 +1767,7 @@ fn pipeline_and_busy(kit: &Kit) -> Graph {
         component: kit.get(BUSY_LOOP),
         label: None,
         resources: Default::default(),
+        attrs: Default::default(),
     });
     graph
 }
@@ -2011,6 +2016,7 @@ async fn shutdown_cancels_everything() {
         component: kit.get(ECHO),
         label: None,
         resources: Default::default(),
+        attrs: Default::default(),
     });
     let mut rt = kit
         .load(graph, RuntimeConfig::default(), Trace::new())
@@ -2027,15 +2033,15 @@ async fn shutdown_cancels_everything() {
 
 #[tokio::test]
 async fn rerun_restarts_an_island_the_host_cannot_feed() {
-    let kit = Kit::new(&[MQTT_NODE, STREAM_CONSUMER]);
+    let kit = Kit::new(&[MQTT_NODE, BYTES_CONSUMER]);
     let graph = kit
         .builder("mqtt")
         .add_node("mqtt", kit.get(MQTT_NODE))
-        .add_node("cons", kit.get(STREAM_CONSUMER))
+        .add_node("cons", kit.get(BYTES_CONSUMER))
         .connect("s", port("mqtt", "messages"), port("cons", "items"))
         .build();
     let compiled = graph.compile(&kit.contracts).expect("compiles");
-    let feed = Arc::new(Mutex::new(VecDeque::from([1u32, 2])));
+    let feed = Arc::new(Mutex::new(VecDeque::from([vec![1u8], vec![2u8]])));
     let mut rt = RuntimeGraph::load_with_host(
         compiled,
         &kit.wasm,
@@ -2046,17 +2052,17 @@ async fn rerun_restarts_an_island_the_host_cannot_feed() {
     .await
     .expect("loads");
     settle(&mut rt).await;
-    assert_eq!(read_u32(&rt, "cons", "total"), 3);
+    assert_eq!(read_u32(&rt, "cons", "total-bytes"), 2);
     rt.cancel(&id("mqtt")).unwrap();
 
-    feed.lock().unwrap().extend([10, 20]);
+    feed.lock().unwrap().extend([vec![10u8, 20], vec![30u8, 40]]);
     assert!(
         matches!(rt.tick().await, TickResult::Idle),
         "nothing is owed"
     );
     rt.rerun(&id("mqtt")).unwrap();
     settle(&mut rt).await;
-    assert_eq!(read_u32(&rt, "cons", "total"), 30);
+    assert_eq!(read_u32(&rt, "cons", "total-bytes"), 4);
 }
 
 #[tokio::test]
@@ -3422,6 +3428,7 @@ fn snapshot_round_trips_through_serde() {
             from: port("n", "out"),
             to: port("n", "in"),
             feedback: true,
+            attrs: Default::default(),
         }],
         links: Vec::new(),
         quiescent: false,

@@ -36,7 +36,7 @@ fn component(wit: &str, world: &str, module_world: &str) -> Vec<u8> {
         module_world,
         ManglingAndAbi::Legacy(LiftLowerAbi::AsyncCallback),
     );
-    wit_component::embed_component_metadata(&mut module, &resolve, world, StringEncoding::UTF8)
+    wit_component::embed_component_metadata(&mut module, &resolve, world, StringEncoding::UTF8, false)
         .unwrap();
     ComponentEncoder::default()
         .module(&module)
@@ -869,7 +869,7 @@ async fn growing_memory_past_the_island_limit_faults() {
                 (memory.grow (i32.const 1024))))"#,
     )
     .unwrap();
-    wit_component::embed_component_metadata(&mut module, &resolve, world, StringEncoding::UTF8)
+    wit_component::embed_component_metadata(&mut module, &resolve, world, StringEncoding::UTF8, false)
         .unwrap();
     let bytes = ComponentEncoder::default()
         .module(&module)
@@ -977,7 +977,7 @@ async fn bytes_with_a_sync_run_are_a_bad_component() {
     let world = resolve.select_world(&[package], Some("w")).unwrap();
     let mut module =
         wit_component::dummy_module(&resolve, world, ManglingAndAbi::Legacy(LiftLowerAbi::Sync));
-    wit_component::embed_component_metadata(&mut module, &resolve, world, StringEncoding::UTF8)
+    wit_component::embed_component_metadata(&mut module, &resolve, world, StringEncoding::UTF8, false)
         .unwrap();
     let bytes = ComponentEncoder::default()
         .module(&module)

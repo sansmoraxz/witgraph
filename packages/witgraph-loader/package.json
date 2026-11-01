@@ -12,7 +12,7 @@
     "typecheck": "tsc -p ."
   },
   "dependencies": {
-    "@bytecodealliance/jco": "^1.35.0"
+    "@bytecodealliance/jco": "^1.40.0"
   },
   "devDependencies": {
     "typescript": "^7.0.2"

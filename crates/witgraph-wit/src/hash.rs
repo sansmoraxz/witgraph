@@ -233,7 +233,8 @@ fn write_resource(out: &mut String, resolve: &Resolve, id: TypeId) {
                     let mut id = format!("{}:{}/{name}", package.namespace, package.name);
                     if let Some(version) = &package.version {
                         id.push('@');
-                        id.push_str(&PackageName::version_compat_track_string(version));
+                        let (track, _) = PackageName::version_compat_track_string(version);
+                        id.push_str(&track);
                     }
                     Some(id)
                 }

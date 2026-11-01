@@ -6,7 +6,7 @@ world mqtt-node {
 
     export node: interface {
         record outputs {
-            messages: stream<u32>,
+            messages: stream<list<u8>>,
         }
         run: async func() -> outputs;
     }
