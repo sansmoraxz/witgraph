@@ -159,3 +159,29 @@ pub const BLOB_RELAY: Guest = guest!("BLOB_RELAY_WASM", "blob-relay");
 /// `blob: list<u8>` → `len: u32`, `last: u8` (0 for none). For measuring how
 /// data moves.
 pub const BLOB_SINK: Guest = guest!("BLOB_SINK_WASM", "blob-sink");
+
+/// Imports `test:data/tensor` (a tensor the host keeps). `width`,
+/// `height`, `seed`: `option<u32>` (64, 48 and 0 when absent) → `tensor:
+/// own<tensor>`, a `[height, width, 4]` `uint8` gradient. Previews `tensor`
+/// as `tensor`.
+pub const TENSOR_SOURCE: Guest = guest!("TENSOR_SOURCE_WASM", "tensor-source");
+
+/// Imports `test:data/tensor`. `tensor: borrow<tensor>` → `tensor:
+/// own<tensor>`, inverted by the host (`invert`): no byte enters the node.
+/// Previews `tensor` as `tensor`.
+pub const TENSOR_INVERT: Guest = guest!("TENSOR_INVERT_WASM", "tensor-invert");
+
+/// Imports `test:data/tensor`. `tensor: borrow<tensor>` (`uint8`) → `tensor:
+/// own<tensor>`, inverted by the node itself: its bytes copied in and out.
+/// Previews `tensor` as `tensor`.
+pub const TENSOR_COPY_INVERT: Guest = guest!("TENSOR_COPY_INVERT_WASM", "tensor-copy-invert");
+
+/// Imports `test:data/tensor`. `tensor: borrow<tensor>` → `sum: u64` (of
+/// its bytes), `len: u64` (how many), read 64 KiB at a time.
+pub const TENSOR_SINK: Guest = guest!("TENSOR_SINK_WASM", "tensor-sink");
+
+/// Imports `test:data/tensor`. `tensor: option<borrow<tensor>>` →
+/// `previous: u64`: keeps its own reference (`clone`) to each input until
+/// the next, and returns the sum of the bytes of the one before (0 for
+/// none).
+pub const TENSOR_KEEP: Guest = guest!("TENSOR_KEEP_WASM", "tensor-keep");

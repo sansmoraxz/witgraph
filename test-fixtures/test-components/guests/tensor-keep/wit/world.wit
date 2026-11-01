@@ -1,0 +1,18 @@
+package test:tensor-keep@0.1.0;
+
+/// Keeps a reference to each input it is given, until the next one:
+/// `previous` is the sum of the bytes of the one before (0 for none).
+world tensor-keep {
+    import test:data/tensor@0.1.0;
+
+    export node: interface {
+        use test:data/tensor@0.1.0.{tensor};
+        record inputs {
+            tensor: option<borrow<tensor>>,
+        }
+        record outputs {
+            previous: u64,
+        }
+        run: async func(inputs: inputs) -> outputs;
+    }
+}

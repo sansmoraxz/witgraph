@@ -1,0 +1,18 @@
+package test:tensor-copy-invert@0.1.0;
+
+/// Its `uint8` input, inverted by the node itself: its bytes are copied in,
+/// inverted, and copied out into a new tensor.
+world tensor-copy-invert {
+    import test:data/tensor@0.1.0;
+
+    export node: interface {
+        use test:data/tensor@0.1.0.{tensor};
+        record inputs {
+            tensor: borrow<tensor>,
+        }
+        record outputs {
+            tensor: tensor,
+        }
+        run: async func(inputs: inputs) -> outputs;
+    }
+}
