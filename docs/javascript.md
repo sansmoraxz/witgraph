@@ -45,6 +45,16 @@ the TypeScript and let `init` fetch the module from beside the script.
 
 - **Capabilities** are plain JavaScript objects, returned from the
   `capabilities` callback.
+- **Handles.** A resource a handle port carries is a class in the
+  capability's object (`{ Tensor }`), the same class for every node, so an
+  object one node makes is one another accepts. A handle output's object is
+  passed to its readers as it is, and `readOutput` returns it. Once nothing
+  holds it, its `[Symbol.dispose]()` is called, if it has one: free what it
+  holds there (`buffer.destroy()`), not when it is collected. jco also calls
+  it when a guest drops an `own` it was given, so every `own` a method
+  returns must be an object of its own (a `clone` returns a new object
+  sharing the data). A viewer showing an output must expect its object to be
+  disposed once the next one replaces it.
 - **Debugging.** `beforeRun` and `afterRun` run around every node call and can
   pause it, which gives you breakpoints and stepping. `onStreamItem` sees
   stream items as they pass between nodes, a chunk at a time: `item` is the
@@ -59,7 +69,8 @@ the TypeScript and let `init` fetch the module from beside the script.
   gets the value).
 - **Contracts.** `session.contracts` has each node's ports. An output whose
   component previews it in its `witgraph-viewer` section has a `viewer`
-  ([Previewing outputs](components.md#previewing-outputs)).
+  ([Previewing outputs](components.md#previewing-outputs)). A handle port
+  has a `handle`, the resource it carries.
 - **Simulation.** `mocks` replaces a node with a function.
 - **Values** use jco's representation: records are objects with camelCase keys,
   64-bit integers are `BigInt`s, lists of numbers are typed arrays, and

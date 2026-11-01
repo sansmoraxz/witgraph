@@ -50,6 +50,36 @@ let rt = RuntimeGraph::load_with_host(compiled, &wasm, config, Perf, host).await
 If a node imports a capability that no plugin provides, loading fails. If
 several plugins provide it, the node's import label picks one.
 
+## Sharing resources
+
+A resource handle ports carry ([Handles](components.md#handles)) is one a
+plugin shares. The plugin:
+
+- says so in `CapabilityPlugin::shares` (a `Host` in `Host::shares`). A graph
+  with a handle port carrying a resource nothing shares fails to load with
+  `LoadError::NotShareable`;
+- defines the resource with `shared::link_resource`;
+- makes objects with `HostState::share(interface, resource, object, bytes)`,
+  which returns the guest's `own` handle, and finds the object behind a
+  handle its methods get with `HostState::shared`. `share_again` gives a new
+  handle to an existing object, as a `clone` would.
+
+```rust
+let mut instance = linker.instance("test:data/tensor@0.1.0")?;
+shared::link_resource(&mut instance, "test:data/tensor@0.1.0", "tensor")?;
+instance.func_wrap("[method]tensor.clone", |mut store, (this,): (ResourceDynamic,)| {
+    let state = store.data_mut().host_state();
+    let tensor = state.shared(&this)?;
+    Ok((state.share_again(tensor)?,))
+})?;
+```
+
+The object is whatever the plugin keeps (a `Shared` holds it, behind an
+`Arc`), and it is dropped when the last latch, or a guest's own reference,
+lets go: its `Drop` frees what it holds. `RuntimeConfig::max_shared_memory`
+(4 GiB by default) bounds the bytes plugins report for all of a graph's
+objects; making one past it faults the node making it.
+
 ## Ticks
 
 Nothing runs between ticks. A tick runs every node that has new input until
@@ -66,7 +96,9 @@ A tick returns `Progress`, `Idle`, `Interrupted`, `StepLimitReached` or
 - `inject(node, port, value)` sets a value input, and `inject_wave` does the
   same from text. Required inputs fed only by feedback need an initial value.
 - `clear_input` removes an injected value.
-- `read_output` returns the last value a node produced.
+- `read_output` returns the last value a node produced, and `read_handle`
+  the object behind a handle output. `shared_memory()` is what the graph's
+  shared objects take.
 - `rerun(node)` runs a node again with its current inputs.
 
 A node only reruns when an input actually changes.
@@ -99,6 +131,9 @@ flight as serializable data. `restore(&snapshot)` puts it back on a graph with
 the same nodes. Guest memory isn't captured: work that was in flight is rerun
 from its inputs, so the result matches the original only if the nodes are
 deterministic.
+
+Handles aren't captured either: the islands that produced them are recorded as
+owing a run, so after a restore they make new ones.
 
 ## Cargo features
 
