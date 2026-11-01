@@ -363,10 +363,10 @@ impl Executor for Js {
             .map(|value| WebValue::Data(Rc::new(Data::from_value(value, ty.clone()))))
     }
 
-    fn to_wave(&self, value: &WebValue) -> String {
+    fn to_wave(&self, value: &WebValue) -> Result<String, String> {
         match value {
-            WebValue::Data(data) => data.wave().unwrap_or_default(),
-            WebValue::Handle(_) => String::new(),
+            WebValue::Data(data) => data.wave(),
+            WebValue::Handle(_) => Err("a stream or future is not a Value".into()),
         }
     }
 }

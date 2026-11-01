@@ -92,6 +92,7 @@ impl Data {
             return Ok(value);
         }
         let js = self.js.get().ok_or("a value with no form")?;
+        affordable(js, &self.ty)?;
         let value = from_js(js, &self.ty)?;
         Ok(self.value.get_or_init(|| value))
     }
@@ -105,6 +106,7 @@ impl Data {
             Some(value) => Ok(to_wave(value)),
             None => {
                 let js = self.js.get().ok_or("a value with no form")?;
+                affordable(js, &self.ty)?;
                 Ok(to_wave(&from_js(js, &self.ty)?))
             }
         }
@@ -148,6 +150,112 @@ impl Data {
             js: OnceCell::from(js),
             value: OnceCell::new(),
         }))
+    }
+}
+
+/// The most bytes converting one value to a WAVE value, and that to text,
+/// may take. The module's memory is 32-bit, so a conversion that does not
+/// fit traps, and a trap leaves the graph unusable (it skips every `Drop`,
+/// a borrow of the graph's among them): one that would not fit is refused
+/// instead, with an error.
+const CONVERSION_BUDGET: usize = 1 << 30;
+
+/// `Ok` when converting `js`, of type `ty`, fits the
+/// [budget](CONVERSION_BUDGET); otherwise how much it would take.
+fn affordable(js: &JsValue, ty: &Type) -> Result<(), String> {
+    let cost = conversion_cost(js, ty, CONVERSION_BUDGET);
+    if cost <= CONVERSION_BUDGET {
+        return Ok(());
+    }
+    let mib = |bytes: usize| bytes >> 20;
+    Err(format!(
+        "too large to convert: it would take over {} MiB as a WAVE value (at most {} MiB)",
+        mib(cost),
+        mib(CONVERSION_BUDGET)
+    ))
+}
+
+/// About how many bytes converting `js`, of type `ty`, to a WAVE value and
+/// to text takes: a `Value` and a few characters per element, and its
+/// strings' bytes. Counting stops once past `limit`.
+fn conversion_cost(js: &JsValue, ty: &Type, limit: usize) -> usize {
+    // A `Value`, its slot in its parent, and its text.
+    let node = std::mem::size_of::<Value>() + 16;
+    match ty.kind() {
+        WasmTypeKind::String | WasmTypeKind::Char => {
+            node + js.as_string().map_or(0, |text| text.len() * 3)
+        }
+        WasmTypeKind::List | WasmTypeKind::FixedLengthList => {
+            let Some(element) = ty.list_element_type() else {
+                return node;
+            };
+            if numeric(element.kind()) && ArrayBuffer::is_view(js) {
+                let length = get(js, "length").as_f64().unwrap_or(0.0);
+                // A typed array's length fits a `usize` on any host it has.
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                return node.saturating_add((length as usize).saturating_mul(node));
+            }
+            let mut cost = node;
+            for item in js.dyn_ref::<Array>().into_iter().flat_map(Array::iter) {
+                cost = cost.saturating_add(conversion_cost(&item, &element, limit));
+                if cost > limit {
+                    break;
+                }
+            }
+            cost
+        }
+        WasmTypeKind::Record => {
+            let mut cost = node;
+            for (name, field_type) in ty.record_fields() {
+                cost = cost.saturating_add(conversion_cost(&field(js, &name), &field_type, limit));
+                if cost > limit {
+                    break;
+                }
+            }
+            cost
+        }
+        WasmTypeKind::Tuple => {
+            let items = js.dyn_ref::<Array>().map(Array::to_vec).unwrap_or_default();
+            ty.tuple_element_types()
+                .zip(items)
+                .fold(node, |cost, (t, item)| {
+                    cost.saturating_add(conversion_cost(&item, &t, limit))
+                })
+        }
+        WasmTypeKind::Variant | WasmTypeKind::Result => {
+            let tag = get(js, "tag").as_string();
+            let payload = match ty.kind() {
+                WasmTypeKind::Variant => ty
+                    .variant_cases()
+                    .find(|(name, _)| Some(name.as_ref()) == tag.as_deref())
+                    .and_then(|(_, t)| t),
+                _ => {
+                    let (ok, err) = ty.result_types().unwrap_or((None, None));
+                    if tag.as_deref() == Some("ok") {
+                        ok
+                    } else {
+                        err
+                    }
+                }
+            };
+            node + payload.map_or(0, |t| conversion_cost(&get(js, "val"), &t, limit))
+        }
+        WasmTypeKind::Option => {
+            let Some(some) = ty.option_some_type() else {
+                return node;
+            };
+            let payload = if nullable(ty) {
+                js.clone()
+            } else {
+                get(js, "val")
+            };
+            if payload.is_undefined() || payload.is_null() {
+                node
+            } else {
+                node + conversion_cost(&payload, &some, limit)
+            }
+        }
+        _ => node,
     }
 }
 

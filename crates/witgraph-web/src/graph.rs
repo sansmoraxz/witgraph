@@ -672,13 +672,18 @@ impl WebGraph {
     }
 
     /// The latched value of a Value output port as WAVE text; `undefined`
-    /// before the node has run. While a tick runs, as `readOutput`.
+    /// before the node has run. While a tick runs, as `readOutput`. Throws,
+    /// naming the port, for a value too large to convert (see
+    /// `readOutput` for the value itself).
     #[wasm_bindgen(js_name = readOutputWave)]
     pub fn read_output_wave(&self, node: &str, port: &str) -> Result<Option<String>, JsError> {
-        Ok(self.output(node, port)?.and_then(|(value, _)| match value {
-            WebValue::Data(data) => data.wave().ok(),
-            WebValue::Handle(_) => None,
-        }))
+        match self.output(node, port)? {
+            Some((WebValue::Data(data), _)) => data
+                .wave()
+                .map(Some)
+                .map_err(|e| error(format!("`{node}.{port}`: {e}"))),
+            _ => Ok(None),
+        }
     }
 
     /// A node's lifecycle state: `{ phase, fault?, culprit? }`. While a
@@ -737,7 +742,8 @@ impl WebGraph {
 
     /// The graph's host-visible state, as JSON (`Snapshot`).
     pub fn snapshot(&self) -> Result<String, JsError> {
-        serde_json::to_string(&self.idle()?.snapshot()).map_err(error)
+        let snapshot = self.idle()?.snapshot().map_err(error)?;
+        serde_json::to_string(&snapshot).map_err(error)
     }
 
     /// Replaces the graph's host-visible state with a snapshot, given as
