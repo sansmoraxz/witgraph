@@ -22,27 +22,27 @@ use witgraph_ir::{NodeId, PortDirection, PortKind, PortName, PortRef};
 use crate::error::NodeFault;
 use crate::plan::IslandPlan;
 
-/// `Send` on native targets, nothing on `wasm32`: there a generation is
+/// `Send` on native targets, nothing on WebAssembly: there a generation is
 /// driven by JavaScript promises, which never leave their thread.
 #[cfg(not(target_family = "wasm"))]
 pub trait MaybeSend: Send {}
 #[cfg(not(target_family = "wasm"))]
 impl<T: Send + ?Sized> MaybeSend for T {}
 
-/// `Send` on native targets, nothing on `wasm32`: there a generation is
+/// `Send` on native targets, nothing on WebAssembly: there a generation is
 /// driven by JavaScript promises, which never leave their thread.
 #[cfg(target_family = "wasm")]
 pub trait MaybeSend {}
 #[cfg(target_family = "wasm")]
 impl<T: ?Sized> MaybeSend for T {}
 
-/// `Sync` on native targets, nothing on `wasm32` (see [`MaybeSend`]).
+/// `Sync` on native targets, nothing on WebAssembly (see [`MaybeSend`]).
 #[cfg(not(target_family = "wasm"))]
 pub trait MaybeSync: Sync {}
 #[cfg(not(target_family = "wasm"))]
 impl<T: Sync + ?Sized> MaybeSync for T {}
 
-/// `Sync` on native targets, nothing on `wasm32` (see [`MaybeSend`]).
+/// `Sync` on native targets, nothing on WebAssembly (see [`MaybeSend`]).
 #[cfg(target_family = "wasm")]
 pub trait MaybeSync {}
 #[cfg(target_family = "wasm")]

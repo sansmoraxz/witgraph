@@ -154,11 +154,15 @@ impl Data {
 }
 
 /// The most bytes converting one value to a WAVE value, and that to text,
-/// may take. The module's memory is 32-bit, so a conversion that does not
-/// fit traps, and a trap leaves the graph unusable (it skips every `Drop`,
-/// a borrow of the graph's among them): one that would not fit is refused
-/// instead, with an error.
+/// may take. A conversion that does not fit the module's memory traps, and
+/// a trap leaves the graph unusable (it skips every `Drop`, a borrow of the
+/// graph's among them): one that would not fit is refused instead, with an
+/// error. A 32-bit memory (4 GiB, shared with everything else) affords a
+/// quarter of it; a 64-bit one, as much as a host's memory reasonably holds.
+#[cfg(target_pointer_width = "32")]
 const CONVERSION_BUDGET: usize = 1 << 30;
+#[cfg(not(target_pointer_width = "32"))]
+const CONVERSION_BUDGET: usize = 1 << 34;
 
 /// `Ok` when converting `js`, of type `ty`, fits the
 /// [budget](CONVERSION_BUDGET); otherwise how much it would take.

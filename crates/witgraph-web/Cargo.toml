@@ -18,8 +18,9 @@ workspace = true
 [lib]
 crate-type = ["cdylib", "rlib"]
 
-# Everything here is for `wasm32`: on other targets the crate is empty.
-[target.'cfg(target_arch = "wasm32")'.dependencies]
+# Everything here is for WebAssembly (`wasm32`, or `wasm64` opting in): on
+# other targets the crate is empty.
+[target.'cfg(target_family = "wasm")'.dependencies]
 witgraph-ir = { workspace = true }
 witgraph-wit = { workspace = true, features = ["compose"] }
 witgraph-sched = { workspace = true }

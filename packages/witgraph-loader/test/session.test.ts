@@ -1231,6 +1231,26 @@ test('the list loop jco generates is there to be replaced', async () => {
   assert.equal(fastListLift('nothing to replace'), 'nothing to replace');
 });
 
+/** Whether the scheduler's module has a 64-bit memory (`pnpm build:wasm64`). */
+function memory64(module: Uint8Array): boolean {
+  const leb = (at: number): [number, number] => {
+    let value = 0;
+    for (let shift = 0; ; shift += 7) {
+      const byte = module[at++];
+      value += (byte & 0x7f) * 2 ** shift;
+      if (byte < 0x80) return [value, at];
+    }
+  };
+  // Sections after the 8-byte header: the memory section's first limits.
+  for (let at = 8; at < module.length; ) {
+    const id = module[at];
+    const [size, body] = leb(at + 1);
+    if (id === 5) return (module[leb(body)[1]] & 0x04) !== 0;
+    at = body + size;
+  }
+  return false;
+}
+
 test('a value too large to convert is refused, naming it, and the session goes on', async () => {
   const session = await load(
     [
@@ -1242,6 +1262,11 @@ test('a value too large to convert is refused, naming it, and the session goes o
   const size = 64 * 1024 * 1024;
   session.graph.inject('source', 'size', size);
   await session.settle();
+  if (memory64(wasm)) {
+    // A 64-bit memory affords it.
+    assert.match(session.graph.readOutputWave('source', 'blob')!, /^\[0, 1, 2, /);
+    return;
+  }
   // As WAVE text it would not fit the scheduler's 32-bit memory.
   assert.throws(
     () => session.graph.readOutputWave('source', 'blob'),

@@ -94,3 +94,11 @@ cancel or shutdown) has its streams closed the same way.
 the tests after `cargo build -p test-components`, and `pnpm typecheck`
 checks the source. `pnpm build` also compiles the TypeScript into `dist/`, which
 is what gets published.
+
+`pnpm build:wasm64` builds the scheduler for a 64-bit memory instead
+(`wasm64-unknown-unknown`), for graphs whose values, as WAVE text or in
+snapshots, need more than a 32-bit memory holds. It is opt-in: it needs a
+nightly toolchain with `rust-src` (the standard library is built from
+source), and a host with the memory64 proposal (recent Chromium and Node,
+for instance). The guests stay 32-bit: components have no 64-bit ABI
+yet.
