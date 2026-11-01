@@ -134,12 +134,6 @@ export interface OutputView {
   pending: boolean;
 }
 
-/** A recorded output value at a given tick. */
-export interface OutputSnapshot {
-  tick: number;
-  wave: string;
-}
-
 /** A reversible editing command for undo/redo. */
 export interface EditorCommand {
   execute(): void;

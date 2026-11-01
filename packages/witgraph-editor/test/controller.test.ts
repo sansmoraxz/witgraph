@@ -485,7 +485,6 @@ test('only what is previewed or selected is recorded', async () => {
   await controller.step();
   await controller.step();
   assert.equal(controller.observe('n', 'out').count, 0, 'nothing recorded');
-  assert.deepEqual(controller.outputHistory('n', 'out'), []);
   // Its latest value is still read when asked for.
   assert.equal(controller.latestOutput('n', 'out'), 2);
 
@@ -494,5 +493,4 @@ test('only what is previewed or selected is recorded', async () => {
   assert.equal(controller.isObserved('n', 'out'), true);
   await controller.step();
   assert.equal(controller.observe('n', 'out').count, 1);
-  assert.equal(controller.outputHistory('n', 'out').length, 1);
 });

@@ -1,6 +1,8 @@
 import type { EditorController } from '../controller/editor-controller.ts';
 import type { NodeVisual, PortVisual } from '../controller/types.ts';
 import { defaultViewer } from '../controller/visual.ts';
+import { weight } from '../util/weight.ts';
+import { summarize } from '../viewers/text.ts';
 import { adoptStyles } from './shared-styles.ts';
 
 const PHASE_BG: Record<string, string> = {
@@ -19,6 +21,9 @@ const KIND_BG: Record<string, string> = {
 
 const BTN =
   'bg-wg-surface text-wg-text border border-wg-text-dim rounded px-2 py-1 cursor-pointer text-xs hover:bg-wg-surface-hover transition-all shadow-sm';
+
+/** The biggest value the inspector writes out as WAVE text, in bytes. */
+const MAX_WAVE_BYTES = 64 * 1024;
 
 const EXTRA_CSS = `
   :host { display: block; height: 100%; overflow-y: auto; overflow-x: hidden; background-color: var(--wg-bg);
@@ -152,6 +157,17 @@ export class WitgraphInspector extends HTMLElement {
     const nodeId = controller.selectedNode;
     const node = nodeId ? controller.nodes.get(nodeId) : undefined;
     return node ? this.#buildInspector(node) : this.#buildGraphProperties();
+  }
+
+  /**
+   * A Value output as WAVE text, or a summary of it when it is too big to
+   * write out (its text could take seconds, and hundreds of megabytes).
+   */
+  #outputText(node: string, port: string): string {
+    const value = this.#controller?.latestOutput(node, port);
+    if (value === undefined) return '-';
+    if (weight(value) > MAX_WAVE_BYTES) return `${summarize(value)} (too large to show as WAVE)`;
+    return this.#controller?.readOutputWave(node, port) ?? '-';
   }
 
   #el(tag: string, cls: string, text?: string): HTMLElement {
@@ -710,7 +726,7 @@ export class WitgraphInspector extends HTMLElement {
           'port-val font-mono text-xs mt-1.5 p-2 bg-wg-bg rounded-md text-wg-primary',
         );
         try {
-          pre.textContent = this.#controller!.readOutputWave(node.id, port.name) ?? '-';
+          pre.textContent = this.#outputText(node.id, port.name);
         } catch {
           pre.textContent = '-';
         }
@@ -951,7 +967,7 @@ export class WitgraphInspector extends HTMLElement {
       'port-val font-mono text-xs p-2 bg-wg-surface rounded-md text-wg-primary shadow-sm',
     );
     try {
-      valEl.textContent = this.#controller!.readOutputWave(edge.fromNode, edge.fromPort) ?? '-';
+      valEl.textContent = this.#outputText(edge.fromNode, edge.fromPort);
     } catch {
       valEl.textContent = '-';
     }
