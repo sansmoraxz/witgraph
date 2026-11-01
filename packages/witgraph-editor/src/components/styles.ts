@@ -11,10 +11,29 @@ export const NODE_HEADER_HEIGHT = 32;
 export const PORT_SPACING = 22;
 export const NODE_PADDING = 8;
 export const NODE_RADIUS = 8;
+/** The narrowest a node can be resized to. */
+export const MIN_NODE_WIDTH = 120;
+/** The height of a node's preview region until it is resized. */
+export const PREVIEW_HEIGHT = 120;
+/** The lowest a node's preview region can be resized to. */
+export const MIN_PREVIEW_HEIGHT = 40;
 
-export function computeNodeHeight(inputCount: number, outputCount: number): number {
+/**
+ * The height of a node's ports band: the region below its header where its
+ * ports sit, above its preview region, if it has one.
+ */
+export function portsBandHeight(inputCount: number, outputCount: number): number {
   const ports = Math.max(inputCount, outputCount);
-  return NODE_HEADER_HEIGHT + ports * PORT_SPACING + NODE_PADDING * 2;
+  return ports * PORT_SPACING + NODE_PADDING * 2;
+}
+
+/** A node's height: header, ports band, then `previewHeight` of preview. */
+export function computeNodeHeight(
+  inputCount: number,
+  outputCount: number,
+  previewHeight = 0,
+): number {
+  return NODE_HEADER_HEIGHT + portsBandHeight(inputCount, outputCount) + previewHeight;
 }
 
 /**

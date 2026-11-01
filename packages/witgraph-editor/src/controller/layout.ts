@@ -6,6 +6,8 @@ export interface LayoutNode {
   id: string;
   width: number;
   height: number;
+  /** Down to the bottom of the ports band: see {@link portPosition}. Defaults to `height`. */
+  portsBottom?: number;
   inputs: { name: string }[];
   outputs: { name: string }[];
 }
@@ -27,14 +29,14 @@ function buildPorts(
   ports: { name: string }[],
   side: 'in' | 'out',
   nodeWidth: number,
-  nodeHeight: number,
+  portsBottom: number,
 ): ElkPort[] {
   const count = ports.length;
   const portSide = side === 'in' ? 'WEST' : 'EAST';
   const x = side === 'in' ? 0 : nodeWidth;
 
   return ports.map((p, i) => {
-    const y = NODE_HEADER_HEIGHT + ((nodeHeight - NODE_HEADER_HEIGHT) * (i + 1)) / (count + 1);
+    const y = NODE_HEADER_HEIGHT + ((portsBottom - NODE_HEADER_HEIGHT) * (i + 1)) / (count + 1);
     return {
       id: portId(nodeId, side, p.name),
       x,
@@ -60,8 +62,8 @@ export async function autoLayout(
     width: n.width,
     height: n.height,
     ports: [
-      ...buildPorts(n.id, n.inputs, 'in', n.width, n.height),
-      ...buildPorts(n.id, n.outputs, 'out', n.width, n.height),
+      ...buildPorts(n.id, n.inputs, 'in', n.width, n.portsBottom ?? n.height),
+      ...buildPorts(n.id, n.outputs, 'out', n.width, n.portsBottom ?? n.height),
     ],
     layoutOptions: {
       'org.eclipse.elk.portConstraints': 'FIXED_SIDE',

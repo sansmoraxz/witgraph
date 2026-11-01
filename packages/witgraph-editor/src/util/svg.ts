@@ -9,6 +9,12 @@ export function edgePath(x1: number, y1: number, x2: number, y2: number): string
   return `M ${x1},${y1} C ${cp1x},${cp1y} ${cp2x},${cp2y} ${x2},${y2}`;
 }
 
+/**
+ * Where a node's port sits: on its left (input) or right (output) edge,
+ * spread evenly below its header over `nodeHeight`. Pass the height down to
+ * the bottom of the node's ports band, not the whole node: a preview region
+ * below it holds no ports.
+ */
 export function portPosition(
   nodeX: number,
   nodeY: number,

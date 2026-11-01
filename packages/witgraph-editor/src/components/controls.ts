@@ -66,14 +66,17 @@ const EXTRA_CSS = `
   .spacer { flex: 1; }
   .icon-only svg { width: 16px; height: 16px; }
   .icon-only { padding: 5px 7px; }
-  .delay-group { display: inline-flex; align-items: center; gap: 4px;
+  .rate-group { display: inline-flex; align-items: center; gap: 4px;
     background: color-mix(in srgb, var(--wg-bg) 50%, transparent); padding: 2px 8px; border-radius: var(--_group-radius); }
-  .delay-label { color: var(--wg-text-dim); font-size: 0.625rem; font-weight: 500;
+  .rate-label { color: var(--wg-text-dim); font-size: 0.625rem; font-weight: 500;
     white-space: nowrap; user-select: none; }
-  .delay-slider { width: 80px; height: 4px; accent-color: var(--wg-primary); cursor: pointer; }
-  .delay-value { color: var(--wg-text); font-size: 0.625rem; font-weight: 600;
+  .rate-slider { width: 80px; height: 4px; accent-color: var(--wg-primary); cursor: pointer; }
+  .rate-value { color: var(--wg-text); font-size: 0.625rem; font-weight: 600;
     min-width: 32px; text-align: right; font-variant-numeric: tabular-nums; }
 `;
+
+/** The rates the tick rate slider steps through, in ticks a second; `0` is no limit. */
+const TICK_RATES = [1, 2, 5, 10, 20, 30, 60, 0];
 
 const ICONS: Record<string, unknown[]> = {
   play: Play,
@@ -113,6 +116,8 @@ export class WitgraphControls extends HTMLElement {
   #btnSnapSave!: HTMLButtonElement;
   #btnSnapRestore!: HTMLButtonElement;
   #badge!: HTMLSpanElement;
+  /** Shows a tick rate on the slider; set once the toolbar is built. */
+  #showRate: ((rate: number) => void) | null = null;
   #durationSpan!: HTMLSpanElement;
 
   connectedCallback(): void {
@@ -199,30 +204,35 @@ export class WitgraphControls extends HTMLElement {
 
     sep();
 
-    // Tick delay slider
-    const delayGroup = document.createElement('div');
-    delayGroup.className = 'delay-group';
-    const delayLabel = document.createElement('span');
-    delayLabel.className = 'delay-label';
-    delayLabel.textContent = 'Delay';
-    const delaySlider = document.createElement('input');
-    delaySlider.type = 'range';
-    delaySlider.className = 'delay-slider';
-    delaySlider.min = '0';
-    delaySlider.max = '2000';
-    delaySlider.step = '50';
-    delaySlider.value = '0';
-    delaySlider.title = 'Artificial delay per node execution (ms)';
-    const delayValue = document.createElement('span');
-    delayValue.className = 'delay-value';
-    delayValue.textContent = '0ms';
-    delaySlider.addEventListener('input', () => {
-      const ms = parseInt(delaySlider.value, 10);
-      delayValue.textContent = `${ms}ms`;
-      if (this.#controller) this.#controller.tickDelayMs = ms;
+    // Tick rate slider: a step per rate, slowest first, `Max` last
+    const rateGroup = document.createElement('div');
+    rateGroup.className = 'rate-group';
+    const rateLabel = document.createElement('span');
+    rateLabel.className = 'rate-label';
+    rateLabel.textContent = 'Rate';
+    const rateSlider = document.createElement('input');
+    rateSlider.type = 'range';
+    rateSlider.className = 'rate-slider';
+    rateSlider.min = '0';
+    rateSlider.max = String(TICK_RATES.length - 1);
+    rateSlider.step = '1';
+    rateSlider.title = 'Most ticks a second a run makes';
+    const rateValue = document.createElement('span');
+    rateValue.className = 'rate-value';
+    const showRate = (rate: number) => {
+      const index = TICK_RATES.indexOf(rate);
+      rateSlider.value = String(index < 0 ? TICK_RATES.length - 1 : index);
+      rateValue.textContent = rate > 0 ? `${rate}/s` : 'Max';
+    };
+    showRate(this.#controller?.tickRate ?? 0);
+    rateSlider.addEventListener('input', () => {
+      const rate = TICK_RATES[parseInt(rateSlider.value, 10)] ?? 0;
+      showRate(rate);
+      if (this.#controller) this.#controller.tickRate = rate;
     });
-    delayGroup.append(delayLabel, delaySlider, delayValue);
-    toolbar.appendChild(delayGroup);
+    this.#showRate = showRate;
+    rateGroup.append(rateLabel, rateSlider, rateValue);
+    toolbar.appendChild(rateGroup);
 
     // Spacer + badge
     const spacer = document.createElement('div');
@@ -276,6 +286,7 @@ export class WitgraphControls extends HTMLElement {
     this.#controller?.removeEventListener('state-changed', this.#onStateChanged);
     this.#controller = ctrl;
     ctrl.addEventListener('state-changed', this.#onStateChanged);
+    this.#showRate?.(ctrl.tickRate);
     this.#render();
   }
 

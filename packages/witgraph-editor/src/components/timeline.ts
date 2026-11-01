@@ -16,6 +16,7 @@ function eventColor(event: string): string {
     case 'generation-stopped':
       return 'var(--wg-accent)';
     case 'restarted':
+    case 'warning':
       return 'var(--wg-warning)';
     case 'compile-ok':
       return 'var(--wg-success)';

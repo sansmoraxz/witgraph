@@ -1,10 +1,12 @@
 import type { EditorController } from '../controller/editor-controller.ts';
-import type { EdgeVisual, NodeVisual } from '../controller/types.ts';
+import type { EdgeVisual, NodePreview, NodeVisual } from '../controller/types.ts';
 import { makeDraggable } from '../util/drag.ts';
 import { edgePath, portPosition } from '../util/svg.ts';
+import { viewerFor } from '../viewers/registry.ts';
+import type { ViewerInstance } from '../viewers/types.ts';
 import { ContextMenu, type MenuItem } from './context-menu.ts';
 import { adoptStyles } from './shared-styles.ts';
-import { NODE_HEADER_HEIGHT, PORT_RADIUS } from './styles.ts';
+import { MIN_NODE_WIDTH, MIN_PREVIEW_HEIGHT, NODE_HEADER_HEIGHT, PORT_RADIUS } from './styles.ts';
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
 
@@ -63,7 +65,53 @@ const SVG_CSS = `
   /* Temp edge for connection drawing */
   .temp-edge { fill: none; stroke: var(--wg-primary); stroke-width: 2; stroke-dasharray: 6 4;
     pointer-events: none; opacity: 0.8; }
+
+  /* Preview region: a node's output, shown by its viewer. A filter would
+     re-rasterize the node on every frame, so a previewing node has none. */
+  .node-group.has-preview, .node-group.has-preview:hover, .node-group.has-preview.selected { filter: none; }
+  .node-preview-host { box-sizing: border-box; width: 100%; height: 100%; padding: 0 6px 6px;
+    overflow: hidden; }
+  .preview-image { display: block; width: 100%; height: 100%; object-fit: contain;
+    image-rendering: pixelated; background: var(--wg-bg); border: 1px solid var(--wg-surface-hover);
+    border-radius: 4px; box-sizing: border-box; }
+  .preview-text { box-sizing: border-box; width: 100%; height: 100%; margin: 0; padding: 4px;
+    overflow: hidden; white-space: pre-wrap; word-break: break-all; font: 10px ui-monospace, monospace;
+    color: var(--wg-text); background: var(--wg-bg); border: 1px solid var(--wg-surface-hover);
+    border-radius: 4px; }
+  .preview-text.pending { color: var(--wg-text-muted); font-style: italic; }
+  .preview-series { box-sizing: border-box; width: 100%; height: 100%; display: flex;
+    flex-direction: column; gap: 2px; padding: 4px; background: var(--wg-bg);
+    border: 1px solid var(--wg-surface-hover); border-radius: 4px; }
+  .preview-series svg { flex: 1; min-height: 0; width: 100%; overflow: visible; }
+  .series-line { fill: none; stroke: var(--wg-primary); stroke-width: 1.5;
+    vector-effect: non-scaling-stroke; stroke-linejoin: round; }
+  .series-area { fill: color-mix(in srgb, var(--wg-primary) 15%, transparent); stroke: none; }
+  .preview-series-label { font: 10px ui-monospace, monospace; color: var(--wg-text-dim);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+  /* Resize handle */
+  .node-resize { fill: var(--wg-text-muted); opacity: 0; cursor: nwse-resize; transition: opacity 0.15s; }
+  .node-group:hover .node-resize, .node-resize.active { opacity: 0.8; }
 `;
+
+/** What a node's group was drawn for: a change redraws it from scratch. */
+function layoutKey(node: NodeVisual): string {
+  const ports = (list: NodeVisual['inputs']) => list.map((p) => [p.name, p.kind]);
+  return JSON.stringify([
+    node.width,
+    node.height,
+    node.portsHeight,
+    ports(node.inputs),
+    ports(node.outputs),
+    node.preview?.port,
+    node.preview?.viewer,
+  ]);
+}
+
+/** Where a node's ports band ends: see {@link portPosition}. */
+function portsBottom(node: NodeVisual): number {
+  return NODE_HEADER_HEIGHT + node.portsHeight;
+}
 
 const PHASES = ['pending', 'running', 'idle', 'faulted', 'cancelled'] as const;
 
@@ -77,6 +125,10 @@ export class WitgraphCanvas extends HTMLElement {
   #nodeEls = new Map<string, SVGGElement>();
   #edgeEls = new Map<string, { visible: SVGPathElement; hit: SVGPathElement }>();
   #dragCleanups = new Map<string, () => void>();
+  /** Each previewing node's viewer, with the output it shows. */
+  #previews = new Map<string, { port: string; viewer: ViewerInstance }>();
+  /** The node being resized: left alone by redraws until the drag ends. */
+  #resizing: string | null = null;
 
   #panX = 0;
   #panY = 0;
@@ -88,9 +140,14 @@ export class WitgraphCanvas extends HTMLElement {
   #lastClickY = 0;
 
   #onStateChanged = () => this.#render();
+  #onOutputChanged = () => this.#updatePreviews();
 
   connectedCallback(): void {
-    if (this.shadowRoot) return;
+    // Moved in the page: listen again, and draw what was removed.
+    if (this.shadowRoot) {
+      this.#listen();
+      return;
+    }
     const shadow = this.attachShadow({ mode: 'open' });
     adoptStyles(shadow, SVG_CSS);
 
@@ -151,23 +208,33 @@ export class WitgraphCanvas extends HTMLElement {
     this.addEventListener('keydown', (e) => this.#onKeyDown(e));
     this.#svg.addEventListener('contextmenu', (e) => this.#onContextMenu(e));
 
-    if (this.#controller) {
-      this.#controller.addEventListener('state-changed', this.#onStateChanged);
-      this.#render();
-    }
+    this.#listen();
   }
 
   disconnectedCallback(): void {
-    this.#controller?.removeEventListener('state-changed', this.#onStateChanged);
-    for (const cleanup of this.#dragCleanups.values()) cleanup();
-    this.#dragCleanups.clear();
+    this.#unlisten();
+    // Out of the page, nothing is drawn: the nodes and their viewers go,
+    // and come back when it is connected again.
+    for (const id of [...this.#nodeEls.keys()]) this.#removeNodeGroup(id);
   }
 
   set controller(ctrl: EditorController) {
-    this.#controller?.removeEventListener('state-changed', this.#onStateChanged);
+    this.#unlisten();
     this.#controller = ctrl;
-    ctrl.addEventListener('state-changed', this.#onStateChanged);
-    if (this.shadowRoot) this.#render();
+    if (this.isConnected && this.shadowRoot) this.#listen();
+  }
+
+  /** Follows the controller's changes, and draws its graph as it is now. */
+  #listen(): void {
+    if (!this.#controller) return;
+    this.#controller.addEventListener('state-changed', this.#onStateChanged);
+    this.#controller.addEventListener('output-changed', this.#onOutputChanged);
+    this.#render();
+  }
+
+  #unlisten(): void {
+    this.#controller?.removeEventListener('state-changed', this.#onStateChanged);
+    this.#controller?.removeEventListener('output-changed', this.#onOutputChanged);
   }
 
   get controller(): EditorController | null {
@@ -244,19 +311,21 @@ export class WitgraphCanvas extends HTMLElement {
     const selectedNodeId = this.#controller.selectedNode;
     const selectedEdgeId = this.#controller.selectedEdge;
 
-    // Diff nodes
-    const liveIds = new Set(nodes.keys());
-    for (const [id, el] of this.#nodeEls) {
-      if (!liveIds.has(id)) {
-        el.remove();
-        this.#nodeEls.delete(id);
-        this.#dragCleanups.get(id)?.();
-        this.#dragCleanups.delete(id);
-      }
+    // Diff nodes: a node whose size, ports or preview changed is drawn again.
+    for (const id of [...this.#nodeEls.keys()]) {
+      if (!nodes.has(id)) this.#removeNodeGroup(id);
     }
     for (const [id, node] of nodes) {
       let g = this.#nodeEls.get(id);
-      if (!g) {
+      if (g && id !== this.#resizing && g.dataset.layout !== layoutKey(node)) {
+        // In the same place among its siblings, so it keeps its stacking.
+        const after = g.nextSibling;
+        this.#removeNodeGroup(id);
+        g = this.#createNodeGroup(node);
+        this.#nodesGroup.insertBefore(g, after);
+        this.#nodeEls.set(id, g);
+        this.#attachNodeDrag(id, g);
+      } else if (!g) {
         g = this.#createNodeGroup(node);
         this.#nodesGroup.appendChild(g);
         this.#nodeEls.set(id, g);
@@ -266,6 +335,7 @@ export class WitgraphCanvas extends HTMLElement {
       }
       g.classList.toggle('selected', id === selectedNodeId);
     }
+    this.#updatePreviews();
 
     // Diff edges
     const edgeIds = new Set(edges.map((e) => e.id));
@@ -307,11 +377,32 @@ export class WitgraphCanvas extends HTMLElement {
     }
   }
 
+  /** Removes a node's group, its drag handlers and its viewer. */
+  #removeNodeGroup(id: string): void {
+    this.#nodeEls.get(id)?.remove();
+    this.#nodeEls.delete(id);
+    for (const key of [id, `${id}:resize`]) {
+      this.#dragCleanups.get(key)?.();
+      this.#dragCleanups.delete(key);
+    }
+    this.#previews.get(id)?.viewer.dispose();
+    this.#previews.delete(id);
+  }
+
+  /** Shows each previewing node's output as it is now. */
+  #updatePreviews(): void {
+    if (!this.#controller) return;
+    for (const [id, { port, viewer }] of this.#previews) {
+      viewer.update(this.#controller.observe(id, port));
+    }
+  }
+
   #createNodeGroup(node: NodeVisual): SVGGElement {
     const g = document.createElementNS(SVG_NS, 'g');
     g.classList.add('node-group');
     g.setAttribute('data-node-id', node.id);
     g.setAttribute('transform', `translate(${node.x},${node.y})`);
+    g.dataset.layout = layoutKey(node);
 
     const body = document.createElementNS(SVG_NS, 'rect');
     body.classList.add('node-body');
@@ -335,6 +426,8 @@ export class WitgraphCanvas extends HTMLElement {
     this.#appendPorts(g, node, 'input');
     this.#appendPorts(g, node, 'output');
     if (node.breakpoint) g.appendChild(this.#makeBreakpoint(node.width));
+    if (node.preview) this.#appendPreview(g, node, node.preview);
+    this.#appendResizeHandle(g, node);
 
     g.addEventListener('click', (e) => {
       e.stopPropagation();
@@ -347,13 +440,85 @@ export class WitgraphCanvas extends HTMLElement {
     return g;
   }
 
+  /** The node's preview region, below its ports band, with its viewer mounted. */
+  #appendPreview(g: SVGGElement, node: NodeVisual, preview: NodePreview): void {
+    const fo = document.createElementNS(SVG_NS, 'foreignObject');
+    fo.classList.add('node-preview');
+    fo.setAttribute('x', '0');
+    fo.setAttribute('y', String(portsBottom(node)));
+    fo.setAttribute('width', String(node.width));
+    fo.setAttribute('height', String(preview.height));
+    fo.setAttribute('data-preview-port', preview.port);
+    const host = document.createElement('div');
+    host.className = 'node-preview-host';
+    fo.appendChild(host);
+    g.appendChild(fo);
+    g.classList.add('has-preview');
+    const port = node.outputs.find((p) => p.name === preview.port);
+    if (!port) return;
+    const viewer = viewerFor(preview.viewer).mount(host, port);
+    this.#previews.get(node.id)?.viewer.dispose();
+    this.#previews.set(node.id, { port: preview.port, viewer });
+  }
+
+  /** A grip at the node's bottom-right corner: drag it to resize the node. */
+  #appendResizeHandle(g: SVGGElement, node: NodeVisual): void {
+    const size = 10;
+    const handle = document.createElementNS(SVG_NS, 'path');
+    handle.classList.add('node-resize');
+    const place = (width: number, height: number) =>
+      handle.setAttribute(
+        'd',
+        `M ${width},${height - size} L ${width},${height} L ${width - size},${height} Z`,
+      );
+    place(node.width, node.height);
+    g.appendChild(handle);
+
+    let width = node.width;
+    let height = node.height;
+    let moved = false;
+    // Only a node with a preview grows taller than its ports need.
+    const minHeight = portsBottom(node) + (node.preview ? MIN_PREVIEW_HEIGHT : 0);
+    const cleanup = makeDraggable(handle, {
+      onStart: () => {
+        this.#resizing = node.id;
+        handle.classList.add('active');
+      },
+      onMove: (dx, dy) => {
+        moved = true;
+        width = Math.max(MIN_NODE_WIDTH, node.width + dx / this.#scale);
+        height = node.preview ? Math.max(minHeight, node.height + dy / this.#scale) : node.height;
+        // Only the outline follows the pointer; the node is drawn again at
+        // its new size when the drag ends.
+        g.querySelector('.node-body')?.setAttribute('width', String(width));
+        g.querySelector('.node-body')?.setAttribute('height', String(height));
+        g.querySelector('.node-header')?.setAttribute('width', String(width));
+        const fo = g.querySelector('.node-preview');
+        fo?.setAttribute('width', String(width));
+        fo?.setAttribute('height', String(height - portsBottom(node)));
+        place(width, height);
+      },
+      onEnd: () => {
+        this.#resizing = null;
+        handle.classList.remove('active');
+        // A click on the grip is no resize.
+        if (moved) this.#controller?.resizeNode(node.id, width, height);
+        // Unchanged, the node is not drawn again: put the handle back.
+        place(width, height);
+      },
+    });
+    this.#dragCleanups.get(`${node.id}:resize`)?.();
+    this.#dragCleanups.set(`${node.id}:resize`, cleanup);
+  }
+
   #appendPorts(g: SVGGElement, node: NodeVisual, side: 'input' | 'output'): void {
     const ports = side === 'input' ? node.inputs : node.outputs;
     for (let i = 0; i < ports.length; i++) {
       const port = ports[i];
       const localX = side === 'input' ? 0 : node.width;
       const localY =
-        NODE_HEADER_HEIGHT + ((node.height - NODE_HEADER_HEIGHT) * (i + 1)) / (ports.length + 1);
+        NODE_HEADER_HEIGHT +
+        ((portsBottom(node) - NODE_HEADER_HEIGHT) * (i + 1)) / (ports.length + 1);
 
       const circle = document.createElementNS(SVG_NS, 'circle');
       circle.classList.add('port', `port-${port.kind}`);
@@ -408,18 +573,6 @@ export class WitgraphCanvas extends HTMLElement {
     }
     const label = g.querySelector('.node-label');
     if (label) label.textContent = node.label;
-    const body = g.querySelector('.node-body');
-    if (body) body.setAttribute('height', String(node.height));
-
-    // Rebuild ports if the count changed
-    const existingPorts = g.querySelectorAll('.port');
-    const expectedPorts = node.inputs.length + node.outputs.length;
-    if (existingPorts.length !== expectedPorts) {
-      for (const el of g.querySelectorAll('.port')) el.remove();
-      for (const el of g.querySelectorAll('.port-label')) el.remove();
-      this.#appendPorts(g, node, 'input');
-      this.#appendPorts(g, node, 'output');
-    }
 
     const bp = g.querySelector('.breakpoint');
     if (node.breakpoint && !bp) g.appendChild(this.#makeBreakpoint(node.width));
@@ -445,12 +598,20 @@ export class WitgraphCanvas extends HTMLElement {
       src.x,
       src.y,
       src.width,
-      src.height,
+      portsBottom(src),
       fi,
       src.outputs.length,
       'output',
     );
-    const to = portPosition(tgt.x, tgt.y, tgt.width, tgt.height, ti, tgt.inputs.length, 'input');
+    const to = portPosition(
+      tgt.x,
+      tgt.y,
+      tgt.width,
+      portsBottom(tgt),
+      ti,
+      tgt.inputs.length,
+      'input',
+    );
     return edgePath(from.x, from.y, to.x, to.y);
   }
 
@@ -484,7 +645,7 @@ export class WitgraphCanvas extends HTMLElement {
           }
         },
       },
-      '.port',
+      '.port, .node-resize',
     );
     this.#dragCleanups.set(nodeId, cleanup);
   }

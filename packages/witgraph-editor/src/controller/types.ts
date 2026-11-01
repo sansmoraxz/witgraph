@@ -21,6 +21,18 @@ export interface PortVisual {
   typeDisplay: string;
   optional: boolean;
   docs?: string;
+  /** Output ports only: the viewer the component declares for previewing it. */
+  viewer?: string;
+}
+
+/** The preview region of a node: one output, shown with one viewer. */
+export interface NodePreview {
+  /** The output previewed. */
+  port: string;
+  /** The viewer showing it (see `registerViewer`). */
+  viewer: string;
+  /** The region's height, below the ports band. */
+  height: number;
 }
 
 /** A node on the canvas, combining layout, contract, and runtime state. */
@@ -29,7 +41,12 @@ export interface NodeVisual {
   x: number;
   y: number;
   width: number;
+  /** The whole node's: header, ports band and preview region. */
   height: number;
+  /** The ports band's, below the header. */
+  portsHeight: number;
+  /** The node's preview region, when it has one. */
+  preview?: NodePreview;
   label: string;
   phase: NodePhase;
   fault?: { kind: string; message: string };
@@ -89,6 +106,32 @@ export interface NodeState {
 /** Discriminator for events the controller dispatches. */
 export interface EditorEvent {
   type: 'state-changed' | 'trace-event' | 'fault' | 'output-changed';
+}
+
+/**
+ * What an output has carried, as a preview shows it. Values are as jco
+ * represents them (records as objects, `list<u8>` as `Uint8Array`, 64-bit
+ * integers as `BigInt`s).
+ */
+export interface OutputView {
+  kind: PortVisual['kind'];
+  /**
+   * A Value output's current value, the last item of a stream, or what a
+   * future resolved to; `undefined` before there is one.
+   */
+  latest: unknown;
+  /**
+   * The values before it, oldest first and `latest` last: one per tick for
+   * a Value output, one per item for a stream. A bounded window.
+   */
+  recent: readonly unknown[];
+  /**
+   * Ticks a Value output had a value at, items a stream carried, futures
+   * that resolved: counted since the graph was loaded.
+   */
+  count: number;
+  /** A future only: its node ran again, and the new one has not resolved yet. */
+  pending: boolean;
 }
 
 /** A recorded output value at a given tick. */
