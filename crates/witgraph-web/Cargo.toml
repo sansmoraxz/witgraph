@@ -7,6 +7,10 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+# Its output ships inside the npm loader package, not on crates.io.
+publish = false
 
 [lints]
 workspace = true
@@ -17,7 +21,7 @@ crate-type = ["cdylib", "rlib"]
 # Everything here is for `wasm32`: on other targets the crate is empty.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 witgraph-ir = { workspace = true }
-witgraph-wit = { path = "../witgraph-wit" }
+witgraph-wit = { workspace = true }
 witgraph-sched = { workspace = true }
 futures = "0.3"
 serde = { workspace = true }

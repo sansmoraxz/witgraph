@@ -62,7 +62,7 @@ Call `session.dispose()` when you're done with a session.
 
 ## Building
 
-`npm run build:wasm` builds the scheduler into the package (it needs
-`wasm-bindgen-cli` and the `wasm32-unknown-unknown` target), `npm test` runs
-the tests after `cargo build -p test-components`, and `npm run typecheck`
+`pnpm build:wasm` builds the scheduler into the package (it needs
+`wasm-bindgen-cli` and the `wasm32-unknown-unknown` target), `pnpm test` runs
+the tests after `cargo build -p test-components`, and `pnpm typecheck`
 checks the source. The package is private and isn't published.

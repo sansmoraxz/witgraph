@@ -1,13 +1,30 @@
 {
   "name": "witgraph-loader",
   "version": "0.1.0",
-  "private": true,
   "description": "Runs witgraph graphs in a browser or Node: jco-transpiled nodes under the witgraph scheduler, with hooks for debugging and simulation",
   "license": "BSD-3-Clause",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sansmoraxz/witgraph.git",
+    "directory": "packages/witgraph-loader"
+  },
+  "homepage": "https://github.com/sansmoraxz/witgraph/blob/main/docs/javascript.md",
+  "bugs": "https://github.com/sansmoraxz/witgraph/issues",
+  "keywords": [
+    "witgraph",
+    "webassembly",
+    "wasm",
+    "component-model",
+    "jco",
+    "dataflow"
+  ],
   "type": "module",
   "exports": "./src/index.ts",
   "scripts": {
     "build:wasm": "cargo build --release -p witgraph-web --target wasm32-unknown-unknown --target-dir ../../target && wasm-bindgen --target web --out-dir pkg ../../target/wasm32-unknown-unknown/release/witgraph_web.wasm",
+    "build:ts": "tsc -p tsconfig.build.json",
+    "build": "pnpm build:wasm && pnpm build:ts",
+    "prepack": "pnpm build",
     "test": "node --test test/",
     "typecheck": "tsc -p ."
   },
@@ -16,5 +33,22 @@
   },
   "devDependencies": {
     "typescript": "^7.0.2"
+  },
+  "files": [
+    "dist",
+    "pkg/witgraph_web.js",
+    "pkg/witgraph_web.d.ts",
+    "pkg/witgraph_web_bg.wasm",
+    "pkg/witgraph_web_bg.wasm.d.ts"
+  ],
+  "publishConfig": {
+    "exports": {
+      ".": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "./wasm": "./pkg/witgraph_web_bg.wasm",
+      "./package.json": "./package.json"
+    }
   }
 }

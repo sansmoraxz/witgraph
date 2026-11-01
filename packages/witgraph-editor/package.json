@@ -1,12 +1,28 @@
 {
   "name": "witgraph-editor",
   "version": "0.1.0",
-  "private": true,
   "description": "Framework-agnostic Web Components for interactive WIT graph editing, execution, and debugging",
   "license": "BSD-3-Clause",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sansmoraxz/witgraph.git",
+    "directory": "packages/witgraph-editor"
+  },
+  "homepage": "https://github.com/sansmoraxz/witgraph/blob/main/docs/editor.md",
+  "bugs": "https://github.com/sansmoraxz/witgraph/issues",
+  "keywords": [
+    "witgraph",
+    "web-components",
+    "graph-editor",
+    "webassembly",
+    "wit",
+    "dataflow"
+  ],
   "type": "module",
   "exports": "./src/index.ts",
   "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "prepack": "pnpm build",
     "test": "node --test test/",
     "typecheck": "tsc -p ."
   },
@@ -18,5 +34,20 @@
   },
   "devDependencies": {
     "typescript": "^7.0.2"
+  },
+  "files": [
+    "dist",
+    "src/styles.css"
+  ],
+  "sideEffects": false,
+  "publishConfig": {
+    "exports": {
+      ".": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "./tailwind.css": "./src/styles.css",
+      "./package.json": "./package.json"
+    }
   }
 }

@@ -102,7 +102,7 @@ properties with no fallback, so define them on the page or a parent element:
 ## Running the demo
 
 1. `cargo build -p test-components`
-2. In `packages/witgraph-loader`: `npm run build:wasm`
+2. In `packages/witgraph-loader`: `pnpm build:wasm`
 3. In `packages/witgraph-editor-demo`: run the `setup` script (it copies the
    test components in), then `dev` to start the app.
 

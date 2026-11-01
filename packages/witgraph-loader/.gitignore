@@ -1,6 +1,7 @@
 node_modules
-# `npm run build:wasm`: the witgraph-web crate, bound with wasm-bindgen.
+# `pnpm build:wasm`: the witgraph-web crate, bound with wasm-bindgen.
 pkg
 
 # Local manual browser tests.
 .chrome-*
+dist
