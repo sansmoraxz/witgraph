@@ -41,9 +41,9 @@ serde = { version = "1.0", default-features = false, features = ["derive", "allo
 serde_json = "1.0"
 sha2 = "0.11"
 # wasmtime and the wasm-tools crates move together: wasmtime 50 is built on
-# wasm-tools 0.261, and guests use the matching wit-bindgen 0.61. Bump every
-# wasm-tools crate below together with wasmtime. wac-graph is the exception: it
-# works on component bytes and carries its own wasm-tools, so it can lag.
+# wasm-tools 0.261. Bump every wasm-tools crate below together with wasmtime.
+# wac-graph is the exception: it works on component bytes and carries its own
+# wasm-tools, so it can lag.
 wasmtime = { version = "50.0.1", default-features = false }
 wit-parser = "0.261"
 wit-component = "0.261"

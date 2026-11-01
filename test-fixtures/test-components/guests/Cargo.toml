@@ -1,0 +1,16 @@
+# Every guest component, as one workspace so the toolchain version is chosen
+# here once. It is deliberately not part of the root workspace: the guests
+# build for wasm32 (see ../build.rs), not for the host.
+[workspace]
+resolver = "3"
+members = ["*"]
+exclude = [".cargo", "target"]
+
+[workspace.dependencies]
+# The guests only need a wit-bindgen whose output the host's wit-component
+# (root Cargo.toml) can encode and wasmtime can run; its own wasm-tools version
+# need not match theirs. Bump it, then run the runtime tests.
+wit-bindgen = { version = "=0.63.0", features = ["async-spawn"] }
+
+[profile.release]
+opt-level = "s"

@@ -34,6 +34,11 @@ fn main() {
     // (wit-bindgen and its dependencies) is built once.
     let target_dir = guest_dir.join("target");
 
+    // The guests share one workspace manifest and lockfile (the toolchain
+    // versions live there), so changing either rebuilds all of them.
+    println!("cargo::rerun-if-changed=guests/Cargo.toml");
+    println!("cargo::rerun-if-changed=guests/Cargo.lock");
+
     for name in GUESTS {
         let crate_dir = guest_dir.join(name);
 
