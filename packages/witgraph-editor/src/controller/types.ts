@@ -1,4 +1,4 @@
-import type { ComponentSource, Capability, Contract, PortValues, Wasm } from 'witgraph-loader';
+import type { Capability, ComponentSource, PortValues, Wasm } from 'witgraph-loader';
 
 // ---------------------------------------------------------------------------
 // Editor state
@@ -35,7 +35,6 @@ export interface NodeVisual {
   fault?: { kind: string; message: string };
   culprit?: string;
   breakpoint: boolean;
-  expanded: boolean;
   inputs: PortVisual[];
   outputs: PortVisual[];
 }

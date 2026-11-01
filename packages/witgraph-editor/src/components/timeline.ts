@@ -1,6 +1,6 @@
-import { adoptStyles } from './shared-styles.ts';
 import type { EditorController } from '../controller/editor-controller.ts';
 import type { TraceEntry } from '../controller/types.ts';
+import { adoptStyles } from './shared-styles.ts';
 
 function eventColor(event: string): string {
   switch (event) {
@@ -78,7 +78,9 @@ export class WitgraphTimeline extends HTMLElement {
     this.#appendNew();
   }
 
-  get controller(): EditorController | null { return this.#controller; }
+  get controller(): EditorController | null {
+    return this.#controller;
+  }
 
   #detach(): void {
     this.#controller?.removeEventListener('trace-event', this.#onTraceEvent);
@@ -99,7 +101,10 @@ export class WitgraphTimeline extends HTMLElement {
 
   #createEventEl(entry: TraceEntry): HTMLDivElement {
     const el = document.createElement('div');
-    el.className = entry.event === 'error' ? 'event event-error font-mono text-xs leading-snug' : 'event font-mono text-xs leading-snug';
+    el.className =
+      entry.event === 'error'
+        ? 'event event-error font-mono text-xs leading-snug'
+        : 'event font-mono text-xs leading-snug';
     el.style.borderLeftColor = eventColor(entry.event);
 
     const time = document.createElement('span');
@@ -138,4 +143,5 @@ export class WitgraphTimeline extends HTMLElement {
   }
 }
 
-if (!customElements.get('witgraph-timeline')) customElements.define('witgraph-timeline', WitgraphTimeline);
+if (!customElements.get('witgraph-timeline'))
+  customElements.define('witgraph-timeline', WitgraphTimeline);

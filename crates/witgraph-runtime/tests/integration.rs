@@ -754,7 +754,11 @@ async fn capability_import_feeds_a_stream() {
     let compiled = graph.compile(&kit.contracts).expect("compiles");
     assert_eq!(compiled.required_capabilities().len(), 1);
     let feed = Arc::new(Mutex::new(VecDeque::from([
-        vec![3u8, 4], vec![5], vec![6, 7, 8], vec![9], vec![10],
+        vec![3u8, 4],
+        vec![5],
+        vec![6, 7, 8],
+        vec![9],
+        vec![10],
     ])));
     let mut rt = RuntimeGraph::load_with_host(
         compiled,
@@ -1217,7 +1221,9 @@ async fn wide_graph_full_flow() {
     let compiled = graph.compile(&kit.contracts).expect("compiles");
     // cfg, echo_a, echo_b, {prod, cons}, plus, sink_a, sink_b, {mqtt, count}
     assert_eq!(compiled.islands().len(), 8);
-    let feed = Arc::new(Mutex::new((0..4u32).map(|i| vec![i as u8]).collect::<VecDeque<_>>()));
+    let feed = Arc::new(Mutex::new(
+        (0..4u32).map(|i| vec![i as u8]).collect::<VecDeque<_>>(),
+    ));
     let mut rt = RuntimeGraph::load_with_host(
         compiled,
         &kit.wasm,
@@ -1241,7 +1247,11 @@ async fn wide_graph_full_flow() {
     assert_eq!(read_u32(&rt, "cons", "total"), 28, "sum(0..8)");
     assert_eq!(read_u32(&rt, "sink_a", "out"), 29);
     assert_eq!(read_u32(&rt, "sink_b", "out"), 29);
-    assert_eq!(read_u32(&rt, "count", "count"), 4, "4 byte messages from mqtt feed");
+    assert_eq!(
+        read_u32(&rt, "count", "count"),
+        4,
+        "4 byte messages from mqtt feed"
+    );
     let trace = rt.mode().trace();
     assert!(faults(&trace).is_empty(), "{:?}", faults(&trace));
     assert_eq!(
@@ -2055,7 +2065,9 @@ async fn rerun_restarts_an_island_the_host_cannot_feed() {
     assert_eq!(read_u32(&rt, "cons", "total-bytes"), 2);
     rt.cancel(&id("mqtt")).unwrap();
 
-    feed.lock().unwrap().extend([vec![10u8, 20], vec![30u8, 40]]);
+    feed.lock()
+        .unwrap()
+        .extend([vec![10u8, 20], vec![30u8, 40]]);
     assert!(
         matches!(rt.tick().await, TickResult::Idle),
         "nothing is owed"

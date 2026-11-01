@@ -1,11 +1,6 @@
 import { NODE_HEADER_HEIGHT } from '../components/styles.ts';
 
-export function edgePath(
-  x1: number,
-  y1: number,
-  x2: number,
-  y2: number,
-): string {
+export function edgePath(x1: number, y1: number, x2: number, y2: number): string {
   const dx = Math.abs(x2 - x1) * 0.4;
   const cp1x = x1 + dx;
   const cp1y = y1;

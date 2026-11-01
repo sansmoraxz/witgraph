@@ -1,0 +1,162 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: Lint (Biome)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 26
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm check
+
+  rust:
+    name: Rust
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v7
+      # Installs the toolchain, components and wasm32 target from rust-toolchain.toml.
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust
+          workspaces: |
+            .
+            test-fixtures/test-components/guests
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      # Every wasmtime feature that witgraph-runtime passes through.
+      - run: cargo test -p witgraph-runtime --all-features
+      - run: cargo doc --workspace --no-deps
+
+  # Builds the guest components and the witgraph-web bindings once. The
+  # JavaScript jobs download the result instead of rebuilding it.
+  wasm:
+    name: Build wasm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust
+          workspaces: |
+            .
+            test-fixtures/test-components/guests
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 26
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+
+      # The wasm-bindgen CLI must match the library version that witgraph-web
+      # pins, so read it from there instead of repeating it here.
+      - name: Read the pinned wasm-bindgen version
+        id: wbg
+        run: echo "version=$(grep -oP 'wasm-bindgen = "=\K[0-9.]+' crates/witgraph-web/Cargo.toml)" >> "$GITHUB_OUTPUT"
+      - name: Cache the wasm-bindgen CLI
+        id: wbg-cache
+        uses: actions/cache@v6
+        with:
+          path: ~/.cargo/bin/wasm-bindgen
+          key: wasm-bindgen-cli-${{ steps.wbg.outputs.version }}
+      - name: Install the wasm-bindgen CLI
+        if: steps.wbg-cache.outputs.cache-hit != 'true'
+        run: cargo install wasm-bindgen-cli --version "${{ steps.wbg.outputs.version }}" --locked
+
+      - run: cargo build -p test-components
+      - run: pnpm --filter witgraph-loader build:wasm
+
+      - name: Collect the outputs
+        run: |
+          out=$(dirname "$(ls -t target/debug/build/test-components-*/out/echo.wasm | head -1)")
+          mkdir -p wasm-artifacts/guests
+          cp "$out"/*.wasm wasm-artifacts/guests/
+          cp -r packages/witgraph-loader/pkg wasm-artifacts/pkg
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wasm
+          path: wasm-artifacts
+          if-no-files-found: error
+          retention-days: 7
+
+  js:
+    name: JavaScript packages
+    needs: wasm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # The tests ask `cargo metadata` where the guests are, which needs the
+      # pinned toolchain but compiles nothing.
+      - run: rustup toolchain install --profile minimal
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 26
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - uses: actions/download-artifact@v8
+        with:
+          name: wasm
+          path: wasm-artifacts
+      - name: Put the wasm where the tests look for it
+        run: |
+          mkdir -p target/debug/build/test-components-ci/out
+          cp wasm-artifacts/guests/*.wasm target/debug/build/test-components-ci/out/
+          cp -r wasm-artifacts/pkg packages/witgraph-loader/pkg
+      - run: pnpm --filter witgraph-loader --filter witgraph-editor typecheck
+      - run: pnpm --filter witgraph-loader --filter witgraph-editor test
+
+  demo:
+    name: Demo
+    needs: wasm
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/witgraph-editor-demo
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup toolchain install --profile minimal
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 26
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+        working-directory: .
+      - uses: actions/download-artifact@v8
+        with:
+          name: wasm
+          path: wasm-artifacts
+      - name: Put the wasm where the demo looks for it
+        run: |
+          mkdir -p ../../target/debug/build/test-components-ci/out
+          cp ../../wasm-artifacts/guests/*.wasm ../../target/debug/build/test-components-ci/out/
+          cp -r ../../wasm-artifacts/pkg ../witgraph-loader/pkg
+      - run: pnpm run setup
+      - run: pnpm exec vite build
+      - run: pnpm exec playwright install --with-deps chromium
+      - run: pnpm test

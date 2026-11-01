@@ -52,7 +52,11 @@ let graph = Graph::builder("g")
 
 The provider is an ordinary component. When the graph is loaded it is composed
 into the node, so the node calls it directly. Each node gets its own provider
-instance. Links aren't supported in the browser yet.
+instance. This works the same in a browser or Node.js: the loader gets the
+composed component and runs that. The `compose` feature of `witgraph-wit` does
+the composition, and `witgraph-runtime` and `witgraph-web` turn it on.
+Providers are listed in `components` like any other component, and are not
+nodes.
 
 ## Editor catalog
 

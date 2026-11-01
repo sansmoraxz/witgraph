@@ -13,9 +13,9 @@ use witgraph_ir::{
     PackageRef, PortDef, PortKind, PortRef,
 };
 use witgraph_sched::{RunShape, Scheduler};
+use witgraph_wit::compose::{LinkedProvider, imported_as, link_node};
 use witgraph_wit::lower::Lowered;
 
-use super::compose::{self, LinkedProvider};
 use super::{RuntimeConfig, RuntimeGraph};
 use crate::engine::{
     self, BuildError, CapabilityGap, Host, NoCapabilities, NodeBinary, RunSignature, Wasmtime,
@@ -71,14 +71,10 @@ struct Checked<'a> {
 
 impl<'a> Checked<'a> {
     /// Composes `links` into `bytes`, which implement `contract` as
-    /// `lowered` (from [`verify`]) says.
-    ///
-    /// A link whose import the bytes do not have (their code never uses
-    /// it) has nothing to satisfy and is left out; one the bytes import at
-    /// a newer semver-compatible version (wit-component merges such
-    /// imports) satisfies that import. `decodable` holds the providers
-    /// (by the address and length of their bytes) already checked in this
-    /// load.
+    /// `lowered` (from [`verify`]) says: see [`witgraph_wit::compose::link_node`],
+    /// which decides which links apply and what the result imports.
+    /// `decodable` holds the providers (by the address and length of their
+    /// bytes) already checked in this load.
     fn new(
         contract: &'a ComponentContract,
         bytes: &'a [u8],
@@ -86,11 +82,6 @@ impl<'a> Checked<'a> {
         links: &[LinkedProvider<'_>],
         decodable: &mut HashSet<(usize, usize)>,
     ) -> Result<Self, LoadError> {
-        let bad_link = |import: &str, message: String| LoadError::BadLink {
-            component: Box::new(contract.id.clone()),
-            import: import.to_string(),
-            message,
-        };
         let mut keys: Vec<LinkKey> = links
             .iter()
             .map(|l| {
@@ -102,79 +93,22 @@ impl<'a> Checked<'a> {
             })
             .collect();
         keys.sort();
-        // Each link with the name the bytes import it under.
-        let mut used: Vec<(&LinkedProvider<'_>, &str)> = Vec::with_capacity(links.len());
-        for link in links {
-            let Some(argument) = imported_as(lowered, link.import) else {
-                continue;
-            };
-            // Two contract imports wit-component merged into one take one
-            // link, as compiling a graph requires (`ImportLinkedTwice`).
-            if let Some((other, _)) = used.iter().find(|(_, name)| *name == argument) {
-                return Err(bad_link(
-                    link.import,
-                    format!(
-                        "the bytes import it and `{}` as one, `{argument}`, which another link \
-                         already satisfies",
-                        other.import
-                    ),
-                ));
+        let linked = link_node(contract, bytes, lowered, links, decodable).map_err(|e| {
+            LoadError::BadLink {
+                component: Box::new(contract.id.clone()),
+                import: e.import,
+                message: e.message,
             }
-            // The provider's bytes are as untrusted as the node's, and the
-            // composer decodes them: rule out what its decoder panics on.
-            let key = (link.bytes.as_ptr() as usize, link.bytes.len());
-            if decodable.insert(key) {
-                witgraph_wit::verify::check_decodable(link.bytes).map_err(|e| {
-                    decodable.remove(&key);
-                    bad_link(link.import, format!("provider `{}`: {e}", link.provider))
-                })?;
-            }
-            used.push((link, argument));
-        }
-        if used.is_empty() {
-            return Ok(Self {
-                parts: Parts {
-                    contract: contract.clone(),
-                    export: lowered.export.clone(),
-                    links: keys,
-                    capabilities: as_declared(contract, lowered, &lowered.contract.capabilities),
-                    components: 1,
-                },
-                bytes: Cow::Borrowed(bytes),
-            });
-        }
-        let export = lowered.export.clone();
-        // What the check above does not rule out is still contained here
-        // (where panics unwind).
-        let composed = std::panic::catch_unwind(|| compose::compose(bytes, &export, &used))
-            .map_err(|_| {
-                let import = used.first().map_or("", |(link, _)| link.import);
-                bad_link(import, "the composition could not decode a provider".into())
-            })?
-            .map_err(|(import, message)| bad_link(&import, message))?;
-        // The composed component's own view of its world: its ports are the
-        // node's, its imports what is left for the host. Lowering validates
-        // the bytes first. The node's own bytes lowered, so what fails now,
-        // a decoder panic included, came with the providers (what they
-        // import).
-        let with_providers = |message: String| {
-            let import = used.first().map_or("", |(link, _)| link.import);
-            bad_link(import, format!("with its providers composed in: {message}"))
-        };
-        let composed_view = std::panic::catch_unwind(|| {
-            witgraph_wit::lower_component(&composed.bytes, &contract.id)
-        })
-        .map_err(|_| with_providers("the composed component's WIT could not be decoded".into()))?
-        .map_err(|e| with_providers(e.to_string()))?;
+        })?;
         Ok(Self {
             parts: Parts {
                 contract: contract.clone(),
-                export,
+                export: linked.export,
                 links: keys,
-                capabilities: as_declared(contract, lowered, &composed_view.contract.capabilities),
-                components: 1 + composed.providers,
+                capabilities: linked.capabilities,
+                components: linked.components,
             },
-            bytes: Cow::Owned(composed.bytes),
+            bytes: linked.bytes,
         })
     }
 
@@ -246,53 +180,6 @@ impl PreparedComponent {
     pub fn engine(&self) -> &Engine {
         self.component.engine()
     }
-}
-
-/// The name component bytes (as `lowered` from them) import a contract's
-/// `import` under: itself, or the newer semver-compatible version
-/// wit-component merged it into. `None` when the bytes never import it.
-fn imported_as<'l>(lowered: &'l Lowered, import: &str) -> Option<&'l str> {
-    witgraph_ir::interface::resolve_import(&lowered.contract.capabilities, import)
-        .filter(|c| c.is_interface())
-        .map(|c| c.interface.as_str())
-}
-
-/// What the host is asked for and links: each capability in `imported`,
-/// named as `contract` declares it when the node's own bytes (`lowered`)
-/// import it under a newer semver-compatible version (wit-component
-/// merges a dependency's newer pin into one import). Verification proved
-/// every item the bytes use is in the declared version, so whatever serves
-/// it serves them, and the linker resolves the newer import to it. What
-/// only a composed provider imports is asked for as the provider imports
-/// it.
-fn as_declared(
-    contract: &ComponentContract,
-    lowered: &Lowered,
-    imported: &[Capability],
-) -> Vec<Capability> {
-    let own = |name: &str| {
-        lowered
-            .contract
-            .capabilities
-            .iter()
-            .any(|c| c.interface == name)
-    };
-    imported
-        .iter()
-        .map(|capability| {
-            own(&capability.interface)
-                .then(|| {
-                    witgraph_ir::interface::resolve_import(
-                        &contract.capabilities,
-                        &capability.interface,
-                    )
-                })
-                .flatten()
-                .filter(|declared| declared.is_interface() == capability.is_interface())
-                .unwrap_or(capability)
-                .clone()
-        })
-        .collect()
 }
 
 /// Whether `ours`, a prepared component's links, are `theirs`, a node's: the

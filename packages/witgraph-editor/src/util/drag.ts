@@ -34,7 +34,9 @@ export function makeDraggable(
     if (!dragging) return;
     dragging = false;
     const e = ev as PointerEvent;
-    try { element.releasePointerCapture(e.pointerId); } catch {}
+    try {
+      element.releasePointerCapture(e.pointerId);
+    } catch {}
     callbacks.onEnd?.(e);
   };
 

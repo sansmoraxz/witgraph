@@ -1,16 +1,36 @@
-import { adoptStyles } from './shared-styles.ts';
+import {
+  Camera,
+  Circle,
+  createElement,
+  Download,
+  FastForward,
+  History,
+  LayoutGrid,
+  Package,
+  Play,
+  Redo2,
+  RotateCcw,
+  Square,
+  StepForward,
+  Undo2,
+  Upload,
+} from 'lucide';
 import type { EditorController } from '../controller/editor-controller.ts';
 import type { EditorMode } from '../controller/types.ts';
-import { createElement } from 'lucide';
-import { Play, StepForward, Square, RotateCcw, Circle, FastForward, LayoutGrid, Undo2, Redo2, Upload, Download, Package, Camera, History } from 'lucide';
+import { adoptStyles } from './shared-styles.ts';
 
 const MODE_LABELS: Record<EditorMode, string> = {
-  idle: 'Idle', running: 'Running…', paused: 'Paused', error: 'Error',
+  idle: 'Idle',
+  running: 'Running…',
+  paused: 'Paused',
+  error: 'Error',
 };
 
 const MODE_BG: Record<EditorMode, string> = {
-  idle: 'bg-wg-phase-idle', running: 'bg-wg-phase-running',
-  paused: 'bg-wg-phase-pending', error: 'bg-wg-phase-faulted',
+  idle: 'bg-wg-phase-idle',
+  running: 'bg-wg-phase-running',
+  paused: 'bg-wg-phase-pending',
+  error: 'bg-wg-phase-faulted',
 };
 
 const EXTRA_CSS = `
@@ -56,10 +76,20 @@ const EXTRA_CSS = `
 `;
 
 const ICONS: Record<string, unknown[]> = {
-  play: Play, 'step-forward': StepForward, square: Square, 'rotate-ccw': RotateCcw,
-  circle: Circle, 'fast-forward': FastForward, 'layout-grid': LayoutGrid,
-  'undo-2': Undo2, 'redo-2': Redo2, upload: Upload, download: Download, package: Package,
-  camera: Camera, history: History,
+  play: Play,
+  'step-forward': StepForward,
+  square: Square,
+  'rotate-ccw': RotateCcw,
+  circle: Circle,
+  'fast-forward': FastForward,
+  'layout-grid': LayoutGrid,
+  'undo-2': Undo2,
+  'redo-2': Redo2,
+  upload: Upload,
+  download: Download,
+  package: Package,
+  camera: Camera,
+  history: History,
 };
 
 function iconEl(name: string): SVGSVGElement | null {
@@ -93,7 +123,12 @@ export class WitgraphControls extends HTMLElement {
     const toolbar = document.createElement('div');
     toolbar.className = 'toolbar';
 
-    const mkBtn = (cls: string, title: string, iconName: string, label?: string): HTMLButtonElement => {
+    const mkBtn = (
+      cls: string,
+      title: string,
+      iconName: string,
+      label?: string,
+    ): HTMLButtonElement => {
       const b = document.createElement('button');
       b.className = `btn ${cls}`;
       b.title = title;
@@ -217,12 +252,16 @@ export class WitgraphControls extends HTMLElement {
     this.#btnResume.addEventListener('click', () => this.#controller?.resumeBreakpoint());
     this.#btnLayout.addEventListener('click', () => this.#controller?.autoLayout());
     this.#btnSnapSave.addEventListener('click', () => {
-      try { this.#controller?.saveSnapshot(); } catch {}
+      try {
+        this.#controller?.saveSnapshot();
+      } catch {}
     });
     this.#btnSnapRestore.addEventListener('click', () => {
       const snaps = this.#controller?.savedSnapshots ?? [];
       if (snaps.length > 0) {
-        try { this.#controller?.restoreNamedSnapshot(snaps[snaps.length - 1].name); } catch {}
+        try {
+          this.#controller?.restoreNamedSnapshot(snaps[snaps.length - 1].name);
+        } catch {}
       }
     });
 
@@ -240,7 +279,9 @@ export class WitgraphControls extends HTMLElement {
     this.#render();
   }
 
-  get controller(): EditorController | null { return this.#controller; }
+  get controller(): EditorController | null {
+    return this.#controller;
+  }
 
   #render(): void {
     if (!this.#btnRun) return;
@@ -257,7 +298,8 @@ export class WitgraphControls extends HTMLElement {
     this.#btnUndo.disabled = !(this.#controller?.canUndo ?? false);
     this.#btnRedo.disabled = !(this.#controller?.canRedo ?? false);
     this.#btnSnapSave.disabled = !this.#controller || mode === 'running';
-    this.#btnSnapRestore.disabled = !this.#controller || (this.#controller.savedSnapshots.length === 0) || mode === 'running';
+    this.#btnSnapRestore.disabled =
+      !this.#controller || this.#controller.savedSnapshots.length === 0 || mode === 'running';
 
     let badgeText = MODE_LABELS[mode];
     if (mode === 'idle' && this.#controller?.lastRunDurationMs != null) {
@@ -274,4 +316,5 @@ export class WitgraphControls extends HTMLElement {
   }
 }
 
-if (!customElements.get('witgraph-controls')) customElements.define('witgraph-controls', WitgraphControls);
+if (!customElements.get('witgraph-controls'))
+  customElements.define('witgraph-controls', WitgraphControls);

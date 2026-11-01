@@ -7,6 +7,8 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [lints]
 workspace = true
@@ -25,6 +27,6 @@ bytes = "1"
 [dev-dependencies]
 serde_json = { workspace = true }
 tokio = { version = "1", features = ["rt", "macros", "net", "io-util", "time"] }
-witgraph-wit = { path = "../witgraph-wit" }
+witgraph-wit = { workspace = true }
 witgraph-runtime = { workspace = true }
 test-components = { path = "../../test-fixtures/test-components" }

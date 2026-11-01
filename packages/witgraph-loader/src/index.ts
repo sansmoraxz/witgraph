@@ -12,9 +12,9 @@
 import { transpile } from '@bytecodealliance/jco/component';
 
 import initModule, {
-  WebGraph,
   describeComponent as describeRaw,
   jsName as jsNameRaw,
+  WebGraph,
 } from '../pkg/witgraph_web.js';
 
 /** A port of a component, as the editor catalog describes one. */
@@ -158,7 +158,9 @@ function sameWasm(a: Wasm | undefined, b: Wasm | undefined): boolean {
         ? new Uint8Array(x.buffer, x.byteOffset, x.byteLength)
         : undefined;
   const [x, y] = [bytes(a), bytes(b)];
-  return x !== undefined && y !== undefined && x.length === y.length && x.every((v, i) => v === y[i]);
+  return (
+    x !== undefined && y !== undefined && x.length === y.length && x.every((v, i) => v === y[i])
+  );
 }
 
 /** What the built-in `fatal` throws; the scheduler turns it into a fatal fault. */
@@ -206,9 +208,13 @@ export async function init(wasm?: Wasm): Promise<void> {
     const done = initModule(wasm === undefined ? undefined : { module_or_path: wasm });
     const entry = { done, wasm, ready: false };
     done.then(
-      () => void (entry.ready = true),
-      // A failed initialisation is not kept: a later call may try again.
-      () => void (initialised === entry && (initialised = undefined)),
+      () => {
+        entry.ready = true;
+      },
+      () => {
+        // A failed initialisation is not kept: a later call may try again.
+        if (initialised === entry) initialised = undefined;
+      },
     );
     initialised = entry;
   } else if (wasm !== undefined && !sameWasm(wasm, initialised.wasm)) {
@@ -220,7 +226,9 @@ export async function init(wasm?: Wasm): Promise<void> {
 /** Throws unless the `witgraph-web` module is initialised. */
 function initialisedOrThrow(): void {
   if (!initialised?.ready) {
-    throw new Error('the witgraph-web module is not initialised: call `init` (or `Session.load`) first');
+    throw new Error(
+      'the witgraph-web module is not initialised: call `init` (or `Session.load`) first',
+    );
   }
 }
 
@@ -259,7 +267,11 @@ export class Session {
   #epoch = new Map<string, number>();
   #disposed = false;
 
-  private constructor(graph: WebGraph, options: SessionOptions, components: Map<string, NodeComponent>) {
+  private constructor(
+    graph: WebGraph,
+    options: SessionOptions,
+    components: Map<string, NodeComponent>,
+  ) {
     this.graph = graph;
     this.#options = options;
     this.#components = components;
@@ -285,15 +297,23 @@ export class Session {
       close: closeUnread,
     });
     try {
-      // The entry of `components` each node runs, as the graph resolved it.
+      // The component each node runs, as the graph resolved it: its entry of
+      // `components`, or, for a node whose links apply, that entry composed
+      // with its providers (`bytes`). Nodes running the same bytes share a
+      // transpile.
       const nodes: string[] = (web.islands() as string[][]).flat();
-      const entries = new Map<number, Promise<Transpiled>>();
+      const entries = new Map<string, Promise<Transpiled>>();
       const transpiled = nodes.map((node) => {
-        const { index, sha256 } = web.component(node) as { index: number; sha256: string };
-        let entry = entries.get(index);
+        const { index, sha256, bytes } = web.component(node) as {
+          index: number;
+          sha256: string;
+          bytes?: Uint8Array;
+        };
+        let entry = entries.get(sha256);
         if (entry === undefined) {
-          entry = transpileCached(sha256, options.components[index]);
-          entries.set(index, entry);
+          const { id } = options.components[index];
+          entry = transpileCached(sha256, bytes ? { id, bytes } : options.components[index]);
+          entries.set(sha256, entry);
         }
         return entry;
       });
@@ -384,7 +404,8 @@ export class Session {
     const instance = await transpiled.instantiate(getCoreModule, provided);
     // An instance whose generation was abandoned meanwhile is nobody's: a
     // newer rebuild may already have run on its own.
-    if (!this.#disposed && (this.#epoch.get(node) ?? 0) === epoch) this.#instances.set(node, instance);
+    if (!this.#disposed && (this.#epoch.get(node) ?? 0) === epoch)
+      this.#instances.set(node, instance);
   }
 
   /** One call of a node's `run`, with the hooks around it. */
@@ -459,7 +480,8 @@ function tapped<T>(stream: AsyncIterable<T>, seen: (item: T) => void): AsyncIter
           return step;
         },
         // The reader stopping stops the writer.
-        return: (value?: unknown) => inner.return?.(value) ?? Promise.resolve({ done: true, value }),
+        return: (value?: unknown) =>
+          inner.return?.(value) ?? Promise.resolve({ done: true, value }),
       } as AsyncIterator<T>;
     },
   };

@@ -31,12 +31,12 @@ world sensor {
 Every field of `inputs` and `outputs` is a port. The field's type decides
 what kind of port it is:
 
-| Field type | Port | Meaning |
-|---|---|---|
-| `T` | Value | Read when `run` starts (inputs) or set when `run` returns (outputs). |
-| `option<T>` | Optional value | On inputs, the port may be left unconnected. |
-| `stream<T>` | Stream | Ordered, back-pressured values that end when the stream closes. |
-| `future<T>` | Future | A single value that arrives later. |
+| Field type  | Port           | Meaning                                                              |
+| ----------- | -------------- | -------------------------------------------------------------------- |
+| `T`         | Value          | Read when `run` starts (inputs) or set when `run` returns (outputs). |
+| `option<T>` | Optional value | On inputs, the port may be left unconnected.                         |
+| `stream<T>` | Stream         | Ordered, back-pressured values that end when the stream closes.      |
+| `future<T>` | Future         | A single value that arrives later.                                   |
 
 `stream` and `future` can only be used directly as a field type, not nested
 inside other types. Resources, `map` and fixed-length lists can't be used in

@@ -9,13 +9,13 @@ The demo in `packages/witgraph-editor-demo` shows everything described here.
 
 ## The layout
 
-| Element | What it does |
-|---|---|
-| `<witgraph-canvas>` | The graph itself: nodes, ports and connections, drawn as SVG. Pan, zoom, drag nodes, and drag from one port to another to connect them. |
-| `<witgraph-catalog>` | The components available to add. Drag one onto the canvas. |
-| `<witgraph-inspector>` | Details for whatever is selected: a node, a connection, or the graph. |
-| `<witgraph-controls>` | The toolbar: run, step, stop, reset, breakpoints, undo and redo, layout, snapshots, import and export. |
-| `<witgraph-timeline>` | A trace of what ran, when, and what faulted. |
+| Element                | What it does                                                                                                                            |
+| ---------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `<witgraph-canvas>`    | The graph itself: nodes, ports and connections, drawn as SVG. Pan, zoom, drag nodes, and drag from one port to another to connect them. |
+| `<witgraph-catalog>`   | The components available to add. Drag one onto the canvas.                                                                              |
+| `<witgraph-inspector>` | Details for whatever is selected: a node, a connection, or the graph.                                                                   |
+| `<witgraph-controls>`  | The toolbar: run, step, stop, reset, breakpoints, undo and redo, layout, snapshots, import and export.                                  |
+| `<witgraph-timeline>`  | A trace of what ran, when, and what faulted.                                                                                            |
 
 Put them anywhere on your page. They all share one `EditorController`.
 
@@ -25,10 +25,10 @@ Put them anywhere on your page. They all share one `EditorController`.
 - **Connect** ports by dragging from an output to an input. Ports are coloured
   by kind (value, stream or future), and the editor refuses connections the
   contracts don't allow (`controller.canConnect` tells you why).
-- **Feedback.** Right-click a connection and choose *Mark as Feedback* to make
+- **Feedback.** Right-click a connection and choose _Mark as Feedback_ to make
   it a feedback edge, which cycles need.
 - **Rename and label** nodes, and set their attributes, in the inspector.
-- **Lay out** the graph automatically with *Layout*.
+- **Lay out** the graph automatically with _Layout_.
 - **Edit freely.** Copy, cut, paste, delete, undo and redo all work, with the
   usual shortcuts (Ctrl+C, X, V, Z, Y and Delete). Right-click the canvas, a
   node or a connection for a menu.
@@ -40,22 +40,21 @@ Put them anywhere on your page. They all share one `EditorController`.
   slows ticks down so you can watch them.
 - Each node shows its state: pending, running, idle, faulted or cancelled. A
   fault shows its cause and, when it is known, which node caused it.
-- **Breakpoints.** Toggle one on a node (toolbar *BP* button or right-click).
-  The run pauses before that node, and *Resume* continues.
-- **Values.** Select a node to see the current and past values of each output
-  port. *Expand Chart* on a node draws a line chart of an output's value on each tick.
+- **Breakpoints.** Toggle one on a node (toolbar _BP_ button or right-click).
+  The run pauses before that node, and _Resume_ continues.
+- **Values.** Select a node to see the current value of each output port.
 - **Inputs.** Give a node an `inject.<port>` attribute to feed that input a
   fixed value.
-- **Mock mode.** In the inspector, turn on *Mock Mode* for a node to skip its
+- **Mock mode.** In the inspector, turn on _Mock Mode_ for a node to skip its
   WebAssembly and give each output a value (written as WAVE text) instead.
   This is useful for trying a graph before every component exists.
-- **Snapshots.** *Save* captures the graph's state and *Restore* goes back to
+- **Snapshots.** _Save_ captures the graph's state and _Restore_ goes back to
   it.
 
 ## Saving and loading
 
-*Load* opens a graph from a JSON file, and *JSON* downloads the current one.
-*Bundle* downloads the graph together with its component bytes, so it can be
+_Load_ opens a graph from a JSON file, and _JSON_ downloads the current one.
+_Bundle_ downloads the graph together with its component bytes, so it can be
 opened without anything else. Graph and node attributes (`attrs`) are kept in
 the JSON.
 
@@ -64,7 +63,7 @@ the JSON.
 ```ts
 import { EditorController, registerAll } from 'witgraph-editor';
 
-registerAll();                       // defines the <witgraph-*> elements
+registerAll(); // defines the <witgraph-*> elements
 const controller = new EditorController();
 
 for (const name of ['canvas', 'catalog', 'inspector', 'controls', 'timeline']) {
@@ -102,7 +101,7 @@ properties with no fallback, so define them on the page or a parent element:
 ## Running the demo
 
 1. `cargo build -p test-components`
-2. In `packages/witgraph-loader`: `npm run build:wasm`
+2. In `packages/witgraph-loader`: `pnpm build:wasm`
 3. In `packages/witgraph-editor-demo`: run the `setup` script (it copies the
    test components in), then `dev` to start the app.
 

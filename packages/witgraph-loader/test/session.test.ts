@@ -4,21 +4,21 @@
 
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { readFile, readdir, stat } from 'node:fs/promises';
+import { readdir, readFile, stat } from 'node:fs/promises';
 import { afterEach, test } from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { parse } from '@bytecodealliance/jco';
 
 import {
-  Session,
-  WebGraph,
-  camelCase,
-  jsName,
   type Capability,
   type ComponentSource,
+  camelCase,
+  jsName,
+  Session,
   type SessionOptions,
   type StreamItem,
+  WebGraph,
 } from '../src/index.ts';
 
 const root = new URL('../../../', import.meta.url);
@@ -61,6 +61,8 @@ const ids: Record<string, string> = {
   'mqtt-node': 'test:mqtt-node/mqtt-node@0.1.0',
   labelled: 'test:labelled/labelled@0.1.0',
   'future-writer': 'test:future-writer/future-writer@0.1.0',
+  calc: 'test:calc/calc@0.1.0',
+  math: 'test:math/math@0.1.0',
 };
 
 /** Components written in WAT here, by guest name, beside the built guests. */
@@ -258,7 +260,10 @@ async function load(
   const graph = {
     metadata: { name: 'test' },
     components: components.map(({ id }) => componentRef(id)),
-    nodes: nodes.map(([id, guest]) => ({ id, component: componentRef(inline[guest]?.id ?? ids[guest]) })),
+    nodes: nodes.map(([id, guest]) => ({
+      id,
+      component: componentRef(inline[guest]?.id ?? ids[guest]),
+    })),
     connections: connections.map(([id, from, to, feedback]) => ({
       id,
       from: port(from),
@@ -271,7 +276,10 @@ async function load(
 
 test('values flow between nodes and equal inputs do not rerun', async () => {
   const session = await load(
-    [['a', 'echo'], ['b', 'echo']],
+    [
+      ['a', 'echo'],
+      ['b', 'echo'],
+    ],
     [['c', 'a.out', 'b.in']],
   );
   session.graph.inject('a', 'in', 5);
@@ -287,7 +295,10 @@ test('values flow between nodes and equal inputs do not rerun', async () => {
   assert.equal(runs().length, 0, 'the same value is not a change');
   session.graph.injectWave('a', 'in', '6.5');
   await session.settle();
-  assert.deepEqual(runs().map((e: any) => e.node), ['a', 'b']);
+  assert.deepEqual(
+    runs().map((e: any) => e.node),
+    ['a', 'b'],
+  );
   assert.equal(session.graph.readOutput('b', 'out'), 6.5);
 
   assert.throws(() => session.graph.inject('a', 'in', 'five'), /expected a number/);
@@ -302,7 +313,10 @@ test('values flow between nodes and equal inputs do not rerun', async () => {
 test('a stream passes between two nodes of an island, and a tap sees its items', async () => {
   const seen: StreamItem[] = [];
   const session = await load(
-    [['prod', 'stream-producer'], ['cons', 'stream-consumer']],
+    [
+      ['prod', 'stream-producer'],
+      ['cons', 'stream-consumer'],
+    ],
     [['s', 'prod.items', 'cons.items']],
     { onStreamItem: (item) => seen.push(item) },
   );
@@ -342,7 +356,10 @@ test('a feedback loop advances one iteration per tick, and a snapshot carries it
 test('a mock replaces a node, and the hooks see every run', async () => {
   const calls: string[] = [];
   const session = await load(
-    [['a', 'echo'], ['b', 'echo']],
+    [
+      ['a', 'echo'],
+      ['b', 'echo'],
+    ],
     [['c', 'a.out', 'b.in']],
     {
       mocks: { a: (inputs) => ({ out: (inputs.in as number) * 100 }) },
@@ -362,7 +379,10 @@ test('a mock replaces a node, and the hooks see every run', async () => {
 });
 
 test('a trap faults its island, and fatal aborts the tick', async () => {
-  const session = await load([['busy', 'busy-loop'], ['e', 'echo']]);
+  const session = await load([
+    ['busy', 'busy-loop'],
+    ['e', 'echo'],
+  ]);
   session.graph.inject('e', 'in', 1);
   session.graph.inject('busy', 'action', 'trap');
   assert.deepEqual(await session.tick(), { result: 'progress' });
@@ -389,7 +409,12 @@ test('capabilities and labelled imports come from the registry, named as on wasm
   const feed = [Uint8Array.of(3), Uint8Array.of(4, 5), Uint8Array.of(6, 7, 8)];
   const asked: [string, Capability][] = [];
   const session = await load(
-    [['mqtt', 'mqtt-node'], ['cons', 'bytes-consumer'], ['kv', 'labelled'], ['busy', 'busy-loop']],
+    [
+      ['mqtt', 'mqtt-node'],
+      ['cons', 'bytes-consumer'],
+      ['kv', 'labelled'],
+      ['busy', 'busy-loop'],
+    ],
     [['s', 'mqtt.messages', 'cons.items']],
     {
       capabilities: (node, capability) => {
@@ -444,10 +469,22 @@ test('a paused tick can be inspected', async () => {
   let resume!: () => void;
   let paused!: () => void;
   const pause = new Promise<void>((resolve) => (paused = resolve));
-  const session = await load([['a', 'echo'], ['b', 'echo']], [['c', 'a.out', 'b.in']], {
-    beforeRun: (node) =>
-      node === 'b' ? new Promise<void>((resolve) => ((resume = resolve), paused())) : undefined,
-  });
+  const session = await load(
+    [
+      ['a', 'echo'],
+      ['b', 'echo'],
+    ],
+    [['c', 'a.out', 'b.in']],
+    {
+      beforeRun: (node) =>
+        node === 'b'
+          ? new Promise<void>((resolve) => {
+              resume = resolve;
+              paused();
+            })
+          : undefined,
+    },
+  );
   session.graph.inject('a', 'in', 7);
   const tick = session.tick();
   await pause;
@@ -455,7 +492,9 @@ test('a paused tick can be inspected', async () => {
   assert.equal(session.graph.readOutputWave('a', 'out'), '7');
   assert.equal(session.graph.readOutput('b', 'out'), undefined, '`b` has not returned');
   assert.equal(session.graph.nodeState('b').phase, 'running');
-  assert.ok(session.graph.takeTrace().some((e: any) => e.event === 'run-started' && e.node === 'b'));
+  assert.ok(
+    session.graph.takeTrace().some((e: any) => e.event === 'run-started' && e.node === 'b'),
+  );
   assert.throws(() => session.graph.inject('a', 'in', 1), /a tick is in progress/);
   resume();
   await tick;
@@ -524,7 +563,11 @@ test('a run whose generation is abandoned stops', async () => {
   const pause = new Promise<void>((resolve) => (paused = resolve));
   const after: string[] = [];
   const session = await load([['a', 'echo']], [], {
-    beforeRun: () => new Promise<void>((resolve) => ((resume = resolve), paused())),
+    beforeRun: () =>
+      new Promise<void>((resolve) => {
+        resume = resolve;
+        paused();
+      }),
     afterRun: (node) => void after.push(node),
   });
   session.graph.inject('a', 'in', 1);
@@ -578,11 +621,20 @@ test('each node runs the component its contract was resolved from', async () => 
   };
   // Other bytes under the unpinned id: the table pins the echo's.
   for (const components of [
-    [{ id: ids.echo, bytes: maybe.bytes }, { id: `${ids.echo}#${hash}`, bytes: echo.bytes }],
-    [{ id: `${ids.echo}#${hash}`, bytes: echo.bytes }, { id: ids.echo, bytes: maybe.bytes }],
+    [
+      { id: ids.echo, bytes: maybe.bytes },
+      { id: `${ids.echo}#${hash}`, bytes: echo.bytes },
+    ],
+    [
+      { id: `${ids.echo}#${hash}`, bytes: echo.bytes },
+      { id: ids.echo, bytes: maybe.bytes },
+    ],
   ]) {
     const session = await loaded({ graph, components, wasm });
-    assert.deepEqual(session.graph.component('n').index, components.findIndex((c) => c.bytes === echo.bytes));
+    assert.deepEqual(
+      session.graph.component('n').index,
+      components.findIndex((c) => c.bytes === echo.bytes),
+    );
     session.graph.inject('n', 'in', 4);
     await session.settle();
     assert.deepEqual(session.graph.takeFaults(), []);
@@ -630,7 +682,10 @@ test('nested options cross in the representation jco picks at each depth', async
   session.graph.inject('n', 'b', { tag: 'none' });
   await session.settle();
   assert.equal(wave('b'), 'some(none)');
-  assert.throws(() => session.graph.inject('n', 'b', 3), /expected `\{ tag: 'none' \| 'some', val \}`/);
+  assert.throws(
+    () => session.graph.inject('n', 'b', 3),
+    /expected `\{ tag: 'none' \| 'some', val \}`/,
+  );
 });
 
 test('lists cross as typed arrays and arrays', async () => {
@@ -650,9 +705,16 @@ test('lists cross as typed arrays and arrays', async () => {
 test('a value JavaScript fails to convert is an error, not a wedged graph', async () => {
   const { proxy, revoke } = Proxy.revocable({}, {});
   revoke();
-  const session = await load([['n', 'values'], ['m', 'values']], [], {
-    mocks: { m: () => ({ a: { tag: 'none' }, b: undefined, xs: { length: Infinity } }) },
-  });
+  const session = await load(
+    [
+      ['n', 'values'],
+      ['m', 'values'],
+    ],
+    [],
+    {
+      mocks: { m: () => ({ a: { tag: 'none' }, b: undefined, xs: { length: Infinity } }) },
+    },
+  );
   for (const value of [proxy, { length: Infinity }]) {
     assert.throws(() => session.graph.inject('n', 'xs', value));
     assert.throws(() => session.graph.inject('n', 'b', value));
@@ -700,7 +762,12 @@ test('a failed run abandons its siblings still in flight', async () => {
   const after: string[] = [];
   let holding = true;
   const session = await load(
-    [['p1', 'stream-producer'], ['c1', 'stream-consumer'], ['m', 'stream-producer'], ['c2', 'stream-consumer']],
+    [
+      ['p1', 'stream-producer'],
+      ['c1', 'stream-consumer'],
+      ['m', 'stream-producer'],
+      ['c2', 'stream-consumer'],
+    ],
     [
       ['s1', 'p1.items', 'c1.items'],
       ['s2', 'm.items', 'c2.items'],
@@ -779,7 +846,10 @@ test('a fatal start function during a rebuild aborts the tick, naming its node',
 test('a failed rebuild names the member whose rebuild failed', async () => {
   let provide = true;
   const session = await load(
-    [['mqtt', 'mqtt-node'], ['cons', 'bytes-consumer']],
+    [
+      ['mqtt', 'mqtt-node'],
+      ['cons', 'bytes-consumer'],
+    ],
     [['s', 'mqtt.messages', 'cons.items']],
     {
       capabilities: (_, capability) =>
@@ -797,7 +867,10 @@ test('a failed rebuild names the member whose rebuild failed', async () => {
   assert.deepEqual(fault.members, ['mqtt', 'cons']);
   assert.equal(fault.culprit, 'mqtt');
   assert.equal(fault.fault.kind, 'restart');
-  assert.match(fault.fault.message, /`mqtt`: node `mqtt` imports `test:mqtt\/source@0.1.0`, which nothing provides/);
+  assert.match(
+    fault.fault.message,
+    /`mqtt`: node `mqtt` imports `test:mqtt\/source@0.1.0`, which nothing provides/,
+  );
 });
 
 test('a generation dropped while it rebuilds is abandoned', async () => {
@@ -812,7 +885,10 @@ test('a generation dropped while it rebuilds is abandoned', async () => {
   const abandoned: string[][] = [];
   const web = WebGraph.load(JSON.stringify(graph), [{ id: ids.echo, bytes }], {
     run: () => ({ out: 1 }),
-    rebuild: () => (rebuilding.open(), new Promise(() => {})),
+    rebuild: () => {
+      rebuilding.open();
+      return new Promise(() => {});
+    },
     abandon: (nodes: string[]) => void abandoned.push(nodes),
   });
   try {
@@ -841,25 +917,42 @@ test('mocks are own properties, called as methods, with an empty result as no ou
   class Mocks {
     factor = 10;
     constructor() {
-      Object.assign(this, { scaled: function (this: Mocks, inputs: any) { return { out: inputs.in * this.factor }; } });
+      Object.assign(this, {
+        scaled: function (this: Mocks, inputs: any) {
+          return { out: inputs.in * this.factor };
+        },
+      });
     }
   }
   const after: [string, string[]][] = [];
   const session = await load(
-    [['constructor', 'echo'], ['toString', 'echo'], ['scaled', 'echo'], ['none', 'echo']],
+    [
+      ['constructor', 'echo'],
+      ['toString', 'echo'],
+      ['scaled', 'echo'],
+      ['none', 'echo'],
+    ],
     [],
     {
       mocks: Object.assign(new Mocks() as any, { none: () => undefined }),
       afterRun: (node, outputs) => void after.push([node, Object.keys(outputs)]),
     },
   );
-  for (const node of ['constructor', 'toString', 'scaled', 'none']) session.graph.inject(node, 'in', 2);
+  for (const node of ['constructor', 'toString', 'scaled', 'none'])
+    session.graph.inject(node, 'in', 2);
   await session.settle();
-  assert.deepEqual(session.graph.takeFaults().map((f: any) => f.members), [['none']], 'only the empty mock is short of `out`');
+  assert.deepEqual(
+    session.graph.takeFaults().map((f: any) => f.members),
+    [['none']],
+    'only the empty mock is short of `out`',
+  );
   assert.equal(session.graph.readOutput('constructor', 'out'), 2, 'not mocked: it ran');
   assert.equal(session.graph.readOutput('toString', 'out'), 2, 'not mocked: it ran');
   assert.equal(session.graph.readOutput('scaled', 'out'), 20);
-  assert.deepEqual(after.find(([node]) => node === 'none'), ['none', []]);
+  assert.deepEqual(
+    after.find(([node]) => node === 'none'),
+    ['none', []],
+  );
 });
 
 test('hooks are called as methods, and a throwing stream observer does not reach the reader', async () => {
@@ -873,7 +966,9 @@ test('hooks are called as methods, and a throwing stream observer does not reach
         { id: 'prod', component: prod },
         { id: 'cons', component: cons },
       ],
-      connections: [{ id: 's', from: { node: 'prod', port: 'items' }, to: { node: 'cons', port: 'items' } }],
+      connections: [
+        { id: 's', from: { node: 'prod', port: 'items' }, to: { node: 'cons', port: 'items' } },
+      ],
     };
     components = sources;
     wasm = wasm;
@@ -932,4 +1027,68 @@ test('nothing needs a secure context', async () => {
     if (subtle) Object.defineProperty(globalThis.crypto, 'subtle', subtle);
     else delete (globalThis.crypto as any).subtle;
   }
+});
+
+/** `calc` nodes, each linked to `math` for `test:math/ops`; `math` is a provider, not a node. */
+async function loadLinked(
+  nodes: string[],
+  { providers = ['math'] }: { providers?: string[] } = {},
+): Promise<Session> {
+  const components = await Promise.all(['calc', ...providers].map(guestSource));
+  const ops = 'test:math/ops@0.1.0';
+  const graph = {
+    metadata: { name: 'test' },
+    components: [componentRef(ids.calc)],
+    nodes: nodes.map((id) => ({ id, component: componentRef(ids.calc) })),
+    connections: [],
+    links: nodes.map((id) => ({
+      id: `link-${id}`,
+      node: id,
+      import: ops,
+      provider: componentRef(ids.math),
+      export: ops,
+    })),
+  };
+  return loaded({ graph, components, wasm });
+}
+
+test('a node runs with the provider its link names composed in', async () => {
+  // No `capabilities`: the link satisfies the only import `calc` has.
+  const session = await loadLinked(['n']);
+  session.graph.inject('n', 'x', 3);
+  await session.settle();
+  assert.equal(session.graph.readOutput('n', 'doubled'), 6);
+  assert.equal(session.graph.readOutput('n', 'slow'), 6);
+  assert.equal(session.graph.readOutput('n', 'total'), 3, '0 + 1 + 2, streamed by the provider');
+  assert.equal(session.graph.readOutput('n', 'calls'), 1);
+});
+
+test('each node gets an instance of the provider of its own', async () => {
+  const session = await loadLinked(['a', 'b']);
+  session.graph.inject('a', 'x', 2);
+  session.graph.inject('b', 'x', 5);
+  await session.settle();
+  assert.equal(session.graph.readOutput('a', 'doubled'), 4);
+  assert.equal(session.graph.readOutput('b', 'doubled'), 10);
+  assert.equal(session.graph.readOutput('a', 'calls'), 1);
+  assert.equal(
+    session.graph.readOutput('b', 'calls'),
+    1,
+    'not the 2 a shared instance would count',
+  );
+});
+
+test('a node component is composed once per set of links', async () => {
+  const session = await loadLinked(['a', 'b']);
+  const [a, b] = ['a', 'b'].map(
+    (node) =>
+      session.graph.component(node) as { index: number; sha256: string; bytes?: Uint8Array },
+  );
+  assert.ok(a.bytes && b.bytes, 'both come back composed');
+  assert.equal(a.sha256, b.sha256);
+  assert.equal(a.index, 0, 'index still names the node entry, not the provider');
+});
+
+test('a link whose provider was not given fails the load by name', async () => {
+  await assert.rejects(loadLinked(['n'], { providers: [] }), /test:math\/math@0\.1\.0/);
 });

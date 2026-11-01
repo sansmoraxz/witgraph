@@ -9,6 +9,8 @@ rust-version = "1.99"
 license = "BSD-3-Clause"
 repository = "https://github.com/sansmoraxz/witgraph"
 readme = "README.md"
+keywords = ["wasm", "webassembly", "component-model", "dataflow", "wit"]
+categories = ["wasm"]
 
 [workspace.lints.rust]
 missing_docs = "deny"
@@ -27,9 +29,10 @@ todo = "deny"
 unimplemented = "deny"
 
 [workspace.dependencies]
-witgraph-ir = { path = "crates/witgraph-ir" }
-witgraph-sched = { path = "crates/witgraph-sched" }
-witgraph-runtime = { path = "crates/witgraph-runtime" }
+witgraph-ir = { path = "crates/witgraph-ir", version = "0.1.0" }
+witgraph-wit = { path = "crates/witgraph-wit", version = "0.1.0" }
+witgraph-sched = { path = "crates/witgraph-sched", version = "0.1.0" }
+witgraph-runtime = { path = "crates/witgraph-runtime", version = "0.1.0" }
 semver = { version = "1.0", default-features = false }
 thiserror = { version = "2.0", default-features = false }
 miette = "7.6"

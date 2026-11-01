@@ -5,13 +5,12 @@
 
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { readFile, readdir, stat } from 'node:fs/promises';
+import { readdir, readFile, stat } from 'node:fs/promises';
 import { afterEach, test } from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-
+import type { ComponentSource } from 'witgraph-loader';
 import { EditorController } from '../src/controller/editor-controller.ts';
 import type { GraphJson } from '../src/controller/types.ts';
-import type { ComponentSource } from 'witgraph-loader';
 
 // ---------------------------------------------------------------------------
 // Helpers (same pattern as witgraph-loader/test/session.test.ts)
@@ -105,7 +104,10 @@ async function loadController(
 
 test('load and dispose', async () => {
   const controller = await loadController(
-    [['a', 'echo'], ['b', 'echo']],
+    [
+      ['a', 'echo'],
+      ['b', 'echo'],
+    ],
     [['c', 'a.out', 'b.in']],
   );
   assert.equal(controller.nodes.size, 2);
@@ -128,7 +130,10 @@ test('step and read output', async () => {
 
 test('run settles the graph', async () => {
   const controller = await loadController(
-    [['a', 'echo'], ['b', 'echo']],
+    [
+      ['a', 'echo'],
+      ['b', 'echo'],
+    ],
     [['c', 'a.out', 'b.in']],
   );
   controller.injectValue('a', 'in', '5');
@@ -191,7 +196,10 @@ test('select dispatches event', async () => {
 
 test('autoLayout positions nodes', async () => {
   const controller = await loadController(
-    [['a', 'echo'], ['b', 'echo']],
+    [
+      ['a', 'echo'],
+      ['b', 'echo'],
+    ],
     [['c', 'a.out', 'b.in']],
   );
   await controller.autoLayout();
@@ -202,10 +210,7 @@ test('autoLayout positions nodes', async () => {
   assert.ok(posA.y >= 0, 'a.y non-negative');
   assert.ok(posB.x >= 0, 'b.x non-negative');
   assert.ok(posB.y >= 0, 'b.y non-negative');
-  assert.ok(
-    posA.x !== posB.x || posA.y !== posB.y,
-    'nodes should not share the same position',
-  );
+  assert.ok(posA.x !== posB.x || posA.y !== posB.y, 'nodes should not share the same position');
 });
 
 test('trace events are collected', async () => {

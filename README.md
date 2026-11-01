@@ -97,26 +97,32 @@ nodes, snapshots, undo and redo, and JSON import and export. See
 
 ## Crates
 
-| Crate | What it does |
-|---|---|
-| `witgraph-ir` | Graph types, validation, and the `GraphBuilder → Graph → CompiledGraph` chain. |
-| `witgraph-wit` | Reads WIT and produces component contracts and the editor catalog. |
-| `witgraph-sched` | The scheduler. It has no engine in it and also builds for `wasm32`. |
-| `witgraph-runtime` | The scheduler on wasmtime. |
-| `witgraph-web` | The scheduler for JavaScript hosts, via `wasm-bindgen`. |
-| `witgraph-source` | Fetches component bytes from files and OCI registries, pinned by digest. |
-| `packages/witgraph-loader` | TypeScript loader that runs a graph in a browser or Node. |
-| `packages/witgraph-editor` | Web Components for editing, running and debugging graphs visually. |
-| `packages/witgraph-editor-demo` | Demo app for the editor. |
-| `test-fixtures/test-components` | Guest components for the tests. Not published. |
+| Crate                           | What it does                                                                   |
+| ------------------------------- | ------------------------------------------------------------------------------ |
+| `witgraph-ir`                   | Graph types, validation, and the `GraphBuilder → Graph → CompiledGraph` chain. |
+| `witgraph-wit`                  | Reads WIT and produces component contracts and the editor catalog.             |
+| `witgraph-sched`                | The scheduler. It has no engine in it and also builds for `wasm32`.            |
+| `witgraph-runtime`              | The scheduler on wasmtime.                                                     |
+| `witgraph-web`                  | The scheduler for JavaScript hosts, via `wasm-bindgen`.                        |
+| `witgraph-source`               | Fetches component bytes from files and OCI registries, pinned by digest.       |
+| `packages/witgraph-loader`      | TypeScript loader that runs a graph in a browser or Node.                      |
+| `packages/witgraph-editor`      | Web Components for editing, running and debugging graphs visually.             |
+| `packages/witgraph-editor-demo` | Demo app for the editor.                                                       |
+| `test-fixtures/test-components` | Guest components for the tests. Not published.                                 |
 
 ## Building
 
 ```sh
-rustup target add wasm32-unknown-unknown
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
+
+`rust-toolchain.toml` pins the toolchain and the `wasm32-unknown-unknown` target,
+so rustup installs both the first time you run cargo here.
+
+For the TypeScript packages, run `pnpm install` once, then `pnpm check` to lint
+and check formatting with [Biome](https://biomejs.dev), or `pnpm format` to fix
+formatting.
 
 `test-components` builds the guests listed in `GUESTS` in
 `test-fixtures/test-components/build.rs`; a new directory under `guests/` is

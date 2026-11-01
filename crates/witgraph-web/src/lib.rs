@@ -37,6 +37,8 @@ mod executor;
 #[cfg(target_arch = "wasm32")]
 mod graph;
 #[cfg(target_arch = "wasm32")]
+mod link;
+#[cfg(target_arch = "wasm32")]
 mod live;
 #[cfg(target_arch = "wasm32")]
 mod value;

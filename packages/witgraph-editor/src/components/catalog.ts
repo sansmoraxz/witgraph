@@ -1,5 +1,5 @@
-import { adoptStyles } from './shared-styles.ts';
 import type { EditorController } from '../controller/editor-controller.ts';
+import { adoptStyles } from './shared-styles.ts';
 
 const KIND_BG: Record<string, string> = {
   value: 'bg-wg-port-value',
@@ -37,7 +37,9 @@ export class WitgraphCatalog extends HTMLElement {
     this.#render();
   }
 
-  connectedCallback(): void { this.#render(); }
+  connectedCallback(): void {
+    this.#render();
+  }
 
   disconnectedCallback(): void {
     this.#controller?.removeEventListener('state-changed', this.#onStateChanged);
@@ -57,7 +59,10 @@ export class WitgraphCatalog extends HTMLElement {
 
     const wrap = this.#el('div', 'catalog-wrap p-2 flex flex-col gap-2');
 
-    const header = this.#el('div', 'flex items-center gap-2 px-2 py-2 font-semibold bg-wg-surface rounded-md shadow-sm select-none');
+    const header = this.#el(
+      'div',
+      'flex items-center gap-2 px-2 py-2 font-semibold bg-wg-surface rounded-md shadow-sm select-none',
+    );
     header.appendChild(this.#el('span', 'text-lg', '\u{1F9E9}'));
     header.appendChild(this.#el('span', '', 'Components'));
     wrap.appendChild(header);
@@ -76,7 +81,10 @@ export class WitgraphCatalog extends HTMLElement {
     }
 
     for (const source of sources) {
-      const card = this.#el('div', 'card p-3 bg-wg-surface rounded-lg cursor-grab border border-transparent shadow-sm');
+      const card = this.#el(
+        'div',
+        'card p-3 bg-wg-surface rounded-lg cursor-grab border border-transparent shadow-sm',
+      );
       card.draggable = true;
       card.addEventListener('dragstart', (e) => {
         e.dataTransfer?.setData('witgraph/component-index', String(source.index));
@@ -93,9 +101,13 @@ export class WitgraphCatalog extends HTMLElement {
         const kinds = new Map<string, number>();
         for (const p of allPorts) kinds.set(p.kind, (kinds.get(p.kind) ?? 0) + 1);
         for (const [kind, count] of kinds) {
-          badges.appendChild(this.#el('span',
-            `inline-block px-1.5 py-0.5 rounded text-2xs font-semibold text-wg-bg ${KIND_BG[kind] ?? ''}`,
-            `${count} ${kind}`));
+          badges.appendChild(
+            this.#el(
+              'span',
+              `inline-block px-1.5 py-0.5 rounded text-2xs font-semibold text-wg-bg ${KIND_BG[kind] ?? ''}`,
+              `${count} ${kind}`,
+            ),
+          );
         }
         card.appendChild(badges);
 
@@ -129,7 +141,11 @@ export class WitgraphCatalog extends HTMLElement {
         card.appendChild(portGrid);
       }
 
-      const hint = this.#el('div', 'drag-hint text-2xs text-wg-text-dim italic text-center mt-2 select-none', 'Drag to canvas');
+      const hint = this.#el(
+        'div',
+        'drag-hint text-2xs text-wg-text-dim italic text-center mt-2 select-none',
+        'Drag to canvas',
+      );
       card.appendChild(hint);
       wrap.appendChild(card);
     }
@@ -145,4 +161,5 @@ export class WitgraphCatalog extends HTMLElement {
   }
 }
 
-if (!customElements.get('witgraph-catalog')) customElements.define('witgraph-catalog', WitgraphCatalog);
+if (!customElements.get('witgraph-catalog'))
+  customElements.define('witgraph-catalog', WitgraphCatalog);
