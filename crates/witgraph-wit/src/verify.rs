@@ -41,15 +41,9 @@ pub fn check_decodable(bytes: &[u8]) -> Result<(), String> {
     ) -> Result<(), String> {
         match ty {
             // A function is a plain, constructor, method or static name.
-            ComponentEntityType::Func(_) => match ComponentName::new(name, 0).map(|n| {
-                matches!(
-                    n.kind(),
-                    ComponentNameKind::Label(_)
-                        | ComponentNameKind::Constructor(_)
-                        | ComponentNameKind::Method(_)
-                        | ComponentNameKind::Static(_)
-                )
-            }) {
+            ComponentEntityType::Func(_) => match ComponentName::new(name, 0)
+                .map(|n| matches!(n.kind(), ComponentNameKind::Plain(_)))
+            {
                 Ok(true) => Ok(()),
                 _ => Err(format!("function `{name}` has an interface's name")),
             },

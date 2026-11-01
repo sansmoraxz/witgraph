@@ -100,6 +100,29 @@ the same nodes. Guest memory isn't captured: work that was in flight is rerun
 from its inputs, so the result matches the original only if the nodes are
 deterministic.
 
+## Cargo features
+
+`witgraph-runtime` always enables what it needs from wasmtime: the Cranelift
+compiler, the component model with async, and WAVE support. Everything else is
+opt-in, so you only compile what you use:
+
+| Feature | Default | What it turns on in wasmtime |
+|---|---|---|
+| `parallel-compilation` | yes | Compiles a component's functions on several threads. |
+| `cache` | no | The on-disk cache of compiled components. |
+| `pooling-allocator` | no | The pooling instance allocator. |
+| `profiling` | no | Profiler support. |
+| `wat` | no | Accepting text-format `.wat` input. |
+| `coredump` | no | Guest core dumps on a trap. |
+| `debug` | no | Guest debugging support. |
+| `demangle` | no | Demangled names in backtraces. |
+| `addr2line` | no | Source locations in backtraces. |
+
+These matter if you reach wasmtime through the `witgraph_runtime::wasmtime`
+re-export, for example to build your own `Engine` and pass it in
+`RuntimeConfig`. The engine witgraph builds itself uses none of them, apart
+from `parallel-compilation`, which only makes compiling faster.
+
 ## Tracing
 
 Pass `Trace` instead of `Perf` to record events such as runs starting and
