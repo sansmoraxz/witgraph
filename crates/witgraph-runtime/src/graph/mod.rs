@@ -17,7 +17,7 @@ use std::future::Future;
 use wasmtime::Engine;
 use wasmtime::component::{Type, Val};
 use witgraph_ir::{CompiledGraph, NodeId, PortDirection, PortName};
-use witgraph_sched::{Scheduler, Snapshot};
+use witgraph_sched::{Scheduler, Snapshot, SnapshotError};
 
 pub use self::load::PreparedComponent;
 use crate::engine::{self, Host, NoCapabilities, StoreSettings, Wasmtime};
@@ -243,7 +243,7 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
     /// Captures the graph's host-visible state, at any time. Stream and
     /// future contents are not captured. See [`Scheduler::snapshot`] and
     /// [`Snapshot`].
-    pub fn snapshot(&self) -> Snapshot {
+    pub fn snapshot(&self) -> Result<Snapshot, SnapshotError> {
         self.sched.snapshot()
     }
 

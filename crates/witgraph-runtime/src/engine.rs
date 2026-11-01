@@ -1373,10 +1373,9 @@ impl<H: Host> Executor for Wasmtime<H> {
         parse_wave(ty, text)
     }
 
-    /// Rendering into a `String` cannot fail, and a Value port never holds
-    /// a kind WAVE cannot render (a handle, say).
-    fn to_wave(&self, value: &Val) -> String {
-        value.to_wave().unwrap_or_default()
+    /// A Value port never holds a kind WAVE cannot render (a handle, say).
+    fn to_wave(&self, value: &Val) -> Result<String, String> {
+        value.to_wave().map_err(|e| e.to_string())
     }
 }
 

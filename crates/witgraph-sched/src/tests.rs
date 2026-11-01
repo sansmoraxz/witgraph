@@ -120,8 +120,8 @@ impl Executor for Adders {
         text.parse().map_err(|e| format!("{e}"))
     }
 
-    fn to_wave(&self, value: &u32) -> String {
-        value.to_string()
+    fn to_wave(&self, value: &u32) -> Result<String, String> {
+        Ok(value.to_string())
     }
 }
 

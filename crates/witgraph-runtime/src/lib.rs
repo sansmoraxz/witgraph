@@ -57,6 +57,6 @@ pub use plugin::{CapabilityPlugin, Extensions, PluginData, Plugins};
 pub use wasmtime::component::Val;
 pub use witgraph_sched::{
     FaultReport, IslandSnapshot, NodeFault, NodePhase, NodeState, Perf, PortValues, RuntimeError,
-    RuntimeMode, Snapshot, TickResult, Trace, TraceEvent,
+    RuntimeMode, Snapshot, SnapshotError, TickResult, Trace, TraceEvent,
 };
 pub use {wasmtime, witgraph_ir, witgraph_sched};

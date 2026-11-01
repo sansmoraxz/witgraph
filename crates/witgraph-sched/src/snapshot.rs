@@ -94,6 +94,18 @@ pub struct IslandSnapshot {
 /// latched inputs is queued.
 type OwedWork<V> = (Option<Replay<V>>, bool);
 
+/// Why a snapshot could not be taken: a value it holds could not be written
+/// as WAVE text ([`Executor::to_wave`]).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{at}: {message}")]
+pub struct SnapshotError {
+    /// Which value: an output or input (`` `node.port` ``), a feedback
+    /// connection, or an input a generation started with.
+    pub at: String,
+    /// Why it could not be written.
+    pub message: String,
+}
+
 impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
     /// Captures the graph's host-visible state, at any time: latched Value
     /// inputs and outputs, pending feedback, every node's phase, and the
@@ -104,23 +116,31 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
     /// generation that was in flight, which recreates its streams from the
     /// recorded inputs; the result matches the original only if the guests are
     /// deterministic.
-    pub fn snapshot(&self) -> Snapshot {
-        let wave = |val: &X::Value| self.executor.to_wave(val);
-        // Latched values as WAVE text, by node and port.
-        let port_values = |map: &HashMap<PortRef, Arc<X::Value>>| {
-            let mut out = PortValues::new();
-            for (port, val) in map {
-                out.entry(port.node.clone())
-                    .or_default()
-                    .insert(port.port.clone(), wave(val));
-            }
-            out
+    ///
+    /// Fails, naming it, on a value the executor cannot write as WAVE text.
+    pub fn snapshot(&self) -> Result<Snapshot, SnapshotError> {
+        let wave = |val: &X::Value, at: &dyn Fn() -> String| {
+            self.executor
+                .to_wave(val)
+                .map_err(|message| SnapshotError { at: at(), message })
         };
+        // Latched values as WAVE text, by node and port.
+        let port_values =
+            |map: &HashMap<PortRef, Arc<X::Value>>| -> Result<PortValues, SnapshotError> {
+                let mut out = PortValues::new();
+                for (port, val) in map {
+                    let text = wave(val, &|| format!("`{}.{}`", port.node, port.port))?;
+                    out.entry(port.node.clone())
+                        .or_default()
+                        .insert(port.port.clone(), text);
+                }
+                Ok(out)
+            };
         let feedback = self
             .feedback
             .iter()
-            .map(|(conn, val)| (conn.clone(), wave(val)))
-            .collect();
+            .map(|(conn, val)| Ok((conn.clone(), wave(val, &|| format!("feedback `{conn}`"))?)))
+            .collect::<Result<_, SnapshotError>>()?;
         let mut islands = Vec::new();
         for slot in &self.slots {
             // In flight, or a restored replay not started yet: its inputs,
@@ -136,12 +156,15 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
                     let entry = by_member.entry(member.node.clone()).or_default();
                     for (field, val) in member.inputs.iter().flatten().zip(fields) {
                         if let Some(val) = val {
-                            entry.insert(field.name.clone(), wave(val));
+                            let at =
+                                || format!("the started input `{}.{}`", member.node, field.name);
+                            entry.insert(field.name.clone(), wave(val, &at)?);
                         }
                     }
                 }
-                by_member
+                Ok::<_, SnapshotError>(by_member)
             });
+            let running = running.transpose()?;
             let stale_feedback = started.map(|(_, stale)| stale.clone()).unwrap_or_default();
             let queued = slot.owed.has_latched();
             if running.is_some() || queued {
@@ -153,7 +176,7 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
                 });
             }
         }
-        Snapshot {
+        Ok(Snapshot {
             nodes: self.components.clone(),
             connections: self.connections.clone(),
             links: self.links.clone(),
@@ -169,11 +192,11 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
                         .map(move |m| (m.node.clone(), phase))
                 })
                 .collect(),
-            inputs: port_values(&self.inputs),
-            outputs: port_values(&self.outputs),
+            inputs: port_values(&self.inputs)?,
+            outputs: port_values(&self.outputs)?,
             feedback,
             islands,
-        }
+        })
     }
 
     /// Replaces the graph's host-visible state with `snapshot`. The next

@@ -544,18 +544,18 @@ async fn flags_are_kept_in_declaration_order() {
         .unwrap();
     // The stub traps, which settles the island with nothing owed.
     let _ = tokio::time::timeout(Duration::from_secs(30), rt.tick()).await;
-    let snapshot = rt.snapshot();
+    let snapshot = rt.snapshot().unwrap();
     assert_eq!(snapshot.inputs[&"n".into()][&"p".into()], "{write, read}");
     assert!(snapshot.islands.is_empty());
 
     rt.inject(&"n".into(), &"p".into(), flags(&["write", "read"]))
         .unwrap();
     assert!(
-        rt.snapshot().islands.is_empty(),
+        rt.snapshot().unwrap().islands.is_empty(),
         "the same set in another order is not a change"
     );
     rt.restore(&snapshot).expect("restores its own snapshot");
-    let mut after = rt.snapshot();
+    let mut after = rt.snapshot().unwrap();
     assert!(
         after.phases.values().all(|p| *p == NodePhase::Pending),
         "a restore drops guest state"
