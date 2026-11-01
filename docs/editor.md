@@ -7,6 +7,10 @@ It has no framework dependency, and it runs your real components through
 
 The demo in `packages/witgraph-editor-demo` shows everything described here.
 
+![The demo graph running: each node previews its output as it changes, from
+a feedback loop's values and a future's result to the frames of a video
+stream through grayscale and invert filters.](assets/editor-demo.gif)
+
 ## The layout
 
 | Element                | What it does                                                                                                                            |
