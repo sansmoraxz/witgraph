@@ -1489,7 +1489,7 @@ function cpuTensors() {
       this.#data = data;
       made.push(this);
     }
-    static fromBytes(dtype: string, shape: ArrayLike<number>, data: Uint8Array) {
+    static async fromBytes(dtype: string, shape: ArrayLike<number>, data: Uint8Array) {
       return new Tensor(dtype, shape, data.slice());
     }
     dtype() {
@@ -1498,21 +1498,21 @@ function cpuTensors() {
     shape() {
       return this.#shape;
     }
-    read(offset: bigint, len: bigint) {
+    async read(offset: bigint, len: bigint) {
       return this.#data.slice(Number(offset), Number(offset + len));
     }
     clone() {
       // Its own object: jco disposes it when the guest drops it.
       return new Tensor(this.#dtype, this.#shape, this.#data);
     }
-    invert() {
+    async invert() {
       return new Tensor(
         this.#dtype,
         this.#shape,
         this.#data.map((b) => 255 - b),
       );
     }
-    conv3x3(): never {
+    async conv3x3(): Promise<never> {
       throw new Error('not on the CPU');
     }
     [Symbol.dispose]() {
@@ -1554,7 +1554,7 @@ test('tensors pass between nodes as the objects their makers returned, disposed 
   });
   await session.settle();
 
-  const bytes = 64 * 48 * 4;
+  const bytes = 64 * 48 * 3;
   const sum = session.graph.readOutput('direct', 'sum') as bigint;
   assert.equal(session.graph.readOutput('direct', 'len'), BigInt(bytes));
   const inverted = 255n * BigInt(bytes) - sum;

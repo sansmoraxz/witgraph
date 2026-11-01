@@ -1,9 +1,12 @@
 package test:tensor-source@0.1.0;
 
-/// A `[height, width, 4]` `uint8` tensor (RGBA rows): a gradient shifted by
-/// `seed`, `width` x `height` pixels (64 x 48 when absent).
+/// A `[height, width, 3]` `uint8` tensor (RGB rows): a gradient with a
+/// square in the middle, shifted by `seed`, `width` x `height` pixels (64
+/// x 48 when absent). Calls `fatal` with the host's reason when it cannot
+/// make one.
 world tensor-source {
     import test:data/tensor@0.1.0;
+    import witgraph:runtime/host@0.1.0;
 
     export node: interface {
         use test:data/tensor@0.1.0.{tensor};

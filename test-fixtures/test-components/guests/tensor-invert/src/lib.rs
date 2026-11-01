@@ -19,7 +19,7 @@ struct Invert;
 impl Guest for Invert {
     async fn run(inputs: Inputs<'_>) -> Outputs {
         Outputs {
-            tensor: inputs.tensor.invert(),
+            tensor: inputs.tensor.invert().await,
         }
     }
 }

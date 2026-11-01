@@ -12,7 +12,7 @@ impl Guest for Sink {
     async fn run(inputs: Inputs<'_>) -> Outputs {
         let (mut sum, mut len) = (0u64, 0u64);
         loop {
-            let window = inputs.tensor.read(len, WINDOW);
+            let window = inputs.tensor.read(len, WINDOW).await;
             if window.is_empty() {
                 break;
             }

@@ -160,9 +160,11 @@ pub const BLOB_RELAY: Guest = guest!("BLOB_RELAY_WASM", "blob-relay");
 /// data moves.
 pub const BLOB_SINK: Guest = guest!("BLOB_SINK_WASM", "blob-sink");
 
-/// Imports `test:data/tensor` (a tensor the host keeps). `width`,
+/// Imports `test:data/tensor` (a tensor the host keeps) and
+/// `witgraph:runtime/host`, calling `fatal` when no tensor can be made. `width`,
 /// `height`, `seed`: `option<u32>` (64, 48 and 0 when absent) → `tensor:
-/// own<tensor>`, a `[height, width, 4]` `uint8` gradient. Previews `tensor`
+/// own<tensor>`, a `[height, width, 3]` `uint8` gradient with a square in
+/// the middle. Previews `tensor`
 /// as `tensor`.
 pub const TENSOR_SOURCE: Guest = guest!("TENSOR_SOURCE_WASM", "tensor-source");
 
@@ -185,3 +187,9 @@ pub const TENSOR_SINK: Guest = guest!("TENSOR_SINK_WASM", "tensor-sink");
 /// the next, and returns the sum of the bytes of the one before (0 for
 /// none).
 pub const TENSOR_KEEP: Guest = guest!("TENSOR_KEEP_WASM", "tensor-keep");
+
+/// Imports `test:data/tensor`. `tensor: borrow<tensor>` (`uint8`) →
+/// `edges: own<tensor>`, by a fixed 3x3 Laplacian the host convolves
+/// (`conv3x3`). Calls `fatal` with the host's reason when it cannot. Previews
+/// `edges` as `tensor`.
+pub const TENSOR_EDGE: Guest = guest!("TENSOR_EDGE_WASM", "tensor-edge");

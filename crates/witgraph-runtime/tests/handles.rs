@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use test_components::{
-    Guest, TENSOR_COPY_INVERT, TENSOR_INVERT, TENSOR_KEEP, TENSOR_SINK, TENSOR_SOURCE,
+    Guest, TENSOR_COPY_INVERT, TENSOR_EDGE, TENSOR_INVERT, TENSOR_KEEP, TENSOR_SINK, TENSOR_SOURCE,
 };
 use wasmtime::StoreContextMut;
 use wasmtime::component::{ComponentType, Lift, Linker, Lower, ResourceDynamic};
@@ -60,20 +60,51 @@ struct Tensors {
 
 type Store<'a> = StoreContextMut<'a, PluginData>;
 
-fn tensor(store: &mut Store<'_>, handle: &ResourceDynamic) -> wasmtime::Result<Arc<Cpu>> {
-    let shared = store.data_mut().host_state().shared(handle)?;
+fn tensor(data: &mut PluginData, handle: &ResourceDynamic) -> wasmtime::Result<Arc<Cpu>> {
+    let shared = data.host_state().shared(handle)?;
     let cpu = shared
         .downcast_ref::<Arc<Cpu>>()
         .ok_or_else(|| wasmtime::format_err!("not a tensor"))?;
     Ok(cpu.clone())
 }
 
-fn share(store: &mut Store<'_>, cpu: Cpu) -> wasmtime::Result<ResourceDynamic> {
+fn share(data: &mut PluginData, cpu: Cpu) -> wasmtime::Result<ResourceDynamic> {
     let bytes = cpu.data.len();
-    store
-        .data_mut()
-        .host_state()
+    data.host_state()
         .share(TENSOR, "tensor", Arc::new(cpu), bytes)
+}
+
+/// `test:data/tensor`'s `conv3x3` of a `[height, width, channels]` `uint8`
+/// tensor.
+fn conv3x3(cpu: &Cpu, weights: &[f32]) -> Result<Cpu, String> {
+    let (&[h, w, c], Dtype::Uint8, 9) = (cpu.shape.as_slice(), cpu.dtype, weights.len()) else {
+        return Err("a [height, width, channels] uint8 tensor and 9 weights".into());
+    };
+    let (h, w, c) = (h as usize, w as usize, c as usize);
+    let at = |y: usize, x: usize, ch: usize| f32::from(cpu.data[(y * w + x) * c + ch]);
+    let mut data = vec![0u8; cpu.data.len()];
+    for y in 0..h {
+        for x in 0..w {
+            for ch in 0..c {
+                let mut sum = 0.0;
+                for (k, weight) in weights.iter().enumerate() {
+                    let (sy, sx) = ((y + k / 3).checked_sub(1), (x + k % 3).checked_sub(1));
+                    if let (Some(sy), Some(sx)) = (sy, sx)
+                        && sy < h
+                        && sx < w
+                    {
+                        sum += weight * at(sy, sx, ch);
+                    }
+                }
+                data[(y * w + x) * c + ch] = sum.trunc().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+    Ok(Cpu {
+        dtype: Dtype::Uint8,
+        shape: cpu.shape.clone(),
+        data: data.into(),
+    })
 }
 
 impl CapabilityPlugin for Tensors {
@@ -97,42 +128,47 @@ impl CapabilityPlugin for Tensors {
     ) -> wasmtime::Result<()> {
         let mut instance = linker.instance(&capability.interface)?;
         link_resource(&mut instance, &capability.interface, "tensor")?;
-        instance.func_wrap(
+        instance.func_wrap_concurrent(
             "[static]tensor.from-bytes",
-            |mut store: Store<'_>, (dtype, shape, data): (Dtype, Vec<u32>, Vec<u8>)| {
-                let elements: usize = shape.iter().map(|&d| d as usize).product();
-                if elements * dtype.size() != data.len() {
-                    return Ok((Err(format!("{} bytes for {elements} elements", data.len())),));
-                }
-                let cpu = Cpu {
-                    dtype,
-                    shape,
-                    data: data.into(),
-                };
-                Ok((Ok(share(&mut store, cpu)?),))
+            |acc, (dtype, shape, data): (Dtype, Vec<u32>, Vec<u8>)| {
+                Box::pin(async move {
+                    let elements: usize = shape.iter().map(|&d| d as usize).product();
+                    if elements * dtype.size() != data.len() {
+                        return Ok((Err(format!("{} bytes for {elements} elements", data.len())),));
+                    }
+                    let cpu = Cpu {
+                        dtype,
+                        shape,
+                        data: data.into(),
+                    };
+                    let made = acc.with(|mut access| share(access.data_mut(), cpu))?;
+                    Ok((Ok(made),))
+                })
             },
         )?;
         instance.func_wrap(
             "[method]tensor.dtype",
             |mut store: Store<'_>, (this,): (ResourceDynamic,)| {
-                Ok((tensor(&mut store, &this)?.dtype,))
+                Ok((tensor(store.data_mut(), &this)?.dtype,))
             },
         )?;
         instance.func_wrap(
             "[method]tensor.shape",
             |mut store: Store<'_>, (this,): (ResourceDynamic,)| {
-                Ok((tensor(&mut store, &this)?.shape.clone(),))
+                Ok((tensor(store.data_mut(), &this)?.shape.clone(),))
             },
         )?;
-        instance.func_wrap(
+        instance.func_wrap_concurrent(
             "[method]tensor.read",
-            |mut store: Store<'_>, (this, offset, len): (ResourceDynamic, u64, u64)| {
-                let cpu = tensor(&mut store, &this)?;
-                let start = usize::try_from(offset)
-                    .unwrap_or(usize::MAX)
-                    .min(cpu.data.len());
-                let end = start.saturating_add(usize::try_from(len).unwrap_or(usize::MAX));
-                Ok((cpu.data[start..end.min(cpu.data.len())].to_vec(),))
+            |acc, (this, offset, len): (ResourceDynamic, u64, u64)| {
+                Box::pin(async move {
+                    let cpu = acc.with(|mut access| tensor(access.data_mut(), &this))?;
+                    let start = usize::try_from(offset)
+                        .unwrap_or(usize::MAX)
+                        .min(cpu.data.len());
+                    let end = start.saturating_add(usize::try_from(len).unwrap_or(usize::MAX));
+                    Ok((cpu.data[start..end.min(cpu.data.len())].to_vec(),))
+                })
             },
         )?;
         instance.func_wrap(
@@ -143,32 +179,44 @@ impl CapabilityPlugin for Tensors {
                 Ok((state.share_again(shared)?,))
             },
         )?;
-        instance.func_wrap(
+        instance.func_wrap_concurrent(
             "[method]tensor.invert",
-            |mut store: Store<'_>, (this,): (ResourceDynamic,)| {
-                let cpu = tensor(&mut store, &this)?;
-                let data = match cpu.dtype {
-                    Dtype::Uint8 => cpu.data.iter().map(|&b| 255 - b).collect(),
-                    Dtype::Float32 => cpu
-                        .data
-                        .as_chunks::<4>()
-                        .0
-                        .iter()
-                        .flat_map(|x| (1.0 - f32::from_le_bytes(*x)).to_le_bytes())
-                        .collect(),
-                };
-                let inverted = Cpu {
-                    dtype: cpu.dtype,
-                    shape: cpu.shape.clone(),
-                    data,
-                };
-                Ok((share(&mut store, inverted)?,))
+            |acc, (this,): (ResourceDynamic,)| {
+                Box::pin(async move {
+                    acc.with(|mut access| {
+                        let cpu = tensor(access.data_mut(), &this)?;
+                        let data = match cpu.dtype {
+                            Dtype::Uint8 => cpu.data.iter().map(|&b| 255 - b).collect(),
+                            Dtype::Float32 => cpu
+                                .data
+                                .as_chunks::<4>()
+                                .0
+                                .iter()
+                                .flat_map(|x| (1.0 - f32::from_le_bytes(*x)).to_le_bytes())
+                                .collect(),
+                        };
+                        let inverted = Cpu {
+                            dtype: cpu.dtype,
+                            shape: cpu.shape.clone(),
+                            data,
+                        };
+                        Ok((share(access.data_mut(), inverted)?,))
+                    })
+                })
             },
         )?;
-        instance.func_wrap(
+        instance.func_wrap_concurrent(
             "[method]tensor.conv3x3",
-            |_: Store<'_>, (_, _): (ResourceDynamic, Vec<f32>)| {
-                Ok((Err::<ResourceDynamic, _>("not on the CPU".to_string()),))
+            |acc, (this, weights): (ResourceDynamic, Vec<f32>)| {
+                Box::pin(async move {
+                    acc.with(|mut access| {
+                        let cpu = tensor(access.data_mut(), &this)?;
+                        Ok((match conv3x3(&cpu, &weights) {
+                            Ok(edges) => Ok(share(access.data_mut(), edges)?),
+                            Err(reason) => Err(reason),
+                        },))
+                    })
+                })
             },
         )?;
         Ok(())
@@ -197,6 +245,7 @@ impl Kit {
             TENSOR_COPY_INVERT,
             TENSOR_SINK,
             TENSOR_KEEP,
+            TENSOR_EDGE,
         ] {
             let c = contract(guest);
             kit.wasm.insert(c.id.clone(), guest.wasm);
@@ -248,8 +297,8 @@ fn u64_of(rt: &RuntimeGraph<Perf, Plugins>, node: &str, port: &str) -> u64 {
     }
 }
 
-/// The bytes of the default 64 x 48 RGBA source tensor.
-const SOURCE_BYTES: usize = 64 * 48 * 4;
+/// The bytes of the default 64 x 48 RGB source tensor.
+const SOURCE_BYTES: usize = 64 * 48 * 3;
 
 /// `src` feeding `inv` (inverted by the host) and `copy` (by the guest),
 /// each into a sink, and `direct`, a sink of `src` itself.
@@ -478,4 +527,43 @@ async fn a_restore_makes_the_tensors_anew() {
     settle(&mut restored).await;
     assert_eq!(u64_of(&restored, "inv-sink", "sum"), sum);
     assert_eq!(restored.shared_memory(), 3 * SOURCE_BYTES);
+}
+
+#[tokio::test]
+async fn edges_are_found_where_the_data_lives() {
+    let kit = Kit::new();
+    let graph = kit
+        .builder()
+        .add_node("src", of(TENSOR_SOURCE))
+        .add_node("edge", of(TENSOR_EDGE))
+        .add_node("sink", of(TENSOR_SINK))
+        .connect(
+            "a",
+            PortRef::new("src", "tensor"),
+            PortRef::new("edge", "tensor"),
+        )
+        .connect(
+            "b",
+            PortRef::new("edge", "edges"),
+            PortRef::new("sink", "tensor"),
+        )
+        .build();
+    let mut rt = kit
+        .load(graph, RuntimeConfig::default(), true)
+        .await
+        .unwrap();
+    settle(&mut rt).await;
+    let edges = rt
+        .read_handle(&"edge".into(), &"edges".into())
+        .unwrap()
+        .unwrap();
+    let cpu = edges.downcast_ref::<Arc<Cpu>>().unwrap();
+    let bright = cpu.data.iter().filter(|&&b| b > 128).count();
+    // The square's outline, and the image's border: some of it, far from all.
+    assert!(
+        bright > 0 && bright < cpu.data.len() / 4,
+        "{bright} of {}",
+        cpu.data.len()
+    );
+    assert_eq!(u64_of(&rt, "sink", "len"), SOURCE_BYTES as u64);
 }

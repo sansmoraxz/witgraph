@@ -451,6 +451,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "tensor-edge-guest"
+version = "0.1.0"
+dependencies = [
+ "wit-bindgen",
+]
+
+[[package]]
 name = "tensor-invert-guest"
 version = "0.1.0"
 dependencies = [

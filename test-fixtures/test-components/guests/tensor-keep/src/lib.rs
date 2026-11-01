@@ -16,11 +16,14 @@ struct Keep;
 impl Guest for Keep {
     async fn run(inputs: Inputs<'_>) -> Outputs {
         let kept = inputs.tensor.map(Tensor::clone);
-        let previous = KEPT.with(|cell| cell.replace(kept)).map_or(0, |previous| {
-            let len: u64 = previous.shape().iter().map(|&d| u64::from(d)).product();
-            previous.read(0, len).iter().map(|&b| u64::from(b)).sum()
-        });
-        Outputs { previous }
+        let Some(previous) = KEPT.with(|cell| cell.replace(kept)) else {
+            return Outputs { previous: 0 };
+        };
+        let len: u64 = previous.shape().iter().map(|&d| u64::from(d)).product();
+        let bytes = previous.read(0, len).await;
+        Outputs {
+            previous: bytes.iter().map(|&b| u64::from(b)).sum(),
+        }
     }
 }
 
