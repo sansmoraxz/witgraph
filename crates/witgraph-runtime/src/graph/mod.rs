@@ -16,6 +16,8 @@ use std::future::Future;
 
 use wasmtime::Engine;
 use wasmtime::component::{Type, Val};
+
+use crate::value::Value;
 use witgraph_ir::{CompiledGraph, NodeId, PortDirection, PortName};
 use witgraph_sched::{Scheduler, Snapshot, SnapshotError};
 
@@ -156,7 +158,7 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
     /// See [`Scheduler::inject`] for which ports qualify and when the
     /// island re-runs.
     pub fn inject(&mut self, node: &NodeId, port: &PortName, val: Val) -> Result<(), RuntimeError> {
-        self.sched.inject(node, port, val)
+        self.sched.inject(node, port, Value::from_val(val))
     }
 
     /// [`inject`](Self::inject)s a value written as WAVE text, parsed
@@ -186,7 +188,10 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
     /// returned last, or `None` if it has not run yet. See
     /// [`Scheduler::read_output`].
     pub fn read_output(&self, node: &NodeId, port: &PortName) -> Result<Option<Val>, RuntimeError> {
-        self.sched.read_output(node, port)
+        Ok(self
+            .sched
+            .read_output(node, port)?
+            .map(|value| value.to_val()))
     }
 
     /// The component type of a Value input port's payload (for an optional

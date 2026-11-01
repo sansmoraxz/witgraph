@@ -49,6 +49,7 @@ pub mod error;
 pub mod graph;
 pub mod plugin;
 pub(crate) mod pump;
+pub(crate) mod value;
 
 pub use engine::{CapabilityGap, Host, HostState, IslandData, NoCapabilities};
 pub use error::LoadError;

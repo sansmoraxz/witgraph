@@ -85,6 +85,8 @@ use futures::FutureExt;
 use futures::channel::{mpsc, oneshot};
 use futures::stream::{FuturesUnordered, StreamExt};
 use wasmtime::component::{Accessor, Func, InstancePre, Linker, Type, Val};
+
+use crate::value::Value;
 use wasmtime::{AsContextMut, Engine, Store, StoreContextMut};
 use witgraph_ir::{
     Capability, ComponentContract, NodeId, PortDirection, PortKind, PortName, PortRef,
@@ -665,7 +667,7 @@ fn signature<D>(store: &Store<D>, run: Func) -> RunSignature {
 /// Runs one generation of `island`.
 pub(crate) async fn run_generation<D: IslandData>(
     mut island: IslandStore<D>,
-    mut generation: Generation<Val>,
+    mut generation: Generation<Value>,
     settings: StoreSettings,
 ) -> Outcome<IslandStore<D>> {
     for cell in &mut island.cells {
@@ -730,8 +732,8 @@ fn pinned_on(fault: &NodeFault, cell: &[usize], members: usize) -> Option<usize>
 /// straight from one to the next.
 async fn run_cell<D: IslandData>(
     cell: &mut Cell<D>,
-    generation: &Generation<Val>,
-    external: Vec<Vec<Option<Val>>>,
+    generation: &Generation<Value>,
+    external: Vec<Vec<Option<Value>>>,
     budget: u64,
 ) -> wasmtime::Result<()> {
     let plan = &generation.plan;
@@ -745,7 +747,7 @@ async fn run_cell<D: IslandData>(
                 budget,
             };
             let send = |kind| generation.send(kind);
-            drive(&members, plan, external, option_payload, &send).await?;
+            drive(&members, plan, external, Value::option_payload, &send).await?;
             poll_fn(|cx| acc.poll_no_interesting_tasks(cx)).await;
             Ok(())
         })
@@ -756,7 +758,7 @@ async fn run_cell<D: IslandData>(
 #[derive(Clone)]
 enum CellValue {
     /// A value, or a handle that stays in the Store it was made in.
-    Local(Val),
+    Local(Value),
     /// A stream on its way to another Store: the receiving end of its pump,
     /// taken by the one member that reads it.
     Pumped(Arc<Mutex<Option<StreamRx>>>),
@@ -822,7 +824,7 @@ impl NodeCaller<CellValue> for Remote<'_> {
 /// the Stores of an island.
 fn cell_option_payload(value: &CellValue) -> OptionPayload<'_, CellValue> {
     match value {
-        CellValue::Local(val) => match option_payload(val) {
+        CellValue::Local(val) => match val.option_payload() {
             OptionPayload::Some(payload) => {
                 OptionPayload::Some(Cow::Owned(CellValue::Local(payload.into_owned())))
             }
@@ -842,8 +844,8 @@ fn cell_option_payload(value: &CellValue) -> OptionPayload<'_, CellValue> {
 /// if it came from one.
 async fn run_cells<D: IslandData>(
     island: &mut IslandStore<D>,
-    generation: &Generation<Val>,
-    external: Vec<Vec<Option<Val>>>,
+    generation: &Generation<Value>,
+    external: Vec<Vec<Option<Value>>>,
     budget: u64,
 ) -> Result<(), (wasmtime::Error, Option<usize>)> {
     let IslandStore { cells, place } = island;
@@ -909,7 +911,7 @@ async fn run_cells<D: IslandData>(
 
 /// An event of a generation, as the scheduler takes it:
 /// Value outputs are plain values.
-fn local_event(kind: IslandEventKind<CellValue>) -> IslandEventKind<Val> {
+fn local_event(kind: IslandEventKind<CellValue>) -> IslandEventKind<Value> {
     kind.filter_map_values(|value| match value {
         CellValue::Local(val) => Some(val),
         _ => None,
@@ -923,7 +925,7 @@ fn local_event(kind: IslandEventKind<CellValue>) -> IslandEventKind<Val> {
 async fn serve_cell<D: IslandData>(
     cell: &mut Cell<D>,
     index: usize,
-    generation: &Generation<Val>,
+    generation: &Generation<Value>,
     place: &[(usize, usize)],
     mut requests: mpsc::UnboundedReceiver<Request>,
     budget: u64,
@@ -997,7 +999,7 @@ struct Served<'a, D: IslandData> {
     acc: &'a Accessor<D>,
     /// The Store's cell.
     index: usize,
-    generation: &'a Generation<Val>,
+    generation: &'a Generation<Value>,
     place: &'a [(usize, usize)],
     runs: &'a [Func],
     streams: &'a [HashMap<String, Type>],
@@ -1056,7 +1058,7 @@ impl<D: IslandData> Served<'_, D> {
                     let rx = rx.ok_or_else(|| wasmtime::format_err!("a stream was read twice"))?;
                     let (val, intake) = import_stream(self.acc, rx)?;
                     lock(&self.intakes)?.push(intake);
-                    Ok(Some(val))
+                    Ok(Some(Value::Scalar(val)))
                 }
                 Some(CellValue::Closed) | None => Ok(None),
             })
@@ -1087,10 +1089,10 @@ impl<D: IslandData> Served<'_, D> {
         val: Val,
     ) -> wasmtime::Result<CellValue> {
         let Some((port, output)) = plan.outputs.get_key_value(name) else {
-            return Ok(CellValue::Local(val));
+            return Ok(CellValue::Local(Value::from_val(val)));
         };
         if output.kind == PortKind::Value {
-            return Ok(CellValue::Local(val));
+            return Ok(CellValue::Local(Value::from_val(val)));
         }
         // A stream or future has one reader in the island, or none.
         let reader = output.consumers.first().map(|consumer| consumer.member);
@@ -1104,7 +1106,7 @@ impl<D: IslandData> Served<'_, D> {
                 close(self.acc, val)?;
                 Ok(CellValue::Closed)
             }
-            (Some(reader), val) if here(reader) => Ok(CellValue::Local(val)),
+            (Some(reader), val) if here(reader) => Ok(CellValue::Local(Value::Scalar(val))),
             (Some(_), Val::Stream(stream)) => {
                 let element = self
                     .streams
@@ -1140,7 +1142,7 @@ pub(crate) async fn rebuild_and_run<D: IslandData>(
     members: IslandBinaries<D>,
     cells: Vec<Vec<usize>>,
     data: Vec<wasmtime::Result<D>>,
-    generation: Generation<Val>,
+    generation: Generation<Value>,
     settings: StoreSettings,
 ) -> Outcome<IslandStore<D>> {
     let parts: Vec<(&NodeId, &NodeBinary<D>)> = members
@@ -1180,26 +1182,33 @@ struct Members<'a, D: IslandData> {
     budget: u64,
 }
 
-impl<D: IslandData> NodeCaller<Val> for Members<'_, D> {
+impl<D: IslandData> NodeCaller<Value> for Members<'_, D> {
     type Error = wasmtime::Error;
 
     async fn call(
         &self,
         member: usize,
-        args: Vec<Option<Val>>,
-    ) -> wasmtime::Result<Vec<(String, Val)>> {
-        call_run(
+        args: Vec<Option<Value>>,
+    ) -> wasmtime::Result<Vec<(String, Value)>> {
+        let outputs = call_run(
             self.acc,
             &self.runs[member],
             &self.plan.members[member],
             args,
             self.budget,
         )
-        .await
+        .await?;
+        Ok(outputs
+            .into_iter()
+            .map(|(name, val)| (name, Value::from_val(val)))
+            .collect())
     }
 
-    fn close(&self, val: Val) -> wasmtime::Result<()> {
-        close(self.acc, val)
+    fn close(&self, value: Value) -> wasmtime::Result<()> {
+        match value {
+            Value::Scalar(val) => close(self.acc, val),
+            _ => Ok(()),
+        }
     }
 
     fn missing_input(&self, member: usize, field: &PortName) -> wasmtime::Error {
@@ -1208,12 +1217,13 @@ impl<D: IslandData> NodeCaller<Val> for Members<'_, D> {
 }
 
 /// Calls a member's `run` with its collected inputs, after resetting the
-/// Store's fuel to `budget`, and returns its outputs by field name.
+/// Store's fuel to `budget`, and returns its outputs by field name, as
+/// wasmtime lifted them.
 async fn call_run<D: IslandData>(
     acc: &Accessor<D>,
     run: &Func,
     plan: &MemberPlan,
-    args: Vec<Option<Val>>,
+    args: Vec<Option<Value>>,
     budget: u64,
 ) -> wasmtime::Result<Vec<(String, Val)>> {
     let params = params(plan, args)?;
@@ -1241,16 +1251,16 @@ fn close<D: IslandData>(acc: &Accessor<D>, val: Val) -> wasmtime::Result<()> {
 }
 
 /// Builds `run`'s parameter list from a member's collected inputs, one per
-/// field of its `inputs` record. [`drive`] has checked that every required
-/// input has a value.
-fn params(member: &MemberPlan, args: Vec<Option<Val>>) -> wasmtime::Result<Vec<Val>> {
+/// field of its `inputs` record: the only place a value becomes a `Val`
+/// again. [`drive`] has checked that every required input has a value.
+fn params(member: &MemberPlan, args: Vec<Option<Value>>) -> wasmtime::Result<Vec<Val>> {
     let Some(fields) = &member.inputs else {
         return Ok(Vec::new());
     };
     let mut record = Vec::with_capacity(fields.len());
     let mut args = args.into_iter();
     for field in fields {
-        let value = args.next().flatten();
+        let value = args.next().flatten().map(Value::into_val);
         let value = match (field.optional, value) {
             (true, value) => Val::Option(value.map(Box::new)),
             (false, Some(value)) => value,
@@ -1321,19 +1331,19 @@ pub(crate) fn island_data<H: Host>(
 }
 
 impl<H: Host> Executor for Wasmtime<H> {
-    type Value = Val;
+    type Value = Value;
     type Type = Type;
     type Island = IslandStore<H::Data>;
 
     fn run(
         &self,
         island: Self::Island,
-        generation: Generation<Val>,
+        generation: Generation<Value>,
     ) -> GenerationFuture<Self::Island> {
         run_generation(island, generation, self.settings).boxed()
     }
 
-    fn rebuild_and_run(&self, generation: Generation<Val>) -> GenerationFuture<Self::Island> {
+    fn rebuild_and_run(&self, generation: Generation<Value>) -> GenerationFuture<Self::Island> {
         let index = generation.plan.index;
         let members = self.binaries.get(index).cloned().unwrap_or_default();
         let cells = self.cells.get(index).cloned().unwrap_or_default();
@@ -1353,8 +1363,8 @@ impl<H: Host> Executor for Wasmtime<H> {
         .boxed()
     }
 
-    fn option_payload(value: &Val) -> OptionPayload<'_, Val> {
-        option_payload(value)
+    fn option_payload(value: &Value) -> OptionPayload<'_, Value> {
+        value.option_payload()
     }
 
     fn port_type(&self, port: &PortRef, direction: PortDirection) -> Option<&Type> {
@@ -1364,18 +1374,19 @@ impl<H: Host> Executor for Wasmtime<H> {
         }
     }
 
-    fn check_input(&self, ty: &Type, value: Val) -> Result<Val, String> {
-        check_type(ty, &value)?;
-        Ok(canonical(ty, value))
+    fn check_input(&self, ty: &Type, value: Value) -> Result<Value, String> {
+        let val = value.into_val();
+        check_type(ty, &val)?;
+        Ok(Value::from_val(canonical(ty, val)))
     }
 
-    fn parse_wave(&self, ty: &Type, text: &str) -> Result<Val, String> {
-        parse_wave(ty, text)
+    fn parse_wave(&self, ty: &Type, text: &str) -> Result<Value, String> {
+        parse_wave(ty, text).map(Value::from_val)
     }
 
     /// A Value port never holds a kind WAVE cannot render (a handle, say).
-    fn to_wave(&self, value: &Val) -> Result<String, String> {
-        value.to_wave().map_err(|e| e.to_string())
+    fn to_wave(&self, value: &Value) -> Result<String, String> {
+        value.to_val().to_wave().map_err(|e| e.to_string())
     }
 }
 
@@ -1410,15 +1421,6 @@ fn classify(
         },
         None,
     )
-}
-
-/// What a connection that unwraps an option delivers for `val`.
-pub(crate) fn option_payload(val: &Val) -> OptionPayload<'_, Val> {
-    match val {
-        Val::Option(Some(payload)) => OptionPayload::Some(Cow::Borrowed(payload)),
-        Val::Option(None) => OptionPayload::None,
-        _ => OptionPayload::NotOption,
-    }
 }
 
 /// Parses WAVE text as a value of type `ty`, in [`canonical`] form. Unlike
@@ -1597,13 +1599,17 @@ mod tests {
 
     #[test]
     fn option_payloads_unwrap() {
-        let some = Val::Option(Some(Box::new(Val::U32(5))));
+        let some = Value::from_val(Val::Option(Some(Box::new(Val::U32(5)))));
         assert_eq!(
-            option_payload(&some),
-            OptionPayload::Some(Cow::Borrowed(&Val::U32(5)))
+            some.option_payload(),
+            OptionPayload::Some(Cow::Borrowed(&Value::Scalar(Val::U32(5))))
         );
-        assert_eq!(option_payload(&Val::Option(None)), OptionPayload::None);
-        assert_eq!(option_payload(&Val::U32(5)), OptionPayload::NotOption);
+        let none = Value::from_val(Val::Option(None));
+        assert_eq!(none.option_payload(), OptionPayload::None);
+        assert_eq!(
+            Value::Scalar(Val::U32(5)).option_payload(),
+            OptionPayload::NotOption
+        );
     }
 
     /// Change detection is `Val ==`: every NaN equals every other, and `0.0` differs from `-0.0`.
