@@ -213,8 +213,19 @@ export class EditorController extends EventTarget {
     return this.#savedSnapshots;
   }
 
+  /** A Value output's WAVE text, a tick at a time, while it is {@link isObserved}. */
   outputHistory(node: string, port: string): readonly OutputSnapshot[] {
     return this.#outputHistory.get(node)?.get(port) ?? [];
+  }
+
+  /**
+   * Whether what `node`'s output `port` carries is kept: when the node
+   * previews it, or the node is selected (the inspector shows its outputs).
+   * Nothing else is recorded or read back, so an output nobody looks at
+   * costs nothing however much it carries.
+   */
+  isObserved(node: string, port: string): boolean {
+    return this.#selectedNode === node || this.#nodes.get(node)?.preview?.port === port;
   }
 
   /**
@@ -1508,11 +1519,15 @@ export class EditorController extends EventTarget {
       afterRun: (): void => {},
 
       onStreamItem: ({ node, port, items }): void => {
-        if (this.#session === session) this.#recordItems(node, port, items);
+        if (this.#session === session && this.isObserved(node, port)) {
+          this.#recordItems(node, port, items);
+        }
       },
 
       onFutureValue: ({ node, port, value }): void => {
-        if (this.#session === session) this.#record(node, port, value);
+        if (this.#session === session && this.isObserved(node, port)) {
+          this.#record(node, port, value);
+        }
       },
     };
 
@@ -1657,39 +1672,31 @@ export class EditorController extends EventTarget {
       }
     }
 
-    // Record output history
+    // Record what the observed Value outputs carry: read once a tick.
     for (const [id, visual] of this.#nodes) {
       for (const port of visual.outputs) {
-        if (port.kind !== 'value') continue;
+        if (port.kind !== 'value' || !this.isObserved(id, port.name)) continue;
         try {
+          const wave = this.#session.graph.readOutputWave(id, port.name);
+          if (wave === undefined) continue;
           const seen = this.#observed.get(id)?.get(port.name);
           if (seen?.tick !== this.#tickCount) {
-            const wave = this.#session.graph.readOutputWave(id, port.name);
             const value = this.#session.graph.readOutput(id, port.name);
-            if (wave !== undefined && value !== undefined) {
+            if (value !== undefined) {
               this.#record(id, port.name, value);
               const recorded = this.#observation(id, port.name);
               recorded.tick = this.#tickCount;
               recorded.wave = wave;
             }
           }
-        } catch {}
-        try {
-          const wave = this.#session.graph.readOutputWave(id, port.name);
-          if (wave !== undefined) {
-            if (!this.#outputHistory.has(id)) {
-              this.#outputHistory.set(id, new Map());
-            }
-            const nodeHistory = this.#outputHistory.get(id)!;
-            if (!nodeHistory.has(port.name)) {
-              nodeHistory.set(port.name, []);
-            }
-            const portHistory = nodeHistory.get(port.name)!;
-            const last = portHistory[portHistory.length - 1];
-            if (!last || last.wave !== wave || last.tick !== this.#tickCount) {
-              portHistory.push({ tick: this.#tickCount, wave });
-              if (portHistory.length > MAX_HISTORY) portHistory.shift();
-            }
+          const nodeHistory = this.#outputHistory.get(id) ?? new Map<string, OutputSnapshot[]>();
+          this.#outputHistory.set(id, nodeHistory);
+          const portHistory = nodeHistory.get(port.name) ?? [];
+          nodeHistory.set(port.name, portHistory);
+          const last = portHistory[portHistory.length - 1];
+          if (!last || last.wave !== wave || last.tick !== this.#tickCount) {
+            portHistory.push({ tick: this.#tickCount, wave });
+            if (portHistory.length > MAX_HISTORY) portHistory.shift();
           }
         } catch {}
       }
