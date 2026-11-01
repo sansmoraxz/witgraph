@@ -1607,9 +1607,9 @@ mod tests {
         assert_eq!(option_payload(&Val::U32(5)), OptionPayload::NotOption);
     }
 
-    /// Change detection is `Val ==`: the README promises how floats compare.
+    /// Change detection is `Val ==`: every NaN equals every other, and `0.0` differs from `-0.0`.
     #[test]
-    fn floats_compare_as_documented() {
+    fn floats_compare_by_val_equality() {
         assert_ne!(Val::Float64(0.0), Val::Float64(-0.0));
         assert_eq!(Val::Float64(f64::NAN), Val::Float64(-f64::NAN));
         assert_ne!(Val::Float32(0.0), Val::Float32(-0.0));
