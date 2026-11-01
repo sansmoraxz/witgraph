@@ -1996,7 +1996,7 @@ mod tests {
             return false;
         };
         let mut module = wit_component::dummy_module(
-            &resolve,
+            resolve,
             world,
             wp::ManglingAndAbi::Legacy(wp::LiftLowerAbi::Sync),
         );

@@ -15,14 +15,29 @@ workspace = true
 witgraph-ir = { workspace = true }
 witgraph-sched = { workspace = true }
 witgraph-wit = { path = "../witgraph-wit" }
-wac-graph = "0.12"
+wac-graph = { workspace = true }
 thiserror = { workspace = true }
 miette = { workspace = true }
 futures = "0.3"
+# The features the runtime cannot work without. Everything else is opt-in below.
 wasmtime = { workspace = true, features = [
-    "runtime", "cranelift", "component-model", "component-model-async", "async", "std",
-    "wave", "parallel-compilation",
+    "runtime", "cranelift", "component-model", "component-model-async", "async", "std", "wave",
 ] }
+
+[features]
+default = ["parallel-compilation"]
+# Each of these turns on the wasmtime feature of the same name, so code that
+# reaches wasmtime through this crate's `wasmtime` re-export can use it
+# without a second dependency on wasmtime.
+parallel-compilation = ["wasmtime/parallel-compilation"]
+cache = ["wasmtime/cache"]
+profiling = ["wasmtime/profiling"]
+pooling-allocator = ["wasmtime/pooling-allocator"]
+wat = ["wasmtime/wat"]
+demangle = ["wasmtime/demangle"]
+addr2line = ["wasmtime/addr2line"]
+coredump = ["wasmtime/coredump"]
+debug = ["wasmtime/debug"]
 
 [dev-dependencies]
 wit-parser = { workspace = true }

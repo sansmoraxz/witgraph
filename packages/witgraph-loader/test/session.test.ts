@@ -56,6 +56,7 @@ const ids: Record<string, string> = {
   relay: 'test:relay/relay@0.1.0',
   'stream-producer': 'test:stream-producer/stream-producer@0.1.0',
   'stream-consumer': 'test:stream-consumer/stream-consumer@0.1.0',
+  'bytes-consumer': 'test:bytes-consumer/bytes-consumer@0.1.0',
   'busy-loop': 'test:busy-loop/busy-loop@0.1.0',
   'mqtt-node': 'test:mqtt-node/mqtt-node@0.1.0',
   labelled: 'test:labelled/labelled@0.1.0',
@@ -385,10 +386,10 @@ test('a trap faults its island, and fatal aborts the tick', async () => {
 });
 
 test('capabilities and labelled imports come from the registry, named as on wasmtime', async () => {
-  const feed = [3, 4, 5];
+  const feed = [Uint8Array.of(3), Uint8Array.of(4, 5), Uint8Array.of(6, 7, 8)];
   const asked: [string, Capability][] = [];
   const session = await load(
-    [['mqtt', 'mqtt-node'], ['cons', 'stream-consumer'], ['kv', 'labelled'], ['busy', 'busy-loop']],
+    [['mqtt', 'mqtt-node'], ['cons', 'bytes-consumer'], ['kv', 'labelled'], ['busy', 'busy-loop']],
     [['s', 'mqtt.messages', 'cons.items']],
     {
       capabilities: (node, capability) => {
@@ -405,7 +406,8 @@ test('capabilities and labelled imports come from the registry, named as on wasm
   session.graph.inject('kv', 'key', 'k');
   session.graph.inject('busy', 'action', 'finish');
   await session.settle();
-  assert.equal(session.graph.readOutput('cons', 'total'), 12);
+  assert.equal(session.graph.readOutput('cons', 'count'), 3);
+  assert.equal(session.graph.readOutput('cons', 'total-bytes'), 6);
   assert.equal(session.graph.readOutput('kv', 'primary'), 'primary:k@kv');
   assert.equal(session.graph.readOutput('kv', 'backup'), 'backup:k@kv');
   // The contract's capabilities, version and labelled interface included;
@@ -777,7 +779,7 @@ test('a fatal start function during a rebuild aborts the tick, naming its node',
 test('a failed rebuild names the member whose rebuild failed', async () => {
   let provide = true;
   const session = await load(
-    [['mqtt', 'mqtt-node'], ['cons', 'stream-consumer']],
+    [['mqtt', 'mqtt-node'], ['cons', 'bytes-consumer']],
     [['s', 'mqtt.messages', 'cons.items']],
     {
       capabilities: (_, capability) =>
