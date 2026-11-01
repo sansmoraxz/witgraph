@@ -24,6 +24,9 @@ import {
   type WitgraphTimeline,
 } from 'witgraph-editor';
 import type { Capability, ComponentSource } from 'witgraph-loader';
+import { type Cnn, cpu } from './accel/cnn.ts';
+import { webgpu } from './accel/webgpu.ts';
+import { webnn } from './accel/webnn.ts';
 
 registerAll();
 
@@ -129,6 +132,7 @@ const GUESTS = [
   'frame-grayscale',
   'frame-invert',
   'video-sink',
+  'edge-detect',
 ];
 
 const allComponents = GUESTS.map((guest) => ({
@@ -296,10 +300,52 @@ const video: GraphJson = {
   ],
 };
 
-/** A graph the demo can load, and the node to select. */
+const edgeDetectRef = {
+  package: { namespace: 'test', name: 'edge-detect', version: '0.1.0' },
+  world: 'edge-detect',
+};
+
+/**
+ * A camera's frames through edge detection: a small convolutional network
+ * with fixed weights, run on the browser's accelerator (`test:accel/cnn`,
+ * provided here by WebGPU or WebNN). A browser without the accelerator
+ * still loads the graph; the edge node faults when run, saying so.
+ */
+function edgeGraph(accelerator: string): GraphJson {
+  return {
+    metadata: {
+      name: `demo-edges-${accelerator.toLowerCase()}`,
+      description: `Edge detection by a fixed-weight CNN on ${accelerator}.`,
+    },
+    components: allComponents,
+    nodes: [
+      { id: 'camera', component: videoSourceRef, label: 'Camera', attrs: { 'inject.fps': '15' } },
+      { id: 'edges', component: edgeDetectRef, label: `Edges (${accelerator})` },
+      { id: 'sink', component: videoSinkRef, label: 'Sink' },
+    ],
+    connections: [
+      {
+        id: 'camera-edges',
+        from: { node: 'camera', port: 'frames' },
+        to: { node: 'edges', port: 'frames' },
+      },
+      {
+        id: 'edges-sink',
+        from: { node: 'edges', port: 'edges' },
+        to: { node: 'sink', port: 'frames' },
+      },
+    ],
+  };
+}
+
+/**
+ * A graph the demo can load, the node to select, and what runs
+ * `test:accel/cnn` for it (the CPU unless it says otherwise).
+ */
 interface Demo {
   graph: GraphJson;
   select: string;
+  accelerator?: () => Promise<Cnn>;
 }
 
 const demos: Record<string, Demo> = {
@@ -311,6 +357,8 @@ const demos: Record<string, Demo> = {
     graph: video,
     select: 'gray',
   },
+  webgpu: { graph: edgeGraph('WebGPU'), select: 'edges', accelerator: webgpu },
+  webnn: { graph: edgeGraph('WebNN'), select: 'edges', accelerator: webnn },
 };
 
 // -- External capabilities (JS implementations for host-provided imports) -----
@@ -356,12 +404,16 @@ const clock = {
   sleep: (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
 };
 
+/** What runs `test:accel/cnn`: chosen by the demo loaded. */
+let cnn: Cnn = cpu();
+
 /** Per-node capability instances (fresh state per instantiation). */
 const capInstances = new Map<string, Record<string, object>>();
 
 function capabilities(node: string, capability: Capability): object | undefined {
   const iface = capability.implements ?? capability.interface;
   if (iface.startsWith('test:video/clock')) return clock;
+  if (iface.startsWith('test:accel/cnn')) return cnn;
   if (iface.startsWith('test:math/ops')) {
     let instances = capInstances.get(node);
     if (!instances) {
@@ -417,6 +469,7 @@ async function loadDemo(): Promise<void> {
   statusEl.textContent = 'Fetching test components...';
 
   try {
+    if (demo.accelerator) cnn = await demo.accelerator();
     const components: ComponentSource[] = await Promise.all(
       GUESTS.map(async (guest) => ({
         id: `test:${guest}/${guest}@0.1.0`,

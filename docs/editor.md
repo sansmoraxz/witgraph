@@ -164,6 +164,23 @@ properties with no fallback, so define them on the page or a parent element:
    test components in), then `dev` to start the app.
 
 The demo opens a graph of every port kind, whose nodes preview a Value, a
-stream of numbers, a stream of bytes, a future and a video stream; the picker
-at the top right switches to a graph of video pipelines alone
-(`?graph=video`). Every component is in the catalog in both. The Playwright tests run with `test` in the same package.
+stream of numbers, a stream of bytes, a future and a video stream. The
+picker at the top right switches to another graph:
+
+| Graph            | What it shows                                                                                                                           |
+| ---------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `?graph=video`   | Video pipelines alone: frames streamed through grayscale and invert filters.                                                            |
+| `?graph=webgpu`  | Edge detection on WebGPU: the `edge-detect` component runs a small CNN with fixed weights through `test:accel/cnn`, here compute shaders. |
+| `?graph=webnn`   | The same on WebNN.                                                                                                                      |
+
+What runs `test:accel/cnn` is the browser's, so a browser without WebGPU or
+WebNN still loads its graph: the edge node faults when run, saying the
+accelerator is missing. Every component is in the catalog in every graph
+(in the default graph, `test:accel/cnn` runs on the CPU).
+
+The Playwright tests run with `test` in the same package, in two Chromium
+projects: `chromium` as it ships, which has neither accelerator (the edge
+graphs must fault, saying so), and `chromium-accelerated`, started with the
+flags turning both on (WebGPU on the SwiftShader software renderer, so no
+GPU is needed), where the edges must be computed and match a CPU
+reference.

@@ -33,6 +33,7 @@ const GUESTS = [
   'frame-grayscale',
   'frame-invert',
   'video-sink',
+  'edge-detect',
 ];
 
 // Resolve the cargo target directory via `cargo metadata`.
