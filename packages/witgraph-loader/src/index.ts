@@ -297,15 +297,23 @@ export class Session {
       close: closeUnread,
     });
     try {
-      // The entry of `components` each node runs, as the graph resolved it.
+      // The component each node runs, as the graph resolved it: its entry of
+      // `components`, or, for a node whose links apply, that entry composed
+      // with its providers (`bytes`). Nodes running the same bytes share a
+      // transpile.
       const nodes: string[] = (web.islands() as string[][]).flat();
-      const entries = new Map<number, Promise<Transpiled>>();
+      const entries = new Map<string, Promise<Transpiled>>();
       const transpiled = nodes.map((node) => {
-        const { index, sha256 } = web.component(node) as { index: number; sha256: string };
-        let entry = entries.get(index);
+        const { index, sha256, bytes } = web.component(node) as {
+          index: number;
+          sha256: string;
+          bytes?: Uint8Array;
+        };
+        let entry = entries.get(sha256);
         if (entry === undefined) {
-          entry = transpileCached(sha256, options.components[index]);
-          entries.set(index, entry);
+          const { id } = options.components[index];
+          entry = transpileCached(sha256, bytes ? { id, bytes } : options.components[index]);
+          entries.set(sha256, entry);
         }
         return entry;
       });

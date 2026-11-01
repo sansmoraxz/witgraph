@@ -1,4 +1,3 @@
-import * as echarts from 'echarts';
 import type { EditorController } from '../controller/editor-controller.ts';
 import type { EdgeVisual, NodeVisual } from '../controller/types.ts';
 import { makeDraggable } from '../util/drag.ts';
@@ -64,13 +63,6 @@ const SVG_CSS = `
   /* Temp edge for connection drawing */
   .temp-edge { fill: none; stroke: var(--wg-primary); stroke-width: 2; stroke-dasharray: 6 4;
     pointer-events: none; opacity: 0.8; }
-
-  /* Expand button */
-  .expand-btn { cursor: pointer; fill: var(--wg-text); font-size: 11px; pointer-events: all; opacity: 0.6; }
-  .expand-btn:hover { opacity: 1; }
-
-  /* Chart container */
-  .chart-container { background: var(--wg-surface); border-radius: 0 0 var(--_node-radius) var(--_node-radius); }
 `;
 
 const PHASES = ['pending', 'running', 'idle', 'faulted', 'cancelled'] as const;
@@ -91,14 +83,9 @@ export class WitgraphCanvas extends HTMLElement {
   #scale = 1;
   #didDrag = false;
   #connectFrom: { node: string; port: string; x: number; y: number } | null = null;
-  #chartInstances = new Map<string, echarts.ECharts>();
   #contextMenu = new ContextMenu();
   #lastClickX = 0;
   #lastClickY = 0;
-
-  #resolveColor(varName: string): string {
-    return getComputedStyle(this).getPropertyValue(varName).trim();
-  }
 
   #onStateChanged = () => this.#render();
 
@@ -174,8 +161,6 @@ export class WitgraphCanvas extends HTMLElement {
     this.#controller?.removeEventListener('state-changed', this.#onStateChanged);
     for (const cleanup of this.#dragCleanups.values()) cleanup();
     this.#dragCleanups.clear();
-    for (const chart of this.#chartInstances.values()) chart.dispose();
-    this.#chartInstances.clear();
   }
 
   set controller(ctrl: EditorController) {
@@ -319,116 +304,6 @@ export class WitgraphCanvas extends HTMLElement {
         entry.hit.setAttribute('d', d);
       }
       entry.visible.classList.toggle('selected', edge.id === selectedEdgeId);
-    }
-
-    this.#updateExpandedCharts();
-  }
-
-  #updateExpandedCharts(): void {
-    if (!this.#controller) return;
-
-    for (const [id, node] of this.#controller.nodes) {
-      const g = this.#nodeEls.get(id);
-      if (!g) continue;
-
-      const existing = g.querySelector('.node-chart-fo');
-      if (!node.expanded) {
-        if (existing) {
-          const key = `${id}:`;
-          for (const [k, chart] of this.#chartInstances) {
-            if (k.startsWith(key)) {
-              chart.dispose();
-              this.#chartInstances.delete(k);
-            }
-          }
-          existing.remove();
-        }
-        continue;
-      }
-
-      const valuePorts = node.outputs.filter((p) => p.kind === 'value');
-      if (valuePorts.length === 0) continue;
-
-      const chartH = 100;
-      const totalH = valuePorts.length * chartH;
-      const foY = node.height;
-
-      let fo = existing as SVGForeignObjectElement | null;
-      if (!fo) {
-        fo = document.createElementNS(SVG_NS, 'foreignObject');
-        fo.classList.add('node-chart-fo');
-        g.appendChild(fo);
-      }
-      fo.setAttribute('x', '0');
-      fo.setAttribute('y', String(foY));
-      fo.setAttribute('width', String(node.width));
-      fo.setAttribute('height', String(totalH));
-
-      for (const port of valuePorts) {
-        const chartKey = `${id}:${port.name}`;
-        let chart = this.#chartInstances.get(chartKey);
-        let container = fo.querySelector<HTMLDivElement>(`[data-chart-port="${port.name}"]`);
-
-        if (!container) {
-          container = document.createElement('div');
-          container.className = 'chart-container';
-          container.setAttribute('data-chart-port', port.name);
-          container.style.width = `${node.width}px`;
-          container.style.height = `${chartH}px`;
-          fo.appendChild(container);
-        }
-
-        if (!chart) {
-          chart = echarts.init(container, undefined, {
-            renderer: 'svg',
-            width: node.width,
-            height: chartH,
-          });
-          this.#chartInstances.set(chartKey, chart);
-        }
-
-        const history = this.#controller!.outputHistory(id, port.name);
-        const ticks = history.map((h) => h.tick);
-        const values = history.map((h) => {
-          const n = parseFloat(h.wave);
-          return Number.isNaN(n) ? 0 : n;
-        });
-
-        const cTextDim = this.#resolveColor('--wg-text-dim');
-        const cMuted = this.#resolveColor('--wg-text-muted');
-        const cHover = this.#resolveColor('--wg-surface-hover');
-        const cSurface = this.#resolveColor('--wg-surface');
-        const cPrimary = this.#resolveColor('--wg-primary');
-        chart.setOption({
-          animation: false,
-          grid: { top: 18, right: 6, bottom: 18, left: 30 },
-          title: { text: port.name, textStyle: { fontSize: 9, color: cTextDim }, left: 4, top: 0 },
-          xAxis: {
-            type: 'category',
-            data: ticks,
-            axisLabel: { fontSize: 8, color: cMuted },
-            axisLine: { lineStyle: { color: cHover } },
-          },
-          yAxis: {
-            type: 'value',
-            axisLabel: { fontSize: 8, color: cMuted },
-            splitLine: { lineStyle: { color: cSurface } },
-            axisLine: { lineStyle: { color: cHover } },
-          },
-          series: [
-            {
-              type: 'line',
-              data: values,
-              smooth: true,
-              symbol: 'circle',
-              symbolSize: 3,
-              lineStyle: { color: cPrimary, width: 1.5 },
-              itemStyle: { color: cPrimary },
-              areaStyle: { color: `color-mix(in srgb, ${cPrimary} 10%, transparent)` },
-            },
-          ],
-        });
-      }
     }
   }
 
@@ -693,10 +568,6 @@ export class WitgraphCanvas extends HTMLElement {
         {
           label: node?.breakpoint ? 'Remove Breakpoint' : 'Toggle Breakpoint',
           action: () => this.#controller!.toggleBreakpoint(nodeId),
-        },
-        {
-          label: node?.expanded ? 'Collapse Chart' : 'Expand Chart',
-          action: () => this.#controller!.toggleExpanded(nodeId),
         },
       ];
     } else if (edgeHit) {

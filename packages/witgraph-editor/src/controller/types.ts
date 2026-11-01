@@ -35,7 +35,6 @@ export interface NodeVisual {
   fault?: { kind: string; message: string };
   culprit?: string;
   breakpoint: boolean;
-  expanded: boolean;
   inputs: PortVisual[];
   outputs: PortVisual[];
 }

@@ -27,7 +27,6 @@
     "typecheck": "tsc -p ."
   },
   "dependencies": {
-    "echarts": "^6.1.0",
     "elkjs": "^0.12.1",
     "lucide": "^1.66.0",
     "witgraph-loader": "workspace:*"

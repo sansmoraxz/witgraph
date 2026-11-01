@@ -61,6 +61,8 @@ const ids: Record<string, string> = {
   'mqtt-node': 'test:mqtt-node/mqtt-node@0.1.0',
   labelled: 'test:labelled/labelled@0.1.0',
   'future-writer': 'test:future-writer/future-writer@0.1.0',
+  calc: 'test:calc/calc@0.1.0',
+  math: 'test:math/math@0.1.0',
 };
 
 /** Components written in WAT here, by guest name, beside the built guests. */
@@ -1025,4 +1027,68 @@ test('nothing needs a secure context', async () => {
     if (subtle) Object.defineProperty(globalThis.crypto, 'subtle', subtle);
     else delete (globalThis.crypto as any).subtle;
   }
+});
+
+/** `calc` nodes, each linked to `math` for `test:math/ops`; `math` is a provider, not a node. */
+async function loadLinked(
+  nodes: string[],
+  { providers = ['math'] }: { providers?: string[] } = {},
+): Promise<Session> {
+  const components = await Promise.all(['calc', ...providers].map(guestSource));
+  const ops = 'test:math/ops@0.1.0';
+  const graph = {
+    metadata: { name: 'test' },
+    components: [componentRef(ids.calc)],
+    nodes: nodes.map((id) => ({ id, component: componentRef(ids.calc) })),
+    connections: [],
+    links: nodes.map((id) => ({
+      id: `link-${id}`,
+      node: id,
+      import: ops,
+      provider: componentRef(ids.math),
+      export: ops,
+    })),
+  };
+  return loaded({ graph, components, wasm });
+}
+
+test('a node runs with the provider its link names composed in', async () => {
+  // No `capabilities`: the link satisfies the only import `calc` has.
+  const session = await loadLinked(['n']);
+  session.graph.inject('n', 'x', 3);
+  await session.settle();
+  assert.equal(session.graph.readOutput('n', 'doubled'), 6);
+  assert.equal(session.graph.readOutput('n', 'slow'), 6);
+  assert.equal(session.graph.readOutput('n', 'total'), 3, '0 + 1 + 2, streamed by the provider');
+  assert.equal(session.graph.readOutput('n', 'calls'), 1);
+});
+
+test('each node gets an instance of the provider of its own', async () => {
+  const session = await loadLinked(['a', 'b']);
+  session.graph.inject('a', 'x', 2);
+  session.graph.inject('b', 'x', 5);
+  await session.settle();
+  assert.equal(session.graph.readOutput('a', 'doubled'), 4);
+  assert.equal(session.graph.readOutput('b', 'doubled'), 10);
+  assert.equal(session.graph.readOutput('a', 'calls'), 1);
+  assert.equal(
+    session.graph.readOutput('b', 'calls'),
+    1,
+    'not the 2 a shared instance would count',
+  );
+});
+
+test('a node component is composed once per set of links', async () => {
+  const session = await loadLinked(['a', 'b']);
+  const [a, b] = ['a', 'b'].map(
+    (node) =>
+      session.graph.component(node) as { index: number; sha256: string; bytes?: Uint8Array },
+  );
+  assert.ok(a.bytes && b.bytes, 'both come back composed');
+  assert.equal(a.sha256, b.sha256);
+  assert.equal(a.index, 0, 'index still names the node entry, not the provider');
+});
+
+test('a link whose provider was not given fails the load by name', async () => {
+  await assert.rejects(loadLinked(['n'], { providers: [] }), /test:math\/math@0\.1\.0/);
 });

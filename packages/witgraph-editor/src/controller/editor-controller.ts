@@ -258,7 +258,6 @@ export class EditorController extends EventTarget {
       label: id,
       phase: 'pending',
       breakpoint: false,
-      expanded: false,
       inputs: [...inputs],
       outputs: [...outputs],
     });
@@ -744,14 +743,6 @@ export class EditorController extends EventTarget {
     this.#dispatch('state-changed');
   }
 
-  toggleExpanded(nodeId: string): void {
-    const visual = this.#nodes.get(nodeId);
-    if (visual) {
-      visual.expanded = !visual.expanded;
-      this.#dispatch('state-changed');
-    }
-  }
-
   // -- Undo / Redo ------------------------------------------------------------
 
   undo(): void {
@@ -843,7 +834,6 @@ export class EditorController extends EventTarget {
         label: newNode.label ?? newId,
         phase: 'pending',
         breakpoint: false,
-        expanded: false,
         inputs: [...inputs],
         outputs: [...outputs],
       });
@@ -1030,7 +1020,6 @@ export class EditorController extends EventTarget {
       label: id,
       phase: 'pending',
       breakpoint: false,
-      expanded: false,
       inputs: [],
       outputs: [],
     });
@@ -1351,7 +1340,6 @@ export class EditorController extends EventTarget {
         label: graphNode.label ?? graphNode.id,
         phase: 'idle',
         breakpoint: this.#breakpoints.has(graphNode.id),
-        expanded: false,
         inputs,
         outputs,
       };

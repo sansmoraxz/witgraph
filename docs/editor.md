@@ -42,8 +42,7 @@ Put them anywhere on your page. They all share one `EditorController`.
   fault shows its cause and, when it is known, which node caused it.
 - **Breakpoints.** Toggle one on a node (toolbar _BP_ button or right-click).
   The run pauses before that node, and _Resume_ continues.
-- **Values.** Select a node to see the current and past values of each output
-  port. _Expand Chart_ on a node draws a line chart of an output's value on each tick.
+- **Values.** Select a node to see the current value of each output port.
 - **Inputs.** Give a node an `inject.<port>` attribute to feed that input a
   fixed value.
 - **Mock mode.** In the inspector, turn on _Mock Mode_ for a node to skip its
