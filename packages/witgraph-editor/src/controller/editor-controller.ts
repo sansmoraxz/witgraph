@@ -61,6 +61,18 @@ interface Observation {
   bytes: number;
 }
 
+/**
+ * Whether two handle ports carry one resource (as compiling checks it
+ * exactly: on one semver track), or neither is a handle.
+ */
+function sameResource(a: PortVisual, b: PortVisual): boolean {
+  if (!a.handle || !b.handle) return !a.handle && !b.handle;
+  const base = (id: string) => id.split('@')[0];
+  return (
+    a.handle.resource === b.handle.resource && base(a.handle.interface) === base(b.handle.interface)
+  );
+}
+
 /** The most edits undo goes back over. */
 const MAX_UNDO = 50;
 
@@ -217,7 +229,7 @@ export class EditorController extends EventTarget {
       count: seen?.count ?? 0,
       pending: seen?.pending ?? false,
     };
-    if (kind === 'value' && this.#session) {
+    if ((kind === 'value' || kind === 'handle') && this.#session) {
       // The latched value itself, not a copy: another one is a new value.
       let latest: unknown;
       try {
@@ -558,7 +570,7 @@ export class EditorController extends EventTarget {
   canBeFeedback(fromNode: string, fromPort: string): boolean {
     const node = this.#nodes.get(fromNode);
     const port = node?.outputs.find((p) => p.name === fromPort);
-    return port?.kind === 'value';
+    return port?.kind === 'value' || port?.kind === 'handle';
   }
 
   canConnect(
@@ -577,6 +589,11 @@ export class EditorController extends EventTarget {
     if (!tgtPort) return { ok: false, reason: `'${toNode}' has no input '${toPort}'` };
     if (srcPort.kind !== tgtPort.kind)
       return { ok: false, reason: `kind mismatch: ${srcPort.kind} -> ${tgtPort.kind}` };
+    if (!sameResource(srcPort, tgtPort))
+      return {
+        ok: false,
+        reason: `resource mismatch: ${srcPort.typeDisplay} -> ${tgtPort.typeDisplay}`,
+      };
     const duplicate = this.#edges.some(
       (e) =>
         e.fromNode === fromNode &&
@@ -598,8 +615,8 @@ export class EditorController extends EventTarget {
     const result: { node: string; port: string; label: string; self: boolean }[] = [];
     for (const [id, n] of this.#nodes) {
       for (const p of n.outputs) {
-        if (p.kind !== tgtPort.kind) continue;
-        if (id === nodeId && tgtPort.kind !== 'value') continue;
+        if (p.kind !== tgtPort.kind || !sameResource(p, tgtPort)) continue;
+        if (id === nodeId && tgtPort.kind !== 'value' && tgtPort.kind !== 'handle') continue;
         result.push({ node: id, port: p.name, label: `${n.label}.${p.name}`, self: id === nodeId });
       }
     }
@@ -1653,7 +1670,8 @@ export class EditorController extends EventTarget {
     // latched value itself, never converted (to WAVE text, say).
     for (const [id, visual] of this.#nodes) {
       for (const port of visual.outputs) {
-        if (port.kind !== 'value' || !this.isObserved(id, port.name)) continue;
+        if ((port.kind !== 'value' && port.kind !== 'handle') || !this.isObserved(id, port.name))
+          continue;
         if (this.#observed.get(id)?.get(port.name)?.tick === this.#tickCount) continue;
         try {
           const value = this.#session.graph.readOutput(id, port.name);

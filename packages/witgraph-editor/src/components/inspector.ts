@@ -13,10 +13,19 @@ const PHASE_BG: Record<string, string> = {
   cancelled: 'bg-wg-phase-cancelled',
 };
 
+/** A handle's object as its own `toString` describes it, else by its resource. */
+function describeHandle(value: unknown, resource: string): string {
+  const own = (value as { toString?: unknown } | null)?.toString;
+  return typeof own === 'function' && own !== Object.prototype.toString
+    ? String(value)
+    : `<${resource}>`;
+}
+
 const KIND_BG: Record<string, string> = {
   value: 'bg-wg-port-value',
   stream: 'bg-wg-port-stream',
   future: 'bg-wg-port-future',
+  handle: 'bg-wg-port-handle',
 };
 
 const BTN =
@@ -166,6 +175,9 @@ export class WitgraphInspector extends HTMLElement {
   #outputText(node: string, port: string): string {
     const value = this.#controller?.latestOutput(node, port);
     if (value === undefined) return '-';
+    const handle = this.#controller?.nodes.get(node)?.outputs.find((p) => p.name === port)?.handle;
+    // A handle has no text: its object may describe itself.
+    if (handle) return describeHandle(value, handle.resource);
     if (weight(value) > MAX_WAVE_BYTES) return `${summarize(value)} (too large to show as WAVE)`;
     try {
       return this.#controller?.readOutputWave(node, port) ?? '-';

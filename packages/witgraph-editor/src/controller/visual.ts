@@ -15,7 +15,9 @@ export function portVisual(port: Port): PortVisual {
   return {
     name: port.name,
     kind: port.kind,
-    typeDisplay: port.type_display,
+    // A handle's full `interface.resource` is long: its resource names it.
+    typeDisplay: port.handle?.resource ?? port.type_display,
+    handle: port.handle,
     optional: port.optional,
     docs: port.docs,
     viewer: port.viewer,

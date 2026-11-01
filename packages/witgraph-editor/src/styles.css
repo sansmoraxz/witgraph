@@ -27,4 +27,5 @@
   --color-wg-port-value: var(--wg-port-value);
   --color-wg-port-stream: var(--wg-port-stream);
   --color-wg-port-future: var(--wg-port-future);
+  --color-wg-port-handle: var(--wg-port-handle);
 }

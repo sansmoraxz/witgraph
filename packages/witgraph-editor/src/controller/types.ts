@@ -17,8 +17,10 @@ export type NodePhase = 'pending' | 'running' | 'idle' | 'faulted' | 'cancelled'
 /** A port on a node, as the editor renders it. */
 export interface PortVisual {
   name: string;
-  kind: 'value' | 'stream' | 'future';
+  kind: 'value' | 'stream' | 'future' | 'handle';
   typeDisplay: string;
+  /** Handle ports only: the resource the port carries. */
+  handle?: { interface: string; resource: string };
   optional: boolean;
   docs?: string;
   /** Output ports only: the viewer the component declares for previewing it. */
