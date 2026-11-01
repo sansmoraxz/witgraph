@@ -62,7 +62,10 @@ the TypeScript and let `init` fetch the module from beside the script.
   ([Previewing outputs](components.md#previewing-outputs)).
 - **Simulation.** `mocks` replaces a node with a function.
 - **Values** use jco's representation: records are objects with camelCase keys,
-  64-bit integers are `BigInt`s, and streams are async iterables.
+  64-bit integers are `BigInt`s, lists of numbers are typed arrays, and
+  streams are async iterables. A Value a node returns is passed to its
+  readers as it is, not copied or converted, and `readOutput` returns that
+  same value: don't change it.
 
 Call `session.dispose()` when you're done with a session. It closes the
 streams the nodes still have open, so a node writing one in the background

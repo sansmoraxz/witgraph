@@ -9,12 +9,14 @@ import { afterEach, test } from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { parse } from '@bytecodealliance/jco';
+import { transpile } from '@bytecodealliance/jco/component';
 
 import {
   type Capability,
   type ComponentSource,
   camelCase,
   type FutureItem,
+  fastListLift,
   jsName,
   Session,
   type SessionOptions,
@@ -68,6 +70,9 @@ const ids: Record<string, string> = {
   'video-source': 'test:video-source/video-source@0.1.0',
   'frame-grayscale': 'test:frame-grayscale/frame-grayscale@0.1.0',
   'video-sink': 'test:video-sink/video-sink@0.1.0',
+  'blob-source': 'test:blob-source/blob-source@0.1.0',
+  'blob-relay': 'test:blob-relay/blob-relay@0.1.0',
+  'blob-sink': 'test:blob-sink/blob-sink@0.1.0',
 };
 
 /** Components written in WAT here, by guest name, beside the built guests. */
@@ -1164,6 +1169,65 @@ test('a future output nothing reads is consumed, so its writer finishes', async 
   // Unlike wasmtime, which drops the read end (2), the loader takes the
   // value.
   assert.equal(session.graph.readOutput('w', 'last'), 1);
+});
+
+test('a Value is passed on as its producer returned it, and compared without converting', async () => {
+  const runs: string[] = [];
+  const session = await load(
+    [
+      ['source', 'blob-source'],
+      ['a', 'blob-relay'],
+      ['sink', 'blob-sink'],
+    ],
+    [
+      ['s-a', 'source.blob', 'a.blob'],
+      ['a-s', 'a.blob', 'sink.blob'],
+    ],
+    { afterRun: (node) => void runs.push(node) },
+  );
+  session.graph.inject('source', 'size', 1000);
+  session.graph.inject('source', 'seed', 7);
+  await session.settle();
+  assert.deepEqual(runs, ['source', 'a', 'sink']);
+  const blob = session.graph.readOutput('source', 'blob');
+  assert.ok(blob instanceof Uint8Array);
+  assert.equal(blob.length, 1000);
+  assert.equal(blob[3], 10);
+  // The very value, shared, not a copy made for each read.
+  assert.equal(session.graph.readOutput('source', 'blob'), blob);
+  assert.equal(session.graph.readOutput('sink', 'len'), 1000);
+  // WAVE text is made when asked for.
+  assert.equal(session.graph.readOutputWave('sink', 'len'), '1000');
+  assert.match(session.graph.readOutputWave('a', 'blob')!, /^\[7, 8, 9, /);
+
+  // An equal value runs nothing downstream; another one does.
+  runs.length = 0;
+  session.graph.inject('source', 'size', 1000);
+  session.graph.rerun('source');
+  await session.settle();
+  assert.deepEqual(runs, ['source'], 'the same bytes again: `a` does not rerun');
+  runs.length = 0;
+  session.graph.inject('source', 'seed', 8);
+  await session.settle();
+  assert.deepEqual(runs, ['source', 'a', 'sink']);
+  assert.equal((session.graph.readOutput('a', 'blob') as Uint8Array)[0], 8);
+});
+
+test('the list loop jco generates is there to be replaced', async () => {
+  // jco lifts a list a guest returns an element at a time; the loader
+  // copies a list of numbers at once instead. A jco that generates its
+  // loop otherwise leaves it alone, and this fails, so the copy is redone.
+  const { bytes } = await guestSource('blob-relay');
+  const { files } = await transpile(bytes, {
+    name: 'node',
+    instantiation: { tag: 'async' },
+    noTypescript: true,
+  });
+  const source = new TextDecoder().decode(
+    (files as [string, Uint8Array][]).find(([name]) => name.endsWith('.js'))![1],
+  );
+  assert.notEqual(fastListLift(source), source);
+  assert.equal(fastListLift('nothing to replace'), 'nothing to replace');
 });
 
 test('a hook sees what a future resolves to, and its reader still gets it', async () => {

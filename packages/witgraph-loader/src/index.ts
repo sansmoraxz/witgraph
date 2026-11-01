@@ -670,9 +670,40 @@ async function transpileComponent(id: string, bytes: Uint8Array): Promise<Transp
     else if (name.endsWith('.js')) source = new TextDecoder().decode(contents);
   }
   if (source === undefined) throw new Error(`\`${id}\` transpiled to no JavaScript`);
+  source = fastListLift(source);
   const url = `data:text/javascript;base64,${base64(new TextEncoder().encode(source))}`;
   const { instantiate } = await import(/* @vite-ignore */ url);
   return { instantiate, modules, imports };
+}
+
+/**
+ * The loop with which jco lifts every element of a list a guest returns,
+ * one call (and one `DataView`) per element: a `list<u8>` of a few
+ * megabytes takes seconds. A list of numbers is its elements' bytes as
+ * they are in linear memory, so it is lifted here in one copy instead, with
+ * the same effect on jco's lifting context; anything else (a list too long
+ * for the storage left, which jco reports) goes through jco's loop.
+ */
+const LIST_LOOP = `        ctx.storagePtr = dataPtr;
+        const val = [];
+        for (var i = 0; i < len; i++) {`;
+const LIST_COPY = `        if (
+          typedArray !== undefined &&
+          elemSize32 === typedArray.BYTES_PER_ELEMENT &&
+          (ctx.storageLen === undefined || ctx.storageLen >= len * elemSize32)
+        ) {
+          const end = dataPtr + len * elemSize32;
+          const copied = new typedArray(ctx.memory.buffer.slice(dataPtr, end));
+          ctx.storagePtr = originalPtr !== null ? originalPtr : end;
+          if (originalLen !== null) ctx.storageLen = originalLen;
+          else if (ctx.storageLen !== undefined) ctx.storageLen -= len * elemSize32;
+          return [copied, ctx];
+        }
+`;
+
+/** `source`, jco's output, with {@link LIST_COPY} ahead of its list loop, if it has one. */
+export function fastListLift(source: string): string {
+  return source.includes(LIST_LOOP) ? source.replace(LIST_LOOP, LIST_COPY + LIST_LOOP) : source;
 }
 
 function base64(bytes: Uint8Array): string {
