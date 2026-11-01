@@ -1,0 +1,38 @@
+package test:accel@0.1.0;
+
+/// A small convolutional network, run on whatever accelerator the host
+/// has: a GPU, a neural network API, or a CPU.
+interface cnn {
+    /// Values, channels first: `channels` x `height` x `width` of them.
+    record tensor {
+        channels: u32,
+        height: u32,
+        width: u32,
+        data: list<f32>,
+    }
+
+    /// A 2-D convolution, stride 1 and padded to keep the size: `weights`
+    /// is `out-channels` x the input's channels x `size` x `size`, `bias`
+    /// one value per output channel.
+    record conv {
+        out-channels: u32,
+        size: u32,
+        weights: list<f32>,
+        bias: list<f32>,
+    }
+
+    /// One layer of a network.
+    variant layer {
+        conv(conv),
+        relu,
+        /// Every value clamped to `[min, max]`.
+        clamp(tuple<f32, f32>),
+    }
+
+    /// The accelerator `run` uses (`webgpu`, `webnn`, `cpu`), or why there
+    /// is none.
+    backend: func() -> result<string, string>;
+
+    /// `layers`, in order, over `input`.
+    run: async func(layers: list<layer>, input: tensor) -> result<tensor, string>;
+}

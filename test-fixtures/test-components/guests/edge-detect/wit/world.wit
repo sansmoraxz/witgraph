@@ -1,0 +1,28 @@
+package test:edge-detect@0.1.0;
+
+/// Edge detection by a small convolutional network with fixed weights, run
+/// by the host's accelerator (`test:accel/cnn`) on every frame of its input
+/// stream: `edges` are the frames' edges, white on black. `backend` names
+/// the accelerator; with none, the node faults, saying why.
+world edge-detect {
+    import test:accel/cnn@0.1.0;
+    import witgraph:runtime/host@0.1.0;
+
+    export node: interface {
+        /// An image: `width` x `height` pixels, row by row, four bytes
+        /// (red, green, blue, alpha) each.
+        record frame {
+            width: u32,
+            height: u32,
+            pixels: list<u8>,
+        }
+        record inputs {
+            frames: stream<frame>,
+        }
+        record outputs {
+            edges: stream<frame>,
+            backend: string,
+        }
+        run: async func(inputs: inputs) -> outputs;
+    }
+}

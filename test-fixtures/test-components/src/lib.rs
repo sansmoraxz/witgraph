@@ -138,3 +138,11 @@ pub const FRAME_INVERT: Guest = guest!("FRAME_INVERT_WASM", "frame-invert");
 /// equal red, green and blue), `first-pixel: u32` (the last frame's first
 /// pixel as RGBA, high byte first). Returns once the stream ends.
 pub const VIDEO_SINK: Guest = guest!("VIDEO_SINK_WASM", "video-sink");
+
+/// Imports `test:accel/cnn` (a small convolutional network, run on the
+/// host's accelerator) and `witgraph:runtime/host`. `frames: stream<frame>`
+/// → `edges: stream<frame>` (each frame's edges, by a fixed-weight
+/// network of Sobel kernels), `backend: string` (the accelerator's name).
+/// Faults, saying why, when the host has no accelerator. Previews `edges`
+/// as `image`.
+pub const EDGE_DETECT: Guest = guest!("EDGE_DETECT_WASM", "edge-detect");
