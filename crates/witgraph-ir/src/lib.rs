@@ -32,6 +32,6 @@ pub use id::{
     ComponentRef, ConnectionId, LinkId, NodeId, PackageRef, ParseComponentRefError, PortName,
     PortRef, ResourceId,
 };
-pub use port::{NodeShape, PortDef, PortDirection, PortKind};
+pub use port::{HandleType, NodeShape, PortDef, PortDirection, PortKind};
 pub use wasm_wave;
 pub use wasm_wave::value::Type;

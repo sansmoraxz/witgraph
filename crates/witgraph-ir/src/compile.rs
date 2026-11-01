@@ -127,7 +127,11 @@ fn same_but_docs(a: &ComponentContract, b: &ComponentContract) -> bool {
     let ports = |x: &[PortDef], y: &[PortDef]| {
         x.len() == y.len()
             && x.iter().zip(y).all(|(p, q)| {
-                p.name == q.name && p.kind == q.kind && p.ty == q.ty && p.optional == q.optional
+                p.name == q.name
+                    && p.kind == q.kind
+                    && p.ty == q.ty
+                    && p.handle == q.handle
+                    && p.optional == q.optional
             })
     };
     a.id == b.id
@@ -933,7 +937,7 @@ fn check_connection_endpoints<'g>(
                     from: from.kind,
                     to: to.kind,
                 });
-            } else if from.ty != to.ty && !from.unwraps_into(to) {
+            } else if !from.carries_into(to) {
                 diagnostics.push(Diagnostic::TypeMismatch {
                     conn: conn.id.clone(),
                     from: from.type_display(),
@@ -986,9 +990,7 @@ fn check_required_inputs(
                     diagnostics.push(Diagnostic::RequiredInputUnconnected { port });
                 }
                 // A Stream or Future feedback edge is an error of its own.
-                Some(conns)
-                    if input.kind == PortKind::Value && conns.iter().all(|c| c.feedback) =>
-                {
+                Some(conns) if !input.kind.is_async() && conns.iter().all(|c| c.feedback) => {
                     diagnostics.push(Diagnostic::FeedbackOnlyInput {
                         port,
                         conn: conns[0].id.clone(),
@@ -1089,7 +1091,7 @@ fn source_kind(
 }
 
 /// Feedback edges are unit-delay boundaries between generations; only a
-/// Value can cross one. A stream or future handle belongs to the run that
+/// Value or a handle can cross one. A stream or future handle belongs to the run that
 /// created it.
 fn check_feedback_kinds(
     graph: &Graph,
@@ -1884,6 +1886,57 @@ mod tests {
                 conn: "c1".into(),
                 from: "f64".into(),
                 to: "u32".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn handles_connect_only_to_the_same_resource() {
+        let handle = |resource: &str, version: &str| {
+            PortDef::handle(
+                "t",
+                crate::HandleType {
+                    interface: format!("test:data/tensor@{version}"),
+                    resource: resource.into(),
+                },
+            )
+        };
+        let graph = |input: PortDef| {
+            builder("t")
+                .add_component(contract(
+                    "make",
+                    vec![],
+                    vec![handle("tensor", "0.1.0")],
+                    &[],
+                ))
+                .add_component(contract("take", vec![input], vec![], &[]))
+                .add_node("m", cref("make"))
+                .add_node("t", cref("take"))
+                .connect("c1", PortRef::new("m", "t"), PortRef::new("t", "t"))
+                .build()
+        };
+        graph(handle("tensor", "0.1.2"))
+            .compile()
+            .expect("the same resource, on one semver track");
+        assert_eq!(
+            diags(graph(handle("blob", "0.1.0")).compile()),
+            vec![Diagnostic::TypeMismatch {
+                conn: "c1".into(),
+                from: "test:data/tensor@0.1.0.tensor".into(),
+                to: "test:data/tensor@0.1.0.blob".into(),
+            }]
+        );
+        assert_eq!(
+            diags(graph(handle("tensor", "0.2.0")).compile()).len(),
+            1,
+            "another track is another resource"
+        );
+        assert_eq!(
+            diags(graph(PortDef::new("t", PortKind::Value, Type::U32)).compile()),
+            vec![Diagnostic::KindMismatch {
+                conn: "c1".into(),
+                from: PortKind::Handle,
+                to: PortKind::Value,
             }]
         );
     }

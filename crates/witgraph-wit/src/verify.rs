@@ -217,7 +217,10 @@ fn port_difference(expected: &[PortDef], found: &[PortDef]) -> Option<String> {
         .find_map(|name| match (expected.get(name), found.get(name)) {
             (Some(_), None) => Some(format!("port `{name}` is missing from the bytes")),
             (None, Some(_)) => Some(format!("port `{name}` is not in the contract")),
-            (Some(e), Some(f)) if (e.kind, e.optional, &e.ty) != (f.kind, f.optional, &f.ty) => {
+            (Some(e), Some(f))
+                if (e.kind, e.optional, &e.ty, &e.handle)
+                    != (f.kind, f.optional, &f.ty, &f.handle) =>
+            {
                 Some(format!(
                     "port `{name}` is a {} in the contract but a {} in the bytes",
                     describe(e),

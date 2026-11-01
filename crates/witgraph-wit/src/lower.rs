@@ -21,6 +21,15 @@
 //! | `option<T>`  | Value     | on `inputs` only: optional, may stay unconnected |
 //! | `stream<T>`  | Stream    | a bare `stream` carries no payload (`ty: None`)  |
 //! | `future<T>`  | Future    | a bare `future` carries no payload (`ty: None`)  |
+//! | `borrow<R>`  | Handle    | on `inputs` only; `option<borrow<R>>` is optional |
+//! | `own<R>`     | Handle    | on `outputs` only                              |
+//!
+//! A handle port carries a resource the host provides, and `R` must be
+//! declared in a named interface the world imports, so every node
+//! importing it names the same resource. An input borrows its handle for
+//! the length of `run`; an output hands its handle to the host. A node
+//! never owns a handle it was given, so it cannot drop one another node
+//! holds.
 //!
 //! Top-level `option<T>` unwraps only on inputs; an output field of
 //! `option<T>` is a Value whose payload is the option itself. `stream` and
@@ -34,9 +43,9 @@
 //!
 //! Payload types are resolved by wasm-wave
 //! ([`wasm_wave::value::resolve_wit_type`]), so a payload is exactly what WAVE
-//! can represent. Resources, handles, `map`, `error-context`, nested
-//! `stream`/`future`, and fixed-length lists (whose length the contract hash
-//! cannot observe) are rejected.
+//! can represent. Resources, handles below the top level of a field, `map`,
+//! `error-context`, nested `stream`/`future`, and fixed-length lists (whose
+//! length the contract hash cannot observe) are rejected.
 //!
 //! Some WIT parses but can never appear in a component, as wasmparser
 //! validates components: empty `record`/`flags`/`tuple` types; types,
@@ -82,7 +91,8 @@ use wasm_wave::value::resolve_wit_type;
 use wit_parser as wp;
 use wit_parser::{Resolve, TypeId, WorldItem, WorldKey};
 use witgraph_ir::{
-    Capability, ComponentContract, ComponentRef, PackageRef, PortDef, PortDirection, PortKind, Type,
+    Capability, ComponentContract, ComponentRef, HandleType, PackageRef, PortDef, PortDirection,
+    PortKind, Type,
 };
 
 use crate::hash;
@@ -343,6 +353,23 @@ pub enum FieldErrorKind {
          at the top level of a port field"
     )]
     NestedAsync,
+    /// An input field owning a handle (`own<R>`): inputs borrow theirs,
+    /// so a node never takes, or drops, what the host shares.
+    #[error("an input borrows its handle: use `borrow<R>`, not `own<R>`")]
+    OwnedInput,
+    /// An output field borrowing a handle: outputs hand theirs to the host.
+    #[error("an output hands its handle to the host: use `own<R>`, not `borrow<R>`")]
+    BorrowedOutput,
+    /// A handle to a resource not declared in a named interface the world
+    /// imports, which no other node, or host, can name.
+    #[error(
+        "resource `{resource}` is not declared in a named interface the world imports, \
+         so no other node can carry it"
+    )]
+    UnsharedResource {
+        /// The resource's name.
+        resource: String,
+    },
     /// A payload type WAVE (or the contract hash) cannot represent.
     #[error("`{kind}` types are not supported in port payloads")]
     Unsupported {
@@ -627,12 +654,13 @@ fn lower_world(
     for (record_name, direction, record) in records {
         for field in &record.fields {
             port_types.push(&field.ty);
-            let port =
-                lower_field(resolve, field, direction).map_err(|kind| LowerErrorKind::Field {
+            let port = lower_field(resolve, world, field, direction).map_err(|kind| {
+                LowerErrorKind::Field {
                     record: record_name,
                     field: field.name.clone(),
                     kind,
-                })?;
+                }
+            })?;
             match direction {
                 PortDirection::Input => inputs.push(port),
                 PortDirection::Output => outputs.push(port),
@@ -1147,9 +1175,11 @@ fn top_kind<'a>(resolve: &'a Resolve, ty: &wp::Type) -> Option<&'a wp::TypeDefKi
 
 fn lower_field(
     resolve: &Resolve,
+    world: &wp::World,
     field: &wp::Field,
     direction: PortDirection,
 ) -> Result<PortDef, FieldErrorKind> {
+    let mut handle = None;
     let (kind, optional, ty) = match top_kind(resolve, &field.ty) {
         Some(wp::TypeDefKind::Stream(payload)) => (
             PortKind::Stream,
@@ -1167,8 +1197,18 @@ fn lower_field(
                 .map(|t| payload_type(resolve, t))
                 .transpose()?,
         ),
+        Some(wp::TypeDefKind::Handle(h)) => {
+            handle = Some(lower_handle(resolve, world, h, direction)?);
+            (PortKind::Handle, false, None)
+        }
         Some(wp::TypeDefKind::Option(inner)) if direction == PortDirection::Input => {
-            (PortKind::Value, true, Some(payload_type(resolve, inner)?))
+            match top_kind(resolve, inner) {
+                Some(wp::TypeDefKind::Handle(h)) => {
+                    handle = Some(lower_handle(resolve, world, h, direction)?);
+                    (PortKind::Handle, true, None)
+                }
+                _ => (PortKind::Value, true, Some(payload_type(resolve, inner)?)),
+            }
         }
         _ => (
             PortKind::Value,
@@ -1180,10 +1220,52 @@ fn lower_field(
         name: field.name.clone().into(),
         kind,
         ty,
+        handle,
         optional,
         docs: field.docs.contents.clone(),
         viewer: None,
     })
+}
+
+/// The resource a top-level handle field carries. An input borrows it (the
+/// host keeps it, and lends it for the length of `run`), an output owns it
+/// (and hands it to the host), and it must be declared in a named
+/// interface the world imports: one every node importing the interface
+/// names alike, implemented by the host.
+fn lower_handle(
+    resolve: &Resolve,
+    world: &wp::World,
+    handle: &wp::Handle,
+    direction: PortDirection,
+) -> Result<HandleType, FieldErrorKind> {
+    let resource = match (handle, direction) {
+        (wp::Handle::Borrow(resource), PortDirection::Input)
+        | (wp::Handle::Own(resource), PortDirection::Output) => *resource,
+        (wp::Handle::Own(_), PortDirection::Input) => return Err(FieldErrorKind::OwnedInput),
+        (wp::Handle::Borrow(_), PortDirection::Output) => {
+            return Err(FieldErrorKind::BorrowedOutput);
+        }
+    };
+    let resource = dealias(resolve, resource);
+    let def = &resolve.types[resource];
+    let name = def.name.clone().unwrap_or_default();
+    let unshared = || FieldErrorKind::UnsharedResource {
+        resource: name.clone(),
+    };
+    let wp::TypeOwner::Interface(owner) = def.owner else {
+        return Err(unshared());
+    };
+    let imported = world
+        .imports
+        .values()
+        .any(|item| matches!(item, WorldItem::Interface { id, .. } if *id == owner));
+    match interface_id(resolve, owner) {
+        Some(interface) if imported => Ok(HandleType {
+            interface,
+            resource: name,
+        }),
+        _ => Err(unshared()),
+    }
 }
 
 /// A payload type, resolved by wasm-wave. wasm-wave resolves type ids only,
@@ -1828,6 +1910,135 @@ mod tests {
             message.contains("nested `stream`/`future`"),
             "an optional async input has no meaning: {message}"
         );
+    }
+
+    /// A world whose `node` declares `fields`, beside a `test:data` package
+    /// declaring `tensor` and `blob` in its `tensor` interface.
+    fn handle_world(fields: &str, extra: &str) -> String {
+        format!(
+            r#"
+            package demo:test@0.1.0;
+            interface node {{
+                use test:data/tensor@0.1.0.{{tensor, blob}};
+                {fields}
+                run: async func(inputs: inputs) -> outputs;
+            }}
+            world w {{ {extra} export node; }}
+
+            package test:data@0.1.0 {{
+                interface tensor {{
+                    resource tensor {{ shape: func() -> list<u32>; }}
+                    resource blob;
+                }}
+            }}
+            "#
+        )
+    }
+
+    #[test]
+    fn handle_fields_lower_to_handle_ports() {
+        let contract = lower_one(&handle_world(
+            "record inputs { a: borrow<tensor>, b: option<borrow<tensor>> }
+             record outputs { c: tensor, d: own<blob> }",
+            "",
+        ));
+        let tensor = HandleType {
+            interface: "test:data/tensor@0.1.0".into(),
+            resource: "tensor".into(),
+        };
+        let a = port(&contract.inputs, "a");
+        assert_eq!(
+            (a.kind, a.optional, &a.ty),
+            (PortKind::Handle, false, &None)
+        );
+        assert_eq!(a.handle.as_ref(), Some(&tensor));
+        let b = port(&contract.inputs, "b");
+        assert_eq!((b.kind, b.optional), (PortKind::Handle, true));
+        assert_eq!(b.handle.as_ref(), Some(&tensor));
+        assert_eq!(port(&contract.outputs, "c").handle.as_ref(), Some(&tensor));
+        assert_eq!(
+            port(&contract.outputs, "d")
+                .handle
+                .as_ref()
+                .map(|h| h.resource.as_str()),
+            Some("blob")
+        );
+        assert_eq!(contract.shape(), NodeShape::Reactive);
+        assert_eq!(
+            capability_names(&contract),
+            ["test:data/tensor@0.1.0"],
+            "the resource's interface is still what the host provides"
+        );
+    }
+
+    #[test]
+    fn inputs_borrow_and_outputs_own_their_handles() {
+        let owned = lower_err(&handle_world(
+            "record inputs { a: tensor } record outputs { b: tensor }",
+            "",
+        ));
+        assert!(
+            owned.contains("field `a`") && owned.contains("use `borrow<R>`"),
+            "{owned}"
+        );
+        let owned = lower_err(&handle_world(
+            "record inputs { a: option<tensor> } record outputs { b: tensor }",
+            "",
+        ));
+        assert!(owned.contains("use `borrow<R>`"), "{owned}");
+        // WIT itself refuses a `borrow` among `run`'s results.
+        let borrowed = lower_err(&handle_world(
+            "record inputs { a: borrow<tensor> } record outputs { b: borrow<tensor> }",
+            "",
+        ));
+        assert!(borrowed.contains("borrow<T>"), "{borrowed}");
+    }
+
+    #[test]
+    fn handles_must_be_shareable_and_top_level() {
+        // Declared by the node itself: no other node can name it.
+        let local = lower_err(
+            r#"
+            package demo:test@0.1.0;
+            interface node {
+                resource mine;
+                record inputs { a: borrow<mine> }
+                record outputs { b: u32 }
+                run: async func(inputs: inputs) -> outputs;
+            }
+            world w { export node; }
+            "#,
+        );
+        assert!(
+            local.contains("resource `mine`") && local.contains("imports"),
+            "{local}"
+        );
+        // Nested handles stay unsupported, inside an option output too.
+        for fields in [
+            "record inputs { a: list<borrow<tensor>> } record outputs { b: u32 }",
+            "record inputs { a: u32 } record outputs { b: option<tensor> }",
+            "record inputs { a: u32 } record outputs { b: tuple<tensor, u32> }",
+        ] {
+            let nested = lower_err(&handle_world(fields, ""));
+            assert!(
+                nested.contains("not supported in port payloads"),
+                "{fields}: {nested}"
+            );
+        }
+    }
+
+    #[test]
+    fn handle_ports_shape_the_hash() {
+        let hash = |version: &str, resource: &str| {
+            let wit = handle_world(
+                &format!("record inputs {{ a: borrow<{resource}> }} record outputs {{ b: u32 }}"),
+                "",
+            )
+            .replace("@0.1.0", &format!("@{version}"));
+            lower_one(&wit).id.content_hash.unwrap()
+        };
+        assert_ne!(hash("0.1.0", "tensor"), hash("0.2.0", "tensor"));
+        assert_ne!(hash("0.1.0", "tensor"), hash("0.1.0", "blob"));
     }
 
     #[test]

@@ -5,6 +5,7 @@ use core::fmt::Write as _;
 use sha2::{Digest, Sha256};
 use wasm_wave::wasm::{WasmType, WasmTypeKind};
 use wit_parser::{Function, Handle, PackageName, Resolve, TypeDefKind, TypeId, TypeOwner};
+use witgraph_ir::interface::compat_track;
 use witgraph_ir::{Capability, ComponentContract, PortDef, PortDirection, Type};
 
 /// Canonical text encoding of the structural contract.
@@ -53,7 +54,17 @@ fn write_ports(out: &mut String, direction: PortDirection, ports: &[PortDef]) {
     let mut lines: Vec<String> = ports
         .iter()
         .map(|p| {
-            let payload = p.ty.as_ref().map_or_else(|| "_".into(), encode_type);
+            let payload = match (&p.ty, &p.handle) {
+                (Some(ty), _) => encode_type(ty),
+                // On its interface's compatibility track, as connections
+                // match handles.
+                (None, Some(handle)) => format!(
+                    "handle {:?}.{:?}",
+                    compat_track(&handle.interface),
+                    handle.resource
+                ),
+                (None, None) => "_".into(),
+            };
             format!(
                 "{direction} {:?} {} {} {payload:?}\n",
                 p.name.as_str(),
