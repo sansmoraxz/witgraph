@@ -6,9 +6,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use test_components::{
-    BUSY_LOOP, BYTES_CONSUMER, CALC, CONFIGURABLE, ECHO, FUTURE_WRITER, Guest, LABELLED, MATH,
-    MAYBE, MQTT_NODE, NAMED_ECHO, READING_CONSUMER, READING_PRODUCER, RELAY, RELAY_PLUS,
-    RELAY_WIDE, STREAM_CONSUMER, STREAM_DRAIN, STREAM_PRODUCER, STREAM_RELAY,
+    BUSY_LOOP, BYTES_CONSUMER, CALC, CONFIGURABLE, ECHO, FRAME_GRAYSCALE, FRAME_INVERT,
+    FUTURE_WRITER, Guest, LABELLED, MATH, MAYBE, MQTT_NODE, NAMED_ECHO, READING_CONSUMER,
+    READING_PRODUCER, RELAY, RELAY_PLUS, RELAY_WIDE, STREAM_CONSUMER, STREAM_DRAIN,
+    STREAM_PRODUCER, STREAM_RELAY, VIDEO_SINK, VIDEO_SOURCE,
 };
 use wasmtime::StoreContextMut;
 use witgraph_ir::{
@@ -773,6 +774,158 @@ async fn capability_import_feeds_a_stream() {
     assert_eq!(read_u32(&rt, "cons", "count"), 5);
     assert_eq!(read_u32(&rt, "cons", "total-bytes"), 8);
     assert!(feed.lock().unwrap().is_empty());
+}
+
+/// Provides `test:video/clock` to the nodes that import it: `sleep` waits
+/// on tokio's clock, from a concurrent host function (the import is an
+/// `async func`).
+struct Clock;
+
+impl Host for Clock {
+    type Data = HostState;
+
+    fn link(
+        &self,
+        _node: &NodeId,
+        contract: &ComponentContract,
+        linker: &mut wasmtime::component::Linker<HostState>,
+    ) -> wasmtime::Result<()> {
+        const CLOCK: &str = "test:video/clock@0.1.0";
+        if !contract.capabilities.iter().any(|c| c.interface == CLOCK) {
+            return Ok(());
+        }
+        linker
+            .instance(CLOCK)?
+            .func_wrap_concurrent("sleep", |_, (ms,): (u32,)| {
+                Box::pin(async move {
+                    tokio::time::sleep(Duration::from_millis(ms.into())).await;
+                    Ok(())
+                })
+            })
+    }
+
+    fn island_data(&self, _members: &[NodeId], state: HostState) -> wasmtime::Result<HostState> {
+        Ok(state)
+    }
+}
+
+/// `source` streaming `frames` frames at `fps`, through `filters` in
+/// order, into `sink`.
+async fn video(
+    kit: &Kit,
+    filters: &[(&str, Guest)],
+    frames: u32,
+    fps: Option<u32>,
+) -> RuntimeGraph<Perf, Clock> {
+    let mut builder = kit
+        .builder("video")
+        .add_node("source", kit.get(VIDEO_SOURCE))
+        .add_node("sink", kit.get(VIDEO_SINK));
+    let mut from = "source";
+    for (node, guest) in filters {
+        builder = builder.add_node(*node, kit.get(*guest)).connect(
+            format!("{from}-{node}"),
+            port(from, "frames"),
+            port(node, "frames"),
+        );
+        from = node;
+    }
+    let graph = builder
+        .connect("to-sink", port(from, "frames"), port("sink", "frames"))
+        .build();
+    let compiled = graph.compile(&kit.contracts).expect("compiles");
+    let mut rt =
+        RuntimeGraph::load_with_host(compiled, &kit.wasm, RuntimeConfig::default(), Perf, Clock)
+            .await
+            .expect("loads with the clock");
+    inject(&mut rt, "source", "frames", Val::U32(frames));
+    if let Some(fps) = fps {
+        inject(&mut rt, "source", "fps", Val::U32(fps));
+    }
+    rt
+}
+
+fn read_bool<M: RuntimeMode, H: Host>(rt: &RuntimeGraph<M, H>, node: &str, port: &str) -> bool {
+    match read(rt, node, port) {
+        Some(Val::Bool(v)) => v,
+        other => panic!("{node}.{port}: expected bool, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_video_pipeline_filters_frames_as_they_stream() {
+    let kit = Kit::new(&[VIDEO_SOURCE, FRAME_GRAYSCALE, FRAME_INVERT, VIDEO_SINK]);
+
+    // Paced by the host's clock.
+    let filters = [("gray", FRAME_GRAYSCALE), ("invert", FRAME_INVERT)];
+    let mut rt = video(&kit, &filters, 5, Some(200)).await;
+    settle(&mut rt).await;
+    assert_eq!(read_u32(&rt, "sink", "count"), 5);
+    assert!(read_bool(&rt, "sink", "gray"));
+    // The last frame's first pixel is hue 24 (255, 102, 0): luma 136,
+    // inverted 119.
+    assert_eq!(read_u32(&rt, "sink", "first-pixel"), 0x7777_77ff);
+
+    // Unpaced and unfiltered, the frames are in colour.
+    let mut rt = video(&kit, &[], 3, None).await;
+    settle(&mut rt).await;
+    assert_eq!(read_u32(&rt, "sink", "count"), 3);
+    assert!(!read_bool(&rt, "sink", "gray"));
+}
+
+#[test]
+fn a_component_declares_its_viewers_in_a_custom_section() {
+    for (guest, viewer) in [
+        (VIDEO_SOURCE, Some("image")),
+        (FRAME_GRAYSCALE, Some("image")),
+        (FRAME_INVERT, Some("image")),
+        (RELAY, Some("series")),
+        (STREAM_PRODUCER, Some("series")),
+        (FUTURE_WRITER, Some("text")),
+        (MQTT_NODE, Some("text")),
+        (CONFIGURABLE, Some("series")),
+    ] {
+        let declared = contract(guest);
+        let lowered = witgraph_wit::lower_component(guest.wasm, &declared.id)
+            .expect("lowers")
+            .contract;
+        assert_eq!(
+            lowered.outputs[0].viewer.as_deref(),
+            viewer,
+            "{}",
+            declared.id
+        );
+        // WIT text declares no viewer.
+        assert_eq!(declared.outputs[0].viewer, None);
+    }
+    let sink = contract(VIDEO_SINK);
+    let lowered = witgraph_wit::lower_component(VIDEO_SINK.wasm, &sink.id).unwrap();
+    assert!(lowered.contract.outputs.iter().all(|p| p.viewer.is_none()));
+    assert_eq!(lowered.warnings, Vec::<String>::new());
+}
+
+#[test]
+fn a_wrong_viewer_hint_is_skipped_not_fatal() {
+    // A second section at the root, after the module's `output.frames=image`:
+    // a stale output, and `frames` again.
+    let hints = b"output.frame=image\noutput.frames=text\n";
+    let name = witgraph_wit::viewer::SECTION.as_bytes();
+    let mut body = vec![u8::try_from(name.len()).unwrap()];
+    body.extend_from_slice(name);
+    body.extend_from_slice(hints);
+    let mut bytes = VIDEO_SOURCE.wasm.to_vec();
+    bytes.push(0);
+    bytes.push(u8::try_from(body.len()).unwrap());
+    bytes.extend(body);
+
+    let id = contract(VIDEO_SOURCE).id;
+    let lowered = witgraph_wit::lower_component(&bytes, &id).expect("still lowers");
+    assert_eq!(lowered.contract.outputs[0].viewer.as_deref(), Some("image"));
+    assert_eq!(lowered.warnings.len(), 2, "{:?}", lowered.warnings);
+    assert!(lowered.warnings.iter().any(|w| w.contains("`frame`")));
+    assert!(lowered.warnings.iter().any(|w| w.contains("named twice")));
+    // The bytes still verify against their contract.
+    witgraph_wit::verify::verify_component(&contract(VIDEO_SOURCE), &bytes).expect("verifies");
 }
 
 /// Serves `test:kv/store`. `get` answers `<plugin id>:<key>#<n>`, where `n`

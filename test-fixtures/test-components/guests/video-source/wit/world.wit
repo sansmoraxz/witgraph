@@ -1,0 +1,27 @@
+package test:video-source@0.1.0;
+
+/// Streams `frames` animated 96x64 frames (forever when absent): a moving
+/// hue gradient with a bouncing white square. Paced at `fps` frames a second
+/// by the host's clock when given, as fast as the reader takes them when
+/// not. Stops once the reader is dropped.
+world video-source {
+    import test:video/clock@0.1.0;
+
+    export node: interface {
+        /// An image: `width` x `height` pixels, row by row, four bytes
+        /// (red, green, blue, alpha) each.
+        record frame {
+            width: u32,
+            height: u32,
+            pixels: list<u8>,
+        }
+        record inputs {
+            frames: option<u32>,
+            fps: option<u32>,
+        }
+        record outputs {
+            frames: stream<frame>,
+        }
+        run: async func(inputs: inputs) -> outputs;
+    }
+}

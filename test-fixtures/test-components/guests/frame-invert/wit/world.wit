@@ -1,0 +1,22 @@
+package test:frame-invert@0.1.0;
+
+/// Inverts the colours of every frame of its input stream (alpha kept) as
+/// the frames arrive. Stops once its reader is dropped.
+world frame-invert {
+    export node: interface {
+        /// An image: `width` x `height` pixels, row by row, four bytes
+        /// (red, green, blue, alpha) each.
+        record frame {
+            width: u32,
+            height: u32,
+            pixels: list<u8>,
+        }
+        record inputs {
+            frames: stream<frame>,
+        }
+        record outputs {
+            frames: stream<frame>,
+        }
+        run: async func(inputs: inputs) -> outputs;
+    }
+}
