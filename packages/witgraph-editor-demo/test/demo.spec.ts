@@ -218,6 +218,20 @@ test.describe('WIT Graph Editor Demo', () => {
     await expect(canvas.locator('[data-node-id="relay-b"] .node-label')).toHaveText('Moved');
   });
 
+  test('the timeline names the nodes of a generation', async ({ page }) => {
+    await page.locator('witgraph-controls').locator('button.step').click();
+    const timeline = page.locator('witgraph-timeline');
+    const started = timeline.locator('.event', { hasText: 'generation-started' }).first();
+    await expect(started).toBeVisible({ timeout: 10_000 });
+    // Its island's nodes, and which generation.
+    await expect(started.locator('.underline').first()).not.toBeEmpty();
+    await expect(started).toContainText(/\(generation \d+\)/);
+    // The video island's four nodes, together.
+    await expect(
+      timeline.locator('.event', { hasText: 'camera, grayscale, invert, video-sink' }).first(),
+    ).toBeVisible();
+  });
+
   test('injected values from attrs are visible', async ({ page }) => {
     const inspector = page.locator('witgraph-inspector');
     const text = await inspector.evaluate((el: HTMLElement) => el.shadowRoot?.textContent ?? '');
