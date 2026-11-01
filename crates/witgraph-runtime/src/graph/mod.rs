@@ -17,6 +17,7 @@ use std::future::Future;
 use wasmtime::Engine;
 use wasmtime::component::{Type, Val};
 
+use crate::shared::Shared;
 use crate::value::Value;
 use witgraph_ir::{CompiledGraph, NodeId, PortDirection, PortName};
 use witgraph_sched::{Scheduler, Snapshot, SnapshotError};
@@ -62,6 +63,15 @@ pub struct RuntimeConfig {
     /// too; other host-side copies of values do not (see
     /// [`hostcall_fuel`](Self::hostcall_fuel)).
     pub max_island_memory: Option<usize>,
+    /// The most memory the graph's shared objects, the resources its
+    /// handle ports carry ([`shared`](crate::shared)), may take in total,
+    /// as their providers report their sizes (host or device memory).
+    /// Making one past it fails the call that makes it, which faults the
+    /// node's island
+    /// ([`NodeFault::MemoryLimit`](crate::NodeFault::MemoryLimit)); an
+    /// object's size is given back when the last holder drops it. `None` is
+    /// unlimited; the default is 4 GiB.
+    pub max_shared_memory: Option<usize>,
     /// Wasmtime's hostcall fuel, per call: roughly the bytes of host memory
     /// the values lifted *out of* a guest in one call may take, where every
     /// value element costs about 48 bytes. It bounds what a `run` returns,
@@ -121,6 +131,7 @@ impl Default for RuntimeConfig {
             yield_interval: 100_000,
             fuel_per_run: None,
             max_island_memory: Some(1 << 30),
+            max_shared_memory: Some(usize::try_from(4u64 << 30).unwrap_or(usize::MAX)),
             // 4 GiB, or all of a 32-bit host's address space.
             hostcall_fuel: usize::try_from(4u64 << 30).unwrap_or(usize::MAX),
             memory_reservation: None,
@@ -158,6 +169,14 @@ pub struct RuntimeGraph<M: RuntimeMode = Perf, H: Host = NoCapabilities> {
     config: RuntimeConfig,
 }
 
+fn not_a_value_output(node: &NodeId, port: &PortName) -> RuntimeError {
+    RuntimeError::NotAValuePort {
+        node: node.clone(),
+        port: port.clone(),
+        direction: PortDirection::Output,
+    }
+}
+
 impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
     /// Writes a value to a Value input port, as an external source would.
     /// See [`Scheduler::inject`] for which ports qualify and when the
@@ -193,10 +212,41 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
     /// returned last, or `None` if it has not run yet. See
     /// [`Scheduler::read_output`].
     pub fn read_output(&self, node: &NodeId, port: &PortName) -> Result<Option<Val>, RuntimeError> {
-        Ok(self
-            .sched
-            .read_output(node, port)?
-            .map(|value| value.to_val()))
+        match self.sched.read_output(node, port)? {
+            Some(Value::Handle(_)) => Err(not_a_value_output(node, port)),
+            value => Ok(value.map(|value| value.to_val())),
+        }
+    }
+
+    /// The latched object of a handle output port: what the node's `run`
+    /// returned last, or `None` if it has not run yet. A port that is no
+    /// handle output is [`RuntimeError::NotAValuePort`].
+    pub fn read_handle(
+        &self,
+        node: &NodeId,
+        port: &PortName,
+    ) -> Result<Option<Shared>, RuntimeError> {
+        match self.sched.read_output(node, port)? {
+            Some(Value::Handle(shared)) => Ok(Some(shared)),
+            None if self.is_handle_output(node, port) => Ok(None),
+            _ => Err(not_a_value_output(node, port)),
+        }
+    }
+
+    fn is_handle_output(&self, node: &NodeId, port: &PortName) -> bool {
+        self.compiled().contract_for(node).is_some_and(|contract| {
+            contract
+                .outputs
+                .iter()
+                .any(|p| &p.name == port && p.kind == witgraph_ir::PortKind::Handle)
+        })
+    }
+
+    /// The memory the graph's shared objects take now, as their providers
+    /// reported it: what counts against
+    /// [`max_shared_memory`](RuntimeConfig::max_shared_memory).
+    pub fn shared_memory(&self) -> usize {
+        self.sched.executor().shared_memory.used()
     }
 
     /// The component type of a Value input port's payload (for an optional

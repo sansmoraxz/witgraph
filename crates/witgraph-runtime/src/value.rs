@@ -15,6 +15,8 @@ use std::sync::Arc;
 use wasmtime::component::Val;
 use witgraph_sched::OptionPayload;
 
+use crate::shared::Shared;
+
 /// A Value port's value as the runtime keeps it: see the [module](self).
 #[derive(Debug, Clone)]
 pub(crate) enum Value {
@@ -37,6 +39,10 @@ pub(crate) enum Value {
     Option(Option<Arc<Value>>),
     Result(Result<Option<Arc<Value>>, Option<Arc<Value>>>),
     Map(Arc<[(Value, Value)]>),
+    /// What a handle port carries, kept by the host: never a `Val`, which
+    /// would be a handle of one Store. `run`'s arguments lend it, and its
+    /// results give it up ([`crate::engine`]).
+    Handle(Shared),
 }
 
 /// A list of numbers, packed.
@@ -95,12 +101,17 @@ impl Value {
             Self::Option(payload) => Val::Option(boxed(payload)),
             Self::Result(Ok(payload)) => Val::Result(Ok(boxed(payload))),
             Self::Result(Err(payload)) => Val::Result(Err(boxed(payload))),
-            // A container's elements are built afresh either way.
+            // A container's elements are built afresh either way (and a
+            // handle is never made a `Val`: see `to_val`).
             other => other.to_val(),
         }
     }
 
-    /// The value as a `Val`, built afresh.
+    /// The value as a `Val`, built afresh. A handle has none: every caller
+    /// keeps handles out (`run`'s arguments lend them, and reading or
+    /// writing a port as a `Val` or WAVE refuses a handle port), and one
+    /// that slipped through would be an empty tuple, which no handle
+    /// type-checks as.
     pub(crate) fn to_val(&self) -> Val {
         let boxed = |payload: &Option<Arc<Value>>| payload.as_ref().map(|v| Box::new(v.to_val()));
         match self {
@@ -138,6 +149,7 @@ impl Value {
                     .map(|(k, v)| (k.to_val(), v.to_val()))
                     .collect(),
             ),
+            Self::Handle(_) => Val::Tuple(Vec::new()),
         }
     }
 
@@ -280,6 +292,7 @@ impl PartialEq for Value {
             (Self::Result(Ok(a)), Self::Result(Ok(b)))
             | (Self::Result(Err(a)), Self::Result(Err(b))) => payload(a, b),
             (Self::Map(a), Self::Map(b)) => shared(a, b),
+            (Self::Handle(a), Self::Handle(b)) => a == b,
             _ => false,
         }
     }

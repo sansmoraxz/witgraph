@@ -49,12 +49,14 @@ pub mod error;
 pub mod graph;
 pub mod plugin;
 pub(crate) mod pump;
+pub mod shared;
 pub(crate) mod value;
 
 pub use engine::{CapabilityGap, Host, HostState, IslandData, NoCapabilities};
 pub use error::LoadError;
 pub use graph::{LinkedProvider, PreparedComponent, RuntimeConfig, RuntimeGraph};
 pub use plugin::{CapabilityPlugin, Extensions, PluginData, Plugins};
+pub use shared::Shared;
 pub use wasmtime::component::Val;
 pub use witgraph_sched::{
     FaultReport, IslandSnapshot, NodeFault, NodePhase, NodeState, Perf, PortValues, RuntimeError,

@@ -46,6 +46,15 @@
 //!   a trap poisons its Store, and the island's other Stores are dropped
 //!   with it.
 //!
+//! # Handles
+//!
+//! A handle port's object ([`Shared`]) is the host's, kept
+//! by the scheduler's latches, never by a Store: each reader's `run` is
+//! lent it as a `borrow` held in the reader's Store only for the call, and
+//! a `run` returning an `own` hands its object back. So a handle passes
+//! between islands as freely as a Value, and its object lives while a
+//! latch, or a guest's own reference, holds it ([`crate::shared`]).
+//!
 //! # Embedding
 //!
 //! A Store's data is the embedder's [`Host::Data`], which carries
@@ -84,12 +93,12 @@ use std::task::Poll;
 use futures::FutureExt;
 use futures::channel::{mpsc, oneshot};
 use futures::stream::{FuturesUnordered, StreamExt};
-use wasmtime::component::{Accessor, Func, InstancePre, Linker, Type, Val};
+use wasmtime::component::{Accessor, Func, InstancePre, Linker, ResourceDynamic, Type, Val};
 
 use crate::value::Value;
 use wasmtime::{AsContextMut, Engine, Store, StoreContextMut};
 use witgraph_ir::{
-    Capability, ComponentContract, NodeId, PortDirection, PortKind, PortName, PortRef,
+    Capability, ComponentContract, HandleType, NodeId, PortDirection, PortKind, PortName, PortRef,
 };
 use witgraph_sched::plan::{IslandPlan, MemberPlan};
 use witgraph_sched::{
@@ -98,6 +107,7 @@ use witgraph_sched::{
 };
 
 use crate::pump::{Ended, Intake, StreamRx, Tap, export_stream, import_stream};
+use crate::shared::{Shared, SharedLimitExceeded, SharedMemory, SharedTable};
 
 /// witgraph's own state in every island Store: who called `fatal`, and the
 /// island's memory accounting.
@@ -116,6 +126,10 @@ pub struct HostState {
     /// How many components the Store's members instantiate (a member with
     /// links counts its providers too): what its item limits scale with.
     components: usize,
+    /// The shared objects this Store's guests hold handles to.
+    shared: SharedTable,
+    /// The graph's shared objects' memory accounting.
+    shared_memory: Arc<SharedMemory>,
 }
 
 /// The memory an island has been granted: its Stores' linear memories and
@@ -198,6 +212,7 @@ impl HostState {
     /// Store's members instantiate.
     pub(crate) fn island(
         memory_limit: Option<usize>,
+        shared_memory: &Arc<SharedMemory>,
         stores: impl IntoIterator<Item = usize>,
     ) -> Vec<Self> {
         let memory = Arc::new(IslandMemory {
@@ -210,6 +225,8 @@ impl HostState {
                 fatal: None,
                 memory: memory.clone(),
                 components: components.max(1),
+                shared: SharedTable::default(),
+                shared_memory: shared_memory.clone(),
             })
             .collect()
     }
@@ -223,6 +240,50 @@ impl HostState {
     /// The island's memory accounting.
     pub(crate) fn memory(&self) -> Arc<IslandMemory> {
         self.memory.clone()
+    }
+
+    pub(crate) fn shared_table(&mut self) -> &mut SharedTable {
+        &mut self.shared
+    }
+
+    /// Makes `object` a shared object of `resource`, declared in
+    /// `interface` (linked with [`link_resource`](crate::shared::link_resource)),
+    /// charged `bytes` against the graph's
+    /// [`max_shared_memory`](crate::RuntimeConfig::max_shared_memory), and
+    /// returns the guest's `own` handle to it: what a constructor or an
+    /// operation making a new object returns. Over the limit, it fails, and
+    /// so does the guest's call, as [`NodeFault::MemoryLimit`].
+    pub fn share<T: std::any::Any + Send + Sync>(
+        &mut self,
+        interface: &str,
+        resource: &str,
+        object: T,
+        bytes: usize,
+    ) -> wasmtime::Result<ResourceDynamic> {
+        let tag = crate::shared::tag(interface, resource);
+        let shared = self
+            .shared_memory
+            .share(tag, object, bytes)
+            .map_err(wasmtime::Error::new)?;
+        self.share_again(shared)
+    }
+
+    /// A new `own` handle to an object that already exists: what an
+    /// operation returning the same object, or a view of it, returns.
+    pub fn share_again(&mut self, shared: Shared) -> wasmtime::Result<ResourceDynamic> {
+        let tag = shared.tag();
+        let rep = self.shared.insert(shared)?;
+        Ok(crate::shared::own(rep, tag))
+    }
+
+    /// The object behind a handle a guest passed: an `own` or a `borrow`
+    /// of a resource handle ports may carry.
+    pub fn shared(&self, handle: &ResourceDynamic) -> wasmtime::Result<Shared> {
+        self.shared
+            .get(handle.rep())
+            .filter(|shared| shared.tag() == handle.ty())
+            .cloned()
+            .ok_or_else(|| wasmtime::format_err!("no shared object behind this handle"))
     }
 }
 
@@ -345,6 +406,18 @@ pub trait Host: 'static {
     fn check(&self, node: &NodeId, capability: &Capability) -> Result<(), CapabilityGap> {
         let _ = (node, capability);
         Ok(())
+    }
+
+    /// Whether `handle`, a resource a handle port of `node` carries, is one
+    /// the host shares between nodes: one it links with
+    /// [`link_resource`](crate::shared::link_resource), whose objects it
+    /// makes with [`HostState::share`] (see [`crate::shared`]). A graph
+    /// with a handle port the host does not share fails to load
+    /// ([`LoadError::NotShareable`](crate::LoadError::NotShareable)). The
+    /// default shares nothing.
+    fn shares(&self, node: &NodeId, handle: &HandleType) -> bool {
+        let _ = (node, handle);
+        false
     }
 }
 
@@ -1086,14 +1159,16 @@ impl<D: IslandData> Served<'_, D> {
         slot: usize,
         plan: &MemberPlan,
         name: &PortName,
-        val: Val,
+        value: Value,
     ) -> wasmtime::Result<CellValue> {
         let Some((port, output)) = plan.outputs.get_key_value(name) else {
-            return Ok(CellValue::Local(Value::from_val(val)));
+            return Ok(CellValue::Local(value));
         };
-        if output.kind == PortKind::Value {
-            return Ok(CellValue::Local(Value::from_val(val)));
-        }
+        // A stream or future is a scalar `Val`, as lifted.
+        let val = match value {
+            Value::Scalar(val) if output.kind.is_async() => val,
+            value => return Ok(CellValue::Local(value)),
+        };
         // A stream or future has one reader in the island, or none.
         let reader = output.consumers.first().map(|consumer| consumer.member);
         let here = |member: usize| {
@@ -1190,18 +1265,14 @@ impl<D: IslandData> NodeCaller<Value> for Members<'_, D> {
         member: usize,
         args: Vec<Option<Value>>,
     ) -> wasmtime::Result<Vec<(String, Value)>> {
-        let outputs = call_run(
+        call_run(
             self.acc,
             &self.runs[member],
             &self.plan.members[member],
             args,
             self.budget,
         )
-        .await?;
-        Ok(outputs
-            .into_iter()
-            .map(|(name, val)| (name, Value::from_val(val)))
-            .collect())
+        .await
     }
 
     fn close(&self, value: Value) -> wasmtime::Result<()> {
@@ -1217,27 +1288,67 @@ impl<D: IslandData> NodeCaller<Value> for Members<'_, D> {
 }
 
 /// Calls a member's `run` with its collected inputs, after resetting the
-/// Store's fuel to `budget`, and returns its outputs by field name, as
-/// wasmtime lifted them.
+/// Store's fuel to `budget`, and returns its outputs by field name. A
+/// handle input is lent to the call as a `borrow` (the lend ends with the
+/// call), and a handle output's object is taken back from the guest.
 async fn call_run<D: IslandData>(
     acc: &Accessor<D>,
     run: &Func,
     plan: &MemberPlan,
     args: Vec<Option<Value>>,
     budget: u64,
-) -> wasmtime::Result<Vec<(String, Val)>> {
-    let params = params(plan, args)?;
-    acc.with(|mut access| access.as_context_mut().set_fuel(budget))?;
-    let mut results = if plan.has_result {
-        vec![Val::Bool(false)]
-    } else {
-        Vec::new()
-    };
-    run.call_concurrent(acc, &params, &mut results).await?;
-    Ok(match results.into_iter().next() {
+) -> wasmtime::Result<Vec<(String, Value)>> {
+    let mut lent = Vec::new();
+    let called = async {
+        let params = params(acc, plan, args, &mut lent)?;
+        acc.with(|mut access| access.as_context_mut().set_fuel(budget))?;
+        let mut results = if plan.has_result {
+            vec![Val::Bool(false)]
+        } else {
+            Vec::new()
+        };
+        run.call_concurrent(acc, &params, &mut results).await?;
+        Ok::<_, wasmtime::Error>(results)
+    }
+    .await;
+    acc.with(|mut access| {
+        let table = access.data_mut().host_state().shared_table();
+        for rep in lent {
+            table.remove(rep);
+        }
+    });
+    let fields = match called?.into_iter().next() {
         Some(Val::Record(fields)) => fields,
         _ => Vec::new(),
-    })
+    };
+    fields
+        .into_iter()
+        .map(|(name, val)| {
+            let handle = plan
+                .outputs
+                .iter()
+                .any(|(port, output)| port.as_str() == name && output.kind == PortKind::Handle);
+            let value = match (handle, val) {
+                (true, Val::Resource(resource)) => Value::Handle(acc.with(|mut access| {
+                    let handle = ResourceDynamic::try_from_resource_any(resource, &mut access)?;
+                    access
+                        .data_mut()
+                        .host_state()
+                        .shared_table()
+                        .remove(handle.rep())
+                        .filter(|shared| shared.tag() == handle.ty())
+                        .ok_or_else(|| {
+                            wasmtime::format_err!(
+                                "`{}.{name}` returned a handle of no shared object",
+                                plan.node
+                            )
+                        })
+                })?),
+                (_, val) => Value::from_val(val),
+            };
+            Ok((name, value))
+        })
+        .collect()
 }
 
 /// Drops the host's copy of an unconsumed stream or future handle so the
@@ -1252,15 +1363,35 @@ fn close<D: IslandData>(acc: &Accessor<D>, val: Val) -> wasmtime::Result<()> {
 
 /// Builds `run`'s parameter list from a member's collected inputs, one per
 /// field of its `inputs` record: the only place a value becomes a `Val`
-/// again. [`drive`] has checked that every required input has a value.
-fn params(member: &MemberPlan, args: Vec<Option<Value>>) -> wasmtime::Result<Vec<Val>> {
+/// again. A handle is lent: held in the Store's table for a `borrow`, its
+/// `rep` added to `lent`. [`drive`] has checked that every required input
+/// has a value.
+fn params<D: IslandData>(
+    acc: &Accessor<D>,
+    member: &MemberPlan,
+    args: Vec<Option<Value>>,
+    lent: &mut Vec<u32>,
+) -> wasmtime::Result<Vec<Val>> {
     let Some(fields) = &member.inputs else {
         return Ok(Vec::new());
     };
     let mut record = Vec::with_capacity(fields.len());
     let mut args = args.into_iter();
     for field in fields {
-        let value = args.next().flatten().map(Value::into_val);
+        let value = match args.next().flatten() {
+            Some(Value::Handle(shared)) => Some(acc.with(|mut access| {
+                let tag = shared.tag();
+                let rep = access
+                    .data_mut()
+                    .host_state()
+                    .shared_table()
+                    .insert(shared)?;
+                lent.push(rep);
+                let borrow = ResourceDynamic::new_borrow(rep, tag);
+                borrow.try_into_resource_any(&mut access).map(Val::Resource)
+            })?),
+            value => value.map(Value::into_val),
+        };
         let value = match (field.optional, value) {
             (true, value) => Val::Option(value.map(Box::new)),
             (false, Some(value)) => value,
@@ -1283,6 +1414,8 @@ pub(crate) struct Wasmtime<H: Host> {
     pub(crate) settings: StoreSettings,
     /// What a new island Store's memory is limited to.
     pub(crate) max_island_memory: Option<usize>,
+    /// The graph's shared objects' memory accounting.
+    pub(crate) shared_memory: Arc<SharedMemory>,
     /// Per island, in island order: its members with what instantiating
     /// each needs, for rebuilds.
     pub(crate) binaries: Vec<IslandBinaries<H::Data>>,
@@ -1300,6 +1433,7 @@ pub(crate) struct Wasmtime<H: Host> {
 pub(crate) fn island_data<H: Host>(
     host: &H,
     memory_limit: Option<usize>,
+    shared_memory: &Arc<SharedMemory>,
     members: &[(&NodeId, &NodeBinary<H::Data>)],
     cells: &[Vec<usize>],
 ) -> Vec<wasmtime::Result<H::Data>> {
@@ -1309,7 +1443,7 @@ pub(crate) fn island_data<H: Host>(
             .map(|(_, binary)| binary.components)
             .sum()
     });
-    let states = HostState::island(memory_limit, components);
+    let states = HostState::island(memory_limit, shared_memory, components);
     cells
         .iter()
         .zip(states)
@@ -1351,7 +1485,13 @@ impl<H: Host> Executor for Wasmtime<H> {
             .iter()
             .map(|(node, binary)| (node, &**binary))
             .collect();
-        let data = island_data(&self.host, self.max_island_memory, &parts, &cells);
+        let data = island_data(
+            &self.host,
+            self.max_island_memory,
+            &self.shared_memory,
+            &parts,
+            &cells,
+        );
         rebuild_and_run(
             self.engine.clone(),
             members,
@@ -1386,6 +1526,9 @@ impl<H: Host> Executor for Wasmtime<H> {
 
     /// A Value port never holds a kind WAVE cannot render (a handle, say).
     fn to_wave(&self, value: &Value) -> Result<String, String> {
+        if let Value::Handle(_) = value {
+            return Err("a handle has no WAVE text".into());
+        }
         value.to_val().to_wave().map_err(|e| e.to_string())
     }
 }
@@ -1399,6 +1542,14 @@ fn classify(
     }
     if error.downcast_ref::<wasmtime::Trap>() == Some(&wasmtime::Trap::OutOfFuel) {
         return (NodeFault::FuelExhausted, None);
+    }
+    // A provider's charge arrives wrapped in the failed host call's error.
+    if let Some(exceeded) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<SharedLimitExceeded>())
+    {
+        let SharedLimitExceeded { requested, limit } = *exceeded;
+        return (NodeFault::MemoryLimit { requested, limit }, None);
     }
     // A pump's charge arrives wrapped in the failed write's error.
     if let Some(exceeded) = error
@@ -1543,7 +1694,7 @@ mod tests {
             &engine,
             &[(&node, &binary)],
             &[vec![0]],
-            HostState::island(None, [1]),
+            HostState::island(None, &SharedMemory::new(None), [1]),
             settings,
         )
         .await
@@ -1560,7 +1711,7 @@ mod tests {
     #[test]
     fn island_memory_counts_tables_and_skips_failed_growth() {
         use wasmtime::ResourceLimiter;
-        let mut states = HostState::island(Some(64 * 1024), [2, 1]);
+        let mut states = HostState::island(Some(64 * 1024), &SharedMemory::new(None), [2, 1]);
         let mut state = states.remove(0);
         assert!(state.memory_growing(0, 65536, None).unwrap());
         assert!(

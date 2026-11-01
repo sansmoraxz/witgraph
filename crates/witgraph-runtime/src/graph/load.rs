@@ -21,6 +21,8 @@ use crate::engine::{
     self, BuildError, CapabilityGap, Host, NoCapabilities, NodeBinary, RunSignature, Wasmtime,
 };
 use crate::error::LoadError;
+use crate::shared::SharedMemory;
+use witgraph_ir::interface::compat_track;
 use witgraph_sched::{RuntimeError, RuntimeMode};
 
 /// A component checked against its contract and compiled, ready for
@@ -208,6 +210,48 @@ fn check_host<H: Host>(
     })
 }
 
+/// Asks `host` whether it shares every resource a handle port of the
+/// graph carries ([`Host::shares`]), and checks that no two of them have
+/// one type tag ([`crate::shared`]).
+fn check_shared<H: Host>(host: &H, compiled: &CompiledGraph) -> Result<(), LoadError> {
+    let mut tags: HashMap<u32, (String, &str)> = HashMap::new();
+    for node in &compiled.graph().nodes {
+        let Some(contract) = compiled.contract_for(&node.id) else {
+            continue;
+        };
+        for port in contract.inputs.iter().chain(&contract.outputs) {
+            let Some(handle) = &port.handle else {
+                continue;
+            };
+            if !host.shares(&node.id, handle) {
+                return Err(LoadError::NotShareable {
+                    node: node.id.clone(),
+                    port: port.name.clone(),
+                    resource: handle.to_string(),
+                });
+            }
+            let resource = (compat_track(&handle.interface), handle.resource.as_str());
+            let tag = crate::shared::tag(&handle.interface, &handle.resource);
+            match tags.entry(tag) {
+                Entry::Occupied(other) if *other.get() != resource => {
+                    return Err(LoadError::Runtime(RuntimeError::InvalidConfig {
+                        message: format!(
+                            "resources `{handle}` and `{}.{}` have the same type tag; rename one",
+                            other.get().0,
+                            other.get().1
+                        ),
+                    }));
+                }
+                Entry::Occupied(_) => {}
+                Entry::Vacant(entry) => {
+                    entry.insert(resource);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 impl<M: RuntimeMode> RuntimeGraph<M, NoCapabilities> {
     /// Loads a compiled graph whose components import no capabilities; see
     /// [`load_with_host`](RuntimeGraph::load_with_host).
@@ -319,6 +363,7 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
         for &(node, index) in &of_node {
             check_host(&host, node, &checked[index].parts.capabilities)?;
         }
+        check_shared(&host, &compiled)?;
         let prepared = checked
             .into_iter()
             .map(|checked| checked.compile(&engine))
@@ -373,6 +418,7 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
             check_host(&host, &node.id, &prepared.parts.capabilities)?;
             nodes.push(prepared);
         }
+        check_shared(&host, &compiled)?;
         Self::link_and_build(compiled, nodes, config, engine, mode, host).await
     }
 
@@ -439,22 +485,29 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
                 list.push(connection);
             }
         }
+        let shared_memory = SharedMemory::new(config.max_shared_memory);
         for (members, connections) in compiled.islands().iter().zip(&inner) {
             let parts = island_parts(&binaries, members)?;
             let cells = cells(connections, members, config.split_islands);
-            let data = engine::island_data(&host, config.max_island_memory, &parts, &cells)
-                .into_iter()
-                .zip(&cells)
-                .map(|(data, cell)| {
-                    data.map_err(|e| LoadError::Instantiation {
-                        node: cell
-                            .first()
-                            .and_then(|member| members.get(*member).cloned())
-                            .unwrap_or_else(|| "?".into()),
-                        message: format!("island data: {e:#}"),
-                    })
+            let data = engine::island_data(
+                &host,
+                config.max_island_memory,
+                &shared_memory,
+                &parts,
+                &cells,
+            )
+            .into_iter()
+            .zip(&cells)
+            .map(|(data, cell)| {
+                data.map_err(|e| LoadError::Instantiation {
+                    node: cell
+                        .first()
+                        .and_then(|member| members.get(*member).cloned())
+                        .unwrap_or_else(|| "?".into()),
+                    message: format!("island data: {e:#}"),
                 })
-                .collect::<Result<Vec<_>, _>>()?;
+            })
+            .collect::<Result<Vec<_>, _>>()?;
             let (island, signatures) =
                 engine::build_island(&engine, &parts, &cells, data, settings)
                     .await
@@ -497,6 +550,7 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
             engine,
             settings,
             max_island_memory: config.max_island_memory,
+            shared_memory,
             binaries: island_binaries,
             cells: island_cells,
             input_types,
@@ -670,6 +724,9 @@ pub(super) fn validate(config: &RuntimeConfig) -> Result<(), RuntimeError> {
     }
     if config.max_island_memory == Some(0) {
         return invalid("max_island_memory must be at least 1");
+    }
+    if config.max_shared_memory == Some(0) {
+        return invalid("max_shared_memory must be at least 1");
     }
     if config.hostcall_fuel == 0 {
         return invalid("hostcall_fuel must be at least 1");
