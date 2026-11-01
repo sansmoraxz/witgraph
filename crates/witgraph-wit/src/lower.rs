@@ -104,6 +104,10 @@ pub struct Lowered {
     pub export: String,
     /// Named types reached from the ports, in first-reference order.
     pub types: Vec<NamedType>,
+    /// What was wrong but did not stop lowering: the component's viewer
+    /// hints that were skipped ([`crate::viewer`]). Always empty for WIT
+    /// text.
+    pub warnings: Vec<String>,
 }
 
 /// A named WIT type reached from a port.
@@ -650,6 +654,7 @@ fn lower_world(
     contract.id.content_hash = Some(hash::content_hash(&contract));
     Ok(Some(Lowered {
         contract,
+        warnings: Vec::new(),
         export: resolve.name_world_key(export),
         types: named_types(
             resolve,
@@ -1177,6 +1182,7 @@ fn lower_field(
         ty,
         optional,
         docs: field.docs.contents.clone(),
+        viewer: None,
     })
 }
 

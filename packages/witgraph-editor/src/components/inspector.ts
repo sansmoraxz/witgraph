@@ -1,5 +1,6 @@
 import type { EditorController } from '../controller/editor-controller.ts';
 import type { NodeVisual, PortVisual } from '../controller/types.ts';
+import { defaultViewer } from '../controller/visual.ts';
 import { adoptStyles } from './shared-styles.ts';
 
 const PHASE_BG: Record<string, string> = {
@@ -57,25 +58,55 @@ const EXTRA_CSS = `
   .toggle-track.on .toggle-knob { left: 18px; }
 `;
 
+/**
+ * What a built inspector shows: its markup, and the values of its form
+ * controls (which the markup leaves out). Equal for equal content.
+ */
+function signature(root: Element): string {
+  const values = [...root.querySelectorAll('input, textarea, select')].map((control) => {
+    const c = control as HTMLInputElement;
+    return c.type === 'checkbox' ? String(c.checked) : c.value;
+  });
+  return [root.outerHTML, ...values].join('\u0000');
+}
+
+/** Whether `el` takes typing: a text field, a text area or a list. */
+function isEditable(el: Element | null): boolean {
+  if (!el) return false;
+  const tag = el.tagName;
+  return (
+    tag === 'TEXTAREA' ||
+    tag === 'SELECT' ||
+    (tag === 'INPUT' && (el as HTMLInputElement).type !== 'checkbox')
+  );
+}
+
 export class WitgraphInspector extends HTMLElement {
   #controller: EditorController | null = null;
+  // Not on `output-changed`: stream items are previewed in the node, and
+  // re-rendering for each would reset whatever is being typed here.
   #onStateChanged = () => this.render();
-  #onOutputChanged = () => this.render();
+  /** What is shown: its {@link signature}, and what it inspects. */
+  #shown: { signature: string; subject: string } | null = null;
+  /** A render put off while a field here was being edited. */
+  #deferred = false;
 
   constructor() {
     super();
     const shadow = this.attachShadow({ mode: 'open' });
     adoptStyles(shadow, EXTRA_CSS);
+    // A render put off for a field being edited happens once it is left.
+    shadow.addEventListener('focusout', () => {
+      if (!this.#deferred) return;
+      this.#deferred = false;
+      queueMicrotask(() => this.render());
+    });
   }
 
   set controller(ctrl: EditorController) {
-    if (this.#controller) {
-      this.#controller.removeEventListener('state-changed', this.#onStateChanged);
-      this.#controller.removeEventListener('output-changed', this.#onOutputChanged);
-    }
+    this.#controller?.removeEventListener('state-changed', this.#onStateChanged);
     this.#controller = ctrl;
     ctrl.addEventListener('state-changed', this.#onStateChanged);
-    ctrl.addEventListener('output-changed', this.#onOutputChanged);
     this.render();
   }
 
@@ -85,39 +116,42 @@ export class WitgraphInspector extends HTMLElement {
 
   disconnectedCallback(): void {
     this.#controller?.removeEventListener('state-changed', this.#onStateChanged);
-    this.#controller?.removeEventListener('output-changed', this.#onOutputChanged);
   }
 
+  /**
+   * Shows the selection's details. Nothing on screen is touched when they
+   * are what is shown already, so a running graph's many state changes do
+   * not redraw it; and a field being edited is not swapped out from under
+   * the cursor while what it belongs to is still selected.
+   */
   render(): void {
     const root = this.shadowRoot!;
+    const subject = `${this.#controller?.selectedEdge ?? ''}\u0000${this.#controller?.selectedNode ?? ''}`;
+    const next = this.#build();
+    const shown = { signature: signature(next), subject };
     const old = root.querySelector('.inspector-root');
-    if (old) old.remove();
-
-    if (!this.#controller) {
-      root.appendChild(this.#buildGraphProperties());
+    if (old && this.#shown?.signature === shown.signature) return;
+    if (old && this.#shown?.subject === subject && isEditable(root.activeElement)) {
+      this.#deferred = true;
       return;
     }
+    const scroll = this.scrollTop;
+    if (old) old.replaceWith(next);
+    else root.appendChild(next);
+    if (this.#shown?.subject === subject) this.scrollTop = scroll;
+    this.#shown = shown;
+  }
 
-    const edgeId = this.#controller.selectedEdge;
-    if (edgeId) {
-      const edge = this.#controller.edges.find((e) => e.id === edgeId);
-      if (edge) {
-        root.appendChild(this.#buildEdgeInspector(edge));
-        return;
-      }
-    }
-
-    const nodeId = this.#controller.selectedNode;
-    if (!nodeId) {
-      root.appendChild(this.#buildGraphProperties());
-      return;
-    }
-    const node = this.#controller.nodes.get(nodeId);
-    if (!node) {
-      root.appendChild(this.#buildGraphProperties());
-      return;
-    }
-    root.appendChild(this.#buildInspector(node));
+  /** The inspector for the selected edge or node, or else the graph's properties. */
+  #build(): HTMLElement {
+    const controller = this.#controller;
+    if (!controller) return this.#buildGraphProperties();
+    const edgeId = controller.selectedEdge;
+    const edge = edgeId ? controller.edges.find((e) => e.id === edgeId) : undefined;
+    if (edge) return this.#buildEdgeInspector(edge);
+    const nodeId = controller.selectedNode;
+    const node = nodeId ? controller.nodes.get(nodeId) : undefined;
+    return node ? this.#buildInspector(node) : this.#buildGraphProperties();
   }
 
   #el(tag: string, cls: string, text?: string): HTMLElement {
@@ -478,8 +512,10 @@ export class WitgraphInspector extends HTMLElement {
     // Ports
     if (node.inputs.length > 0)
       wrap.appendChild(this.#buildPortSection('Inputs', node.inputs, node, 'input'));
-    if (node.outputs.length > 0)
+    if (node.outputs.length > 0) {
       wrap.appendChild(this.#buildPortSection('Outputs', node.outputs, node, 'output'));
+      wrap.appendChild(this.#buildPreviewSelector(node, graphNode?.attrs));
+    }
 
     // Capabilities
     const caps = this.#controller?.nodeCapabilities(node.id) ?? [];
@@ -509,6 +545,40 @@ export class WitgraphInspector extends HTMLElement {
     }
 
     return wrap;
+  }
+
+  /** Which output the node previews: its component's choice, none, or one picked. */
+  #buildPreviewSelector(node: NodeVisual, attrs: Record<string, string> = {}): HTMLElement {
+    const row = this.#el('div', 'flex items-center gap-2');
+    row.appendChild(
+      this.#el('span', 'text-xs text-wg-text-dim font-semibold select-none', 'Preview'),
+    );
+    const select = document.createElement('select');
+    select.className =
+      'preview-select focus-ring flex-1 bg-wg-surface text-wg-text border border-wg-text-dim rounded-md px-2 py-1 text-sm';
+    select.style.minWidth = '0';
+    const declared = node.outputs.find((p) => p.viewer !== undefined);
+    const choices: [string, string][] = [
+      ['', declared ? `Default (${declared.name})` : 'Default (none)'],
+      ['none', 'None'],
+      ...node.outputs.map((p): [string, string] => [
+        p.name,
+        `${p.name} (${p.viewer ?? defaultViewer(p)})`,
+      ]),
+    ];
+    const current = attrs['editor.preview'] ?? '';
+    for (const [value, text] of choices) {
+      const option = document.createElement('option');
+      option.value = value;
+      option.textContent = text;
+      option.selected = value === current;
+      select.appendChild(option);
+    }
+    select.addEventListener('change', () =>
+      this.#controller?.setPreview(node.id, select.value === '' ? null : select.value),
+    );
+    row.appendChild(select);
+    return row;
   }
 
   #buildCapabilitiesSection(

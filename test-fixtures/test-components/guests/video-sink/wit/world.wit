@@ -1,0 +1,26 @@
+package test:video-sink@0.1.0;
+
+/// Reads its input stream of frames to its end: `count` frames, `gray`
+/// whether every pixel of every one had equal red, green and blue, and
+/// `first-pixel` the first pixel of the last frame (red, green, blue,
+/// alpha, from the high byte down; 0 when there was none).
+world video-sink {
+    export node: interface {
+        /// An image: `width` x `height` pixels, row by row, four bytes
+        /// (red, green, blue, alpha) each.
+        record frame {
+            width: u32,
+            height: u32,
+            pixels: list<u8>,
+        }
+        record inputs {
+            frames: stream<frame>,
+        }
+        record outputs {
+            count: u32,
+            gray: bool,
+            first-pixel: u32,
+        }
+        run: async func(inputs: inputs) -> outputs;
+    }
+}

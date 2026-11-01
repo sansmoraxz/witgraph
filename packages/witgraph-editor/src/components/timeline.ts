@@ -16,6 +16,7 @@ function eventColor(event: string): string {
     case 'generation-stopped':
       return 'var(--wg-accent)';
     case 'restarted':
+    case 'warning':
       return 'var(--wg-warning)';
     case 'compile-ok':
       return 'var(--wg-success)';
@@ -117,16 +118,24 @@ export class WitgraphTimeline extends HTMLElement {
     name.textContent = entry.event;
     el.appendChild(name);
 
-    if (entry.node) {
-      el.appendChild(document.createTextNode(' '));
+    // A node's event names the node; an island's names its nodes.
+    const nodes =
+      entry.node !== undefined
+        ? [entry.node]
+        : entry.island !== undefined
+          ? (this.#controller?.islands[entry.island] ?? [])
+          : [];
+    nodes.forEach((node, i) => {
+      el.appendChild(document.createTextNode(i === 0 ? ' ' : ', '));
       const nodeSpan = document.createElement('span');
       nodeSpan.className = 'text-wg-primary cursor-pointer underline';
-      nodeSpan.textContent = entry.node;
-      nodeSpan.addEventListener('click', () => this.#controller?.select(entry.node!));
+      nodeSpan.textContent = node;
+      nodeSpan.addEventListener('click', () => this.#controller?.select(node));
       el.appendChild(nodeSpan);
-    }
+    });
 
     const details: string[] = [];
+    if (entry.generation !== undefined) details.push(`(generation ${entry.generation})`);
     if (entry.message) details.push(entry.message);
     if (entry.from && entry.to) details.push(`${entry.from} → ${entry.to}`);
     if (entry.fault) details.push(entry.fault.message);

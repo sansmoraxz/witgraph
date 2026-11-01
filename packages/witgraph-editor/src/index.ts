@@ -10,8 +10,10 @@ export type {
   GraphJsonConnection,
   GraphJsonNode,
   GraphJsonPortRef,
+  NodePreview,
   NodeVisual,
   OutputSnapshot,
+  OutputView,
   PortVisual,
   SavedSnapshot,
 } from './controller/types.ts';
@@ -23,6 +25,12 @@ import { WitgraphInspector } from './components/inspector.ts';
 import { WitgraphTimeline } from './components/timeline.ts';
 
 export { autoLayout } from './controller/layout.ts';
+export { defaultViewer } from './controller/visual.ts';
+export { asImage, type ImageValue, imageViewer, sniffImageType } from './viewers/image.ts';
+export { registerViewer, viewerFor } from './viewers/registry.ts';
+export { numeric, plotPoints, seriesViewer } from './viewers/series.ts';
+export { describe, summarize, textViewer } from './viewers/text.ts';
+export type { PortViewer, ViewerInstance } from './viewers/types.ts';
 export { WitgraphCanvas, WitgraphCatalog, WitgraphControls, WitgraphInspector, WitgraphTimeline };
 
 const define = (name: string, ctor: CustomElementConstructor) =>

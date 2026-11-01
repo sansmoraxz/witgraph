@@ -8,9 +8,9 @@ import { execFileSync } from 'node:child_process';
 import { readdir, readFile, stat } from 'node:fs/promises';
 import { afterEach, test } from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import type { ComponentSource } from 'witgraph-loader';
+import type { Capability, ComponentSource } from 'witgraph-loader';
 import { EditorController } from '../src/controller/editor-controller.ts';
-import type { GraphJson } from '../src/controller/types.ts';
+import type { EditorLoadOptions, GraphJson } from '../src/controller/types.ts';
 
 // ---------------------------------------------------------------------------
 // Helpers (same pattern as witgraph-loader/test/session.test.ts)
@@ -48,6 +48,13 @@ const wasm = await readFile(
 const ids: Record<string, string> = {
   echo: 'test:echo/echo@0.1.0',
   relay: 'test:relay/relay@0.1.0',
+  'video-source': 'test:video-source/video-source@0.1.0',
+  'frame-grayscale': 'test:frame-grayscale/frame-grayscale@0.1.0',
+  'video-sink': 'test:video-sink/video-sink@0.1.0',
+  'stream-producer': 'test:stream-producer/stream-producer@0.1.0',
+  'stream-consumer': 'test:stream-consumer/stream-consumer@0.1.0',
+  'future-writer': 'test:future-writer/future-writer@0.1.0',
+  'future-reader': 'test:future-reader/future-reader@0.1.0',
 };
 
 function componentRef(id: string) {
@@ -74,6 +81,7 @@ type Connection = [id: string, from: string, to: string, feedback?: boolean];
 async function loadController(
   nodes: [string, string][],
   connections: Connection[] = [],
+  options: Partial<EditorLoadOptions> = {},
 ): Promise<EditorController> {
   const used = [...new Set(nodes.map(([, guest]) => guest))];
   const components = await Promise.all(used.map(guestSource));
@@ -93,7 +101,7 @@ async function loadController(
     })),
   };
   const controller = new EditorController();
-  await controller.load({ graph, components, wasm });
+  await controller.load({ graph, components, wasm, ...options });
   controllers.push(controller);
   return controller;
 }
@@ -218,4 +226,251 @@ test('trace events are collected', async () => {
   controller.injectValue('a', 'in', '5');
   await controller.run();
   assert.ok(controller.traceEvents.length > 0, 'should have trace events after a run');
+});
+
+// ---------------------------------------------------------------------------
+// Previews
+// ---------------------------------------------------------------------------
+
+/** `test:video/clock`, sleeping on the event loop. */
+const clock = (_node: string, capability: Capability) =>
+  capability.interface === 'test:video/clock@0.1.0'
+    ? { sleep: (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)) }
+    : undefined;
+
+interface Frame {
+  width: number;
+  height: number;
+  pixels: Uint8Array;
+}
+
+/** source → gray → sink. */
+function loadVideo(): Promise<EditorController> {
+  return loadController(
+    [
+      ['source', 'video-source'],
+      ['gray', 'frame-grayscale'],
+      ['sink', 'video-sink'],
+    ],
+    [
+      ['a', 'source.frames', 'gray.frames'],
+      ['b', 'gray.frames', 'sink.frames'],
+    ],
+    { capabilities: clock },
+  );
+}
+
+const pause = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+test('a node previews the output its component declares a viewer for', async () => {
+  const controller = await loadVideo();
+  for (const node of ['source', 'gray']) {
+    const preview = controller.nodes.get(node)?.preview;
+    assert.deepEqual([preview?.port, preview?.viewer], ['frames', 'image'], node);
+  }
+  assert.equal(controller.nodes.get('sink')?.preview, undefined);
+
+  let changes = 0;
+  controller.addEventListener('output-changed', () => changes++);
+  controller.injectValue('source', 'frames', '3');
+  await controller.run();
+  await pause(50);
+  assert.ok(changes >= 1, 'stream items are announced');
+  assert.equal(controller.latestOutput('sink', 'count'), 3);
+
+  // Row 40, column 50: below the moving square.
+  const rgb = (node: string) => {
+    const frame = controller.latestOutput(node, 'frames') as Frame;
+    assert.deepEqual([frame.width, frame.height], [96, 64], node);
+    const at = (40 * 96 + 50) * 4;
+    return [...frame.pixels.subarray(at, at + 3)];
+  };
+  const [r, g, b] = rgb('gray');
+  assert.ok(r === g && g === b, `gray: ${[r, g, b]}`);
+  const [cr, cg, cb] = rgb('source');
+  assert.ok(cr !== cg || cg !== cb, `in colour: ${[cr, cg, cb]}`);
+});
+
+test('a node is resized and its preview picked by undoable edits', async () => {
+  const controller = await loadVideo();
+  const before = structuredClone(controller.nodes.get('gray')!);
+  controller.resizeNode('gray', 300, 420);
+  const resized = controller.nodes.get('gray')!;
+  assert.deepEqual([resized.width, resized.height], [300, 420]);
+  assert.equal(resized.preview?.height, 420 - 32 - resized.portsHeight);
+  controller.undo();
+  const undone = controller.nodes.get('gray')!;
+  assert.deepEqual([undone.width, undone.height], [before.width, before.height]);
+
+  controller.setPreview('gray', 'none');
+  assert.equal(controller.nodes.get('gray')!.preview, undefined);
+  assert.ok(controller.nodes.get('gray')!.height < before.height);
+  controller.setPreview('gray', null);
+  assert.equal(controller.nodes.get('gray')!.preview?.port, 'frames');
+
+  // A node with no preview keeps the height its ports give it.
+  const sink = controller.nodes.get('sink')!;
+  controller.resizeNode('sink', 280, 500);
+  assert.deepEqual(
+    [controller.nodes.get('sink')!.width, controller.nodes.get('sink')!.height],
+    [280, sink.height],
+  );
+  const sinkAttrs = (controller.graphJson as GraphJson).nodes.find((n) => n.id === 'sink')!.attrs!;
+  assert.equal(sinkAttrs['editor.h'], undefined);
+
+  // The size and preview are the graph's: they survive a reload.
+  controller.resizeNode('gray', 260, 300);
+  controller.setPreview('source', 'none');
+  await controller.importGraph(controller.exportGraph());
+  assert.equal(controller.nodes.get('gray')!.width, 260);
+  assert.equal(controller.nodes.get('source')!.preview, undefined);
+});
+
+test('stop ends a stream still being written, and run starts it again', async () => {
+  const controller = await loadVideo();
+  // Endless, paced: a run lasts until it is stopped.
+  controller.injectValue('source', 'fps', '200');
+  const frame = () => controller.latestOutput('gray', 'frames');
+  const waitForFrame = async (previous: unknown) => {
+    for (let i = 0; i < 400 && frame() === previous; i++) await pause(5);
+    assert.notEqual(frame(), previous, 'a new frame arrives');
+  };
+
+  const running = controller.run();
+  await waitForFrame(undefined);
+  controller.stop();
+  await running;
+  const stopped = frame();
+  await pause(100);
+  assert.equal(frame(), stopped, 'no frame arrives once stopped');
+
+  const again = controller.run();
+  await waitForFrame(stopped);
+  controller.stop();
+  await again;
+});
+
+test('a stream output keeps its recent items and their count', async () => {
+  const controller = await loadController(
+    [
+      ['prod', 'stream-producer'],
+      ['cons', 'stream-consumer'],
+    ],
+    [['s', 'prod.items', 'cons.items']],
+  );
+  assert.equal(controller.nodes.get('prod')?.preview?.viewer, 'series');
+  controller.injectValue('prod', 'burst-size', '5');
+  await controller.step();
+  const items = controller.observe('prod', 'items');
+  assert.deepEqual([items.kind, items.count, items.latest], ['stream', 5, 4]);
+  assert.deepEqual(items.recent, [0, 1, 2, 3, 4]);
+
+  controller.injectValue('prod', 'burst-size', '3');
+  await controller.step();
+  const more = controller.observe('prod', 'items');
+  assert.equal(more.count, 8, 'counted across runs');
+  assert.deepEqual(more.recent, [0, 1, 2, 3, 4, 0, 1, 2]);
+
+  // Only the newest are kept; all are counted.
+  controller.injectValue('prod', 'burst-size', '500');
+  await controller.run();
+  const many = controller.observe('prod', 'items');
+  assert.equal(many.count, 508);
+  assert.equal(many.recent.length, 120);
+  assert.equal(many.latest, 499);
+});
+
+test('a future output is pending until it resolves', async () => {
+  const controller = await loadController(
+    [
+      ['w', 'future-writer'],
+      ['r', 'future-reader'],
+    ],
+    [['c', 'w.done', 'r.data']],
+  );
+  assert.deepEqual(controller.observe('w', 'done'), {
+    kind: 'future',
+    latest: undefined,
+    recent: [],
+    count: 0,
+    pending: false,
+  });
+  await controller.step();
+  for (let i = 0; i < 50 && controller.observe('w', 'done').count === 0; i++) await pause(10);
+  const done = controller.observe('w', 'done');
+  assert.deepEqual([done.latest, done.count, done.pending], [7, 1, false]);
+  assert.equal(controller.latestOutput('r', 'value'), 7);
+});
+
+test('a Value output keeps one value a tick', async () => {
+  const controller = await loadController([['n', 'relay']], [['loop', 'n.out', 'n.in', true]]);
+  assert.equal(controller.nodes.get('n')?.preview?.viewer, 'series');
+  controller.injectValue('n', 'in', '1');
+  controller.injectValue('n', 'add', '2');
+  for (let i = 0; i < 3; i++) await controller.step();
+  const out = controller.observe('n', 'out');
+  assert.equal(out.kind, 'value');
+  assert.deepEqual(out.recent, [3, 5, 7]);
+  assert.equal(out.latest, 7);
+
+  // Observing again shows the same: the value recorded is not shown twice.
+  for (let i = 0; i < 3; i++) {
+    const again = controller.observe('n', 'out');
+    assert.deepEqual([again.recent, again.latest], [[3, 5, 7], 7]);
+  }
+});
+
+test('a run that never settles goes on until it is stopped', async () => {
+  const controller = await loadController([['n', 'relay']], [['loop', 'n.out', 'n.in', true]]);
+  controller.injectValue('n', 'in', '0');
+  controller.injectValue('n', 'add', '1');
+  const running = controller.run();
+  await pause(600);
+  assert.equal(controller.mode, 'running');
+  const before = controller.observe('n', 'out').count;
+  assert.ok(before > 5, `the loop advances: ${before} ticks`);
+  controller.stop();
+  await running;
+  assert.equal(controller.mode, 'idle');
+});
+
+test('a step is one bounded tick; what it left running stops on stop', async () => {
+  const controller = await loadVideo();
+  controller.injectValue('source', 'fps', '100');
+  const started = performance.now();
+  await controller.step();
+  assert.ok(performance.now() - started < 2000, 'the endless stream does not hold the step');
+  assert.equal(controller.mode, 'idle');
+  // The stream carries on after the step...
+  const first = controller.observe('gray', 'frames').count;
+  await pause(200);
+  const later = controller.observe('gray', 'frames').count;
+  assert.ok(later > first, `frames keep coming: ${first} then ${later}`);
+  // ...until it is stopped.
+  controller.stop();
+  await pause(50);
+  const stopped = controller.observe('gray', 'frames').count;
+  await pause(200);
+  assert.equal(controller.observe('gray', 'frames').count, stopped);
+});
+
+test('a run ticks no faster than its tick rate, which can change as it runs', async () => {
+  const controller = await loadController([['n', 'relay']], [['loop', 'n.out', 'n.in', true]]);
+  controller.injectValue('n', 'in', '0');
+  controller.injectValue('n', 'add', '1');
+  controller.tickRate = 5;
+  const running = controller.run();
+  await pause(1_000);
+  const slow = controller.observe('n', 'out').count;
+  assert.ok(slow >= 3 && slow <= 7, `about 5 ticks in a second: ${slow}`);
+
+  controller.tickRate = 0;
+  await pause(500);
+  const fast = controller.observe('n', 'out').count - slow;
+  assert.ok(fast > 10, `unlimited, many more in half a second: ${fast}`);
+  controller.stop();
+  await running;
+
+  controller.tickRate = -3;
+  assert.equal(controller.tickRate, 0, 'anything but a positive rate is no limit');
 });

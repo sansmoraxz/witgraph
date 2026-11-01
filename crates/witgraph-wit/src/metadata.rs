@@ -47,6 +47,10 @@ pub struct ComponentMeta {
     /// Named types referenced by the ports, for tooltips and pickers.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub types: Vec<TypeMeta>,
+    /// What was wrong with the component but did not stop it lowering:
+    /// viewer hints skipped ([`Lowered::warnings`]).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 /// Editor-facing view of one capability a component requires.
@@ -96,6 +100,10 @@ pub struct PortMeta {
     /// Doc comment from the WIT field, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub docs: Option<String>,
+    /// Output ports only: the viewer the component's `witgraph-viewer`
+    /// section names for it, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub viewer: Option<String>,
 }
 
 fn port_meta(port: &PortDef) -> PortMeta {
@@ -105,6 +113,7 @@ fn port_meta(port: &PortDef) -> PortMeta {
         type_display: port.type_display(),
         optional: port.optional,
         docs: port.docs.clone(),
+        viewer: port.viewer.clone(),
     }
 }
 
@@ -129,6 +138,7 @@ impl ComponentMeta {
                 })
                 .collect(),
             types: Vec::new(),
+            warnings: Vec::new(),
         }
     }
 }
@@ -144,8 +154,12 @@ pub fn generate_catalog(lowered: &[Lowered]) -> Catalog {
         .into_iter()
         .map(
             |Lowered {
-                 contract, types, ..
+                 contract,
+                 types,
+                 warnings,
+                 ..
              }| ComponentMeta {
+                warnings: warnings.clone(),
                 types: types
                     .iter()
                     .map(|decl| TypeMeta {

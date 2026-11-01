@@ -14,6 +14,7 @@ import {
   type Capability,
   type ComponentSource,
   camelCase,
+  type FutureItem,
   jsName,
   Session,
   type SessionOptions,
@@ -61,8 +62,12 @@ const ids: Record<string, string> = {
   'mqtt-node': 'test:mqtt-node/mqtt-node@0.1.0',
   labelled: 'test:labelled/labelled@0.1.0',
   'future-writer': 'test:future-writer/future-writer@0.1.0',
+  'future-reader': 'test:future-reader/future-reader@0.1.0',
   calc: 'test:calc/calc@0.1.0',
   math: 'test:math/math@0.1.0',
+  'video-source': 'test:video-source/video-source@0.1.0',
+  'frame-grayscale': 'test:frame-grayscale/frame-grayscale@0.1.0',
+  'video-sink': 'test:video-sink/video-sink@0.1.0',
 };
 
 /** Components written in WAT here, by guest name, beside the built guests. */
@@ -326,11 +331,157 @@ test('a stream passes between two nodes of an island, and a tap sees its items',
   assert.equal(session.graph.readOutput('cons', 'count'), 5);
   assert.equal(session.graph.readOutput('cons', 'total'), 10);
   assert.equal(session.graph.readOutput('prod', 'limit'), 5);
-  const items = seen.flatMap(({ node, port, item }) => {
+  const items = seen.flatMap(({ node, port, item, items }) => {
     assert.deepEqual([node, port], ['prod', 'items']);
-    return Array.from(item as Uint32Array);
+    // A chunk of numbers is a typed array: its items, not copied.
+    assert.equal(items, item);
+    return Array.from(items);
   });
   assert.deepEqual(items, [0, 1, 2, 3, 4]);
+});
+
+/** `test:video/clock`, sleeping on the event loop. */
+const clock = (_node: string, capability: Capability) =>
+  capability.interface === 'test:video/clock@0.1.0'
+    ? { sleep: (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)) }
+    : undefined;
+
+/** A frame as jco hands one over. */
+interface Frame {
+  width: number;
+  height: number;
+  pixels: Uint8Array;
+}
+
+test('a stream of records reaches the tap one record a chunk, and outputs carry their viewer', async () => {
+  const seen: StreamItem[] = [];
+  const session = await load(
+    [
+      ['source', 'video-source'],
+      ['gray', 'frame-grayscale'],
+      ['sink', 'video-sink'],
+    ],
+    [
+      ['a', 'source.frames', 'gray.frames'],
+      ['b', 'gray.frames', 'sink.frames'],
+    ],
+    { capabilities: clock, onStreamItem: (item) => seen.push(item) },
+  );
+  session.graph.inject('source', 'frames', 3);
+  session.graph.inject('source', 'fps', 100);
+  await session.settle();
+  assert.equal(session.graph.readOutput('sink', 'count'), 3);
+  assert.equal(session.graph.readOutput('sink', 'gray'), true);
+
+  for (const node of ['source', 'gray']) {
+    const chunks = seen.filter((s) => s.node === node);
+    assert.equal(chunks.length, 3, node);
+    for (const { port, item, items } of chunks) {
+      assert.equal(port, 'frames');
+      assert.deepEqual(Array.from(items), [item], 'a record is one item');
+      const frame = item as Frame;
+      assert.deepEqual([frame.width, frame.height], [96, 64]);
+      assert.ok(frame.pixels instanceof Uint8Array);
+      assert.equal(frame.pixels.length, 96 * 64 * 4);
+    }
+  }
+  const rgb = (node: string) => {
+    const { pixels } = seen.find((s) => s.node === node)!.item as Frame;
+    // Row 40, column 50: below the square of the first frame.
+    const at = (40 * 96 + 50) * 4;
+    return [...pixels.subarray(at, at + 3)];
+  };
+  const [r, g, b] = rgb('gray');
+  assert.ok(r === g && g === b, `gray: ${[r, g, b]}`);
+  const [cr, cg, cb] = rgb('source');
+  assert.ok(cr !== cg || cg !== cb, `the source is in colour: ${[cr, cg, cb]}`);
+
+  // The bytes' `witgraph-viewer` section, on the contract.
+  const viewers = (node: string) =>
+    session.contracts.get(node)!.outputs.map(({ name, viewer }) => [name, viewer]);
+  assert.deepEqual(viewers('source'), [['frames', 'image']]);
+  assert.deepEqual(viewers('gray'), [['frames', 'image']]);
+  assert.ok(viewers('sink').every(([, viewer]) => viewer === undefined));
+});
+
+test('a contract from WIT text takes its viewers from the bytes', async () => {
+  const wit = await readFile(
+    new URL('test-fixtures/test-components/guests/frame-grayscale/wit/world.wit', root),
+    'utf8',
+  );
+  const source = await guestSource('video-source');
+  const { bytes } = await guestSource('frame-grayscale');
+  const graph = {
+    metadata: { name: 'test' },
+    components: [componentRef(ids['video-source']), componentRef(ids['frame-grayscale'])],
+    nodes: [
+      { id: 'source', component: componentRef(ids['video-source']) },
+      { id: 'gray', component: componentRef(ids['frame-grayscale']) },
+    ],
+    connections: [
+      { id: 'a', from: { node: 'source', port: 'frames' }, to: { node: 'gray', port: 'frames' } },
+    ],
+  };
+  const session = await loaded({
+    graph,
+    components: [source, { id: ids['frame-grayscale'], bytes, wit }],
+    wasm,
+    capabilities: clock,
+  });
+  assert.equal(session.contracts.get('gray')!.outputs[0].viewer, 'image');
+});
+
+test('a wrong viewer hint is a warning, not a failed load', async () => {
+  // `video-source` with a section at its root naming an output it lacks.
+  const { id, bytes } = await guestSource('video-source');
+  const name = new TextEncoder().encode('witgraph-viewer');
+  const hint = new TextEncoder().encode('output.frame=image\n');
+  const body = [name.length, ...name, ...hint];
+  const stale = Uint8Array.from([...bytes, 0, body.length, ...body]);
+  const warned: unknown[] = [];
+  const warn = console.warn;
+  console.warn = (...args: unknown[]) => warned.push(args.join(' '));
+  try {
+    const session = await loaded({
+      graph: {
+        metadata: { name: 'test' },
+        components: [componentRef(id)],
+        nodes: [{ id: 'source', component: componentRef(id) }],
+        connections: [],
+      },
+      components: [{ id, bytes: stale }],
+      wasm,
+      capabilities: clock,
+    });
+    assert.equal(session.warnings.length, 1);
+    assert.match(session.warnings[0], /`test:video-source.*`frame`/);
+    assert.deepEqual(warned, [`witgraph: ${session.warnings[0]}`]);
+    // Its good hint still holds.
+    assert.equal(session.contracts.get('source')!.outputs[0].viewer, 'image');
+  } finally {
+    console.warn = warn;
+  }
+});
+
+test('disposing a session stops the streams its nodes are still writing', async () => {
+  let frames = 0;
+  const session = await load(
+    [
+      ['source', 'video-source'],
+      ['sink', 'video-sink'],
+    ],
+    [['a', 'source.frames', 'sink.frames']],
+    { capabilities: clock, onStreamItem: () => frames++ },
+  );
+  // Endless, paced: the tick lasts as long as the stream.
+  session.graph.inject('source', 'fps', 200);
+  const tick = session.tick().catch(() => undefined);
+  while (frames < 3) await new Promise((resolve) => setTimeout(resolve, 5));
+  session.dispose();
+  await tick;
+  const after = frames;
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(frames, after, 'no frame is seen once the session is disposed');
 });
 
 test('a feedback loop advances one iteration per tick, and a snapshot carries it on', async () => {
@@ -1013,6 +1164,28 @@ test('a future output nothing reads is consumed, so its writer finishes', async 
   // Unlike wasmtime, which drops the read end (2), the loader takes the
   // value.
   assert.equal(session.graph.readOutput('w', 'last'), 1);
+});
+
+test('a hook sees what a future resolves to, and its reader still gets it', async () => {
+  const seen: FutureItem[] = [];
+  const session = await load(
+    [
+      ['w', 'future-writer'],
+      ['r', 'future-reader'],
+      ['alone', 'future-writer'],
+    ],
+    [['c', 'w.done', 'r.data']],
+    { onFutureValue: (item) => seen.push(item) },
+  );
+  await session.settle();
+  assert.equal(session.graph.readOutput('r', 'value'), 7);
+  // The unread one too, once it settles.
+  for (let i = 0; i < 50 && seen.length < 2; i++) await new Promise((r) => setTimeout(r, 10));
+  const values = seen.map(({ node, port, value }) => [node, port, value]).sort();
+  assert.deepEqual(values, [
+    ['alone', 'done', 7],
+    ['w', 'done', 7],
+  ]);
 });
 
 test('nothing needs a secure context', async () => {

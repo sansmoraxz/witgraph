@@ -23,6 +23,8 @@ const EXTRA_CSS = `
 export class WitgraphCatalog extends HTMLElement {
   #controller: EditorController | null = null;
   #onStateChanged = () => this.#render();
+  /** What the cards shown were drawn from: see {@link #render}. */
+  #shown: string | null = null;
 
   constructor() {
     super();
@@ -52,11 +54,33 @@ export class WitgraphCatalog extends HTMLElement {
     return el;
   }
 
+  /**
+   * Shows the components. The cards are drawn from each component's id
+   * and ports only, so they are drawn again only when those change: not on
+   * each of a running graph's many state changes.
+   */
   #render(): void {
     const root = this.shadowRoot!;
+    const sources = this.#controller?.componentSources;
+    const shown = JSON.stringify(
+      sources?.map(({ id, index, inputs, outputs }) => [
+        id,
+        index,
+        inputs.map((p) => [p.name, p.kind]),
+        outputs.map((p) => [p.name, p.kind]),
+      ]) ?? null,
+    );
     const existing = root.querySelector('.catalog-wrap');
-    if (existing) existing.remove();
+    if (existing && shown === this.#shown) return;
+    this.#shown = shown;
+    const scroll = this.scrollTop;
+    const wrap = this.#build(sources);
+    if (existing) existing.replaceWith(wrap);
+    else root.appendChild(wrap);
+    this.scrollTop = scroll;
+  }
 
+  #build(sources: EditorController['componentSources'] | undefined): HTMLElement {
     const wrap = this.#el('div', 'catalog-wrap p-2 flex flex-col gap-2');
 
     const header = this.#el(
@@ -67,17 +91,13 @@ export class WitgraphCatalog extends HTMLElement {
     header.appendChild(this.#el('span', '', 'Components'));
     wrap.appendChild(header);
 
-    if (!this.#controller) {
+    if (!sources) {
       wrap.appendChild(this.#emptyState('No graph loaded'));
-      root.appendChild(wrap);
-      return;
+      return wrap;
     }
-
-    const sources = this.#controller.componentSources;
     if (sources.length === 0) {
       wrap.appendChild(this.#emptyState('No components available'));
-      root.appendChild(wrap);
-      return;
+      return wrap;
     }
 
     for (const source of sources) {
@@ -150,7 +170,7 @@ export class WitgraphCatalog extends HTMLElement {
       wrap.appendChild(card);
     }
 
-    root.appendChild(wrap);
+    return wrap;
   }
 
   #emptyState(text: string): HTMLElement {

@@ -1,0 +1,7 @@
+package test:video@0.1.0;
+
+/// Time, as the host keeps it.
+interface clock {
+    /// Returns once `ms` milliseconds have passed.
+    sleep: async func(ms: u32);
+}

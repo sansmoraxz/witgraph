@@ -5,7 +5,7 @@ import {
   Session,
   type SessionOptions,
 } from 'witgraph-loader';
-import { computeNodeHeight, NODE_WIDTH } from '../components/styles.ts';
+import { NODE_HEADER_HEIGHT } from '../components/styles.ts';
 import { autoLayout, type LayoutEdge, type LayoutNode } from './layout.ts';
 import type {
   BreakpointState,
@@ -22,14 +22,67 @@ import type {
   NodeState,
   NodeVisual,
   OutputSnapshot,
+  OutputView,
   PortVisual,
   SavedSnapshot,
   TraceEntry,
 } from './types.ts';
+import { nodeSize, nodeVisual, portVisual } from './visual.ts';
 
 const MAX_TRACE_ENTRIES = 1000;
-const MAX_TICKS_PER_RUN = 200;
+/**
+ * The longest a tick runs before it is interrupted: work that never ends (an
+ * endless stream) carries on into the next tick, and the rest of the graph
+ * (a feedback loop, say) still advances a tick at a time beside it.
+ */
+const TICK_SLICE_MS = 100;
+
+/** Waits for the next frame, so a run that never settles leaves the page time to draw. */
+function nextFrame(): Promise<void> {
+  return new Promise((resolve) =>
+    typeof requestAnimationFrame === 'function'
+      ? requestAnimationFrame(() => resolve())
+      : setTimeout(resolve, 16),
+  );
+}
 const MAX_HISTORY = 50;
+/** The most values an output's preview history keeps... */
+const MAX_RECENT = 120;
+/** ...and roughly the most bytes (a stream of video frames is heavy). */
+const MAX_RECENT_BYTES = 8 * 1024 * 1024;
+
+/** What an output carried: an {@link OutputView}, and its history's weight. */
+interface Observation {
+  latest: unknown;
+  recent: unknown[];
+  count: number;
+  pending: boolean;
+  /** Value outputs only: the tick its latest value was recorded at... */
+  tick: number;
+  /** ...and that value as WAVE text, to tell a new value from it. */
+  wave?: string;
+  bytes: number;
+}
+
+/** The most edits undo goes back over. */
+const MAX_UNDO = 50;
+
+/**
+ * About how many bytes `value` holds: its strings and buffers, through its
+ * lists and records, and a little for the rest.
+ */
+function weight(value: unknown, depth = 0): number {
+  if (typeof value === 'string') return 16 + value.length * 2;
+  if (ArrayBuffer.isView(value)) return 16 + value.byteLength;
+  if (typeof value !== 'object' || value === null) return 8;
+  // Deeper than any WIT type nests in practice.
+  if (depth > 16) return 16;
+  let bytes = 16;
+  for (const item of Array.isArray(value) ? value : Object.values(value)) {
+    bytes += weight(item, depth + 1);
+  }
+  return bytes;
+}
 
 export class EditorController extends EventTarget {
   #session: Session | null = null;
@@ -52,6 +105,14 @@ export class EditorController extends EventTarget {
 
   #tickCount = 0;
   #outputHistory = new Map<string, Map<string, OutputSnapshot[]>>();
+  /** Per node and output, what it carried: see {@link observe}. */
+  #observed = new Map<string, Map<string, Observation>>();
+  #stopRequested = false;
+  #islands: string[][] = [];
+  /** The load warnings already in the trace. */
+  #warned = new Set<string>();
+  /** Whether a run or step is ticking the graph. */
+  #ticking = false;
   #lastRunDurationMs: number | null = null;
   #lastRunTicks = 0;
 
@@ -63,7 +124,7 @@ export class EditorController extends EventTarget {
     ports: Map<string, { inputs: PortVisual[]; outputs: PortVisual[] }>;
   } | null = null;
   #compileError: string | null = null;
-  #tickDelayMs = 0;
+  #tickRate = 0;
   #componentContracts = new Map<number, Contract>();
 
   // -- Mock & capability state ------------------------------------------------
@@ -114,20 +175,30 @@ export class EditorController extends EventTarget {
     return this.#lastRunTicks;
   }
 
-  get tickDelayMs(): number {
-    return this.#tickDelayMs;
+  /**
+   * The most ticks a second a run makes; `0` (the default) for as many as
+   * the display draws. A tick lasts at most one interval: what is still
+   * running then carries on into the next. Takes effect from the next tick,
+   * so it can be changed while running.
+   */
+  get tickRate(): number {
+    return this.#tickRate;
   }
-  set tickDelayMs(ms: number) {
-    this.#tickDelayMs = Math.max(0, ms);
+  set tickRate(perSecond: number) {
+    this.#tickRate = Number.isFinite(perSecond) && perSecond > 0 ? perSecond : 0;
   }
 
+  /** The time between two ticks' starts, in ms: 0 when unlimited. */
+  get #tickInterval(): number {
+    return this.#tickRate > 0 ? 1000 / this.#tickRate : 0;
+  }
+
+  /**
+   * The graph's execution islands, as it was compiled: read once per load,
+   * since the scheduler cannot be asked while a tick holds it.
+   */
   get islands(): readonly string[][] {
-    if (!this.#session) return [];
-    try {
-      return this.#session.graph.islands() as string[][];
-    } catch {
-      return [];
-    }
+    return this.#islands;
   }
   get canUndo(): boolean {
     return this.#undoStack.length > 0;
@@ -144,6 +215,83 @@ export class EditorController extends EventTarget {
 
   outputHistory(node: string, port: string): readonly OutputSnapshot[] {
     return this.#outputHistory.get(node)?.get(port) ?? [];
+  }
+
+  /**
+   * What an output has carried: its latest value and those before it, as a
+   * node's preview shows them. A Value output's latest is read from the
+   * scheduler, so it is current even mid-tick.
+   */
+  observe(node: string, port: string): OutputView {
+    const kind = this.#nodes.get(node)?.outputs.find((p) => p.name === port)?.kind ?? 'value';
+    const seen = this.#observed.get(node)?.get(port);
+    const view: OutputView = {
+      kind,
+      latest: seen?.latest,
+      recent: seen?.recent ?? [],
+      count: seen?.count ?? 0,
+      pending: seen?.pending ?? false,
+    };
+    if (kind === 'value' && this.#session) {
+      // Read as WAVE text first: each read as a value is a new object, so
+      // only the text tells whether it is still the value recorded.
+      let wave: string | undefined;
+      try {
+        wave = this.#session.graph.readOutputWave(node, port);
+      } catch {}
+      if (wave !== undefined && wave !== seen?.wave) {
+        // Mid-tick, the value so far is not recorded yet: show it last.
+        try {
+          view.latest = this.#session.graph.readOutput(node, port);
+          view.recent = [...view.recent, view.latest];
+        } catch {}
+      }
+    }
+    return view;
+  }
+
+  /** What an output carried last: {@link observe}'s `latest`. */
+  latestOutput(node: string, port: string): unknown {
+    return this.observe(node, port).latest;
+  }
+
+  /** The record of what `node`'s `port` carried, made on first use. */
+  #observation(node: string, port: string): Observation {
+    const ports = this.#observed.get(node) ?? new Map<string, Observation>();
+    this.#observed.set(node, ports);
+    let seen = ports.get(port);
+    if (!seen) {
+      seen = { latest: undefined, recent: [], count: 0, pending: false, tick: -1, bytes: 0 };
+      ports.set(port, seen);
+    }
+    return seen;
+  }
+
+  /**
+   * Records a chunk of a stream's items. Only the newest are kept, so only
+   * those are recorded; the rest are counted.
+   */
+  #recordItems(node: string, port: string, items: ArrayLike<unknown>): void {
+    const from = Math.max(0, items.length - MAX_RECENT);
+    this.#observation(node, port).count += from;
+    for (let i = from; i < items.length; i++) this.#record(node, port, items[i]);
+  }
+
+  /** Records a value `node`'s `port` carried, within the history's bounds. */
+  #record(node: string, port: string, value: unknown): void {
+    const seen = this.#observation(node, port);
+    seen.latest = value;
+    seen.pending = false;
+    seen.count += 1;
+    seen.recent.push(value);
+    seen.bytes += weight(value);
+    while (
+      seen.recent.length > 1 &&
+      (seen.recent.length > MAX_RECENT || seen.bytes > MAX_RECENT_BYTES)
+    ) {
+      seen.bytes -= weight(seen.recent.shift());
+    }
+    this.#dispatch('output-changed');
   }
 
   get componentSources(): readonly {
@@ -193,24 +341,11 @@ export class EditorController extends EventTarget {
           /* component bytes may be invalid */
         }
       }
-      const toPortVisual = (p: {
-        name: string;
-        kind: string;
-        type_display: string;
-        optional: boolean;
-        docs?: string;
-      }): PortVisual => ({
-        name: p.name,
-        kind: p.kind as PortVisual['kind'],
-        typeDisplay: p.type_display,
-        optional: p.optional,
-        docs: p.docs,
-      });
       result.push({
         id: comp.id,
         index: i,
-        inputs: (contract?.inputs ?? []).map(toPortVisual),
-        outputs: (contract?.outputs ?? []).map(toPortVisual),
+        inputs: (contract?.inputs ?? []).map(portVisual),
+        outputs: (contract?.outputs ?? []).map(portVisual),
       });
     }
 
@@ -249,18 +384,10 @@ export class EditorController extends EventTarget {
       attrs: { 'editor.x': String(x), 'editor.y': String(y) },
     };
     this.#graphJson.nodes.push(node);
-    this.#nodes.set(id, {
+    this.#nodes.set(
       id,
-      x,
-      y,
-      width: NODE_WIDTH,
-      height: computeNodeHeight(inputs.length, outputs.length),
-      label: id,
-      phase: 'pending',
-      breakpoint: false,
-      inputs: [...inputs],
-      outputs: [...outputs],
-    });
+      nodeVisual({ id, attrs: node.attrs, inputs, outputs, phase: 'pending', breakpoint: false }),
+    );
     this.#selectedNode = id;
     this.#selectedEdge = null;
     void this.#reloadAfterEdit();
@@ -280,6 +407,7 @@ export class EditorController extends EventTarget {
       if (!graphNode.attrs) graphNode.attrs = {};
       graphNode.attrs[key] = value;
     }
+    if (key.startsWith('editor.')) this.#resize(nodeId);
     this.#dispatch('state-changed');
   }
 
@@ -288,7 +416,61 @@ export class EditorController extends EventTarget {
     if (graphNode?.attrs) {
       delete graphNode.attrs[key];
     }
+    if (key.startsWith('editor.')) this.#resize(nodeId);
     this.#dispatch('state-changed');
+  }
+
+  /**
+   * Which output a node previews: `port`, `'none'` for no preview, or
+   * `null` for the first one its component declares a viewer for.
+   */
+  setPreview(nodeId: string, port: string | null): void {
+    if (port === null) this.removeNodeAttr(nodeId, 'editor.preview');
+    else this.setNodeAttr(nodeId, 'editor.preview', port);
+  }
+
+  /** Resizes a node (an undoable edit); its preview region takes the height. */
+  resizeNode(nodeId: string, width: number, height: number): void {
+    const graphNode = this.#graphJson?.nodes.find((n) => n.id === nodeId);
+    if (!graphNode) return;
+    const before = [graphNode.attrs?.['editor.w'], graphNode.attrs?.['editor.h']] as const;
+    // Only a node with a preview has a height of its own: one without
+    // keeps whatever it had, for when it gets a preview back.
+    const height_ = this.#nodes.get(nodeId)?.preview ? String(Math.round(height)) : before[1];
+    const after = [String(Math.round(width)), height_] as const;
+    if (before[0] === after[0] && before[1] === after[1]) return;
+    const apply = ([w, h]: readonly [string | undefined, string | undefined]) => {
+      const node = this.#graphJson?.nodes.find((n) => n.id === nodeId);
+      if (!node) return;
+      node.attrs ??= {};
+      for (const [key, value] of [
+        ['editor.w', w],
+        ['editor.h', h],
+      ] as const) {
+        if (value === undefined) delete node.attrs[key];
+        else node.attrs[key] = value;
+      }
+      this.#resize(nodeId);
+      this.#dispatch('state-changed');
+    };
+    apply(after);
+    this.#undoStack.push({
+      description: `Resize ${nodeId}`,
+      execute: () => apply(after),
+      undo: () => apply(before),
+    });
+    if (this.#undoStack.length > MAX_UNDO) this.#undoStack.shift();
+    this.#redoStack.length = 0;
+  }
+
+  /** Sizes a node's visual again from its `editor.*` attributes. */
+  #resize(nodeId: string): void {
+    const visual = this.#nodes.get(nodeId);
+    const graphNode = this.#graphJson?.nodes.find((n) => n.id === nodeId);
+    if (!visual || !graphNode) return;
+    const size = nodeSize(visual.inputs, visual.outputs, graphNode.attrs);
+    visual.preview = undefined;
+    Object.assign(visual, size);
   }
 
   renameNode(oldId: string, newId: string): void {
@@ -333,11 +515,13 @@ export class EditorController extends EventTarget {
       this.#breakpoints.delete(oldId);
       this.#breakpoints.add(newId);
     }
-    // Update output history
-    const history = this.#outputHistory.get(oldId);
-    if (history) {
-      this.#outputHistory.delete(oldId);
-      this.#outputHistory.set(newId, history);
+    // Update output history and the streams' latest items
+    for (const observed of [this.#outputHistory, this.#observed] as Map<string, unknown>[]) {
+      const entry = observed.get(oldId);
+      if (entry) {
+        observed.delete(oldId);
+        observed.set(newId, entry);
+      }
     }
     // Update selection
     if (this.#selectedNode === oldId) this.#selectedNode = newId;
@@ -488,6 +672,7 @@ export class EditorController extends EventTarget {
     this.#redoStack = [];
     this.#traceEvents = [];
     this.#outputHistory.clear();
+    this.#observed.clear();
     this.#tickCount = 0;
     this.#lastRunDurationMs = null;
     this.#lastRunTicks = 0;
@@ -565,6 +750,8 @@ export class EditorController extends EventTarget {
   dispose(): void {
     this.#session?.dispose();
     this.#session = null;
+    this.#islands = [];
+    this.#warned.clear();
     this.#nodes.clear();
     this.#edges = [];
     this.#mode = 'idle';
@@ -579,6 +766,7 @@ export class EditorController extends EventTarget {
     this.#breakpointState = null;
     this.#tickCount = 0;
     this.#outputHistory.clear();
+    this.#observed.clear();
     this.#injectedValues.clear();
     this.#undoStack.length = 0;
     this.#redoStack.length = 0;
@@ -628,52 +816,40 @@ export class EditorController extends EventTarget {
     this.#mode = 'running';
     this.#lastRunDurationMs = null;
     this.#lastRunTicks = 0;
+    this.#stopRequested = false;
+    this.#rerunCancelled();
     this.#dispatch('state-changed');
 
     const startTime = performance.now();
     let ticks = 0;
-    const stopPromise = new Promise<void>((resolve) => {
-      this.#stopResolve = resolve;
-    });
-
     try {
-      let done = false;
-      while (!done) {
-        const tick = await this.#session!.tick(stopPromise);
-        this.#tickCount++;
+      // Until the graph settles or is stopped: a graph with an endless
+      // stream or a feedback loop runs until it is stopped.
+      for (;;) {
+        const started = performance.now();
+        const result = await this.#tick();
         ticks++;
-        this.#pollState();
-
-        switch (tick.result) {
-          case 'progress':
-          case 'step-limit':
-            if (ticks >= MAX_TICKS_PER_RUN) {
-              done = true;
-              this.#pushError(`Run stopped after ${MAX_TICKS_PER_RUN} ticks (limit reached)`);
-              this.#mode = 'idle';
-            }
-            break;
-          case 'idle':
-          case 'interrupted':
-            done = true;
-            if ((this.#mode as EditorMode) !== 'paused') {
-              this.#mode = 'idle';
-            }
-            break;
-          case 'aborted':
-            done = true;
-            this.#mode = 'error';
-            break;
+        if (result === 'idle' || result === 'stopped') break;
+        if (result === 'aborted') {
+          this.#mode = 'error';
+          break;
         }
+        // The next tick starts a frame later at the soonest, and no sooner
+        // than the tick rate allows (read each frame: it may change).
+        do await nextFrame();
+        while (!this.#stopRequested && performance.now() - started < this.#tickInterval);
+        // Stopped between two ticks: `stop` already shut the graph down.
+        if (this.#stopRequested) break;
       }
     } catch (err) {
       this.#mode = 'error';
       const msg = err instanceof Error ? err.message : String(err);
       this.#pushError(`Run failed: ${msg}`);
     } finally {
+      const mode = this.#mode as EditorMode;
+      if (mode === 'running' || mode === 'paused') this.#mode = 'idle';
       this.#lastRunDurationMs = performance.now() - startTime;
       this.#lastRunTicks = ticks;
-      this.#stopResolve = null;
       this.#dispatch('state-changed');
     }
   }
@@ -696,13 +872,15 @@ export class EditorController extends EventTarget {
     }
 
     this.#mode = 'running';
+    this.#stopRequested = false;
+    this.#rerunCancelled();
     this.#dispatch('state-changed');
 
     const startTime = performance.now();
     try {
-      await this.#session.tick();
-      this.#tickCount++;
-      this.#pollState();
+      // One tick, at most a slice long: what is still running carries on
+      // until the next tick, or until Stop.
+      if ((await this.#tick()) === 'aborted') this.#mode = 'error';
     } catch (err) {
       this.#mode = 'error';
       const msg = err instanceof Error ? err.message : String(err);
@@ -711,13 +889,82 @@ export class EditorController extends EventTarget {
     this.#lastRunDurationMs = performance.now() - startTime;
     this.#lastRunTicks = 1;
 
-    if ((this.#mode as EditorMode) !== 'paused') {
-      this.#mode = 'idle';
-    }
+    const mode = this.#mode as EditorMode;
+    if (mode === 'running' || mode === 'paused') this.#mode = 'idle';
     this.#dispatch('state-changed');
   }
 
+  /**
+   * Runs one tick, interrupted after {@link TICK_SLICE_MS} (or the tick
+   * interval, if shorter) or by `stop`,
+   * whichever comes first; a stop also shuts the graph down. A node held at
+   * a breakpoint holds no slice: its tick waits for it.
+   */
+  async #tick(): Promise<'idle' | 'progress' | 'aborted' | 'stopped'> {
+    const session = this.#session;
+    if (!session) throw new Error('no session loaded');
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const stopped = new Promise<void>((resolve) => {
+      this.#stopResolve = resolve;
+    });
+    // A tick fits in its interval, so the rate holds beside endless work.
+    const sliceMs =
+      this.#tickInterval > 0 ? Math.min(TICK_SLICE_MS, this.#tickInterval) : TICK_SLICE_MS;
+    const slice = new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, sliceMs);
+    });
+    this.#ticking = true;
+    let result: Awaited<ReturnType<Session['tick']>>['result'];
+    try {
+      // Paused at a breakpoint, a tick ends only when resumed or stopped.
+      const stop = Promise.race([stopped, slice.then(() => this.#paused())]);
+      result = (await session.tick(stop)).result;
+    } finally {
+      this.#ticking = false;
+      this.#stopResolve = null;
+      clearTimeout(timer);
+    }
+    this.#tickCount++;
+    const stop = this.#stopRequested;
+    if (stop) this.#shutdown();
+    this.#pollState();
+    if (stop) return 'stopped';
+    if (result === 'aborted') return 'aborted';
+    return result === 'idle' ? 'idle' : 'progress';
+  }
+
+  /** Resolves once no node is held at a breakpoint. */
+  async #paused(): Promise<void> {
+    while (this.#breakpointResolve && !this.#stopRequested) await nextFrame();
+  }
+
+  /** Stops every island: what is still running ends, streams included. */
+  #shutdown(): void {
+    try {
+      this.#session?.graph.shutdown();
+    } catch {}
+  }
+
+  /** Islands a stop cancelled run again on their latched inputs. */
+  #rerunCancelled(): void {
+    for (const [id, visual] of this.#nodes) {
+      if (visual.phase !== 'cancelled') continue;
+      try {
+        this.#session?.graph.rerun(id);
+      } catch {}
+    }
+  }
+
+  /**
+   * Stops a run or step, and whatever it left running: an endless stream
+   * stops too. Between ticks, it stops what earlier ticks left running.
+   */
   stop(): void {
+    this.#stopRequested = true;
+    if (!this.#ticking && this.#session) {
+      this.#shutdown();
+      this.#pollState();
+    }
     if (this.#breakpointResolve) {
       this.#breakpointResolve();
       this.#breakpointResolve = null;
@@ -768,7 +1015,7 @@ export class EditorController extends EventTarget {
       execute: () => this.moveNode(nodeId, toX, toY),
       undo: () => this.moveNode(nodeId, fromX, fromY),
     });
-    if (this.#undoStack.length > 50) this.#undoStack.shift();
+    if (this.#undoStack.length > MAX_UNDO) this.#undoStack.shift();
     this.#redoStack.length = 0;
   }
 
@@ -819,24 +1066,26 @@ export class EditorController extends EventTarget {
       const savedPorts = this.#clipboard.ports.get(node.id);
       const inputs = source.inputs.length > 0 ? source.inputs : (savedPorts?.inputs ?? []);
       const outputs = source.outputs.length > 0 ? source.outputs : (savedPorts?.outputs ?? []);
+      const copy = structuredClone(node);
       const newNode: GraphJsonNode = {
-        ...structuredClone(node),
+        ...copy,
         id: newId,
-        attrs: { 'editor.x': String(x), 'editor.y': String(y) },
+        // Its injected inputs, mocks, size and preview go with it.
+        attrs: { ...copy.attrs, 'editor.x': String(x), 'editor.y': String(y) },
       };
       this.#graphJson.nodes.push(newNode);
-      this.#nodes.set(newId, {
-        id: newId,
-        x,
-        y,
-        width: NODE_WIDTH,
-        height: computeNodeHeight(inputs.length, outputs.length),
-        label: newNode.label ?? newId,
-        phase: 'pending',
-        breakpoint: false,
-        inputs: [...inputs],
-        outputs: [...outputs],
-      });
+      this.#nodes.set(
+        newId,
+        nodeVisual({
+          id: newId,
+          label: newNode.label,
+          attrs: newNode.attrs,
+          inputs,
+          outputs,
+          phase: 'pending',
+          breakpoint: false,
+        }),
+      );
       x += 30;
       y += 30;
     }
@@ -1011,18 +1260,17 @@ export class EditorController extends EventTarget {
       attrs: { 'editor.x': String(x), 'editor.y': String(y) },
     };
     this.#graphJson.nodes.push(node);
-    this.#nodes.set(id, {
+    this.#nodes.set(
       id,
-      x,
-      y,
-      width: NODE_WIDTH,
-      height: computeNodeHeight(0, 0),
-      label: id,
-      phase: 'pending',
-      breakpoint: false,
-      inputs: [],
-      outputs: [],
-    });
+      nodeVisual({
+        id,
+        attrs: node.attrs,
+        inputs: [],
+        outputs: [],
+        phase: 'pending',
+        breakpoint: false,
+      }),
+    );
     void this.#reloadAfterEdit();
   }
 
@@ -1047,7 +1295,7 @@ export class EditorController extends EventTarget {
         void this.#reloadAfterEdit();
       },
     });
-    if (this.#undoStack.length > 50) this.#undoStack.shift();
+    if (this.#undoStack.length > MAX_UNDO) this.#undoStack.shift();
     this.#redoStack.length = 0;
 
     this.#doRemoveNode(id);
@@ -1060,6 +1308,8 @@ export class EditorController extends EventTarget {
       (c) => c.from.node !== id && c.to.node !== id,
     );
     this.#nodes.delete(id);
+    this.#outputHistory.delete(id);
+    this.#observed.delete(id);
     this.#edges = this.#edges.filter((e) => e.fromNode !== id && e.toNode !== id);
     if (this.#selectedNode === id) this.#selectedNode = null;
     void this.#reloadAfterEdit();
@@ -1112,7 +1362,7 @@ export class EditorController extends EventTarget {
         void this.#reloadAfterEdit();
       },
     });
-    if (this.#undoStack.length > 50) this.#undoStack.shift();
+    if (this.#undoStack.length > MAX_UNDO) this.#undoStack.shift();
     this.#redoStack.length = 0;
 
     this.#doRemoveConnection(id);
@@ -1179,6 +1429,7 @@ export class EditorController extends EventTarget {
       id: n.id,
       width: n.width,
       height: n.height,
+      portsBottom: NODE_HEADER_HEIGHT + n.portsHeight,
       inputs: n.inputs.map((p) => ({ name: p.name })),
       outputs: n.outputs.map((p) => ({ name: p.name })),
     }));
@@ -1222,6 +1473,8 @@ export class EditorController extends EventTarget {
     }
     const mocks = { ...attrMocks, ...callerMocks };
 
+    // Set once loaded: until then, and once replaced, its hooks are stale.
+    let session: Session | null = null;
     const sessionOptions: SessionOptions = {
       graph: graph,
       components: this.#originalOptions.components,
@@ -1239,24 +1492,40 @@ export class EditorController extends EventTarget {
             this.#breakpointResolve = resolve;
           });
         }
-        if (this.#tickDelayMs > 0) {
-          const visual = this.#nodes.get(node);
-          if (visual) {
-            visual.phase = 'running';
-            this.#dispatch('state-changed');
-          }
-          return new Promise<void>((resolve) => setTimeout(resolve, this.#tickDelayMs));
+        // Shown running until the tick ends, however long its run takes
+        // (one reading a stream, say).
+        const visual = this.#nodes.get(node);
+        if (visual && visual.phase !== 'running') {
+          visual.phase = 'running';
+          this.#dispatch('state-changed');
+        }
+        // Its futures are new: until they resolve, the last ones are stale.
+        for (const port of visual?.outputs ?? []) {
+          if (port.kind === 'future') this.#observation(node, port.name).pending = true;
         }
       },
 
       afterRun: (): void => {},
 
-      onStreamItem: (): void => {
-        this.#dispatch('output-changed');
+      onStreamItem: ({ node, port, items }): void => {
+        if (this.#session === session) this.#recordItems(node, port, items);
+      },
+
+      onFutureValue: ({ node, port, value }): void => {
+        if (this.#session === session) this.#record(node, port, value);
       },
     };
 
-    this.#session = await Session.load(sessionOptions);
+    session = await Session.load(sessionOptions);
+    this.#session = session;
+    // Each once, though every edit loads the graph again.
+    for (const message of session.warnings) {
+      if (this.#warned.has(message)) continue;
+      this.#warned.add(message);
+      this.#traceEvents.push({ event: 'warning', message, timestamp: performance.now() });
+      this.#dispatch('trace-event');
+    }
+    this.#islands = session.graph.islands() as string[][];
     this.#dirty = false;
     this.#buildVisuals();
     this.#restoreInjections(graph);
@@ -1311,47 +1580,24 @@ export class EditorController extends EventTarget {
 
     for (const graphNode of this.#graphJson.nodes) {
       const contract = contracts.get(graphNode.id);
-      const inputs: PortVisual[] = (contract?.inputs ?? []).map((p) => ({
-        name: p.name,
-        kind: p.kind,
-        typeDisplay: p.type_display,
-        optional: p.optional,
-        docs: p.docs,
-      }));
-      const outputs: PortVisual[] = (contract?.outputs ?? []).map((p) => ({
-        name: p.name,
-        kind: p.kind,
-        typeDisplay: p.type_display,
-        optional: p.optional,
-        docs: p.docs,
-      }));
-
-      const x = parseFloat(graphNode.attrs?.['editor.x'] ?? '') || 0;
-      const y = parseFloat(graphNode.attrs?.['editor.y'] ?? '') || 0;
-      const width = NODE_WIDTH;
-      const height = computeNodeHeight(inputs.length, outputs.length);
-
-      const nodeVisual: NodeVisual = {
+      const visual: NodeVisual = nodeVisual({
         id: graphNode.id,
-        x,
-        y,
-        width,
-        height,
-        label: graphNode.label ?? graphNode.id,
+        label: graphNode.label,
+        attrs: graphNode.attrs,
+        inputs: (contract?.inputs ?? []).map(portVisual),
+        outputs: (contract?.outputs ?? []).map(portVisual),
         phase: 'idle',
         breakpoint: this.#breakpoints.has(graphNode.id),
-        inputs,
-        outputs,
-      };
+      });
 
       try {
         const state = this.#session.graph.nodeState(graphNode.id) as NodeState;
-        nodeVisual.phase = state.phase;
-        if (state.fault) nodeVisual.fault = state.fault;
-        if (state.culprit) nodeVisual.culprit = state.culprit;
+        visual.phase = state.phase;
+        if (state.fault) visual.fault = state.fault;
+        if (state.culprit) visual.culprit = state.culprit;
       } catch {}
 
-      this.#nodes.set(graphNode.id, nodeVisual);
+      this.#nodes.set(graphNode.id, visual);
     }
 
     for (const conn of this.#graphJson.connections) {
@@ -1401,12 +1647,33 @@ export class EditorController extends EventTarget {
         visual.fault = state.fault;
         visual.culprit = state.culprit;
       } catch {}
+      // A faulted or cancelled run's futures never resolve: they are not
+      // pending, but gone.
+      if (visual.phase === 'faulted' || visual.phase === 'cancelled') {
+        for (const port of visual.outputs) {
+          const seen = this.#observed.get(id)?.get(port.name);
+          if (port.kind === 'future' && seen) seen.pending = false;
+        }
+      }
     }
 
     // Record output history
     for (const [id, visual] of this.#nodes) {
       for (const port of visual.outputs) {
         if (port.kind !== 'value') continue;
+        try {
+          const seen = this.#observed.get(id)?.get(port.name);
+          if (seen?.tick !== this.#tickCount) {
+            const wave = this.#session.graph.readOutputWave(id, port.name);
+            const value = this.#session.graph.readOutput(id, port.name);
+            if (wave !== undefined && value !== undefined) {
+              this.#record(id, port.name, value);
+              const recorded = this.#observation(id, port.name);
+              recorded.tick = this.#tickCount;
+              recorded.wave = wave;
+            }
+          }
+        } catch {}
         try {
           const wave = this.#session.graph.readOutputWave(id, port.name);
           if (wave !== undefined) {
@@ -1432,6 +1699,7 @@ export class EditorController extends EventTarget {
   }
 
   #dispatchQueued = false;
+  #outputQueued = false;
   #dispatch(type: string): void {
     if (type === 'state-changed') {
       if (this.#dispatchQueued) return;
@@ -1440,6 +1708,16 @@ export class EditorController extends EventTarget {
         this.#dispatchQueued = false;
         this.dispatchEvent(new CustomEvent(type));
       });
+    } else if (type === 'output-changed') {
+      // Once a frame, however many stream items arrive in it.
+      if (this.#outputQueued) return;
+      this.#outputQueued = true;
+      const fire = () => {
+        this.#outputQueued = false;
+        this.dispatchEvent(new CustomEvent(type));
+      };
+      if (typeof requestAnimationFrame === 'function') requestAnimationFrame(fire);
+      else setTimeout(fire, 16);
     } else {
       this.dispatchEvent(new CustomEvent(type));
     }

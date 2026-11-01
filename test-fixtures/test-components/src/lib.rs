@@ -29,15 +29,18 @@ pub const ECHO: Guest = guest!("ECHO_WASM", "echo");
 
 /// `rate: option<u32>`, `gain: option<f64>` → `result: f64`
 /// (`rate * gain`, defaults 1 and 1.0).
+/// Previews `result` as `series`.
 pub const CONFIGURABLE: Guest = guest!("CONFIGURABLE_WASM", "configurable");
 
 /// `in: u32`, `add: option<u32>` → `out: u32` (`in + add`).
+/// Previews `out` as `series`.
 pub const RELAY: Guest = guest!("RELAY_WASM", "relay");
 
 /// `burst-size: option<u32>` → `items: stream<u32>` streaming
 /// 0, 1, 2, ... (forever when `burst-size` is absent), stopping once the
 /// reader is dropped; `limit: u32` is `burst-size`, or `u32::MAX` when
 /// endless, returned at once.
+/// Previews `items` as `series`.
 pub const STREAM_PRODUCER: Guest = guest!("STREAM_PRODUCER_WASM", "stream-producer");
 
 /// `items: stream<u32>`, `take: option<u32>`, `delay: option<u32>` →
@@ -56,6 +59,7 @@ pub const STREAM_DRAIN: Guest = guest!("STREAM_DRAIN_WASM", "stream-drain");
 /// `again: option<u32>` → `done: future<u32>`, written 7 from a task after
 /// `run` returned, and `last: u32`, how the previous run's write ended (0
 /// none yet, 1 a reader took it, 2 the reader was dropped).
+/// Previews `done` as `text`.
 pub const FUTURE_WRITER: Guest = guest!("FUTURE_WRITER_WASM", "future-writer");
 
 /// `data: future<u32>` → `value: u32`, the value written by the future writer.
@@ -63,6 +67,7 @@ pub const FUTURE_READER: Guest = guest!("FUTURE_READER_WASM", "future-reader");
 
 /// Imports the `test:mqtt/source` capability and streams its
 /// messages on `messages: stream<list<u8>>` until the feed is exhausted.
+/// Previews `messages` as `text`.
 pub const MQTT_NODE: Guest = guest!("MQTT_NODE_WASM", "mqtt-node");
 
 /// `items: stream<list<u8>>` → `count: u32`, `total-bytes: u32`.
@@ -112,3 +117,32 @@ pub const READING_PRODUCER: Guest = guest!("READING_PRODUCER_WASM", "reading-pro
 /// `items: stream<reading>` → `total: u32` (the sum of the values),
 /// `count: u32`.
 pub const READING_CONSUMER: Guest = guest!("READING_CONSUMER_WASM", "reading-consumer");
+
+/// Imports `test:video/clock` (`sleep: async func(ms: u32)`).
+/// `frames: option<u32>`, `fps: option<u32>` → `frames: stream<frame>`
+/// (a record `{ width, height, pixels: list<u8> }`, 96x64 RGBA): an
+/// animated gradient, `frames` of them (forever when absent), sleeping
+/// `1000 / fps` ms between two when `fps` is given. Its `witgraph-viewer`
+/// section previews `frames` as `image`.
+pub const VIDEO_SOURCE: Guest = guest!("VIDEO_SOURCE_WASM", "video-source");
+
+/// `frames: stream<frame>` → `frames: stream<frame>`, each frame turned
+/// gray (red, green and blue set to the luma). Previews `frames` as `image`.
+pub const FRAME_GRAYSCALE: Guest = guest!("FRAME_GRAYSCALE_WASM", "frame-grayscale");
+
+/// `frames: stream<frame>` → `frames: stream<frame>`, each frame's colours
+/// inverted (alpha kept). Previews `frames` as `image`.
+pub const FRAME_INVERT: Guest = guest!("FRAME_INVERT_WASM", "frame-invert");
+
+/// `frames: stream<frame>` → `count: u32`, `gray: bool` (every pixel had
+/// equal red, green and blue), `first-pixel: u32` (the last frame's first
+/// pixel as RGBA, high byte first). Returns once the stream ends.
+pub const VIDEO_SINK: Guest = guest!("VIDEO_SINK_WASM", "video-sink");
+
+/// Imports `test:accel/cnn` (a small convolutional network, run on the
+/// host's accelerator) and `witgraph:runtime/host`. `frames: stream<frame>`
+/// → `edges: stream<frame>` (each frame's edges, by a fixed-weight
+/// network of Sobel kernels), `backend: string` (the accelerator's name).
+/// Faults, saying why, when the host has no accelerator. Previews `edges`
+/// as `image`.
+pub const EDGE_DETECT: Guest = guest!("EDGE_DETECT_WASM", "edge-detect");
