@@ -15,7 +15,7 @@ const session = await Session.load({
   beforeRun: async (node, inputs) => {
     /* a breakpoint: the run waits */
   },
-  onStreamItem: ({ node, port, item }) => console.log(node, port, item),
+  onStreamItem: ({ node, port, items }) => console.log(node, port, items),
 });
 session.graph.inject('scale', 'factor', 10);
 await session.tick();
@@ -47,12 +47,27 @@ the TypeScript and let `init` fetch the module from beside the script.
   `capabilities` callback.
 - **Debugging.** `beforeRun` and `afterRun` run around every node call and can
   pause it, which gives you breakpoints and stepping. `onStreamItem` sees
-  stream items as they pass between nodes.
+  stream items as they pass between nodes, a chunk at a time: `item` is the
+  chunk as jco yields it, and `items` the items in it: a stream of numbers
+  (`NUMERIC_TYPES`) comes in typed arrays, which are its items as they are;
+  anything else is one item a chunk.
+- **Warnings.** `session.warnings` lists what was wrong with the components
+  but did not stop the load (a viewer hint naming an output the component
+  does not have, say); each is also written to the console.
+- **Futures.** `onFutureValue` sees what each future output resolves to. With
+  it, a future is read as soon as its node's run returns (its reader still
+  gets the value).
+- **Contracts.** `session.contracts` has each node's ports. An output whose
+  component previews it in its `witgraph-viewer` section has a `viewer`
+  ([Previewing outputs](components.md#previewing-outputs)).
 - **Simulation.** `mocks` replaces a node with a function.
 - **Values** use jco's representation: records are objects with camelCase keys,
   64-bit integers are `BigInt`s, and streams are async iterables.
 
-Call `session.dispose()` when you're done with a session.
+Call `session.dispose()` when you're done with a session. It closes the
+streams the nodes still have open, so a node writing one in the background
+stops instead of running on, and a generation the scheduler abandons (on a
+cancel or shutdown) has its streams closed the same way.
 
 ## Differences from wasmtime
 

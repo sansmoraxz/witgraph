@@ -25,6 +25,11 @@ export interface Port {
   type_display: string;
   optional: boolean;
   docs?: string;
+  /**
+   * Output ports only: how an editor should preview the port (`image`,
+   * say), as the component's `witgraph-viewer` custom section declares it.
+   */
+  viewer?: string;
 }
 
 /** A component's contract, as the editor catalog describes one. */
@@ -40,6 +45,12 @@ export interface Contract {
   capabilities: { name: string; implements?: string }[];
   /** Named types the ports use (from `describeComponent` only). */
   types?: { name: string; owner?: string; type_display: string; docs?: string }[];
+  /**
+   * What was wrong with the component but did not stop it loading (from
+   * `describeComponent` only): a viewer hint naming an output it does not
+   * have, say.
+   */
+  warnings?: string[];
 }
 
 /**
@@ -84,6 +95,22 @@ export interface StreamItem {
   port: string;
   /** One chunk of the stream, as jco yields it. */
   item: unknown;
+  /**
+   * The chunk's items: a stream of numbers (see {@link NUMERIC_TYPES})
+   * comes in typed arrays, which are its items as they are, not copied;
+   * any other chunk is one item (a record, or a `list<u8>`'s `Uint8Array`).
+   */
+  items: ArrayLike<unknown>;
+}
+
+/** The value a future between two nodes resolved to. */
+export interface FutureItem {
+  /** The node whose output the future is. */
+  node: string;
+  /** The output port, as the contract names it. */
+  port: string;
+  /** The value, as jco represents it. */
+  value: unknown;
 }
 
 export interface SessionOptions {
@@ -118,6 +145,14 @@ export interface SessionOptions {
    * reported to the console and does not reach the reader.
    */
   onStreamItem?: (item: StreamItem) => void;
+  /**
+   * Called with the value of every future output once it resolves. Given
+   * this hook, a future is read as soon as its node's run returns, rather
+   * than when its reader takes it (the reader still gets the value), so its
+   * writer's write completes that much sooner. What it throws is reported
+   * to the console.
+   */
+  onFutureValue?: (item: FutureItem) => void;
 }
 
 /**
@@ -257,6 +292,12 @@ export class Session {
   readonly graph: WebGraph;
   /** Every node's contract, by node id. */
   readonly contracts: Map<string, Contract>;
+  /**
+   * What was wrong with the components but did not stop the load (a viewer
+   * hint naming an output the component does not have, say). Each is also
+   * reported to the console as the session loads.
+   */
+  readonly warnings: readonly string[];
   #options: SessionOptions;
   #components: Map<string, NodeComponent>;
   #instances = new Map<string, Record<string, any>>();
@@ -265,6 +306,8 @@ export class Session {
    * started under an older count belongs to none.
    */
   #epoch = new Map<string, number>();
+  /** Per node, the stream outputs of its runs still open. */
+  #streams = new Map<string, Set<Tap>>();
   #disposed = false;
 
   private constructor(
@@ -279,6 +322,8 @@ export class Session {
     this.contracts = new Map(
       [...components.keys()].map((node) => [node, graph.contract(node) as Contract]),
     );
+    this.warnings = graph.warnings() as string[];
+    for (const warning of this.warnings) console.warn(`witgraph: ${warning}`);
   }
 
   /** Loads the graph, transpiles the components its nodes run and instantiates every node. */
@@ -348,6 +393,7 @@ export class Session {
   dispose(): void {
     if (this.#disposed) return;
     this.#disposed = true;
+    for (const node of [...this.#streams.keys()]) this.#close(node);
     this.#instances.clear();
     this.graph.free();
   }
@@ -371,9 +417,23 @@ export class Session {
     throw new Error(`the graph did not settle in ${limit} ticks`);
   }
 
-  /** Counts a generation of each node abandoned. */
+  /**
+   * Counts a generation of each node abandoned, and closes the streams its
+   * runs returned: their writers' next writes fail, so a guest's background
+   * writer stops instead of running on for nobody.
+   */
   #abandon(nodes: string[]): void {
-    for (const node of nodes) this.#epoch.set(node, (this.#epoch.get(node) ?? 0) + 1);
+    for (const node of nodes) {
+      this.#epoch.set(node, (this.#epoch.get(node) ?? 0) + 1);
+      this.#close(node);
+    }
+  }
+
+  /** Closes the streams `node`'s runs returned that are still open. */
+  #close(node: string): void {
+    const taps = this.#streams.get(node);
+    this.#streams.delete(node);
+    for (const tap of taps ?? []) tap.close();
   }
 
   /** Whether `node` is mocked: only the mocks' own properties count. */
@@ -423,21 +483,54 @@ export class Session {
       (this.#mocked(node)
         ? await options.mocks![node](inputs)
         : await nodeExport(this.#instances.get(node)!).run(inputs)) ?? {};
-    if (abandoned()) return outputs;
-    if (options.onStreamItem) {
+    if (abandoned()) {
+      // Nothing reads what an abandoned run returns: its streams' writers
+      // stop now, rather than run on for nobody.
       for (const port of this.contracts.get(node)?.outputs ?? []) {
-        const key = camelCase(port.name);
-        if (port.kind === 'stream' && outputs[key]) {
-          const stream = outputs[key] as AsyncIterable<unknown>;
-          outputs[key] = tapped(stream, (item) => {
-            try {
-              options.onStreamItem?.({ node, port: port.name, item });
-            } catch (error) {
-              console.error(`onStreamItem threw on \`${node}.${port.name}\`:`, error);
-            }
-          });
-        }
+        if (port.kind === 'stream') closeUnread(outputs[camelCase(port.name)]);
       }
+      return outputs;
+    }
+    // Every stream output is tapped, so it can be closed when its
+    // generation is abandoned or the session disposed.
+    for (const port of this.contracts.get(node)?.outputs ?? []) {
+      const key = camelCase(port.name);
+      if (port.kind === 'future' && options.onFutureValue) {
+        // jco's future settles once, and its reader is given the same
+        // value: watching it takes nothing from the reader.
+        const future = outputs[key] as PromiseLike<unknown> | undefined;
+        future?.then?.(
+          (value) => {
+            if (this.#disposed || abandoned()) return;
+            try {
+              options.onFutureValue?.({ node, port: port.name, value });
+            } catch (error) {
+              console.error(`onFutureValue threw on \`${node}.${port.name}\`:`, error);
+            }
+          },
+          () => {},
+        );
+      }
+      if (port.kind !== 'stream' || !outputs[key]) continue;
+      const numeric = NUMERIC_TYPES.has(port.type_display);
+      const open = this.#streams.get(node) ?? new Set<Tap>();
+      this.#streams.set(node, open);
+      const tap: Tap = tapped(
+        outputs[key] as AsyncIterable<unknown>,
+        (item) => {
+          if (!options.onStreamItem || this.#disposed) return;
+          const items =
+            numeric && ArrayBuffer.isView(item) ? (item as unknown as ArrayLike<unknown>) : [item];
+          try {
+            options.onStreamItem({ node, port: port.name, item, items });
+          } catch (error) {
+            console.error(`onStreamItem threw on \`${node}.${port.name}\`:`, error);
+          }
+        },
+        () => open.delete(tap),
+      );
+      open.add(tap);
+      outputs[key] = tap;
     }
     await options.afterRun?.(node, outputs);
     return outputs;
@@ -468,21 +561,73 @@ function nodeExport(instance: Record<string, any>): { run: (inputs: PortValues) 
   return instance[key];
 }
 
-/** `stream`, reporting each item as its reader takes it. */
-function tapped<T>(stream: AsyncIterable<T>, seen: (item: T) => void): AsyncIterable<T> {
+/** The number types: jco hands over a stream of one of them in typed arrays. */
+export const NUMERIC_TYPES: ReadonlySet<string> = new Set([
+  'u8',
+  'u16',
+  'u32',
+  'u64',
+  's8',
+  's16',
+  's32',
+  's64',
+  'f32',
+  'f64',
+]);
+
+/** A stream output as its reader sees it: see {@link tapped}. */
+interface Tap extends AsyncIterable<unknown> {
+  /** Ends the stream for its reader and stops its writer. */
+  close(): void;
+}
+
+/**
+ * `stream`, reporting each chunk as its reader takes it. Closing it, or
+ * the stream ending, calls `ended` once; a closed stream reads as ended.
+ */
+function tapped(
+  stream: AsyncIterable<unknown>,
+  seen: (chunk: unknown) => void,
+  ended: () => void,
+): Tap {
+  let inner: AsyncIterator<unknown> | undefined;
+  let closed = false;
+  const done = { done: true, value: undefined } as const;
+  const end = () => {
+    if (closed) return;
+    closed = true;
+    ended();
+  };
+  // Stopping the reader stops the writer: its next write fails.
+  const stop = async () => {
+    end();
+    const stopped = inner ?? stream[Symbol.asyncIterator]();
+    inner = undefined;
+    await Promise.resolve(stopped.return?.()).catch(() => {});
+    return done;
+  };
   return {
+    close: () => void stop(),
     [Symbol.asyncIterator]() {
-      const inner = stream[Symbol.asyncIterator]();
+      if (!closed) inner ??= stream[Symbol.asyncIterator]();
       return {
         async next() {
-          const step = await inner.next();
-          if (!step.done) seen(step.value);
+          if (closed || !inner) return done;
+          let step: IteratorResult<unknown>;
+          try {
+            step = await inner.next();
+          } catch (error) {
+            // A read cut short by closing the stream is its end.
+            if (closed) return done;
+            throw error;
+          }
+          if (closed) return done;
+          if (step.done) end();
+          else seen(step.value);
           return step;
         },
-        // The reader stopping stops the writer.
-        return: (value?: unknown) =>
-          inner.return?.(value) ?? Promise.resolve({ done: true, value }),
-      } as AsyncIterator<T>;
+        return: stop,
+      };
     },
   };
 }
