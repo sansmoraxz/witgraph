@@ -22,9 +22,9 @@ impl Guest for Grayscale {
         let (mut tx, rx) = wit_stream::new::<Frame>();
         wit_bindgen::spawn_local(async move {
             while let Some(mut frame) = frames.next().await {
-                for pixel in frame.pixels.chunks_exact_mut(4) {
+                for pixel in frame.pixels.as_chunks_mut::<4>().0 {
                     // Rec. 601 luma, in integers.
-                    let [r, g, b] = [pixel[0], pixel[1], pixel[2]].map(u32::from);
+                    let [r, g, b, _] = pixel.map(u32::from);
                     let luma = ((299 * r + 587 * g + 114 * b) / 1000) as u8;
                     pixel[..3].fill(luma);
                 }

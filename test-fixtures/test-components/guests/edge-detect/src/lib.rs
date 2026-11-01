@@ -78,8 +78,10 @@ impl Guest for EdgeDetect {
 fn luma(frame: &Frame) -> Tensor {
     let data = frame
         .pixels
-        .chunks_exact(4)
-        .map(|p| (0.299 * f32::from(p[0]) + 0.587 * f32::from(p[1]) + 0.114 * f32::from(p[2])) / 255.0)
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|&[r, g, b, _]| (0.299 * f32::from(r) + 0.587 * f32::from(g) + 0.114 * f32::from(b)) / 255.0)
         .collect();
     Tensor {
         channels: 1,

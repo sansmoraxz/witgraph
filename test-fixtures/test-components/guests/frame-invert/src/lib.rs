@@ -22,7 +22,7 @@ impl Guest for Invert {
         let (mut tx, rx) = wit_stream::new::<Frame>();
         wit_bindgen::spawn_local(async move {
             while let Some(mut frame) = frames.next().await {
-                for pixel in frame.pixels.chunks_exact_mut(4) {
+                for pixel in frame.pixels.as_chunks_mut::<4>().0 {
                     for channel in &mut pixel[..3] {
                         *channel = 255 - *channel;
                     }

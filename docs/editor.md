@@ -167,11 +167,11 @@ The demo opens a graph of every port kind, whose nodes preview a Value, a
 stream of numbers, a stream of bytes, a future and a video stream. The
 picker at the top right switches to another graph:
 
-| Graph            | What it shows                                                                                                                           |
-| ---------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
-| `?graph=video`   | Video pipelines alone: frames streamed through grayscale and invert filters.                                                            |
-| `?graph=webgpu`  | Edge detection on WebGPU: the `edge-detect` component runs a small CNN with fixed weights through `test:accel/cnn`, here compute shaders. |
-| `?graph=webnn`   | The same on WebNN.                                                                                                                      |
+| Graph           | What it shows                                                                                                                             |
+| --------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `?graph=video`  | Video pipelines alone: frames streamed through grayscale and invert filters.                                                              |
+| `?graph=webgpu` | Edge detection on WebGPU: the `edge-detect` component runs a small CNN with fixed weights through `test:accel/cnn`, here compute shaders. |
+| `?graph=webnn`  | The same on WebNN.                                                                                                                        |
 
 What runs `test:accel/cnn` is the browser's, so a browser without WebGPU or
 WebNN still loads its graph: the edge node faults when run, saying the

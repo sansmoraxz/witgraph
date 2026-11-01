@@ -16,8 +16,10 @@ impl Guest for Sink {
             outputs.count += 1;
             outputs.gray &= frame
                 .pixels
-                .chunks_exact(4)
-                .all(|p| p[0] == p[1] && p[1] == p[2]);
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|[r, g, b, _]| r == g && g == b);
             if let Some(&[r, g, b, a]) = frame.pixels.first_chunk::<4>() {
                 outputs.first_pixel = u32::from_be_bytes([r, g, b, a]);
             }
