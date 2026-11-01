@@ -69,9 +69,11 @@ the TypeScript and let `init` fetch the module from beside the script.
 
 - **Large values.** WAVE text of a value (`readOutputWave`, `snapshot`) is
   refused, with an error naming the value, when it would not fit the
-  scheduler's memory. Should the scheduler's WebAssembly module trap anyway,
-  `session.broken` says in which call, and every call after throws that: load
-  the graph again in a new session.
+  scheduler's memory. Should the scheduler's WebAssembly module trap anyway
+  (run out of memory, say), `session.broken` says in which call, or that it
+  was during a tick (which then fails), and every call after throws that:
+  load the graph again in a new session. A trap breaks every session, as
+  they share the module.
 
 Call `session.dispose()` when you're done with a session. It closes the
 streams the nodes still have open, so a node writing one in the background

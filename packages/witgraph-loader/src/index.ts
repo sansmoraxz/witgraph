@@ -311,6 +311,11 @@ export class Session {
   #disposed = false;
   /** Set once the scheduler's module trapped: see {@link broken}. */
   #trapped: { broken?: Error } = {};
+  /** What fails each tick still running, should the scheduler trap. */
+  #ticking = new Set<(error: Error) => void>();
+  /** Every session not yet disposed: a trap breaks them all. */
+  static #live = new Set<Session>();
+  static #watching = false;
 
   private constructor(
     graph: WebGraph,
@@ -318,6 +323,8 @@ export class Session {
     components: Map<string, NodeComponent>,
   ) {
     this.graph = watchTraps(graph, this.#trapped);
+    Session.#live.add(this);
+    Session.#watchUncaught();
     this.#options = options;
     this.#components = components;
     // The contracts the graph was loaded with: lowered once, by `WebGraph.load`.
@@ -395,6 +402,7 @@ export class Session {
   dispose(): void {
     if (this.#disposed) return;
     this.#disposed = true;
+    Session.#live.delete(this);
     for (const node of [...this.#streams.keys()]) this.#close(node);
     this.#instances.clear();
     // A graph the scheduler trapped in is still held by the call that
@@ -418,7 +426,53 @@ export class Session {
    */
   tick(stop?: Promise<unknown>): Promise<TickResult> {
     if (this.#disposed) return Promise.reject(new Error('the session is disposed'));
-    return this.graph.tick(stop) as Promise<TickResult>;
+    return new Promise<TickResult>((resolve, reject) => {
+      // Should the scheduler trap while the tick runs, the tick's own
+      // promise never settles: this rejects it instead.
+      this.#ticking.add(reject);
+      (this.graph.tick(stop) as Promise<TickResult>)
+        .then(resolve, reject)
+        .finally(() => this.#ticking.delete(reject));
+    });
+  }
+
+  /** Breaks the session (see {@link broken}) and fails its ticks still running. */
+  #break(error: Error): void {
+    this.#trapped.broken ??= error;
+    for (const fail of this.#ticking) fail(this.#trapped.broken);
+    this.#ticking.clear();
+  }
+
+  /**
+   * Watches for a trap of the scheduler's module that no call sees: one in
+   * the work of a tick, which the module runs from microtasks, so it is
+   * thrown into the host (the browser's `error` event; Node's
+   * `uncaughtExceptionMonitor`, which leaves Node's own handling as it is)
+   * and the tick never settles. Every live session shares the module, so
+   * every one is broken. A guest's trap is not the scheduler's: it is the
+   * fault of its node.
+   */
+  static #watchUncaught(): void {
+    if (Session.#watching) return;
+    Session.#watching = true;
+    const seen = (error: unknown) => {
+      if (!(error instanceof WebAssembly.RuntimeError)) return;
+      if (!/witgraph_web/.test(error.stack ?? '')) return;
+      const broken = new Error(
+        `the scheduler stopped while running a tick (${error.message}): ` +
+          'the session can no longer be used; load the graph again',
+        { cause: error },
+      );
+      for (const session of Session.#live) session.#break(broken);
+    };
+    const host = globalThis as {
+      addEventListener?: (type: 'error', listener: (event: { error?: unknown }) => void) => void;
+      process?: {
+        on?: (event: 'uncaughtExceptionMonitor', listener: (error: unknown) => void) => void;
+      };
+    };
+    host.addEventListener?.('error', (event) => seen(event.error));
+    host.process?.on?.('uncaughtExceptionMonitor', seen);
   }
 
   /** Ticks until the graph is idle, at most `limit` times; returns the ticks run. */

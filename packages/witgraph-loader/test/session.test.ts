@@ -1306,6 +1306,41 @@ test('a trap of the scheduler breaks the session, naming the call', async () => 
   assert.ok(other.broken);
 });
 
+test('a trap of the scheduler during a tick fails the tick and breaks every session', async () => {
+  const session = await load(
+    [
+      ['prod', 'stream-producer'],
+      ['cons', 'stream-consumer'],
+    ],
+    [['s', 'prod.items', 'cons.items']],
+  );
+  const bystander = await load([['a', 'echo']]);
+  // Endless: the tick runs until something stops it.
+  const tick = session.tick();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const trap = (where: string) => {
+    const error = new WebAssembly.RuntimeError('unreachable');
+    error.stack = `RuntimeError: unreachable\n    at ${where}`;
+    // What the host reports for an exception nothing caught.
+    process.emit('uncaughtExceptionMonitor', error, 'uncaughtException');
+  };
+  // A guest's trap is its node's fault, not the scheduler's.
+  trap('relay_guest.wasm.run (wasm://wasm/relay_guest.wasm-1:1)');
+  assert.equal(session.broken, undefined);
+  trap('witgraph_web.wasm.alloc (wasm://wasm/witgraph_web.wasm-1:1)');
+  await assert.rejects(tick, /the scheduler stopped while running a tick \(unreachable\)/);
+  for (const s of [session, bystander]) {
+    assert.match(String(s.broken), /load the graph again/);
+    assert.throws(
+      () => s.graph.readOutput('cons', 'count'),
+      (e) => e === s.broken,
+    );
+  }
+  // Disposing a broken session leaves what the trap held alone.
+  session.dispose();
+  bystander.dispose();
+});
+
 test('a hook sees what a future resolves to, and its reader still gets it', async () => {
   const seen: FutureItem[] = [];
   const session = await load(
