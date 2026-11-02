@@ -56,50 +56,13 @@ pub struct Hints {
 /// it (a link's provider, composed in) belongs to that component, whose
 /// ports are not this one's.
 pub fn read(bytes: &[u8]) -> Hints {
-    use wasmparser::{Parser, Payload};
-
-    /// What a section nests in, outermost first.
-    #[derive(PartialEq)]
-    enum Scope {
-        Module,
-        Component,
-    }
-
+    let (texts, mut problems) = crate::section::texts(bytes, SECTION);
     let mut text = String::new();
-    let mut problems = Vec::new();
-    let mut scopes: Vec<Scope> = Vec::new();
-    for payload in Parser::new(0).parse_all(bytes) {
-        let payload = match payload {
-            Ok(payload) => payload,
-            Err(e) => {
-                problems.push(format!(
-                    "the component could not be read for `{SECTION}`: {e}"
-                ));
-                break;
-            }
-        };
-        match payload {
-            Payload::ModuleSection { .. } => scopes.push(Scope::Module),
-            Payload::ComponentSection { .. } => scopes.push(Scope::Component),
-            Payload::End(_) => {
-                scopes.pop();
-            }
-            Payload::CustomSection(reader)
-                if reader.name() == SECTION
-                    && matches!(scopes.as_slice(), [] | [Scope::Module]) =>
-            {
-                match std::str::from_utf8(reader.data()) {
-                    Ok(data) => {
-                        text.push_str(data);
-                        // A section that does not end its last line still ends it.
-                        if !text.ends_with('\n') {
-                            text.push('\n');
-                        }
-                    }
-                    Err(e) => problems.push(format!("a `{SECTION}` section is not UTF-8: {e}")),
-                }
-            }
-            _ => {}
+    for data in texts {
+        text.push_str(&data);
+        // A section that does not end its last line still ends it.
+        if !text.ends_with('\n') {
+            text.push('\n');
         }
     }
     let mut hints = parse(&text);

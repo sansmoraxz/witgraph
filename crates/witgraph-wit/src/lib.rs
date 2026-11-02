@@ -2,10 +2,12 @@
 
 #[cfg(feature = "compose")]
 pub mod compose;
+pub mod docs;
 pub mod hash;
 pub mod load;
 pub mod lower;
 pub mod metadata;
+mod section;
 pub mod verify;
 pub mod viewer;
 
@@ -142,7 +144,8 @@ pub fn contract_from_str(
 /// The outputs the component's `witgraph-viewer` section names get their
 /// [`viewer`](witgraph_ir::PortDef::viewer). A hint that is wrong (one
 /// naming an output the component does not have, say) is skipped, and
-/// noted in [`warnings`](lower::Lowered::warnings).
+/// noted in [`warnings`](lower::Lowered::warnings). Its `witgraph-docs`
+/// section is the contract's [`docs`](witgraph_ir::ComponentContract::docs).
 ///
 /// See [`load::load_component`] on untrusted bytes; a panic lowering what
 /// it decoded is contained the same way.
@@ -169,6 +172,9 @@ pub fn lower_component(
             lowered
                 .warnings
                 .extend(viewer::apply(&mut lowered.contract, &hints.hints));
+            let (docs, problems) = docs::read(bytes);
+            lowered.warnings.extend(problems);
+            lowered.contract.docs = lowered.contract.docs.take().or(docs);
             Ok(lowered)
         }
         found => Err(Error::NotOneNode { found }),

@@ -347,11 +347,19 @@ export class EditorController extends EventTarget {
   get componentSources(): readonly {
     id: string;
     index: number;
+    /** What its world's doc comment says of it. */
+    docs?: string;
     inputs: PortVisual[];
     outputs: PortVisual[];
   }[] {
     if (!this.#session || !this.#originalOptions) return [];
-    const result: { id: string; index: number; inputs: PortVisual[]; outputs: PortVisual[] }[] = [];
+    const result: {
+      id: string;
+      index: number;
+      docs?: string;
+      inputs: PortVisual[];
+      outputs: PortVisual[];
+    }[] = [];
     const seen = new Set<number>();
 
     for (const [nodeId, visual] of this.#nodes) {
@@ -372,6 +380,7 @@ export class EditorController extends EventTarget {
       result.push({
         id: source.id,
         index: compIdx,
+        docs: this.#session.contracts.get(nodeId)?.docs,
         inputs: visual.inputs,
         outputs: visual.outputs,
       });
@@ -394,6 +403,7 @@ export class EditorController extends EventTarget {
       result.push({
         id: comp.id,
         index: i,
+        docs: contract?.docs,
         inputs: (contract?.inputs ?? []).map(portVisual),
         outputs: (contract?.outputs ?? []).map(portVisual),
       });
@@ -436,7 +446,15 @@ export class EditorController extends EventTarget {
     this.#graphJson.nodes.push(node);
     this.#nodes.set(
       id,
-      nodeVisual({ id, attrs: node.attrs, inputs, outputs, phase: 'pending', breakpoint: false }),
+      nodeVisual({
+        id,
+        docs: source?.docs,
+        attrs: node.attrs,
+        inputs,
+        outputs,
+        phase: 'pending',
+        breakpoint: false,
+      }),
     );
     this.#selectedNode = id;
     this.#selectedEdge = null;
@@ -1130,6 +1148,7 @@ export class EditorController extends EventTarget {
         nodeVisual({
           id: newId,
           label: newNode.label,
+          docs: source.docs,
           attrs: newNode.attrs,
           inputs,
           outputs,
@@ -1650,6 +1669,7 @@ export class EditorController extends EventTarget {
       const visual: NodeVisual = nodeVisual({
         id: graphNode.id,
         label: graphNode.label,
+        docs: contract?.docs,
         attrs: graphNode.attrs,
         inputs: (contract?.inputs ?? []).map(portVisual),
         outputs: (contract?.outputs ?? []).map(portVisual),

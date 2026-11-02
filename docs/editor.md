@@ -162,6 +162,10 @@ the graph as JSON, the component bytes, the scheduler's `wasm`, and a
 show your own status or react to edits. `output-changed` fires at most once a
 frame while streams carry items.
 
+The catalog describes each component with the description it carries, a
+`witgraph-docs` section of its bytes
+([Describing a component](components.md#describing-a-component)).
+
 ## Styling
 
 The editor ships no theme. All colours and radii come from `--wg-*` CSS custom

@@ -136,6 +136,22 @@ test('load and dispose', async () => {
   assert.equal(controller.nodes.size, 0);
 });
 
+test('the catalog describes a component by the docs it carries', async () => {
+  // The description is in the component's bytes (a `witgraph-docs` section).
+  const components = await Promise.all(['relay', 'echo'].map(guestSource));
+  const controller = await loadController([['a', 'relay']], [['c', 'a.out', 'a.in', true]], {
+    components,
+  });
+
+  const docs = new Map(controller.componentSources.map((source) => [source.id, source.docs]));
+  assert.equal(docs.get(ids.relay), 'Passes a u32 through, adding `add` (default 0).');
+  // One no node uses is described the same.
+  assert.equal(docs.size, 2);
+  assert.ok(docs.get(ids.echo), 'echo has docs');
+  // And the node shows its component's.
+  assert.equal(controller.nodes.get('a')?.docs, docs.get(ids.relay));
+});
+
 test('step and read output', async () => {
   const controller = await loadController([['a', 'echo']]);
   controller.injectValue('a', 'in', '5');

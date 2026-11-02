@@ -475,6 +475,8 @@ export class WitgraphInspector extends HTMLElement {
         .filter(Boolean)
         .join('');
       compInfo.appendChild(this.#el('div', 'font-mono text-wg-primary truncate', compId));
+      if (node.docs)
+        compInfo.appendChild(this.#el('div', 'node-docs text-wg-text mt-1', node.docs));
       wrap.appendChild(compInfo);
     }
 

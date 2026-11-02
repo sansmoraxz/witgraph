@@ -50,6 +50,8 @@ export interface NodeVisual {
   /** The node's preview region, when it has one. */
   preview?: NodePreview;
   label: string;
+  /** What its component says of itself. */
+  docs?: string;
   phase: NodePhase;
   fault?: { kind: string; message: string };
   culprit?: string;

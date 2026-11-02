@@ -218,6 +218,26 @@ test.describe('WIT Graph Editor Demo', () => {
     await expect(canvas.locator('[data-node-id="relay-b"] .node-label')).toHaveText('Moved');
   });
 
+  test('the catalog describes a component by its world docs', async ({ page }) => {
+    const catalog = page.locator('witgraph-catalog');
+    for (const [world, docs] of [
+      ['relay', 'Passes a u32 through'],
+      ['stream-producer', 'Streams 0, 1, 2'],
+      // None of the default graph's nodes is a camera.
+      ['camera-source', "Streams the host's camera"],
+    ]) {
+      const card = catalog.locator('.card', { hasText: `${world}@` });
+      await expect(card.locator('.docs')).toContainText(docs);
+    }
+  });
+
+  test('the inspector describes the selected node by its component', async ({ page }) => {
+    await page.locator('witgraph-canvas').locator('[data-node-id="relay-a"]').click();
+    await expect(page.locator('witgraph-inspector').locator('.node-docs')).toContainText(
+      'Passes a u32 through',
+    );
+  });
+
   test('the timeline names the nodes of a generation', async ({ page }) => {
     await page.locator('witgraph-controls').locator('button.step').click();
     const timeline = page.locator('witgraph-timeline');
