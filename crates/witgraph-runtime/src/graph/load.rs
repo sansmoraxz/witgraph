@@ -71,6 +71,11 @@ struct Parts {
     /// How many components an instance holds: the node's, and one per
     /// provider composed in.
     components: usize,
+    /// A hash of the bytes and links it was prepared from, when they were
+    /// given: what tells a saved component from one rebuilt with the same
+    /// contract.
+    #[cfg(feature = "precompiled")]
+    source: Option<String>,
 }
 
 /// What identifies a link among a node's: its import, provider and export.
@@ -124,6 +129,8 @@ impl<'a> Checked<'a> {
                 links: keys,
                 capabilities: linked.capabilities,
                 components: linked.components,
+                #[cfg(feature = "precompiled")]
+                source: None,
             },
             bytes: linked.bytes,
         })
@@ -187,7 +194,11 @@ impl PreparedComponent {
         links: &[LinkedProvider<'_>],
     ) -> Result<Self, LoadError> {
         let lowered = verify(contract, bytes)?;
-        Checked::new(contract, bytes, &lowered, links, &mut HashSet::new())?.compile(engine)
+        let prepared =
+            Checked::new(contract, bytes, &lowered, links, &mut HashSet::new())?.compile(engine)?;
+        #[cfg(feature = "precompiled")]
+        let prepared = prepared.with_source(bytes, links);
+        Ok(prepared)
     }
 
     /// The contract the component was checked against.

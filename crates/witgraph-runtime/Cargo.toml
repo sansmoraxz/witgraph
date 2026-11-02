@@ -22,6 +22,8 @@ miette = { workspace = true }
 futures = "0.3"
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+hex = { workspace = true, optional = true }
 # The features the runtime cannot work without. Everything else is opt-in below.
 wasmtime = { workspace = true, features = [
     "runtime", "component-model", "component-model-async", "async", "std", "wave",
@@ -33,7 +35,7 @@ default = ["compile", "parallel-compilation"]
 # links. Without it a graph loads only from `precompiled` components.
 compile = ["wasmtime/cranelift", "witgraph-wit/compose"]
 # Saving prepared components and loading them back without compiling.
-precompiled = ["dep:serde", "dep:serde_json"]
+precompiled = ["dep:serde", "dep:serde_json", "dep:sha2", "dep:hex"]
 # Each of these turns on the wasmtime feature of the same name, so code that
 # reaches wasmtime through this crate's `wasmtime` re-export can use it
 # without a second dependency on wasmtime.
