@@ -49,6 +49,10 @@ jobs:
       - run: cargo test --workspace
       # Every wasmtime feature that witgraph-runtime passes through.
       - run: cargo test -p witgraph-runtime --all-features
+      # A build with no compiler runs what a build with one saved.
+      - run: cargo clippy -p witgraph-runtime --no-default-features --features precompiled -- -D warnings
+      - run: cargo run -p witgraph-runtime --example precompiled --features precompiled -- save target/echo.bin
+      - run: cargo run -p witgraph-runtime --example precompiled --no-default-features --features precompiled -- run target/echo.bin
       - run: cargo doc --workspace --no-deps
 
   # Builds the guest components and the witgraph-web bindings once. The

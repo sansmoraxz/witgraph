@@ -54,7 +54,9 @@ pub(crate) mod value;
 
 pub use engine::{CapabilityGap, Host, HostState, IslandData, NoCapabilities};
 pub use error::LoadError;
-pub use graph::{LinkedProvider, PreparedComponent, RuntimeConfig, RuntimeGraph};
+#[cfg(feature = "compile")]
+pub use graph::LinkedProvider;
+pub use graph::{PreparedComponent, RuntimeConfig, RuntimeGraph};
 pub use plugin::{CapabilityPlugin, Extensions, PluginData, Plugins};
 pub use shared::Shared;
 pub use wasmtime::component::Val;

@@ -16,21 +16,28 @@ workspace = true
 [dependencies]
 witgraph-ir = { workspace = true }
 witgraph-sched = { workspace = true }
-witgraph-wit = { workspace = true, features = ["compose"] }
+witgraph-wit = { workspace = true }
 thiserror = { workspace = true }
 miette = { workspace = true }
 futures = "0.3"
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
 # The features the runtime cannot work without. Everything else is opt-in below.
 wasmtime = { workspace = true, features = [
-    "runtime", "cranelift", "component-model", "component-model-async", "async", "std", "wave",
+    "runtime", "component-model", "component-model-async", "async", "std", "wave",
 ] }
 
 [features]
-default = ["parallel-compilation"]
+default = ["compile", "parallel-compilation"]
+# Compiling components from their bytes, with Cranelift, and composing their
+# links. Without it a graph loads only from `precompiled` components.
+compile = ["wasmtime/cranelift", "witgraph-wit/compose"]
+# Saving prepared components and loading them back without compiling.
+precompiled = ["dep:serde", "dep:serde_json"]
 # Each of these turns on the wasmtime feature of the same name, so code that
 # reaches wasmtime through this crate's `wasmtime` re-export can use it
 # without a second dependency on wasmtime.
-parallel-compilation = ["wasmtime/parallel-compilation"]
+parallel-compilation = ["compile", "wasmtime/parallel-compilation"]
 cache = ["wasmtime/cache"]
 profiling = ["wasmtime/profiling"]
 pooling-allocator = ["wasmtime/pooling-allocator"]
@@ -47,3 +54,7 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time"] 
 test-components = { path = "../../test-fixtures/test-components" }
 wit-component = { workspace = true, features = ["dummy-module"] }
 wat = "1"
+
+[[example]]
+name = "precompiled"
+required-features = ["precompiled"]

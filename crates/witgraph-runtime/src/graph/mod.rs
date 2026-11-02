@@ -25,6 +25,7 @@ use witgraph_sched::{Scheduler, Snapshot, SnapshotError};
 pub use self::load::PreparedComponent;
 use crate::engine::{self, Host, NoCapabilities, StoreSettings, Wasmtime};
 use witgraph_sched::{FaultReport, NodeState, Perf, RuntimeError, RuntimeMode, TickResult};
+#[cfg(feature = "compile")]
 pub use witgraph_wit::compose::LinkedProvider;
 
 /// Configuration for a runtime graph.
