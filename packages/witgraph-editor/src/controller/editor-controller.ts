@@ -6,6 +6,7 @@ import {
   type SessionOptions,
 } from 'witgraph-loader';
 import { NODE_HEADER_HEIGHT } from '../components/styles.ts';
+import { weight } from '../util/weight.ts';
 import { autoLayout, type LayoutEdge, type LayoutNode } from './layout.ts';
 import type {
   BreakpointState,
@@ -21,7 +22,6 @@ import type {
   GraphJsonPortRef,
   NodeState,
   NodeVisual,
-  OutputSnapshot,
   OutputView,
   PortVisual,
   SavedSnapshot,
@@ -45,7 +45,6 @@ function nextFrame(): Promise<void> {
       : setTimeout(resolve, 16),
   );
 }
-const MAX_HISTORY = 50;
 /** The most values an output's preview history keeps... */
 const MAX_RECENT = 120;
 /** ...and roughly the most bytes (a stream of video frames is heavy). */
@@ -57,32 +56,25 @@ interface Observation {
   recent: unknown[];
   count: number;
   pending: boolean;
-  /** Value outputs only: the tick its latest value was recorded at... */
+  /** Value outputs only: the tick its latest value was recorded at. */
   tick: number;
-  /** ...and that value as WAVE text, to tell a new value from it. */
-  wave?: string;
   bytes: number;
+}
+
+/**
+ * Whether two handle ports carry one resource (as compiling checks it
+ * exactly: on one semver track), or neither is a handle.
+ */
+function sameResource(a: PortVisual, b: PortVisual): boolean {
+  if (!a.handle || !b.handle) return !a.handle && !b.handle;
+  const base = (id: string) => id.split('@')[0];
+  return (
+    a.handle.resource === b.handle.resource && base(a.handle.interface) === base(b.handle.interface)
+  );
 }
 
 /** The most edits undo goes back over. */
 const MAX_UNDO = 50;
-
-/**
- * About how many bytes `value` holds: its strings and buffers, through its
- * lists and records, and a little for the rest.
- */
-function weight(value: unknown, depth = 0): number {
-  if (typeof value === 'string') return 16 + value.length * 2;
-  if (ArrayBuffer.isView(value)) return 16 + value.byteLength;
-  if (typeof value !== 'object' || value === null) return 8;
-  // Deeper than any WIT type nests in practice.
-  if (depth > 16) return 16;
-  let bytes = 16;
-  for (const item of Array.isArray(value) ? value : Object.values(value)) {
-    bytes += weight(item, depth + 1);
-  }
-  return bytes;
-}
 
 export class EditorController extends EventTarget {
   #session: Session | null = null;
@@ -104,7 +96,6 @@ export class EditorController extends EventTarget {
   #breakpointState: BreakpointState | null = null;
 
   #tickCount = 0;
-  #outputHistory = new Map<string, Map<string, OutputSnapshot[]>>();
   /** Per node and output, what it carried: see {@link observe}. */
   #observed = new Map<string, Map<string, Observation>>();
   #stopRequested = false;
@@ -213,8 +204,14 @@ export class EditorController extends EventTarget {
     return this.#savedSnapshots;
   }
 
-  outputHistory(node: string, port: string): readonly OutputSnapshot[] {
-    return this.#outputHistory.get(node)?.get(port) ?? [];
+  /**
+   * Whether what `node`'s output `port` carries is kept: when the node
+   * previews it, or the node is selected (the inspector shows its outputs).
+   * Nothing else is recorded or read back, so an output nobody looks at
+   * costs nothing however much it carries.
+   */
+  isObserved(node: string, port: string): boolean {
+    return this.#selectedNode === node || this.#nodes.get(node)?.preview?.port === port;
   }
 
   /**
@@ -232,19 +229,16 @@ export class EditorController extends EventTarget {
       count: seen?.count ?? 0,
       pending: seen?.pending ?? false,
     };
-    if (kind === 'value' && this.#session) {
-      // Read as WAVE text first: each read as a value is a new object, so
-      // only the text tells whether it is still the value recorded.
-      let wave: string | undefined;
+    if ((kind === 'value' || kind === 'handle') && this.#session) {
+      // The latched value itself, not a copy: another one is a new value.
+      let latest: unknown;
       try {
-        wave = this.#session.graph.readOutputWave(node, port);
+        latest = this.#session.graph.readOutput(node, port);
       } catch {}
-      if (wave !== undefined && wave !== seen?.wave) {
+      if (latest !== undefined && latest !== seen?.latest) {
         // Mid-tick, the value so far is not recorded yet: show it last.
-        try {
-          view.latest = this.#session.graph.readOutput(node, port);
-          view.recent = [...view.recent, view.latest];
-        } catch {}
+        view.latest = latest;
+        view.recent = [...view.recent, latest];
       }
     }
     return view;
@@ -516,12 +510,10 @@ export class EditorController extends EventTarget {
       this.#breakpoints.add(newId);
     }
     // Update output history and the streams' latest items
-    for (const observed of [this.#outputHistory, this.#observed] as Map<string, unknown>[]) {
-      const entry = observed.get(oldId);
-      if (entry) {
-        observed.delete(oldId);
-        observed.set(newId, entry);
-      }
+    const observed = this.#observed.get(oldId);
+    if (observed) {
+      this.#observed.delete(oldId);
+      this.#observed.set(newId, observed);
     }
     // Update selection
     if (this.#selectedNode === oldId) this.#selectedNode = newId;
@@ -578,7 +570,7 @@ export class EditorController extends EventTarget {
   canBeFeedback(fromNode: string, fromPort: string): boolean {
     const node = this.#nodes.get(fromNode);
     const port = node?.outputs.find((p) => p.name === fromPort);
-    return port?.kind === 'value';
+    return port?.kind === 'value' || port?.kind === 'handle';
   }
 
   canConnect(
@@ -597,6 +589,11 @@ export class EditorController extends EventTarget {
     if (!tgtPort) return { ok: false, reason: `'${toNode}' has no input '${toPort}'` };
     if (srcPort.kind !== tgtPort.kind)
       return { ok: false, reason: `kind mismatch: ${srcPort.kind} -> ${tgtPort.kind}` };
+    if (!sameResource(srcPort, tgtPort))
+      return {
+        ok: false,
+        reason: `resource mismatch: ${srcPort.typeDisplay} -> ${tgtPort.typeDisplay}`,
+      };
     const duplicate = this.#edges.some(
       (e) =>
         e.fromNode === fromNode &&
@@ -618,8 +615,8 @@ export class EditorController extends EventTarget {
     const result: { node: string; port: string; label: string; self: boolean }[] = [];
     for (const [id, n] of this.#nodes) {
       for (const p of n.outputs) {
-        if (p.kind !== tgtPort.kind) continue;
-        if (id === nodeId && tgtPort.kind !== 'value') continue;
+        if (p.kind !== tgtPort.kind || !sameResource(p, tgtPort)) continue;
+        if (id === nodeId && tgtPort.kind !== 'value' && tgtPort.kind !== 'handle') continue;
         result.push({ node: id, port: p.name, label: `${n.label}.${p.name}`, self: id === nodeId });
       }
     }
@@ -671,7 +668,6 @@ export class EditorController extends EventTarget {
     this.#undoStack = [];
     this.#redoStack = [];
     this.#traceEvents = [];
-    this.#outputHistory.clear();
     this.#observed.clear();
     this.#tickCount = 0;
     this.#lastRunDurationMs = null;
@@ -765,7 +761,6 @@ export class EditorController extends EventTarget {
     this.#pausedNode = null;
     this.#breakpointState = null;
     this.#tickCount = 0;
-    this.#outputHistory.clear();
     this.#observed.clear();
     this.#injectedValues.clear();
     this.#undoStack.length = 0;
@@ -1202,9 +1197,20 @@ export class EditorController extends EventTarget {
 
   // -- Simulation / Snapshots -------------------------------------------------
 
+  /**
+   * Saves the graph's state under `name`. A state that cannot be written
+   * (a value too large to convert, say) is reported in the trace, naming
+   * the value, and nothing is saved.
+   */
   saveSnapshot(name?: string): void {
     if (!this.#session) throw new Error('no session loaded');
-    const data = this.#session.graph.snapshot();
+    let data: string;
+    try {
+      data = this.#session.graph.snapshot();
+    } catch (err) {
+      this.#pushError(`Snapshot failed: ${err instanceof Error ? err.message : String(err)}`);
+      return;
+    }
     const snapName = name ?? `snap-${this.#savedSnapshots.length + 1}`;
     this.#savedSnapshots.push({ name: snapName, data, timestamp: Date.now() });
     this.#dispatch('state-changed');
@@ -1308,7 +1314,6 @@ export class EditorController extends EventTarget {
       (c) => c.from.node !== id && c.to.node !== id,
     );
     this.#nodes.delete(id);
-    this.#outputHistory.delete(id);
     this.#observed.delete(id);
     this.#edges = this.#edges.filter((e) => e.fromNode !== id && e.toNode !== id);
     if (this.#selectedNode === id) this.#selectedNode = null;
@@ -1508,11 +1513,15 @@ export class EditorController extends EventTarget {
       afterRun: (): void => {},
 
       onStreamItem: ({ node, port, items }): void => {
-        if (this.#session === session) this.#recordItems(node, port, items);
+        if (this.#session === session && this.isObserved(node, port)) {
+          this.#recordItems(node, port, items);
+        }
       },
 
       onFutureValue: ({ node, port, value }): void => {
-        if (this.#session === session) this.#record(node, port, value);
+        if (this.#session === session && this.isObserved(node, port)) {
+          this.#record(node, port, value);
+        }
       },
     };
 
@@ -1657,40 +1666,18 @@ export class EditorController extends EventTarget {
       }
     }
 
-    // Record output history
+    // Record what the observed Value outputs carry, once a tick: the
+    // latched value itself, never converted (to WAVE text, say).
     for (const [id, visual] of this.#nodes) {
       for (const port of visual.outputs) {
-        if (port.kind !== 'value') continue;
+        if ((port.kind !== 'value' && port.kind !== 'handle') || !this.isObserved(id, port.name))
+          continue;
+        if (this.#observed.get(id)?.get(port.name)?.tick === this.#tickCount) continue;
         try {
-          const seen = this.#observed.get(id)?.get(port.name);
-          if (seen?.tick !== this.#tickCount) {
-            const wave = this.#session.graph.readOutputWave(id, port.name);
-            const value = this.#session.graph.readOutput(id, port.name);
-            if (wave !== undefined && value !== undefined) {
-              this.#record(id, port.name, value);
-              const recorded = this.#observation(id, port.name);
-              recorded.tick = this.#tickCount;
-              recorded.wave = wave;
-            }
-          }
-        } catch {}
-        try {
-          const wave = this.#session.graph.readOutputWave(id, port.name);
-          if (wave !== undefined) {
-            if (!this.#outputHistory.has(id)) {
-              this.#outputHistory.set(id, new Map());
-            }
-            const nodeHistory = this.#outputHistory.get(id)!;
-            if (!nodeHistory.has(port.name)) {
-              nodeHistory.set(port.name, []);
-            }
-            const portHistory = nodeHistory.get(port.name)!;
-            const last = portHistory[portHistory.length - 1];
-            if (!last || last.wave !== wave || last.tick !== this.#tickCount) {
-              portHistory.push({ tick: this.#tickCount, wave });
-              if (portHistory.length > MAX_HISTORY) portHistory.shift();
-            }
-          }
+          const value = this.#session.graph.readOutput(id, port.name);
+          if (value === undefined) continue;
+          this.#record(id, port.name, value);
+          this.#observation(id, port.name).tick = this.#tickCount;
         } catch {}
       }
     }

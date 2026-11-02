@@ -45,6 +45,16 @@ the TypeScript and let `init` fetch the module from beside the script.
 
 - **Capabilities** are plain JavaScript objects, returned from the
   `capabilities` callback.
+- **Handles.** A resource a handle port carries is a class in the
+  capability's object (`{ Tensor }`), the same class for every node, so an
+  object one node makes is one another accepts. A handle output's object is
+  passed to its readers as it is, and `readOutput` returns it. Once nothing
+  holds it, its `[Symbol.dispose]()` is called, if it has one: free what it
+  holds there (`buffer.destroy()`), not when it is collected. jco also calls
+  it when a guest drops an `own` it was given, so every `own` a method
+  returns must be an object of its own (a `clone` returns a new object
+  sharing the data). A viewer showing an output must expect its object to be
+  disposed once the next one replaces it.
 - **Debugging.** `beforeRun` and `afterRun` run around every node call and can
   pause it, which gives you breakpoints and stepping. `onStreamItem` sees
   stream items as they pass between nodes, a chunk at a time: `item` is the
@@ -59,10 +69,22 @@ the TypeScript and let `init` fetch the module from beside the script.
   gets the value).
 - **Contracts.** `session.contracts` has each node's ports. An output whose
   component previews it in its `witgraph-viewer` section has a `viewer`
-  ([Previewing outputs](components.md#previewing-outputs)).
+  ([Previewing outputs](components.md#previewing-outputs)). A handle port
+  has a `handle`, the resource it carries.
 - **Simulation.** `mocks` replaces a node with a function.
 - **Values** use jco's representation: records are objects with camelCase keys,
-  64-bit integers are `BigInt`s, and streams are async iterables.
+  64-bit integers are `BigInt`s, lists of numbers are typed arrays, and
+  streams are async iterables. A Value a node returns is passed to its
+  readers as it is, not copied or converted, and `readOutput` returns that
+  same value: don't change it.
+
+- **Large values.** WAVE text of a value (`readOutputWave`, `snapshot`) is
+  refused, with an error naming the value, when it would not fit the
+  scheduler's memory. Should the scheduler's WebAssembly module trap anyway
+  (run out of memory, say), `session.broken` says in which call, or that it
+  was during a tick (which then fails), and every call after throws that:
+  load the graph again in a new session. A trap breaks every session, as
+  they share the module.
 
 Call `session.dispose()` when you're done with a session. It closes the
 streams the nodes still have open, so a node writing one in the background
@@ -83,3 +105,11 @@ cancel or shutdown) has its streams closed the same way.
 the tests after `cargo build -p test-components`, and `pnpm typecheck`
 checks the source. `pnpm build` also compiles the TypeScript into `dist/`, which
 is what gets published.
+
+`pnpm build:wasm64` builds the scheduler for a 64-bit memory instead
+(`wasm64-unknown-unknown`), for graphs whose values, as WAVE text or in
+snapshots, need more than a 32-bit memory holds. It is opt-in: it needs a
+nightly toolchain with `rust-src` (the standard library is built from
+source), and a host with the memory64 proposal (recent Chromium and Node,
+for instance). The guests stay 32-bit: components have no 64-bit ABI
+yet.

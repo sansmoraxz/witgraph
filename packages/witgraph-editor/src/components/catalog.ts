@@ -5,6 +5,7 @@ const KIND_BG: Record<string, string> = {
   value: 'bg-wg-port-value',
   stream: 'bg-wg-port-stream',
   future: 'bg-wg-port-future',
+  handle: 'bg-wg-port-handle',
 };
 
 const EXTRA_CSS = `
@@ -136,6 +137,7 @@ export class WitgraphCatalog extends HTMLElement {
           value: 'text-wg-port-value',
           stream: 'text-wg-port-stream',
           future: 'text-wg-port-future',
+          handle: 'text-wg-port-handle',
         };
         const inCol = this.#el('div', '');
         if (source.inputs.length > 0) {

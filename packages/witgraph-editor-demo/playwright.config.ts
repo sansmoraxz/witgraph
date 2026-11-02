@@ -30,10 +30,10 @@ export default defineConfig({
   projects: [
     // Chromium as it ships: no WebGPU adapter, no WebNN.
     { name: 'chromium', use: { browserName: 'chromium' } },
-    // With both: only the accelerator tests run here.
+    // With both: only the accelerator and tensor tests run here.
     {
       name: 'chromium-accelerated',
-      testMatch: /accelerators\.spec\.ts/,
+      testMatch: /(accelerators|tensors)\.spec\.ts/,
       use: { browserName: 'chromium', launchOptions: { args: ACCELERATORS } },
     },
   ],

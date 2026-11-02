@@ -31,7 +31,7 @@ use std::any::{Any, TypeId};
 use std::collections::HashMap;
 
 use wasmtime::component::Linker;
-use witgraph_ir::{Capability, ComponentContract, NodeId};
+use witgraph_ir::{Capability, ComponentContract, HandleType, NodeId};
 
 use crate::engine::{CapabilityGap, Host, HostState, IslandData};
 use witgraph_ir::interface::semver_serves;
@@ -62,6 +62,17 @@ pub trait CapabilityPlugin<D: IslandData = PluginData>: Send + Sync + 'static {
         capability: &Capability,
         linker: &mut Linker<D>,
     ) -> wasmtime::Result<()>;
+
+    /// Whether `resource`, declared in `interface` (one of the interfaces
+    /// it [provides](Self::provides)), is one handle ports may carry: one
+    /// it links with [`link_resource`](crate::shared::link_resource) and
+    /// makes objects of with
+    /// [`HostState::share`](crate::HostState::share). The default shares
+    /// nothing.
+    fn shares(&self, interface: &str, resource: &str) -> bool {
+        let _ = (interface, resource);
+        false
+    }
 }
 
 /// Per-Store state of any type, one value per type: where plugins sharing
@@ -248,6 +259,12 @@ impl<D: IslandData> Host for Plugins<D> {
 
     fn check(&self, _: &NodeId, capability: &Capability) -> Result<(), CapabilityGap> {
         self.route(capability).map(|_| ())
+    }
+
+    /// Asks the plugin the resource's interface is routed to.
+    fn shares(&self, _: &NodeId, handle: &HandleType) -> bool {
+        self.route(&Capability::new(handle.interface.clone()))
+            .is_ok_and(|plugin| plugin.shares(&handle.interface, &handle.resource))
     }
 }
 

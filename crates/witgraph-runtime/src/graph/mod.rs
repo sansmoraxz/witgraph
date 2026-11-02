@@ -16,12 +16,16 @@ use std::future::Future;
 
 use wasmtime::Engine;
 use wasmtime::component::{Type, Val};
+
+use crate::shared::Shared;
+use crate::value::Value;
 use witgraph_ir::{CompiledGraph, NodeId, PortDirection, PortName};
-use witgraph_sched::{Scheduler, Snapshot};
+use witgraph_sched::{Scheduler, Snapshot, SnapshotError};
 
 pub use self::load::PreparedComponent;
 use crate::engine::{self, Host, NoCapabilities, StoreSettings, Wasmtime};
 use witgraph_sched::{FaultReport, NodeState, Perf, RuntimeError, RuntimeMode, TickResult};
+#[cfg(feature = "compile")]
 pub use witgraph_wit::compose::LinkedProvider;
 
 /// Configuration for a runtime graph.
@@ -60,6 +64,15 @@ pub struct RuntimeConfig {
     /// too; other host-side copies of values do not (see
     /// [`hostcall_fuel`](Self::hostcall_fuel)).
     pub max_island_memory: Option<usize>,
+    /// The most memory the graph's shared objects, the resources its
+    /// handle ports carry ([`shared`](crate::shared)), may take in total,
+    /// as their providers report their sizes (host or device memory).
+    /// Making one past it fails the call that makes it, which faults the
+    /// node's island
+    /// ([`NodeFault::MemoryLimit`](crate::NodeFault::MemoryLimit)); an
+    /// object's size is given back when the last holder drops it. `None` is
+    /// unlimited; the default is 4 GiB.
+    pub max_shared_memory: Option<usize>,
     /// Wasmtime's hostcall fuel, per call: roughly the bytes of host memory
     /// the values lifted *out of* a guest in one call may take, where every
     /// value element costs about 48 bytes. It bounds what a `run` returns,
@@ -68,9 +81,13 @@ pub struct RuntimeConfig {
     /// an island. Going over faults the island
     /// ([`NodeFault::HostcallFuelExhausted`](crate::NodeFault::HostcallFuelExhausted)).
     /// Values passed *into* a guest are not charged. It bounds each lifted
-    /// value, not the host's copies of it: a Value output is copied once
-    /// for the host and once more for each in-island consumer, and every
-    /// generation start copies its external inputs.
+    /// value, not the host's copies of it: the runtime keeps a Value packed
+    /// (a list of numbers at its own size) and shared, and makes it into
+    /// wasmtime's values again for each call that takes it.
+    ///
+    /// The default, 4 GiB (everything a 32-bit host addresses, on one),
+    /// lets a `list<u8>` of about 85 MiB leave a node; lower it to bound
+    /// what one call may make the host allocate.
     pub hostcall_fuel: usize,
     /// How much address space each linear memory reserves up front, rounded
     /// up to whole 64 KiB pages (`0` reserves nothing). `None` keeps
@@ -115,7 +132,9 @@ impl Default for RuntimeConfig {
             yield_interval: 100_000,
             fuel_per_run: None,
             max_island_memory: Some(1 << 30),
-            hostcall_fuel: 128 << 20,
+            max_shared_memory: Some(usize::try_from(4u64 << 30).unwrap_or(usize::MAX)),
+            // 4 GiB, or all of a 32-bit host's address space.
+            hostcall_fuel: usize::try_from(4u64 << 30).unwrap_or(usize::MAX),
             memory_reservation: None,
             engine: None,
             split_islands: false,
@@ -151,12 +170,20 @@ pub struct RuntimeGraph<M: RuntimeMode = Perf, H: Host = NoCapabilities> {
     config: RuntimeConfig,
 }
 
+fn not_a_value_output(node: &NodeId, port: &PortName) -> RuntimeError {
+    RuntimeError::NotAValuePort {
+        node: node.clone(),
+        port: port.clone(),
+        direction: PortDirection::Output,
+    }
+}
+
 impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
     /// Writes a value to a Value input port, as an external source would.
     /// See [`Scheduler::inject`] for which ports qualify and when the
     /// island re-runs.
     pub fn inject(&mut self, node: &NodeId, port: &PortName, val: Val) -> Result<(), RuntimeError> {
-        self.sched.inject(node, port, val)
+        self.sched.inject(node, port, Value::from_val(val))
     }
 
     /// [`inject`](Self::inject)s a value written as WAVE text, parsed
@@ -186,7 +213,41 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
     /// returned last, or `None` if it has not run yet. See
     /// [`Scheduler::read_output`].
     pub fn read_output(&self, node: &NodeId, port: &PortName) -> Result<Option<Val>, RuntimeError> {
-        self.sched.read_output(node, port)
+        match self.sched.read_output(node, port)? {
+            Some(Value::Handle(_)) => Err(not_a_value_output(node, port)),
+            value => Ok(value.map(|value| value.to_val())),
+        }
+    }
+
+    /// The latched object of a handle output port: what the node's `run`
+    /// returned last, or `None` if it has not run yet. A port that is no
+    /// handle output is [`RuntimeError::NotAValuePort`].
+    pub fn read_handle(
+        &self,
+        node: &NodeId,
+        port: &PortName,
+    ) -> Result<Option<Shared>, RuntimeError> {
+        match self.sched.read_output(node, port)? {
+            Some(Value::Handle(shared)) => Ok(Some(shared)),
+            None if self.is_handle_output(node, port) => Ok(None),
+            _ => Err(not_a_value_output(node, port)),
+        }
+    }
+
+    fn is_handle_output(&self, node: &NodeId, port: &PortName) -> bool {
+        self.compiled().contract_for(node).is_some_and(|contract| {
+            contract
+                .outputs
+                .iter()
+                .any(|p| &p.name == port && p.kind == witgraph_ir::PortKind::Handle)
+        })
+    }
+
+    /// The memory the graph's shared objects take now, as their providers
+    /// reported it: what counts against
+    /// [`max_shared_memory`](RuntimeConfig::max_shared_memory).
+    pub fn shared_memory(&self) -> usize {
+        self.sched.executor().shared_memory.used()
     }
 
     /// The component type of a Value input port's payload (for an optional
@@ -243,7 +304,7 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
     /// Captures the graph's host-visible state, at any time. Stream and
     /// future contents are not captured. See [`Scheduler::snapshot`] and
     /// [`Snapshot`].
-    pub fn snapshot(&self) -> Snapshot {
+    pub fn snapshot(&self) -> Result<Snapshot, SnapshotError> {
         self.sched.snapshot()
     }
 

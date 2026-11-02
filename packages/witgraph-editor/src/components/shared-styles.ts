@@ -100,9 +100,11 @@ const DEFAULT_CSS = `
   .bg-wg-port-value { background-color: var(--wg-port-value); }
   .bg-wg-port-stream { background-color: var(--wg-port-stream); }
   .bg-wg-port-future { background-color: var(--wg-port-future); }
+  .bg-wg-port-handle { background-color: var(--wg-port-handle); }
   .text-wg-port-value { color: var(--wg-port-value); }
   .text-wg-port-stream { color: var(--wg-port-stream); }
   .text-wg-port-future { color: var(--wg-port-future); }
+  .text-wg-port-handle { color: var(--wg-port-handle); }
 
   .text-wg-bg { color: var(--wg-bg); }
 

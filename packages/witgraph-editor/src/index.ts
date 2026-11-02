@@ -12,7 +12,6 @@ export type {
   GraphJsonPortRef,
   NodePreview,
   NodeVisual,
-  OutputSnapshot,
   OutputView,
   PortVisual,
   SavedSnapshot,

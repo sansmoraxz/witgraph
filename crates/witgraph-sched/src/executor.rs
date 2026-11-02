@@ -22,38 +22,38 @@ use witgraph_ir::{NodeId, PortDirection, PortKind, PortName, PortRef};
 use crate::error::NodeFault;
 use crate::plan::IslandPlan;
 
-/// `Send` on native targets, nothing on `wasm32`: there a generation is
+/// `Send` on native targets, nothing on WebAssembly: there a generation is
 /// driven by JavaScript promises, which never leave their thread.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 pub trait MaybeSend: Send {}
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 impl<T: Send + ?Sized> MaybeSend for T {}
 
-/// `Send` on native targets, nothing on `wasm32`: there a generation is
+/// `Send` on native targets, nothing on WebAssembly: there a generation is
 /// driven by JavaScript promises, which never leave their thread.
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_family = "wasm")]
 pub trait MaybeSend {}
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_family = "wasm")]
 impl<T: ?Sized> MaybeSend for T {}
 
-/// `Sync` on native targets, nothing on `wasm32` (see [`MaybeSend`]).
-#[cfg(not(target_arch = "wasm32"))]
+/// `Sync` on native targets, nothing on WebAssembly (see [`MaybeSend`]).
+#[cfg(not(target_family = "wasm"))]
 pub trait MaybeSync: Sync {}
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 impl<T: Sync + ?Sized> MaybeSync for T {}
 
-/// `Sync` on native targets, nothing on `wasm32` (see [`MaybeSend`]).
-#[cfg(target_arch = "wasm32")]
+/// `Sync` on native targets, nothing on WebAssembly (see [`MaybeSend`]).
+#[cfg(target_family = "wasm")]
 pub trait MaybeSync {}
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_family = "wasm")]
 impl<T: ?Sized> MaybeSync for T {}
 
 /// The future of one generation: boxed, and `Send` on native targets.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(target_family = "wasm"))]
 pub type GenerationFuture<L> = futures::future::BoxFuture<'static, Outcome<L>>;
 
 /// The future of one generation: boxed, and `Send` on native targets.
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_family = "wasm")]
 pub type GenerationFuture<L> = futures::future::LocalBoxFuture<'static, Outcome<L>>;
 
 /// A value a port carries, as the scheduler needs it: cloned to fan out,
@@ -287,8 +287,9 @@ pub trait Executor: 'static {
     /// fields, cases and flags the type does not have are errors.
     fn parse_wave(&self, ty: &Self::Type, text: &str) -> Result<Self::Value, String>;
 
-    /// A value of a Value port as WAVE text.
-    fn to_wave(&self, value: &Self::Value) -> String;
+    /// A value of a Value port as WAVE text, or why it cannot be written
+    /// (one too large for the host to convert, say).
+    fn to_wave(&self, value: &Self::Value) -> Result<String, String>;
 }
 
 /// How [`drive`] calls the members of one island.
@@ -335,11 +336,11 @@ pub type OptionPayloadFn<V> = for<'a> fn(&'a V) -> OptionPayload<'a, V>;
 /// - A member's `run` is called once every in-island producer it reads
 ///   from has returned. Its arguments are those producers' fresh outputs
 ///   plus `args`, the host-supplied external Value inputs.
-/// - A Value output is cloned to each in-island consumer; a stream or
-///   future output is moved to its one consumer, or closed when it has
-///   none.
+/// - A Value or handle output is cloned to each in-island consumer; a
+///   stream or future output is moved to its one consumer, or closed when
+///   it has none.
 /// - Each start and return is reported through `send`; a return carries
-///   the member's Value outputs.
+///   the member's Value and handle outputs.
 /// - A connection that unwraps an option delivers what `option_payload`
 ///   says.
 pub async fn drive<V, C>(
@@ -387,7 +388,7 @@ where
                 continue;
             };
             match output.kind {
-                PortKind::Value => {
+                PortKind::Value | PortKind::Handle => {
                     for consumer in &output.consumers {
                         let delivered = if consumer.unwrap_option {
                             option_payload(&val).delivered(&val)

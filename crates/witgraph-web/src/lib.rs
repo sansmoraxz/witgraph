@@ -14,8 +14,10 @@
 //! is always pinned on its node, where wasmtime names no culprit for a
 //! fault in a Store several members share.
 //!
-//! Built for `wasm32-unknown-unknown` and bound with `wasm-bindgen`, it
-//! exports one class, `WebGraph`. On any other target the crate is empty.
+//! Built for `wasm32-unknown-unknown` (or, opting in, for
+//! `wasm64-unknown-unknown`: a 64-bit memory, for values past what 4 GiB
+//! holds) and bound with `wasm-bindgen`, it exports one class, `WebGraph`.
+//! On any non-WebAssembly target the crate is empty.
 //!
 //! # Values
 //!
@@ -32,16 +34,16 @@
 //! arrays. A stream or future is whatever the node returned (an async
 //! iterable, a thenable) and is handed to its reader untouched.
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_family = "wasm")]
 mod executor;
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_family = "wasm")]
 mod graph;
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_family = "wasm")]
 mod link;
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_family = "wasm")]
 mod live;
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_family = "wasm")]
 mod value;
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(target_family = "wasm")]
 pub use graph::{WebGraph, describe_component, js_name};

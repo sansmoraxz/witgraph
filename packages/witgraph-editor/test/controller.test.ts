@@ -474,3 +474,23 @@ test('a run ticks no faster than its tick rate, which can change as it runs', as
   controller.tickRate = -3;
   assert.equal(controller.tickRate, 0, 'anything but a positive rate is no limit');
 });
+
+test('only what is previewed or selected is recorded', async () => {
+  const controller = await loadController([['n', 'relay']], [['loop', 'n.out', 'n.in', true]]);
+  controller.injectValue('n', 'in', '0');
+  controller.injectValue('n', 'add', '1');
+  controller.setPreview('n', 'none');
+  controller.select(null);
+  assert.equal(controller.isObserved('n', 'out'), false);
+  await controller.step();
+  await controller.step();
+  assert.equal(controller.observe('n', 'out').count, 0, 'nothing recorded');
+  // Its latest value is still read when asked for.
+  assert.equal(controller.latestOutput('n', 'out'), 2);
+
+  // Selected, the inspector shows it: it is recorded from then on.
+  controller.select('n');
+  assert.equal(controller.isObserved('n', 'out'), true);
+  await controller.step();
+  assert.equal(controller.observe('n', 'out').count, 1);
+});

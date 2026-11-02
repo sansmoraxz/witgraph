@@ -1,7 +1,7 @@
 //! Values of the JavaScript executor, and their jco representation.
 
 use std::borrow::Cow;
-use std::cell::RefCell;
+use std::cell::{OnceCell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -16,10 +16,49 @@ use witgraph_ir::wasm_wave::wasm::{WasmType, WasmTypeKind, WasmValue};
 pub(crate) enum WebValue {
     /// A Value port's value, shared: the scheduler, its consumers and the
     /// live view hold the same one.
-    Data(Rc<Value>),
+    Data(Rc<Data>),
     /// A stream or future, as its producer returned it. Two handles are
     /// equal only when they are the same object.
     Handle(JsValue),
+    /// What a handle port carries: an object the host provides, which the
+    /// scheduler, its readers and the live view share. Equal only to
+    /// itself.
+    Resource(Rc<Resource>),
+}
+
+/// An object a handle port carries, as its maker returned it: the host's
+/// (whatever it holds, a buffer on a device, say) until no latch or view
+/// holds it any more, when its `[Symbol.dispose]()` is called, if it has
+/// one, so what it holds is freed then rather than when it is collected.
+#[derive(Debug)]
+pub(crate) struct Resource(JsValue);
+
+impl Resource {
+    pub(crate) fn new(js: JsValue) -> Self {
+        Self(js)
+    }
+
+    pub(crate) fn js(&self) -> &JsValue {
+        &self.0
+    }
+}
+
+impl Drop for Resource {
+    fn drop(&mut self) {
+        // `Symbol.dispose`, where the engine has it; else the symbol jco
+        // falls back to.
+        let symbol = js_sys::Reflect::get(&js_sys::global(), &"Symbol".into())
+            .and_then(|symbol| js_sys::Reflect::get(&symbol, &"dispose".into()))
+            .ok()
+            .filter(JsValue::is_symbol)
+            .unwrap_or_else(|| js_sys::Symbol::for_("dispose").into());
+        if let Ok(dispose) = js_sys::Reflect::get(&self.0, &symbol)
+            && let Some(dispose) = dispose.dyn_ref::<js_sys::Function>()
+        {
+            // Best effort: a provider's failure to free is its own.
+            let _ = dispose.call0(&self.0);
+        }
+    }
 }
 
 /// Values compare as on wasmtime: floats by their bits, except that every
@@ -27,10 +66,525 @@ pub(crate) enum WebValue {
 impl PartialEq for WebValue {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (Self::Data(a), Self::Data(b)) => same(a, b),
+            (Self::Data(a), Self::Data(b)) => Rc::ptr_eq(a, b) || a.equals(b),
             (Self::Handle(a), Self::Handle(b)) => a == b,
+            (Self::Resource(a), Self::Resource(b)) => Rc::ptr_eq(a, b),
             _ => false,
         }
+    }
+}
+
+/// A Value port's value of type `ty`, in the forms it has been needed in:
+/// as jco represents it, as a WAVE value, or both, each made from the other
+/// the first time it is needed.
+///
+/// A guest's output stays as jco handed it over: passed on to its
+/// consumers, compared and read as it is, so moving it between nodes
+/// converts nothing. Only WAVE text, snapshots and type checks need the
+/// WAVE value, and convert it once. The JavaScript value is shared, by
+/// every consumer and every read: nothing may change it.
+#[derive(Debug)]
+pub(crate) struct Data {
+    ty: Type,
+    js: OnceCell<JsValue>,
+    value: OnceCell<Value>,
+}
+
+impl Data {
+    /// `value`, of type `ty`.
+    pub(crate) fn from_value(value: Value, ty: Type) -> Self {
+        Self {
+            ty,
+            js: OnceCell::new(),
+            value: OnceCell::from(value),
+        }
+    }
+
+    /// What a guest returned for a port of type `ty`: kept as it is when it
+    /// is exactly what jco makes of a value of `ty` (see [`exact`]),
+    /// converted otherwise (a mock's output, say), which checks it and
+    /// puts it in that form.
+    pub(crate) fn from_output(js: JsValue, ty: Type) -> Result<Self, String> {
+        if exact(&js, &ty) {
+            Ok(Self {
+                ty,
+                js: OnceCell::from(js),
+                value: OnceCell::new(),
+            })
+        } else {
+            Ok(Self::from_value(from_js(&js, &ty)?, ty))
+        }
+    }
+
+    /// The value as jco represents it.
+    pub(crate) fn js(&self) -> &JsValue {
+        self.js.get_or_init(|| match self.value.get() {
+            Some(value) => to_js(value, &self.ty),
+            // Every `Data` is made with one form or the other.
+            None => JsValue::UNDEFINED,
+        })
+    }
+
+    /// The value as a WAVE value. Converting an exact JavaScript value
+    /// cannot fail; the error is for what should not happen.
+    pub(crate) fn value(&self) -> Result<&Value, String> {
+        if let Some(value) = self.value.get() {
+            return Ok(value);
+        }
+        let js = self.js.get().ok_or("a value with no form")?;
+        affordable(js, &self.ty)?;
+        let value = from_js(js, &self.ty)?;
+        Ok(self.value.get_or_init(|| value))
+    }
+
+    /// The value as WAVE text. A value that has no WAVE value yet is
+    /// converted for the text alone, and the WAVE value dropped again: it
+    /// can take many times the value's own size (a `list<u8>` takes tens of
+    /// bytes a byte), so only what needs it to stay (a type check) keeps it.
+    pub(crate) fn wave(&self) -> Result<String, String> {
+        match self.value.get() {
+            Some(value) => Ok(to_wave(value)),
+            None => {
+                let js = self.js.get().ok_or("a value with no form")?;
+                affordable(js, &self.ty)?;
+                Ok(to_wave(&from_js(js, &self.ty)?))
+            }
+        }
+    }
+
+    /// Whether `self` and `other` are the same value, as [`WebValue`]'s
+    /// equality has it: compared as JavaScript values when both are, so a
+    /// guest's outputs compare without converting.
+    fn equals(&self, other: &Self) -> bool {
+        match (self.js.get(), other.js.get()) {
+            (Some(a), Some(b)) => same_js(a, b, &self.ty),
+            _ => match (self.value(), other.value()) {
+                (Ok(a), Ok(b)) => same(a, b),
+                _ => false,
+            },
+        }
+    }
+
+    /// For an option, what its `some` holds (as a value of the payload
+    /// type), or `None` for `none`; `Err` for anything else.
+    pub(crate) fn option_payload(&self) -> Result<Option<Self>, ()> {
+        let Some(some) = self.ty.option_some_type() else {
+            return Err(());
+        };
+        if let Some(value) = self.value.get() {
+            return Ok(value
+                .unwrap_option()
+                .map(|payload| Self::from_value(payload.into_owned(), some)));
+        }
+        let js = self.js();
+        let payload = if nullable(&self.ty) {
+            (!js.is_undefined() && !js.is_null()).then(|| js.clone())
+        } else {
+            match get(js, "tag").as_string().as_deref() {
+                Some("some") => Some(get(js, "val")),
+                _ => None,
+            }
+        };
+        Ok(payload.map(|js| Self {
+            ty: some,
+            js: OnceCell::from(js),
+            value: OnceCell::new(),
+        }))
+    }
+}
+
+/// The most bytes converting one value to a WAVE value, and that to text,
+/// may take. A conversion that does not fit the module's memory traps, and
+/// a trap leaves the graph unusable (it skips every `Drop`, a borrow of the
+/// graph's among them): one that would not fit is refused instead, with an
+/// error. A 32-bit memory (4 GiB, shared with everything else) affords a
+/// quarter of it; a 64-bit one, as much as a host's memory reasonably holds.
+#[cfg(target_pointer_width = "32")]
+const CONVERSION_BUDGET: usize = 1 << 30;
+#[cfg(not(target_pointer_width = "32"))]
+const CONVERSION_BUDGET: usize = 1 << 34;
+
+/// `Ok` when converting `js`, of type `ty`, fits the
+/// [budget](CONVERSION_BUDGET); otherwise how much it would take.
+fn affordable(js: &JsValue, ty: &Type) -> Result<(), String> {
+    let cost = conversion_cost(js, ty, CONVERSION_BUDGET);
+    if cost <= CONVERSION_BUDGET {
+        return Ok(());
+    }
+    let mib = |bytes: usize| bytes >> 20;
+    Err(format!(
+        "too large to convert: it would take over {} MiB as a WAVE value (at most {} MiB)",
+        mib(cost),
+        mib(CONVERSION_BUDGET)
+    ))
+}
+
+/// About how many bytes converting `js`, of type `ty`, to a WAVE value and
+/// to text takes: a `Value` and a few characters per element, and its
+/// strings' bytes. Counting stops once past `limit`.
+fn conversion_cost(js: &JsValue, ty: &Type, limit: usize) -> usize {
+    // A `Value`, its slot in its parent, and its text.
+    let node = std::mem::size_of::<Value>() + 16;
+    match ty.kind() {
+        WasmTypeKind::String | WasmTypeKind::Char => {
+            node + js.as_string().map_or(0, |text| text.len() * 3)
+        }
+        WasmTypeKind::List | WasmTypeKind::FixedLengthList => {
+            let Some(element) = ty.list_element_type() else {
+                return node;
+            };
+            if numeric(element.kind()) && ArrayBuffer::is_view(js) {
+                let length = get(js, "length").as_f64().unwrap_or(0.0);
+                // A typed array's length fits a `usize` on any host it has.
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                return node.saturating_add((length as usize).saturating_mul(node));
+            }
+            let mut cost = node;
+            for item in js.dyn_ref::<Array>().into_iter().flat_map(Array::iter) {
+                cost = cost.saturating_add(conversion_cost(&item, &element, limit));
+                if cost > limit {
+                    break;
+                }
+            }
+            cost
+        }
+        WasmTypeKind::Record => {
+            let mut cost = node;
+            for (name, field_type) in ty.record_fields() {
+                cost = cost.saturating_add(conversion_cost(&field(js, &name), &field_type, limit));
+                if cost > limit {
+                    break;
+                }
+            }
+            cost
+        }
+        WasmTypeKind::Tuple => {
+            let items = js.dyn_ref::<Array>().map(Array::to_vec).unwrap_or_default();
+            ty.tuple_element_types()
+                .zip(items)
+                .fold(node, |cost, (t, item)| {
+                    cost.saturating_add(conversion_cost(&item, &t, limit))
+                })
+        }
+        WasmTypeKind::Variant | WasmTypeKind::Result => {
+            let tag = get(js, "tag").as_string();
+            let payload = match ty.kind() {
+                WasmTypeKind::Variant => ty
+                    .variant_cases()
+                    .find(|(name, _)| Some(name.as_ref()) == tag.as_deref())
+                    .and_then(|(_, t)| t),
+                _ => {
+                    let (ok, err) = ty.result_types().unwrap_or((None, None));
+                    if tag.as_deref() == Some("ok") {
+                        ok
+                    } else {
+                        err
+                    }
+                }
+            };
+            node + payload.map_or(0, |t| conversion_cost(&get(js, "val"), &t, limit))
+        }
+        WasmTypeKind::Option => {
+            let Some(some) = ty.option_some_type() else {
+                return node;
+            };
+            let payload = if nullable(ty) {
+                js.clone()
+            } else {
+                get(js, "val")
+            };
+            if payload.is_undefined() || payload.is_null() {
+                node
+            } else {
+                node + conversion_cost(&payload, &some, limit)
+            }
+        }
+        _ => node,
+    }
+}
+
+/// The value of an optional input whose payload is `data`, of type `ty`,
+/// as jco represents `some` of it (see [`some_to_js`]).
+pub(crate) fn some_js(data: &Data, ty: &Type) -> JsValue {
+    if nullable(ty) {
+        tagged("some", Some(data.js().clone()))
+    } else {
+        data.js().clone()
+    }
+}
+
+/// Whether jco hands over a list of `element` as a typed array.
+fn numeric(element: WasmTypeKind) -> bool {
+    matches!(
+        element,
+        WasmTypeKind::U8
+            | WasmTypeKind::S8
+            | WasmTypeKind::U16
+            | WasmTypeKind::S16
+            | WasmTypeKind::U32
+            | WasmTypeKind::S32
+            | WasmTypeKind::U64
+            | WasmTypeKind::S64
+            | WasmTypeKind::F32
+            | WasmTypeKind::F64
+    )
+}
+
+/// The typed array class jco uses for a list of `element`, as a check of
+/// `js` and its bytes; `None` when it uses a plain array.
+macro_rules! typed_bytes {
+    ($js:expr, $element:expr) => {{
+        macro_rules! view {
+            ($array:ident) => {
+                $js.dyn_ref::<js_sys::$array>().map(|a| {
+                    js_sys::Uint8Array::new_with_byte_offset_and_length(
+                        &a.buffer(),
+                        a.byte_offset(),
+                        a.byte_length(),
+                    )
+                })
+            };
+        }
+        match $element {
+            WasmTypeKind::U8 => Some(view!(Uint8Array)),
+            WasmTypeKind::S8 => Some(view!(Int8Array)),
+            WasmTypeKind::U16 => Some(view!(Uint16Array)),
+            WasmTypeKind::S16 => Some(view!(Int16Array)),
+            WasmTypeKind::U32 => Some(view!(Uint32Array)),
+            WasmTypeKind::S32 => Some(view!(Int32Array)),
+            WasmTypeKind::U64 => Some(view!(BigUint64Array)),
+            WasmTypeKind::S64 => Some(view!(BigInt64Array)),
+            WasmTypeKind::F32 => Some(view!(Float32Array)),
+            WasmTypeKind::F64 => Some(view!(Float64Array)),
+            _ => None,
+        }
+    }};
+}
+
+/// Whether `js` is exactly what jco makes of a value of type `ty`, as a
+/// guest returns one: every integer of 32 bits or fewer a number in range,
+/// every 64-bit one a `BigInt`, every list of numbers the typed array jco
+/// uses, `none` `undefined` (or tagged), and so on. Such a value converts
+/// to a WAVE value without error, and can be handed to another guest as it
+/// is. Anything else is `false`, even a value [`from_js`] would accept.
+pub(crate) fn exact(js: &JsValue, ty: &Type) -> bool {
+    let integer = |min: f64, max: f64| {
+        js.as_f64()
+            .is_some_and(|n| n.fract() == 0.0 && (min..=max).contains(&n))
+    };
+    match ty.kind() {
+        WasmTypeKind::Bool => js.as_bool().is_some(),
+        WasmTypeKind::S8 => integer(i8::MIN.into(), i8::MAX.into()),
+        WasmTypeKind::U8 => integer(0.0, u8::MAX.into()),
+        WasmTypeKind::S16 => integer(i16::MIN.into(), i16::MAX.into()),
+        WasmTypeKind::U16 => integer(0.0, u16::MAX.into()),
+        WasmTypeKind::S32 => integer(i32::MIN.into(), i32::MAX.into()),
+        WasmTypeKind::U32 => integer(0.0, u32::MAX.into()),
+        WasmTypeKind::S64 => js
+            .dyn_ref::<BigInt>()
+            .is_some_and(|b| i64::try_from(b.clone()).is_ok()),
+        WasmTypeKind::U64 => js
+            .dyn_ref::<BigInt>()
+            .is_some_and(|b| u64::try_from(b.clone()).is_ok()),
+        WasmTypeKind::F32 | WasmTypeKind::F64 => js.as_f64().is_some(),
+        WasmTypeKind::Char => js.as_string().is_some_and(|t| t.chars().count() == 1),
+        WasmTypeKind::String => js.is_string(),
+        WasmTypeKind::List | WasmTypeKind::FixedLengthList => {
+            let Some(element) = ty.list_element_type() else {
+                return false;
+            };
+            if numeric(element.kind()) {
+                // `isView` first: it sees through no proxy, so what passes
+                // is a typed array whose class is checked without calling
+                // back into JavaScript.
+                return ArrayBuffer::is_view(js)
+                    && typed_bytes!(js, element.kind()).flatten().is_some();
+            }
+            is_array(js).unwrap_or(false)
+                && js
+                    .dyn_ref::<Array>()
+                    .is_some_and(|items| items.iter().all(|item| exact(&item, &element)))
+        }
+        WasmTypeKind::Record => {
+            js.is_object()
+                && ty
+                    .record_fields()
+                    .all(|(name, field_type)| exact(&field(js, &name), &field_type))
+        }
+        WasmTypeKind::Tuple => {
+            let types: Vec<Type> = ty.tuple_element_types().collect();
+            is_array(js).unwrap_or(false)
+                && js.dyn_ref::<Array>().is_some_and(|items| {
+                    items.length() as usize == types.len()
+                        && types
+                            .iter()
+                            .zip(items.iter())
+                            .all(|(t, item)| exact(&item, t))
+                })
+        }
+        WasmTypeKind::Variant => {
+            let Some(tag) = get(js, "tag").as_string() else {
+                return false;
+            };
+            ty.variant_cases()
+                .find(|(name, _)| *name == tag)
+                .is_some_and(|(_, payload)| payload.is_none_or(|t| exact(&get(js, "val"), &t)))
+        }
+        WasmTypeKind::Enum => js
+            .as_string()
+            .is_some_and(|case| ty.enum_cases().any(|name| name == case)),
+        WasmTypeKind::Option => {
+            let Some(some) = ty.option_some_type() else {
+                return false;
+            };
+            if nullable(ty) {
+                js.is_undefined() || exact(js, &some)
+            } else {
+                match get(js, "tag").as_string().as_deref() {
+                    Some("none") => true,
+                    Some("some") => exact(&get(js, "val"), &some),
+                    _ => false,
+                }
+            }
+        }
+        WasmTypeKind::Result => {
+            let (ok, err) = ty.result_types().unwrap_or((None, None));
+            let payload = match get(js, "tag").as_string().as_deref() {
+                Some("ok") => ok,
+                Some("err") => err,
+                _ => return false,
+            };
+            payload.is_none_or(|t| exact(&get(js, "val"), &t))
+        }
+        WasmTypeKind::Flags => {
+            js.is_object()
+                && ty
+                    .flags_names()
+                    .all(|name| field(js, &name).as_bool().is_some())
+        }
+        _ => false,
+    }
+}
+
+/// Whether two exact values of type `ty` (see [`exact`]) are the same, as
+/// [`WebValue`]'s equality has it: floats by their bits, every NaN equal to
+/// every other. Typed arrays compare by their bytes.
+fn same_js(a: &JsValue, b: &JsValue, ty: &Type) -> bool {
+    let float = |x: f64, y: f64| (x.is_nan() && y.is_nan()) || x.to_bits() == y.to_bits();
+    match ty.kind() {
+        // Narrowing to `f32` is the comparison itself.
+        #[allow(clippy::cast_possible_truncation)]
+        WasmTypeKind::F32 => match (a.as_f64(), b.as_f64()) {
+            (Some(x), Some(y)) => {
+                let (x, y) = (x as f32, y as f32);
+                (x.is_nan() && y.is_nan()) || x.to_bits() == y.to_bits()
+            }
+            _ => false,
+        },
+        WasmTypeKind::F64 => a.as_f64().zip(b.as_f64()).is_some_and(|(x, y)| float(x, y)),
+        WasmTypeKind::List | WasmTypeKind::FixedLengthList => {
+            let Some(element) = ty.list_element_type() else {
+                return false;
+            };
+            if let (Some(Some(x)), Some(Some(y))) = (
+                typed_bytes!(a, element.kind()),
+                typed_bytes!(b, element.kind()),
+            ) {
+                if x.length() != y.length() {
+                    return false;
+                }
+                let (x, y) = (x.to_vec(), y.to_vec());
+                if x == y {
+                    return true;
+                }
+                // Unequal bytes are unequal values, but for NaNs.
+                return match element.kind() {
+                    WasmTypeKind::F32 => {
+                        x.as_chunks::<4>()
+                            .0
+                            .iter()
+                            .zip(y.as_chunks::<4>().0)
+                            .all(|(p, q)| {
+                                let (p, q) = (f32::from_le_bytes(*p), f32::from_le_bytes(*q));
+                                (p.is_nan() && q.is_nan()) || p.to_bits() == q.to_bits()
+                            })
+                    }
+                    WasmTypeKind::F64 => x
+                        .as_chunks::<8>()
+                        .0
+                        .iter()
+                        .zip(y.as_chunks::<8>().0)
+                        .all(|(p, q)| float(f64::from_le_bytes(*p), f64::from_le_bytes(*q))),
+                    _ => false,
+                };
+            }
+            match (a.dyn_ref::<Array>(), b.dyn_ref::<Array>()) {
+                (Some(x), Some(y)) => {
+                    x.length() == y.length()
+                        && x.iter()
+                            .zip(y.iter())
+                            .all(|(p, q)| same_js(&p, &q, &element))
+                }
+                _ => false,
+            }
+        }
+        WasmTypeKind::Record => ty
+            .record_fields()
+            .all(|(name, t)| same_js(&field(a, &name), &field(b, &name), &t)),
+        WasmTypeKind::Tuple => match (a.dyn_ref::<Array>(), b.dyn_ref::<Array>()) {
+            (Some(x), Some(y)) => ty
+                .tuple_element_types()
+                .zip(x.iter().zip(y.iter()))
+                .all(|(t, (p, q))| same_js(&p, &q, &t)),
+            _ => false,
+        },
+        WasmTypeKind::Variant => {
+            let tag = get(a, "tag").as_string();
+            tag.is_some()
+                && tag == get(b, "tag").as_string()
+                && ty
+                    .variant_cases()
+                    .find(|(name, _)| Some(name.as_ref()) == tag.as_deref())
+                    .is_some_and(|(_, payload)| {
+                        payload.is_none_or(|t| same_js(&get(a, "val"), &get(b, "val"), &t))
+                    })
+        }
+        WasmTypeKind::Option => {
+            let Some(some) = ty.option_some_type() else {
+                return false;
+            };
+            if nullable(ty) {
+                match (a.is_undefined(), b.is_undefined()) {
+                    (true, true) => true,
+                    (false, false) => same_js(a, b, &some),
+                    _ => false,
+                }
+            } else {
+                let tag = get(a, "tag").as_string();
+                tag == get(b, "tag").as_string()
+                    && (tag.as_deref() != Some("some")
+                        || same_js(&get(a, "val"), &get(b, "val"), &some))
+            }
+        }
+        WasmTypeKind::Result => {
+            let (ok, err) = ty.result_types().unwrap_or((None, None));
+            let tag = get(a, "tag").as_string();
+            if tag.is_none() || tag != get(b, "tag").as_string() {
+                return false;
+            }
+            let payload = if tag.as_deref() == Some("ok") {
+                ok
+            } else {
+                err
+            };
+            payload.is_none_or(|t| same_js(&get(a, "val"), &get(b, "val"), &t))
+        }
+        WasmTypeKind::Flags => ty
+            .flags_names()
+            .all(|name| field(a, &name).as_bool() == field(b, &name).as_bool()),
+        // Numbers, `BigInt`s, booleans and strings: equal as JavaScript has
+        // them (`===`).
+        _ => a == b,
     }
 }
 

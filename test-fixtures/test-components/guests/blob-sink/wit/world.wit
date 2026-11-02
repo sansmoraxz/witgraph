@@ -1,0 +1,16 @@
+package test:blob-sink@0.1.0;
+
+/// How many bytes it was given, and the last of them (0 for none). For
+/// measuring how data moves.
+world blob-sink {
+    export node: interface {
+        record inputs {
+            blob: list<u8>,
+        }
+        record outputs {
+            len: u32,
+            last: u8,
+        }
+        run: async func(inputs: inputs) -> outputs;
+    }
+}

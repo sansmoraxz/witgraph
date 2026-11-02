@@ -1,0 +1,17 @@
+package test:blob-source@0.1.0;
+
+/// `size` bytes (none when absent), `(i + seed) % 256` each: a new `seed`
+/// makes new bytes, so everything downstream runs again. For measuring how
+/// data moves.
+world blob-source {
+    export node: interface {
+        record inputs {
+            size: option<u32>,
+            seed: option<u32>,
+        }
+        record outputs {
+            blob: list<u8>,
+        }
+        run: async func(inputs: inputs) -> outputs;
+    }
+}

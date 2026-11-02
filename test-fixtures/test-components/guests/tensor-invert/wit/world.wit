@@ -1,0 +1,18 @@
+package test:tensor-invert@0.1.0;
+
+/// Its input, inverted by the host where the data lives: no byte enters
+/// the node.
+world tensor-invert {
+    import test:data/tensor@0.1.0;
+
+    export node: interface {
+        use test:data/tensor@0.1.0.{tensor};
+        record inputs {
+            tensor: borrow<tensor>,
+        }
+        record outputs {
+            tensor: tensor,
+        }
+        run: async func(inputs: inputs) -> outputs;
+    }
+}

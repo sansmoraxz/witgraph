@@ -49,14 +49,19 @@ pub mod error;
 pub mod graph;
 pub mod plugin;
 pub(crate) mod pump;
+pub mod shared;
+pub(crate) mod value;
 
 pub use engine::{CapabilityGap, Host, HostState, IslandData, NoCapabilities};
 pub use error::LoadError;
-pub use graph::{LinkedProvider, PreparedComponent, RuntimeConfig, RuntimeGraph};
+#[cfg(feature = "compile")]
+pub use graph::LinkedProvider;
+pub use graph::{PreparedComponent, RuntimeConfig, RuntimeGraph};
 pub use plugin::{CapabilityPlugin, Extensions, PluginData, Plugins};
+pub use shared::Shared;
 pub use wasmtime::component::Val;
 pub use witgraph_sched::{
     FaultReport, IslandSnapshot, NodeFault, NodePhase, NodeState, Perf, PortValues, RuntimeError,
-    RuntimeMode, Snapshot, TickResult, Trace, TraceEvent,
+    RuntimeMode, Snapshot, SnapshotError, TickResult, Trace, TraceEvent,
 };
 pub use {wasmtime, witgraph_ir, witgraph_sched};

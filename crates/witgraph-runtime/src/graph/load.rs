@@ -1,26 +1,40 @@
 //! Loading: checking component bytes against their contracts, compiling
 //! and linking them, and wiring the islands.
 
+#[cfg(feature = "precompiled")]
+mod precompiled;
+
+#[cfg(feature = "compile")]
 use std::borrow::Cow;
+use std::collections::HashMap;
+#[cfg(feature = "compile")]
+use std::collections::HashSet;
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
+#[cfg(feature = "compile")]
+use std::sync::OnceLock;
 
 use wasmtime::Engine;
 use wasmtime::component::{Component, Type};
+#[cfg(feature = "compile")]
+use witgraph_ir::PackageRef;
 use witgraph_ir::{
     Capability, CompiledConnection, CompiledGraph, ComponentContract, ComponentRef, NodeId,
-    PackageRef, PortDef, PortKind, PortRef,
+    PortDef, PortKind, PortRef,
 };
 use witgraph_sched::{RunShape, Scheduler};
+#[cfg(feature = "compile")]
 use witgraph_wit::compose::{LinkedProvider, imported_as, link_node};
+#[cfg(feature = "compile")]
 use witgraph_wit::lower::Lowered;
 
 use super::{RuntimeConfig, RuntimeGraph};
-use crate::engine::{
-    self, BuildError, CapabilityGap, Host, NoCapabilities, NodeBinary, RunSignature, Wasmtime,
-};
+#[cfg(feature = "compile")]
+use crate::engine::NoCapabilities;
+use crate::engine::{self, BuildError, CapabilityGap, Host, NodeBinary, RunSignature, Wasmtime};
 use crate::error::LoadError;
+use crate::shared::SharedMemory;
+use witgraph_ir::interface::compat_track;
 use witgraph_sched::{RuntimeError, RuntimeMode};
 
 /// A component checked against its contract and compiled, ready for
@@ -32,7 +46,8 @@ use witgraph_sched::{RuntimeError, RuntimeMode};
 /// executor (`spawn_blocking`, say) and keep the result to load the same
 /// component again without recompiling. A prepared component belongs to
 /// the engine it was compiled on, and to the contract it was checked
-/// against.
+/// against. With the `precompiled` feature it can be saved, and loaded in
+/// another process without compiling, by a build with no compiler in it.
 #[derive(Clone)]
 pub struct PreparedComponent {
     parts: Parts,
@@ -56,6 +71,11 @@ struct Parts {
     /// How many components an instance holds: the node's, and one per
     /// provider composed in.
     components: usize,
+    /// A hash of the bytes and links it was prepared from, when they were
+    /// given: what tells a saved component from one rebuilt with the same
+    /// contract.
+    #[cfg(feature = "precompiled")]
+    source: Option<String>,
 }
 
 /// What identifies a link among a node's: its import, provider and export.
@@ -63,12 +83,14 @@ type LinkKey = (String, ComponentRef, String);
 
 /// A component checked against its contract, with its links composed in:
 /// everything preparing does except compiling.
+#[cfg(feature = "compile")]
 struct Checked<'a> {
     parts: Parts,
     /// The node's bytes, or the composed component's.
     bytes: Cow<'a, [u8]>,
 }
 
+#[cfg(feature = "compile")]
 impl<'a> Checked<'a> {
     /// Composes `links` into `bytes`, which implement `contract` as
     /// `lowered` (from [`verify`]) says: see [`witgraph_wit::compose::link_node`],
@@ -107,6 +129,8 @@ impl<'a> Checked<'a> {
                 links: keys,
                 capabilities: linked.capabilities,
                 components: linked.components,
+                #[cfg(feature = "precompiled")]
+                source: None,
             },
             bytes: linked.bytes,
         })
@@ -140,6 +164,7 @@ impl PreparedComponent {
     /// that cannot run a graph is an `InvalidConfig`
     /// ([`LoadError::Runtime`]). What the bytes import is what the host is
     /// asked for when the graph loads ([`Host::check`], [`Host::link`]).
+    #[cfg(feature = "compile")]
     pub fn new(
         engine: &Engine,
         contract: &ComponentContract,
@@ -161,6 +186,7 @@ impl PreparedComponent {
     /// the composed component still imports (the node's unlinked imports,
     /// and the providers' own) is what the host is asked for when the
     /// graph loads ([`Host::check`], [`Host::link`]).
+    #[cfg(feature = "compile")]
     pub fn linked(
         engine: &Engine,
         contract: &ComponentContract,
@@ -168,7 +194,11 @@ impl PreparedComponent {
         links: &[LinkedProvider<'_>],
     ) -> Result<Self, LoadError> {
         let lowered = verify(contract, bytes)?;
-        Checked::new(contract, bytes, &lowered, links, &mut HashSet::new())?.compile(engine)
+        let prepared =
+            Checked::new(contract, bytes, &lowered, links, &mut HashSet::new())?.compile(engine)?;
+        #[cfg(feature = "precompiled")]
+        let prepared = prepared.with_source(bytes, links);
+        Ok(prepared)
     }
 
     /// The contract the component was checked against.
@@ -208,6 +238,49 @@ fn check_host<H: Host>(
     })
 }
 
+/// Asks `host` whether it shares every resource a handle port of the
+/// graph carries ([`Host::shares`]), and checks that no two of them have
+/// one type tag ([`crate::shared`]).
+fn check_shared<H: Host>(host: &H, compiled: &CompiledGraph) -> Result<(), LoadError> {
+    let mut tags: HashMap<u32, (String, &str)> = HashMap::new();
+    for node in &compiled.graph().nodes {
+        let Some(contract) = compiled.contract_for(&node.id) else {
+            continue;
+        };
+        for port in contract.inputs.iter().chain(&contract.outputs) {
+            let Some(handle) = &port.handle else {
+                continue;
+            };
+            if !host.shares(&node.id, handle) {
+                return Err(LoadError::NotShareable {
+                    node: node.id.clone(),
+                    port: port.name.clone(),
+                    resource: handle.to_string(),
+                });
+            }
+            let resource = (compat_track(&handle.interface), handle.resource.as_str());
+            let tag = crate::shared::tag(&handle.interface, &handle.resource);
+            match tags.entry(tag) {
+                Entry::Occupied(other) if *other.get() != resource => {
+                    return Err(LoadError::Runtime(RuntimeError::InvalidConfig {
+                        message: format!(
+                            "resources `{handle}` and `{}.{}` have the same type tag; rename one",
+                            other.get().0,
+                            other.get().1
+                        ),
+                    }));
+                }
+                Entry::Occupied(_) => {}
+                Entry::Vacant(entry) => {
+                    entry.insert(resource);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "compile")]
 impl<M: RuntimeMode> RuntimeGraph<M, NoCapabilities> {
     /// Loads a compiled graph whose components import no capabilities; see
     /// [`load_with_host`](RuntimeGraph::load_with_host).
@@ -243,6 +316,7 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
     /// compiling takes (often seconds per component). On a shared async
     /// executor, prepare the components with [`PreparedComponent::new`] on
     /// a blocking thread instead, and call `load_prepared`.
+    #[cfg(feature = "compile")]
     pub async fn load_with_host(
         compiled: CompiledGraph,
         wasm: &HashMap<ComponentRef, &[u8]>,
@@ -319,6 +393,7 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
         for &(node, index) in &of_node {
             check_host(&host, node, &checked[index].parts.capabilities)?;
         }
+        check_shared(&host, &compiled)?;
         let prepared = checked
             .into_iter()
             .map(|checked| checked.compile(&engine))
@@ -373,6 +448,7 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
             check_host(&host, &node.id, &prepared.parts.capabilities)?;
             nodes.push(prepared);
         }
+        check_shared(&host, &compiled)?;
         Self::link_and_build(compiled, nodes, config, engine, mode, host).await
     }
 
@@ -439,22 +515,29 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
                 list.push(connection);
             }
         }
+        let shared_memory = SharedMemory::new(config.max_shared_memory);
         for (members, connections) in compiled.islands().iter().zip(&inner) {
             let parts = island_parts(&binaries, members)?;
             let cells = cells(connections, members, config.split_islands);
-            let data = engine::island_data(&host, config.max_island_memory, &parts, &cells)
-                .into_iter()
-                .zip(&cells)
-                .map(|(data, cell)| {
-                    data.map_err(|e| LoadError::Instantiation {
-                        node: cell
-                            .first()
-                            .and_then(|member| members.get(*member).cloned())
-                            .unwrap_or_else(|| "?".into()),
-                        message: format!("island data: {e:#}"),
-                    })
+            let data = engine::island_data(
+                &host,
+                config.max_island_memory,
+                &shared_memory,
+                &parts,
+                &cells,
+            )
+            .into_iter()
+            .zip(&cells)
+            .map(|(data, cell)| {
+                data.map_err(|e| LoadError::Instantiation {
+                    node: cell
+                        .first()
+                        .and_then(|member| members.get(*member).cloned())
+                        .unwrap_or_else(|| "?".into()),
+                    message: format!("island data: {e:#}"),
                 })
-                .collect::<Result<Vec<_>, _>>()?;
+            })
+            .collect::<Result<Vec<_>, _>>()?;
             let (island, signatures) =
                 engine::build_island(&engine, &parts, &cells, data, settings)
                     .await
@@ -497,6 +580,7 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
             engine,
             settings,
             max_island_memory: config.max_island_memory,
+            shared_memory,
             binaries: island_binaries,
             cells: island_cells,
             input_types,
@@ -671,6 +755,9 @@ pub(super) fn validate(config: &RuntimeConfig) -> Result<(), RuntimeError> {
     if config.max_island_memory == Some(0) {
         return invalid("max_island_memory must be at least 1");
     }
+    if config.max_shared_memory == Some(0) {
+        return invalid("max_shared_memory must be at least 1");
+    }
     if config.hostcall_fuel == 0 {
         return invalid("hostcall_fuel must be at least 1");
     }
@@ -749,16 +836,19 @@ pub(super) fn contract_of<'a>(
 }
 
 /// The keys given for one world, with their bytes.
+#[cfg(feature = "compile")]
 type World<'w, 'a> = Vec<(&'w ComponentRef, &'a [u8])>;
 
 /// The given bytes, looked up by exact key and, on a miss, by package
 /// (version included) and world: a miss costs the keys of that one world,
 /// not every key given. The index for misses is built on the first one.
+#[cfg(feature = "compile")]
 struct WasmIndex<'w, 'a> {
     wasm: &'w HashMap<ComponentRef, &'a [u8]>,
     by_world: OnceLock<HashMap<&'w PackageRef, HashMap<&'w str, World<'w, 'a>>>>,
 }
 
+#[cfg(feature = "compile")]
 impl<'w, 'a> WasmIndex<'w, 'a> {
     fn new(wasm: &'w HashMap<ComponentRef, &'a [u8]>) -> Self {
         Self {
@@ -840,6 +930,7 @@ impl<'w, 'a> WasmIndex<'w, 'a> {
 /// Checks that `bytes` implement `contract`
 /// ([`witgraph_wit::verify::verify_component`]), and returns the bytes' own
 /// view of their world.
+#[cfg(feature = "compile")]
 fn verify(contract: &ComponentContract, bytes: &[u8]) -> Result<Lowered, LoadError> {
     use witgraph_wit::verify::VerifyError;
     let component = Box::new(contract.id.clone());

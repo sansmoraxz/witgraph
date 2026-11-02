@@ -44,6 +44,7 @@ const SVG_CSS = `
   .port-value { fill: var(--wg-port-value); }
   .port-stream { fill: var(--wg-port-stream); }
   .port-future { fill: var(--wg-port-future); }
+  .port-handle { fill: var(--wg-port-handle); }
   .port:hover { r: 8; stroke: var(--wg-text); stroke-width: 2; }
   .port-drop-target { r: 9; stroke: var(--wg-success); stroke-width: 2.5; }
   .port-label { fill: var(--wg-text); font-size: 10px; pointer-events: none; font-weight: 500; }
@@ -53,6 +54,7 @@ const SVG_CSS = `
   .edge-value { stroke: var(--wg-port-value); }
   .edge-stream { stroke: var(--wg-port-stream); }
   .edge-future { stroke: var(--wg-port-future); }
+  .edge-handle { stroke: var(--wg-port-handle); }
   .edge-default { stroke: var(--wg-text-muted); }
   .edge-feedback { stroke-dasharray: 8 4; }
   .edge.selected { stroke-width: 3.5; filter: drop-shadow(0 0 4px color-mix(in srgb, var(--wg-primary) 40%, transparent)); }

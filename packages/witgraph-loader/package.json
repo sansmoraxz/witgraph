@@ -22,6 +22,7 @@
   "exports": "./src/index.ts",
   "scripts": {
     "build:wasm": "cargo build --release -p witgraph-web --target wasm32-unknown-unknown --target-dir ../../target && wasm-bindgen --target web --out-dir pkg ../../target/wasm32-unknown-unknown/release/witgraph_web.wasm",
+    "build:wasm64": "cargo +nightly build --release -p witgraph-web --target wasm64-unknown-unknown -Zbuild-std=std,panic_abort --target-dir ../../target && wasm-bindgen --target web --out-dir pkg ../../target/wasm64-unknown-unknown/release/witgraph_web.wasm",
     "build:ts": "tsc -p tsconfig.build.json",
     "build": "pnpm build:wasm && pnpm build:ts",
     "prepack": "pnpm build",

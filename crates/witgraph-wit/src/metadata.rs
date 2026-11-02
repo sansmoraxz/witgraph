@@ -4,7 +4,7 @@
 //! frontend editors (palette entries, port pickers, tooltips).
 
 use serde::Serialize;
-use witgraph_ir::{ComponentContract, PortDef, PortKind};
+use witgraph_ir::{ComponentContract, HandleType, PortDef, PortKind};
 
 use crate::lower::Lowered;
 
@@ -92,9 +92,13 @@ pub struct PortMeta {
     /// The port's delivery semantics; serialized lowercase.
     pub kind: PortKind,
     /// WIT-syntax rendering of the payload type (`_` for a bare `stream` or
-    /// `future`). Editors resolve structure by re-deriving the contract from
-    /// WIT, never from this string.
+    /// `future`, `interface.resource` for a handle). Editors resolve
+    /// structure by re-deriving the contract from WIT, never from this
+    /// string.
     pub type_display: String,
+    /// Handle ports only: the resource the port carries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub handle: Option<HandleType>,
     /// Value input ports only: the port may be left unconnected.
     pub optional: bool,
     /// Doc comment from the WIT field, if any.
@@ -111,6 +115,7 @@ fn port_meta(port: &PortDef) -> PortMeta {
         name: port.name.to_string(),
         kind: port.kind,
         type_display: port.type_display(),
+        handle: port.handle.clone(),
         optional: port.optional,
         docs: port.docs.clone(),
         viewer: port.viewer.clone(),

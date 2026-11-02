@@ -1,0 +1,18 @@
+package test:tensor-sink@0.1.0;
+
+/// `sum`: the sum of its input's bytes; `len`: how many there are.
+world tensor-sink {
+    import test:data/tensor@0.1.0;
+
+    export node: interface {
+        use test:data/tensor@0.1.0.{tensor};
+        record inputs {
+            tensor: borrow<tensor>,
+        }
+        record outputs {
+            sum: u64,
+            len: u64,
+        }
+        run: async func(inputs: inputs) -> outputs;
+    }
+}

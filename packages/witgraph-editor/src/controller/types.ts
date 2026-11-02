@@ -17,8 +17,10 @@ export type NodePhase = 'pending' | 'running' | 'idle' | 'faulted' | 'cancelled'
 /** A port on a node, as the editor renders it. */
 export interface PortVisual {
   name: string;
-  kind: 'value' | 'stream' | 'future';
+  kind: 'value' | 'stream' | 'future' | 'handle';
   typeDisplay: string;
+  /** Handle ports only: the resource the port carries. */
+  handle?: { interface: string; resource: string };
   optional: boolean;
   docs?: string;
   /** Output ports only: the viewer the component declares for previewing it. */
@@ -132,12 +134,6 @@ export interface OutputView {
   count: number;
   /** A future only: its node ran again, and the new one has not resolved yet. */
   pending: boolean;
-}
-
-/** A recorded output value at a given tick. */
-export interface OutputSnapshot {
-  tick: number;
-  wave: string;
 }
 
 /** A reversible editing command for undo/redo. */

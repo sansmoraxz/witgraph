@@ -6,9 +6,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use test_components::{
-    BUSY_LOOP, BYTES_CONSUMER, CALC, CONFIGURABLE, ECHO, EDGE_DETECT, FRAME_GRAYSCALE,
-    FRAME_INVERT, FUTURE_WRITER, Guest, LABELLED, MATH, MAYBE, MQTT_NODE, NAMED_ECHO,
-    READING_CONSUMER, READING_PRODUCER, RELAY, RELAY_PLUS, RELAY_WIDE, STREAM_CONSUMER,
+    BLOB_SINK, BLOB_SOURCE, BUSY_LOOP, BYTES_CONSUMER, CALC, CONFIGURABLE, ECHO, EDGE_DETECT,
+    FRAME_GRAYSCALE, FRAME_INVERT, FUTURE_WRITER, Guest, LABELLED, MATH, MAYBE, MQTT_NODE,
+    NAMED_ECHO, READING_CONSUMER, READING_PRODUCER, RELAY, RELAY_PLUS, RELAY_WIDE, STREAM_CONSUMER,
     STREAM_DRAIN, STREAM_PRODUCER, STREAM_RELAY, VIDEO_SINK, VIDEO_SOURCE,
 };
 use wasmtime::StoreContextMut;
@@ -432,7 +432,7 @@ async fn two_versions_of_one_contract_run_side_by_side() {
     );
     assert_eq!(read_u32(&rt, "a", "out"), 11, "0.1.0: in + add");
     assert_eq!(read_u32(&rt, "b", "out"), 13, "0.2.0: in + add + 1");
-    let snapshot = rt.snapshot();
+    let snapshot = rt.snapshot().unwrap();
     let minor = |node: &str| {
         snapshot.nodes[&id(node)]
             .package
@@ -1322,7 +1322,7 @@ async fn a_link_satisfies_an_import_with_a_providers_export() {
     assert_eq!(read_u32(&rt, "a", "calls"), 1);
 
     // A snapshot names the links: it restores only onto the same ones.
-    let snapshot = rt.snapshot();
+    let snapshot = rt.snapshot().unwrap();
     assert_eq!(snapshot.links.len(), 2);
     let mut other = snapshot.clone();
     other.links[0].export = "test:math/other@0.1.0".into();
@@ -1895,7 +1895,7 @@ async fn shutdown_forgets_feedback_buffered_by_an_unfinished_tick() {
     let tick = tokio::time::timeout(Duration::from_millis(500), rt.tick()).await;
     assert!(tick.is_err(), "the endless pipeline keeps the tick running");
     assert_eq!(read_u32(&rt, "b", "out"), 1);
-    let snapshot = rt.snapshot();
+    let snapshot = rt.snapshot().unwrap();
     assert_eq!(
         snapshot.inputs[&id("a")][&"in".into()],
         "1",
@@ -1904,7 +1904,7 @@ async fn shutdown_forgets_feedback_buffered_by_an_unfinished_tick() {
     assert_eq!(snapshot.islands.len(), 2, "`a` owes its next iteration");
 
     rt.shutdown();
-    assert!(rt.snapshot().feedback.is_empty());
+    assert!(rt.snapshot().unwrap().feedback.is_empty());
     assert!(matches!(rt.tick().await, TickResult::Idle));
     assert_eq!(read_u32(&rt, "b", "out"), 1);
     assert_eq!(runs_of(&rt.mode().trace(), "a"), 1, "nothing restarted");
@@ -1997,7 +1997,7 @@ async fn step_limited_self_loop(kit: &Kit) -> RuntimeGraph<Trace> {
     inject(&mut rt, "a", "in", Val::U32(0));
     inject(&mut rt, "a", "add", Val::U32(1));
     assert!(matches!(rt.tick().await, TickResult::StepLimitReached));
-    assert_eq!(rt.snapshot().feedback.len(), 1, "buffered");
+    assert_eq!(rt.snapshot().unwrap().feedback.len(), 1, "buffered");
     rt
 }
 
@@ -2006,7 +2006,7 @@ async fn cancel_forgets_buffered_feedback() {
     let kit = Kit::new(&[RELAY]);
     let mut rt = step_limited_self_loop(&kit).await;
     rt.cancel(&id("a")).unwrap();
-    assert!(rt.snapshot().feedback.is_empty());
+    assert!(rt.snapshot().unwrap().feedback.is_empty());
     for _ in 0..5 {
         let _ = rt.tick().await;
     }
@@ -2018,7 +2018,7 @@ async fn shutdown_forgets_buffered_feedback() {
     let kit = Kit::new(&[RELAY]);
     let mut rt = step_limited_self_loop(&kit).await;
     rt.shutdown();
-    assert!(rt.snapshot().feedback.is_empty());
+    assert!(rt.snapshot().unwrap().feedback.is_empty());
     for _ in 0..5 {
         let _ = rt.tick().await;
     }
@@ -2889,6 +2889,23 @@ async fn a_tiny_hostcall_budget_faults_a_run_that_returns_a_record() {
 }
 
 #[tokio::test]
+async fn by_default_a_list_of_megabytes_leaves_a_node() {
+    // Lifting a `list<u8>` is charged ~48 bytes of hostcall fuel a byte: a
+    // default of 128 MiB stopped one of 4 MiB.
+    let kit = Kit::new(&[BLOB_SOURCE, BLOB_SINK]);
+    let graph = kit
+        .builder("blob")
+        .add_node("source", kit.get(BLOB_SOURCE))
+        .add_node("sink", kit.get(BLOB_SINK))
+        .connect("c", port("source", "blob"), port("sink", "blob"))
+        .build();
+    let mut rt = kit.load(graph, RuntimeConfig::default(), Perf).await;
+    inject(&mut rt, "source", "size", Val::U32(4 << 20));
+    settle(&mut rt).await;
+    assert_eq!(read_u32(&rt, "sink", "len"), 4 << 20);
+}
+
+#[tokio::test]
 async fn an_unconsumed_endless_stream_is_closed() {
     let kit = Kit::new(&[STREAM_PRODUCER]);
     let graph = kit
@@ -2917,12 +2934,12 @@ async fn feedback_unwraps_an_option_into_an_optional_input() {
     inject(&mut rt, "m", "x", Val::U32(5));
     settle(&mut rt).await;
     assert_eq!(phase(&rt, "m"), NodePhase::Idle, "some(5) latched as 5");
-    assert_eq!(rt.snapshot().inputs[&id("m")][&"x".into()], "5");
+    assert_eq!(rt.snapshot().unwrap().inputs[&id("m")][&"x".into()], "5");
     rt.clear_input(&id("m"), &"x".into()).unwrap();
     settle(&mut rt).await;
     assert_eq!(phase(&rt, "m"), NodePhase::Idle);
     assert!(
-        !rt.snapshot().inputs.contains_key(&id("m")),
+        !rt.snapshot().unwrap().inputs.contains_key(&id("m")),
         "none latched as no value"
     );
 }
@@ -2989,7 +3006,7 @@ async fn a_restored_replay_keeps_the_host_write_over_stale_feedback() {
     poll_tick_once(&mut rt).await;
     // Newer than what the in-flight generation will feed back.
     inject(&mut rt, "r", "in", Val::U32(100));
-    let snapshot = rt.snapshot();
+    let snapshot = rt.snapshot().unwrap();
     assert_eq!(
         snapshot
             .islands
@@ -3428,7 +3445,7 @@ async fn restore_continues_a_feedback_loop_from_the_snapshot() {
         assert!(matches!(rt.tick().await, TickResult::Progress));
     }
     assert_eq!(read_u32(&rt, "b", "out"), 3);
-    let snapshot = rt.snapshot();
+    let snapshot = rt.snapshot().unwrap();
 
     let mut fresh = kit
         .load(counter_loop(&kit), RuntimeConfig::default(), Trace::new())
@@ -3444,7 +3461,10 @@ async fn restore_continues_a_feedback_loop_from_the_snapshot() {
     let trace = fresh.mode().trace();
     assert_eq!(runs_of(&trace, "a"), 1);
     assert_eq!(runs_of(&trace, "b"), 1);
-    assert_eq!(fresh.snapshot().outputs[&id("b")][&"out".into()], "4");
+    assert_eq!(
+        fresh.snapshot().unwrap().outputs[&id("b")][&"out".into()],
+        "4"
+    );
 }
 
 #[tokio::test]
@@ -3462,7 +3482,7 @@ async fn restore_onto_an_untouched_graph_runs_only_queued_islands() {
     inject(&mut rt, "a", "in", Val::Float64(1.0));
     settle(&mut rt).await;
     inject(&mut rt, "b", "in", Val::Float64(2.0));
-    let snapshot = rt.snapshot();
+    let snapshot = rt.snapshot().unwrap();
     assert!(snapshot.quiescent);
     assert_eq!(
         snapshot.islands,
@@ -3510,7 +3530,7 @@ async fn a_mid_flight_snapshot_replays_the_streaming_generation() {
     poll_tick_once(&mut rt).await;
     assert_eq!(phase(&rt, "cons"), NodePhase::Running);
 
-    let snapshot = rt.snapshot();
+    let snapshot = rt.snapshot().unwrap();
     assert!(!snapshot.quiescent);
     assert_eq!(snapshot.phases[&id("cons")], NodePhase::Running);
     let [island] = snapshot.islands.as_slice() else {
@@ -3547,7 +3567,7 @@ async fn restore_after_shutdown_replays_the_interrupted_generation() {
     inject(&mut rt, "cons", "take", Val::U32(3000));
     inject(&mut rt, "cons", "delay", Val::U32(4));
     poll_tick_once(&mut rt).await;
-    let snapshot = rt.snapshot();
+    let snapshot = rt.snapshot().unwrap();
 
     rt.shutdown();
     rt.restore(&snapshot)
@@ -3568,7 +3588,7 @@ async fn restore_works_right_after_cancel() {
     inject(&mut rt, "cons", "take", Val::U32(3000));
     inject(&mut rt, "cons", "delay", Val::U32(4));
     poll_tick_once(&mut rt).await;
-    let snapshot = rt.snapshot();
+    let snapshot = rt.snapshot().unwrap();
     assert!(!snapshot.quiescent);
 
     rt.cancel(&id("cons")).unwrap();
@@ -3588,7 +3608,7 @@ async fn restore_rejects_another_graph_and_bad_values() {
         .await;
     inject(&mut rt, "n", "in", Val::Float64(1.5));
     settle(&mut rt).await;
-    let snapshot = rt.snapshot();
+    let snapshot = rt.snapshot().unwrap();
 
     let other = kit
         .builder("c")
@@ -3613,7 +3633,7 @@ async fn restore_rejects_another_graph_and_bad_values() {
         .await;
     inject(&mut fresh, "n", "in", Val::Float64(7.0));
     settle(&mut fresh).await;
-    let before = fresh.snapshot();
+    let before = fresh.snapshot().unwrap();
     let err = fresh.restore(&bad).unwrap_err();
     assert!(matches!(err, RuntimeError::SnapshotValue { .. }), "{err}");
 
@@ -3625,7 +3645,11 @@ async fn restore_rejects_another_graph_and_bad_values() {
         .insert("nope".into(), "1".into());
     let err = fresh.restore(&unknown).unwrap_err();
     assert!(matches!(err, RuntimeError::SnapshotValue { .. }), "{err}");
-    assert_eq!(fresh.snapshot(), before, "a failed restore changes nothing");
+    assert_eq!(
+        fresh.snapshot().unwrap(),
+        before,
+        "a failed restore changes nothing"
+    );
     assert_eq!(read_f64(&fresh, "n", "out"), 7.0);
 }
 
@@ -3645,7 +3669,7 @@ async fn restore_rejects_a_rewired_graph() {
         .await;
     inject(&mut rt, "e1", "in", Val::Float64(4.0));
     settle(&mut rt).await;
-    let snapshot = rt.snapshot();
+    let snapshot = rt.snapshot().unwrap();
 
     let mut other = kit
         .load(wired("e3"), RuntimeConfig::default(), Trace::new())
@@ -3664,7 +3688,7 @@ async fn restore_matches_islands_by_their_members_in_any_order() {
     inject(&mut rt, "cons", "take", Val::U32(300));
     inject(&mut rt, "cons", "delay", Val::U32(4));
     poll_tick_once(&mut rt).await;
-    let mut snapshot = rt.snapshot();
+    let mut snapshot = rt.snapshot().unwrap();
     assert_eq!(
         snapshot.islands[0].members,
         vec![id("cons"), id("prod")],
@@ -3684,7 +3708,7 @@ async fn restore_rejects_a_replay_missing_a_required_input() {
     let mut rt = kit
         .load(counter_loop(&kit), RuntimeConfig::default(), Trace::new())
         .await;
-    let mut snapshot = rt.snapshot();
+    let mut snapshot = rt.snapshot().unwrap();
     snapshot.islands = vec![IslandSnapshot {
         members: vec![id("a")],
         running: Some([(id("a"), Default::default())].into_iter().collect()),
@@ -3730,7 +3754,7 @@ async fn restore_rejects_inconsistent_snapshots_and_changes_nothing() {
     for _ in 0..3 {
         let _ = rt.tick().await;
     }
-    let good = rt.snapshot();
+    let good = rt.snapshot().unwrap();
     let running = |node: &str| -> Option<witgraph_runtime::PortValues> {
         Some(
             [(
@@ -3770,14 +3794,14 @@ async fn restore_rejects_inconsistent_snapshots_and_changes_nothing() {
     phases.phases.insert(id("ghost"), NodePhase::Idle);
     cases.push(("a phase for a node not in the graph", phases));
 
-    let before = rt.snapshot();
+    let before = rt.snapshot().unwrap();
     for (what, snapshot) in cases {
         let err = rt.restore(&snapshot).unwrap_err();
         assert!(
             matches!(err, RuntimeError::SnapshotMismatch { .. }),
             "{what}: {err}"
         );
-        assert_eq!(rt.snapshot(), before, "{what}: nothing changed");
+        assert_eq!(rt.snapshot().unwrap(), before, "{what}: nothing changed");
     }
     rt.restore(&good).expect("the good snapshot restores");
 }

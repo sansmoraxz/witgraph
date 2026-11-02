@@ -3512,8 +3512,11 @@ name = "witgraph-runtime"
 version = "0.1.0"
 dependencies = [
  "futures",
+ "hex",
  "miette",
+ "serde",
  "serde_json",
+ "sha2 0.11.1",
  "test-components",
  "thiserror 2.0.21",
  "tokio",

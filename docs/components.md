@@ -31,16 +31,53 @@ world sensor {
 Every field of `inputs` and `outputs` is a port. The field's type decides
 what kind of port it is:
 
-| Field type  | Port           | Meaning                                                              |
-| ----------- | -------------- | -------------------------------------------------------------------- |
-| `T`         | Value          | Read when `run` starts (inputs) or set when `run` returns (outputs). |
-| `option<T>` | Optional value | On inputs, the port may be left unconnected.                         |
-| `stream<T>` | Stream         | Ordered, back-pressured values that end when the stream closes.      |
-| `future<T>` | Future         | A single value that arrives later.                                   |
+| Field type  | Port           | Meaning                                                                |
+| ----------- | -------------- | ---------------------------------------------------------------------- |
+| `T`         | Value          | Read when `run` starts (inputs) or set when `run` returns (outputs).   |
+| `option<T>` | Optional value | On inputs, the port may be left unconnected.                           |
+| `stream<T>` | Stream         | Ordered, back-pressured values that end when the stream closes.        |
+| `future<T>` | Future         | A single value that arrives later.                                     |
+| `borrow<R>` | Handle         | On inputs: a resource the host provides, lent for the length of `run`. |
+| `own<R>`    | Handle         | On outputs: a resource handed to the host when `run` returns.          |
 
-`stream` and `future` can only be used directly as a field type, not nested
-inside other types. Resources, `map` and fixed-length lists can't be used in
-ports.
+`stream`, `future` and handles can only be used directly as a field type, not
+nested inside other types (an optional handle input, `option<borrow<R>>`, is
+the exception). `map` and fixed-length lists can't be used in ports.
+
+## Handles
+
+A handle port carries a resource the host provides, such as a tensor. The
+resource must be declared in a named interface the world imports, so every
+node importing that interface names the same resource:
+
+```wit
+world edges {
+    import test:data/tensor@0.1.0;
+
+    export node: interface {
+        use test:data/tensor@0.1.0.{tensor};
+        record inputs  { image: borrow<tensor> }
+        record outputs { edges: tensor }        // own<tensor>
+        run: async func(inputs: inputs) -> outputs;
+    }
+}
+```
+
+Nodes pass only the handle. What it refers to, and where that lives (host
+memory, a GPU buffer, an ML runtime's tensor), is up to the host, and so are
+its operations: a node calls them, and they run where the data lives. Only a
+node that reads the data into its own memory copies it.
+
+The host owns every shared object between runs. An input borrows its handle,
+so a node can neither keep nor destroy what other nodes hold, and an output
+hands its handle over. A node that wants to keep a value past its `run` asks
+the resource for a reference of its own, if the resource offers one (a
+`clone`, say). An object is freed when nothing holds it any more.
+
+A handle is not text: it can't be injected or written as WAVE, and
+snapshots leave handles out (see [Snapshots](running.md#snapshots)). Which
+resources ports may carry is the host's to say: see
+[Sharing resources](running.md#sharing-resources).
 
 ## `run`
 

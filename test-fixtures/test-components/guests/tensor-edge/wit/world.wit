@@ -1,0 +1,20 @@
+package test:tensor-edge@0.1.0;
+
+/// The edges of its `uint8` image tensor, by a fixed 3x3 Laplacian kernel
+/// the host convolves where the data lives: no byte enters the node. Calls
+/// `fatal` with the host's reason when it cannot.
+world tensor-edge {
+    import test:data/tensor@0.1.0;
+    import witgraph:runtime/host@0.1.0;
+
+    export node: interface {
+        use test:data/tensor@0.1.0.{tensor};
+        record inputs {
+            tensor: borrow<tensor>,
+        }
+        record outputs {
+            edges: tensor,
+        }
+        run: async func(inputs: inputs) -> outputs;
+    }
+}

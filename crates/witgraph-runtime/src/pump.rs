@@ -151,7 +151,7 @@ impl<T> Drop for Pipe<T> {
 
 /// Reports the items passing through a pump as island events.
 pub(crate) struct Tap {
-    pub(crate) reporter: Reporter<Val>,
+    pub(crate) reporter: Reporter<crate::value::Value>,
     /// The member whose output the stream is.
     pub(crate) member: usize,
     pub(crate) port: PortName,

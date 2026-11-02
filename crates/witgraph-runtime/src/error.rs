@@ -1,7 +1,7 @@
 //! What loading a graph's components can fail with ([`LoadError`]),
 //! besides the scheduler's [`RuntimeError`].
 
-use witgraph_ir::{ComponentRef, NodeId};
+use witgraph_ir::{ComponentRef, NodeId, PortName};
 use witgraph_sched::RuntimeError;
 
 /// Why a graph could not be loaded: its components, their links and
@@ -114,6 +114,19 @@ pub enum LoadError {
         implements: Option<String>,
         /// The ids of the providers that could serve it.
         providers: Vec<String>,
+    },
+    /// A handle port carries a resource the host does not share
+    /// ([`Host::shares`](crate::Host::shares)): one whose handles cannot
+    /// pass from node to node.
+    #[error("`{node}.{port}` carries `{resource}`, which the host does not share between nodes")]
+    #[diagnostic(code(witgraph::load::not_shareable))]
+    NotShareable {
+        /// The node.
+        node: NodeId,
+        /// The handle port.
+        port: PortName,
+        /// The resource (`interface.resource`).
+        resource: String,
     },
     /// A scheduler error: an invalid config, an unknown node, or a graph
     /// the scheduler cannot run.

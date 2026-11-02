@@ -28,14 +28,16 @@ inspect (execution order, islands, required capabilities) and then run.
 ## Connection rules
 
 - **Types must match exactly.** There is no coercion. The one exception is a
-  value of type `option<T>` can feed an optional input of type `T`.
+  value of type `option<T>` can feed an optional input of type `T`. Handles
+  match when they carry the same resource of the same interface, at
+  semver-compatible versions.
 - **One writer per input.** An input has at most one incoming connection.
 - **No fan-out for streams and futures.** Use a tee node to split one. Values
-  can fan out freely.
+  and handles can fan out freely.
 - **Required inputs must be connected.**
 - **Cycles need a feedback edge.** Mark at least one connection in each cycle
   as `feedback`. It delivers the previous iteration's value and can only carry
-  values.
+  values and handles.
 
 ## Links
 

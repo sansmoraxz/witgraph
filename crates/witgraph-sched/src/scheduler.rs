@@ -300,16 +300,16 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
         Ok(())
     }
 
-    /// The latched value of a Value output port: what the node's `run`
-    /// returned last, or `None` if it has not run yet. An unknown node
-    /// ([`RuntimeError::UnknownNode`]) or a port that is not a Value output
+    /// The latched value of a Value or handle output port: what the node's
+    /// `run` returned last, or `None` if it has not run yet. An unknown node
+    /// ([`RuntimeError::UnknownNode`]) or a port that is neither
     /// ([`RuntimeError::NotAValuePort`]) is an error.
     pub fn read_output(
         &self,
         node: &NodeId,
         port: &PortName,
     ) -> Result<Option<X::Value>, RuntimeError> {
-        let (port_ref, _) = self.value_port(node, port, PortDirection::Output)?;
+        let port_ref = self.latched_port(node, port, PortDirection::Output)?;
         Ok(self.outputs.get(&port_ref).map(|val| (**val).clone()))
     }
 
@@ -337,6 +337,32 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
         port: &PortName,
     ) -> Result<&X::Type, RuntimeError> {
         self.host_input(node, port).map(|(_, ty)| ty)
+    }
+
+    /// Checks that `node` exists and `port` is a Value or handle port of it
+    /// in `direction`: one whose values the host latches.
+    fn latched_port(
+        &self,
+        node: &NodeId,
+        port: &PortName,
+        direction: PortDirection,
+    ) -> Result<PortRef, RuntimeError> {
+        self.island(node)?;
+        let latched = self.compiled.contract_for(node).is_some_and(|contract| {
+            let ports = match direction {
+                PortDirection::Input => &contract.inputs,
+                PortDirection::Output => &contract.outputs,
+            };
+            ports.iter().any(|p| &p.name == port && p.kind.is_latched())
+        });
+        if !latched {
+            return Err(RuntimeError::NotAValuePort {
+                node: node.clone(),
+                port: port.clone(),
+                direction,
+            });
+        }
+        Ok(PortRef::new(node.clone(), port.clone()))
     }
 
     /// Checks that `node` exists and `port` is a Value port of it in

@@ -34,6 +34,10 @@ const GUESTS = [
   'frame-invert',
   'video-sink',
   'edge-detect',
+  'tensor-source',
+  'tensor-edge',
+  'tensor-invert',
+  'tensor-sink',
 ];
 
 // Resolve the cargo target directory via `cargo metadata`.

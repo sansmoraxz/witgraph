@@ -80,7 +80,11 @@ node previews the first one it names.
 - **Every kind of port.** A Value output's preview keeps a value a tick (the
   value so far while a tick runs), a stream's every item as its reader takes
   it, and a future's value once it resolves, showing it _pending_ while its
-  node runs again.
+  node runs again. A handle output's preview is given the object itself, as
+  its maker returned it: a viewer for it reads what it needs through the
+  object's own methods, and must expect it to be disposed once the next one
+  replaces it. The inspector shows a handle by the object's `toString`, or by
+  its resource, and offers no inject box for a handle input.
 - **Viewers.** `image` draws RGBA frames and PNG, JPEG, GIF or WebP bytes;
   `series` plots recent numbers; `text` shows any value, a stream's recent
   items, or a pending future. Add your own with `registerViewer`; it is
@@ -147,7 +151,8 @@ properties with no fallback, so define them on the page or a parent element:
   `--wg-text`, `--wg-text-dim`, `--wg-text-muted`, `--wg-primary`,
   `--wg-primary-hover`, `--wg-accent`, `--wg-success`, `--wg-warning`,
   `--wg-error`.
-- Port kinds: `--wg-port-value`, `--wg-port-stream`, `--wg-port-future`.
+- Port kinds: `--wg-port-value`, `--wg-port-stream`, `--wg-port-future`,
+  `--wg-port-handle`.
 - Node states: `--wg-phase-pending`, `--wg-phase-running`, `--wg-phase-idle`,
   `--wg-phase-faulted`, `--wg-phase-cancelled`.
 - Shape: `--wg-node-radius`, `--wg-port-radius`, `--wg-btn-radius`,
@@ -167,20 +172,25 @@ The demo opens a graph of every port kind, whose nodes preview a Value, a
 stream of numbers, a stream of bytes, a future and a video stream. The
 picker at the top right switches to another graph:
 
-| Graph           | What it shows                                                                                                                             |
-| --------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| `?graph=video`  | Video pipelines alone: frames streamed through grayscale and invert filters.                                                              |
-| `?graph=webgpu` | Edge detection on WebGPU: the `edge-detect` component runs a small CNN with fixed weights through `test:accel/cnn`, here compute shaders. |
-| `?graph=webnn`  | The same on WebNN.                                                                                                                        |
+| Graph                   | What it shows                                                                                                                             |
+| ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `?graph=video`          | Video pipelines alone: frames streamed through grayscale and invert filters.                                                              |
+| `?graph=webgpu`         | Edge detection on WebGPU: the `edge-detect` component runs a small CNN with fixed weights through `test:accel/cnn`, here compute shaders. |
+| `?graph=webnn`          | The same on WebNN.                                                                                                                        |
+| `?graph=tensors`        | Tensors on the CPU: an image made once, its edges found and inverted by the tensors' own operations, nodes passing only handles.          |
+| `?graph=tensors-webgpu` | The same with the tensors kept in WebGPU storage buffers, and their operations run as compute shaders.                                    |
+| `?graph=tensors-webnn`  | The same with the tensors kept as WebNN tensors, and their operations run as WebNN graphs.                                                |
 
 What runs `test:accel/cnn` is the browser's, so a browser without WebGPU or
 WebNN still loads its graph: the edge node faults when run, saying the
-accelerator is missing. Every component is in the catalog in every graph
+accelerator is missing. So does the image node of a tensor graph whose
+backend the browser lacks. Every component is in the catalog in every graph
 (in the default graph, `test:accel/cnn` runs on the CPU).
 
 The Playwright tests run with `test` in the same package, in two Chromium
 projects: `chromium` as it ships, which has neither accelerator (the edge
-graphs must fault, saying so), and `chromium-accelerated`, started with the
-flags turning both on (WebGPU on the SwiftShader software renderer, so no
-GPU is needed), where the edges must be computed and match a CPU
-reference.
+graphs, and the tensor graphs but the CPU one, must fault, saying so), and
+`chromium-accelerated`, started with the flags turning both on (WebGPU on the
+SwiftShader software renderer, so no GPU is needed), where the edges must be
+computed and match a CPU reference, and the tensors must stay on their
+device.

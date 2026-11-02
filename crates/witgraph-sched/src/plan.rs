@@ -72,15 +72,15 @@ pub struct MemberPlan {
 }
 
 impl MemberPlan {
-    /// The member's Value inputs the host supplies (unconnected ones, and
-    /// ones fed by feedback connections or from other islands), with their
-    /// field index.
+    /// The member's Value and handle inputs the host supplies (unconnected
+    /// ones, and ones fed by feedback connections or from other islands),
+    /// with their field index.
     pub fn external_values(&self) -> impl Iterator<Item = (usize, &InputField)> {
         self.inputs
             .iter()
             .flatten()
             .enumerate()
-            .filter(|(_, f)| f.source == InputSource::External && f.kind == PortKind::Value)
+            .filter(|(_, f)| f.source == InputSource::External && f.kind.is_latched())
     }
 
     /// How many fields the member's `inputs` record has.

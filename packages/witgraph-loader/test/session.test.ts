@@ -9,17 +9,20 @@ import { afterEach, test } from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { parse } from '@bytecodealliance/jco';
+import { transpile } from '@bytecodealliance/jco/component';
 
 import {
   type Capability,
   type ComponentSource,
   camelCase,
   type FutureItem,
+  fastListLift,
   jsName,
   Session,
   type SessionOptions,
   type StreamItem,
   WebGraph,
+  watchTraps,
 } from '../src/index.ts';
 
 const root = new URL('../../../', import.meta.url);
@@ -68,6 +71,14 @@ const ids: Record<string, string> = {
   'video-source': 'test:video-source/video-source@0.1.0',
   'frame-grayscale': 'test:frame-grayscale/frame-grayscale@0.1.0',
   'video-sink': 'test:video-sink/video-sink@0.1.0',
+  'blob-source': 'test:blob-source/blob-source@0.1.0',
+  'blob-relay': 'test:blob-relay/blob-relay@0.1.0',
+  'blob-sink': 'test:blob-sink/blob-sink@0.1.0',
+  'tensor-source': 'test:tensor-source/tensor-source@0.1.0',
+  'tensor-invert': 'test:tensor-invert/tensor-invert@0.1.0',
+  'tensor-copy-invert': 'test:tensor-copy-invert/tensor-copy-invert@0.1.0',
+  'tensor-sink': 'test:tensor-sink/tensor-sink@0.1.0',
+  'tensor-keep': 'test:tensor-keep/tensor-keep@0.1.0',
 };
 
 /** Components written in WAT here, by guest name, beside the built guests. */
@@ -312,7 +323,7 @@ test('values flow between nodes and equal inputs do not rerun', async () => {
   assert.throws(() => session.graph.inject('b', 'in', 'five'), /written by connection/);
   assert.throws(() => session.graph.inject('a', 'nope', 1), /not a Value input port/);
   assert.throws(() => session.graph.readOutput('x', 'out'), /unknown node `x`/);
-  assert.throws(() => session.graph.readOutput('a', 'nope'), /not a Value output port/);
+  assert.throws(() => session.graph.readOutput('a', 'nope'), /not a Value or handle output port/);
 });
 
 test('a stream passes between two nodes of an island, and a tap sees its items', async () => {
@@ -1166,6 +1177,200 @@ test('a future output nothing reads is consumed, so its writer finishes', async 
   assert.equal(session.graph.readOutput('w', 'last'), 1);
 });
 
+test('a Value is passed on as its producer returned it, and compared without converting', async () => {
+  const runs: string[] = [];
+  const session = await load(
+    [
+      ['source', 'blob-source'],
+      ['a', 'blob-relay'],
+      ['sink', 'blob-sink'],
+    ],
+    [
+      ['s-a', 'source.blob', 'a.blob'],
+      ['a-s', 'a.blob', 'sink.blob'],
+    ],
+    { afterRun: (node) => void runs.push(node) },
+  );
+  session.graph.inject('source', 'size', 1000);
+  session.graph.inject('source', 'seed', 7);
+  await session.settle();
+  assert.deepEqual(runs, ['source', 'a', 'sink']);
+  const blob = session.graph.readOutput('source', 'blob');
+  assert.ok(blob instanceof Uint8Array);
+  assert.equal(blob.length, 1000);
+  assert.equal(blob[3], 10);
+  // The very value, shared, not a copy made for each read.
+  assert.equal(session.graph.readOutput('source', 'blob'), blob);
+  assert.equal(session.graph.readOutput('sink', 'len'), 1000);
+  // WAVE text is made when asked for.
+  assert.equal(session.graph.readOutputWave('sink', 'len'), '1000');
+  assert.match(session.graph.readOutputWave('a', 'blob')!, /^\[7, 8, 9, /);
+
+  // An equal value runs nothing downstream; another one does.
+  runs.length = 0;
+  session.graph.inject('source', 'size', 1000);
+  session.graph.rerun('source');
+  await session.settle();
+  assert.deepEqual(runs, ['source'], 'the same bytes again: `a` does not rerun');
+  runs.length = 0;
+  session.graph.inject('source', 'seed', 8);
+  await session.settle();
+  assert.deepEqual(runs, ['source', 'a', 'sink']);
+  assert.equal((session.graph.readOutput('a', 'blob') as Uint8Array)[0], 8);
+});
+
+test('the list loop jco generates is there to be replaced', async () => {
+  // jco lifts a list a guest returns an element at a time; the loader
+  // copies a list of numbers at once instead. A jco that generates its
+  // loop otherwise leaves it alone, and this fails, so the copy is redone.
+  const { bytes } = await guestSource('blob-relay');
+  const { files } = await transpile(bytes, {
+    name: 'node',
+    instantiation: { tag: 'async' },
+    noTypescript: true,
+  });
+  const source = new TextDecoder().decode(
+    (files as [string, Uint8Array][]).find(([name]) => name.endsWith('.js'))![1],
+  );
+  assert.notEqual(fastListLift(source), source);
+  assert.equal(fastListLift('nothing to replace'), 'nothing to replace');
+});
+
+/** Whether the scheduler's module has a 64-bit memory (`pnpm build:wasm64`). */
+function memory64(module: Uint8Array): boolean {
+  const leb = (at: number): [number, number] => {
+    let value = 0;
+    for (let shift = 0; ; shift += 7) {
+      const byte = module[at++];
+      value += (byte & 0x7f) * 2 ** shift;
+      if (byte < 0x80) return [value, at];
+    }
+  };
+  // Sections after the 8-byte header: the memory section's first limits.
+  for (let at = 8; at < module.length; ) {
+    const id = module[at];
+    const [size, body] = leb(at + 1);
+    if (id === 5) return (module[leb(body)[1]] & 0x04) !== 0;
+    at = body + size;
+  }
+  return false;
+}
+
+test('a value too large to convert is refused, naming it, and the session goes on', async () => {
+  const session = await load(
+    [
+      ['source', 'blob-source'],
+      ['sink', 'blob-sink'],
+    ],
+    [['c', 'source.blob', 'sink.blob']],
+  );
+  const size = 64 * 1024 * 1024;
+  session.graph.inject('source', 'size', size);
+  await session.settle();
+  if (memory64(wasm)) {
+    // A 64-bit memory affords it.
+    assert.match(session.graph.readOutputWave('source', 'blob')!, /^\[0, 1, 2, /);
+    return;
+  }
+  // As WAVE text it would not fit the scheduler's 32-bit memory.
+  assert.throws(
+    () => session.graph.readOutputWave('source', 'blob'),
+    /`source\.blob`: too large to convert/,
+  );
+  // A snapshot names the first such value it meets: the output, or the
+  // sink's latched input holding the same bytes.
+  assert.throws(() => session.graph.snapshot(), /`(source|sink)\.blob`: too large to convert/);
+  // Nothing trapped: the session is as it was.
+  assert.equal(session.broken, undefined);
+  assert.equal((session.graph.readOutput('source', 'blob') as Uint8Array).length, size);
+  assert.equal(session.graph.readOutputWave('sink', 'len'), String(size));
+  session.graph.inject('source', 'size', 3);
+  await session.settle();
+  assert.equal(session.graph.readOutputWave('source', 'blob'), '[0, 1, 2]');
+  assert.ok(session.graph.snapshot().length > 0);
+});
+
+test('a trap of the scheduler breaks the session, naming the call', async () => {
+  const state: { broken?: Error } = {};
+  const graph = watchTraps(
+    {
+      readOutputWave(node: string, port: string): string {
+        throw new WebAssembly.RuntimeError(`unreachable (${node}.${port})`);
+      },
+      readOutput: () => 3,
+      parse: () => {
+        throw new Error('not a trap');
+      },
+      tick: async () => {
+        throw new WebAssembly.RuntimeError('unreachable');
+      },
+    },
+    state,
+  );
+  // Other errors pass through, and leave the session as it is.
+  assert.throws(() => graph.parse(), /^Error: not a trap$/);
+  assert.equal(graph.readOutput(), 3);
+  assert.throws(
+    () => graph.readOutputWave('source', 'blob'),
+    /the scheduler stopped in `readOutputWave\("source", "blob"\)` \(unreachable \(source\.blob\)\): the session can no longer be used/,
+  );
+  // Every call after throws the same.
+  assert.equal(state.broken?.cause instanceof WebAssembly.RuntimeError, true);
+  assert.throws(
+    () => graph.readOutput(),
+    (e) => e === state.broken,
+  );
+
+  const other: { broken?: Error } = {};
+  await assert.rejects(
+    watchTraps(
+      {
+        tick: async () => {
+          throw new WebAssembly.RuntimeError('unreachable');
+        },
+      },
+      other,
+    ).tick(),
+    /stopped in `tick\(\)`/,
+  );
+  assert.ok(other.broken);
+});
+
+test('a trap of the scheduler during a tick fails the tick and breaks every session', async () => {
+  const session = await load(
+    [
+      ['prod', 'stream-producer'],
+      ['cons', 'stream-consumer'],
+    ],
+    [['s', 'prod.items', 'cons.items']],
+  );
+  const bystander = await load([['a', 'echo']]);
+  // Endless: the tick runs until something stops it.
+  const tick = session.tick();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const trap = (where: string) => {
+    const error = new WebAssembly.RuntimeError('unreachable');
+    error.stack = `RuntimeError: unreachable\n    at ${where}`;
+    // What the host reports for an exception nothing caught.
+    process.emit('uncaughtExceptionMonitor', error, 'uncaughtException');
+  };
+  // A guest's trap is its node's fault, not the scheduler's.
+  trap('relay_guest.wasm.run (wasm://wasm/relay_guest.wasm-1:1)');
+  assert.equal(session.broken, undefined);
+  trap('witgraph_web.wasm.alloc (wasm://wasm/witgraph_web.wasm-1:1)');
+  await assert.rejects(tick, /the scheduler stopped while running a tick \(unreachable\)/);
+  for (const s of [session, bystander]) {
+    assert.match(String(s.broken), /load the graph again/);
+    assert.throws(
+      () => s.graph.readOutput('cons', 'count'),
+      (e) => e === s.broken,
+    );
+  }
+  // Disposing a broken session leaves what the trap held alone.
+  session.dispose();
+  bystander.dispose();
+});
+
 test('a hook sees what a future resolves to, and its reader still gets it', async () => {
   const seen: FutureItem[] = [];
   const session = await load(
@@ -1264,4 +1469,134 @@ test('a node component is composed once per set of links', async () => {
 
 test('a link whose provider was not given fails the load by name', async () => {
   await assert.rejects(loadLinked(['n'], { providers: [] }), /test:math\/math@0\.1\.0/);
+});
+
+/**
+ * `test:data/tensor` in host memory, as every node imports it: one class,
+ * so a tensor one node makes is one another accepts. Counts how often each
+ * tensor is disposed.
+ */
+function cpuTensors() {
+  const disposed = new Map<object, number>();
+  const made: object[] = [];
+  class Tensor {
+    readonly #dtype: string;
+    readonly #shape: number[];
+    readonly #data: Uint8Array;
+    constructor(dtype: string, shape: ArrayLike<number>, data: Uint8Array) {
+      this.#dtype = dtype;
+      this.#shape = Array.from(shape);
+      this.#data = data;
+      made.push(this);
+    }
+    static async fromBytes(dtype: string, shape: ArrayLike<number>, data: Uint8Array) {
+      return new Tensor(dtype, shape, data.slice());
+    }
+    dtype() {
+      return this.#dtype;
+    }
+    shape() {
+      return this.#shape;
+    }
+    async read(offset: bigint, len: bigint) {
+      return this.#data.slice(Number(offset), Number(offset + len));
+    }
+    clone() {
+      // Its own object: jco disposes it when the guest drops it.
+      return new Tensor(this.#dtype, this.#shape, this.#data);
+    }
+    async invert() {
+      return new Tensor(
+        this.#dtype,
+        this.#shape,
+        this.#data.map((b) => 255 - b),
+      );
+    }
+    async conv3x3(): Promise<never> {
+      throw new Error('not on the CPU');
+    }
+    [Symbol.dispose]() {
+      disposed.set(this, (disposed.get(this) ?? 0) + 1);
+    }
+  }
+  const live = () => made.filter((t) => !disposed.has(t)).length;
+  return { imports: { Tensor }, disposed, made, live };
+}
+
+test('tensors pass between nodes as the objects their makers returned, disposed once unheld', async () => {
+  const tensors = cpuTensors();
+  const session = await load(
+    [
+      ['src', 'tensor-source'],
+      ['inv', 'tensor-invert'],
+      ['copy', 'tensor-copy-invert'],
+      ['direct', 'tensor-sink'],
+      ['inv-sink', 'tensor-sink'],
+      ['copy-sink', 'tensor-sink'],
+    ],
+    [
+      ['a', 'src.tensor', 'inv.tensor'],
+      ['b', 'src.tensor', 'copy.tensor'],
+      ['c', 'src.tensor', 'direct.tensor'],
+      ['d', 'inv.tensor', 'inv-sink.tensor'],
+      ['e', 'copy.tensor', 'copy-sink.tensor'],
+    ],
+    {
+      capabilities: (_, capability) =>
+        capability.interface === 'test:data/tensor@0.1.0' ? tensors.imports : undefined,
+    },
+  );
+  const [input] = session.contracts.get('inv')?.inputs ?? [];
+  assert.equal(input?.kind, 'handle');
+  assert.deepEqual(input?.handle, {
+    interface: 'test:data/tensor@0.1.0',
+    resource: 'tensor',
+  });
+  await session.settle();
+
+  const bytes = 64 * 48 * 3;
+  const sum = session.graph.readOutput('direct', 'sum') as bigint;
+  assert.equal(session.graph.readOutput('direct', 'len'), BigInt(bytes));
+  const inverted = 255n * BigInt(bytes) - sum;
+  assert.equal(session.graph.readOutput('inv-sink', 'sum'), inverted, 'inverted by the host');
+  assert.equal(session.graph.readOutput('copy-sink', 'sum'), inverted, 'inverted by the guest');
+  const source = session.graph.readOutput('src', 'tensor');
+  assert.ok(source instanceof tensors.imports.Tensor, 'the object its maker returned');
+  assert.throws(() => session.graph.readOutputWave('src', 'tensor'), /has no WAVE text/);
+  assert.throws(() => session.graph.inject('inv', 'tensor', source), /not a Value input port/);
+  assert.equal(tensors.live(), 3, 'the source tensor and the two inverted ones');
+
+  session.graph.inject('src', 'seed', 7);
+  await session.settle();
+  assert.notEqual(session.graph.readOutput('direct', 'sum'), sum);
+  assert.equal(tensors.live(), 3, 'the old ones are disposed');
+  assert.ok(
+    [...tensors.disposed.values()].every((times) => times === 1),
+    'each once, borrows by readers never',
+  );
+  session.dispose();
+  sessions.splice(sessions.indexOf(session), 1);
+  assert.equal(tensors.live(), 0, 'a disposed session holds none');
+});
+
+test('a node keeps its own reference to a tensor across runs', async () => {
+  const tensors = cpuTensors();
+  const session = await load(
+    [
+      ['src', 'tensor-source'],
+      ['keep', 'tensor-keep'],
+    ],
+    [['a', 'src.tensor', 'keep.tensor']],
+    {
+      capabilities: (_, capability) =>
+        capability.interface === 'test:data/tensor@0.1.0' ? tensors.imports : undefined,
+    },
+  );
+  await session.settle();
+  assert.equal(session.graph.readOutput('keep', 'previous'), 0n);
+  session.graph.inject('src', 'seed', 1);
+  await session.settle();
+  assert.ok((session.graph.readOutput('keep', 'previous') as bigint) > 0n);
+  // The latched second tensor, and `keep`'s clone of it.
+  assert.equal(tensors.live(), 2);
 });

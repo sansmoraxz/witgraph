@@ -32,6 +32,23 @@ pub fn semver_compatible(a: &str, b: &str) -> bool {
     track(&va) == track(&vb)
 }
 
+/// An interface id with its version cut to its compatibility track
+/// (`@1` for 1.x, `@0.2` for 0.2.x), as [`semver_compatible`] matches
+/// them: two ids are compatible iff their tracks are equal. An id without
+/// a version, or at a 0.0.x or pre-release version, is its own track.
+pub fn compat_track(id: &str) -> String {
+    let Some((base, version)) = split_version(id) else {
+        return id.to_string();
+    };
+    if (version.major == 0 && version.minor == 0) || !version.pre.is_empty() {
+        return id.to_string();
+    }
+    match track(&version) {
+        (0, minor) => format!("{base}@0.{minor}"),
+        (major, _) => format!("{base}@{major}"),
+    }
+}
+
 /// Whether an implementation of interface `provided` serves an import of
 /// `wanted`: the same id, or the same interface at a semver-compatible
 /// version no older than it.
@@ -86,6 +103,32 @@ mod tests {
             "without a version, an id matches only itself"
         );
         assert!(!semver_compatible("config", "other"));
+    }
+
+    #[test]
+    fn compatible_ids_share_a_track() {
+        assert_eq!(compat_track("a:b/c@0.1.3"), "a:b/c@0.1");
+        assert_eq!(compat_track("a:b/c@1.9.1"), "a:b/c@1");
+        assert_eq!(compat_track("a:b/c@0.0.2"), "a:b/c@0.0.2");
+        assert_eq!(compat_track("a:b/c@1.0.0-rc.1"), "a:b/c@1.0.0-rc.1");
+        assert_eq!(compat_track("config"), "config");
+        let ids = [
+            "a:b/c@0.1.0",
+            "a:b/c@0.1.3",
+            "a:b/c@0.2.0",
+            "a:b/c@0.0.1",
+            "a:b/c@1.2.0",
+            "a:b/c@1.9.1",
+        ];
+        for a in ids {
+            for b in ids {
+                assert_eq!(
+                    compat_track(a) == compat_track(b),
+                    semver_compatible(a, b),
+                    "{a} {b}"
+                );
+            }
+        }
     }
 
     #[test]

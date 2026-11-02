@@ -17,6 +17,7 @@ import {
   EditorController,
   type GraphJson,
   registerAll,
+  registerViewer,
   type WitgraphCanvas,
   type WitgraphCatalog,
   type WitgraphControls,
@@ -27,8 +28,13 @@ import type { Capability, ComponentSource } from 'witgraph-loader';
 import { type Cnn, cpu } from './accel/cnn.ts';
 import { webgpu } from './accel/webgpu.ts';
 import { webnn } from './accel/webnn.ts';
+import { type Backend, cpu as cpuTensors, tensors } from './data/tensors.ts';
+import { tensorViewer } from './data/viewer.ts';
+import { webgpu as webgpuTensors } from './data/webgpu.ts';
+import { webnn as webnnTensors } from './data/webnn.ts';
 
 registerAll();
+registerViewer(tensorViewer);
 
 const controller = new EditorController();
 
@@ -133,6 +139,10 @@ const GUESTS = [
   'frame-invert',
   'video-sink',
   'edge-detect',
+  'tensor-source',
+  'tensor-edge',
+  'tensor-invert',
+  'tensor-sink',
 ];
 
 const allComponents = GUESTS.map((guest) => ({
@@ -338,14 +348,59 @@ function edgeGraph(accelerator: string): GraphJson {
   };
 }
 
+const tensorRef = (name: string) => ({
+  package: { namespace: 'test', name, version: '0.1.0' },
+  world: name,
+});
+
 /**
- * A graph the demo can load, the node to select, and what runs
- * `test:accel/cnn` for it (the CPU unless it says otherwise).
+ * Tensors that stay where `where` keeps them: an image made once, its
+ * edges found and inverted there, and the result summed. Nodes pass only
+ * handles; previews and the sink read the data back.
+ */
+function tensorGraph(where: string): GraphJson {
+  return {
+    metadata: {
+      name: `demo-tensors-${where.toLowerCase()}`,
+      description: `Tensors on ${where}: nodes pass handles, operations run where the data lives.`,
+    },
+    components: allComponents,
+    nodes: [
+      { id: 'image', component: tensorRef('tensor-source'), label: 'Image' },
+      { id: 'edges', component: tensorRef('tensor-edge'), label: `Edges (${where})` },
+      { id: 'invert', component: tensorRef('tensor-invert'), label: 'Invert' },
+      { id: 'sum', component: tensorRef('tensor-sink'), label: 'Sum' },
+    ],
+    connections: [
+      {
+        id: 'image-edges',
+        from: { node: 'image', port: 'tensor' },
+        to: { node: 'edges', port: 'tensor' },
+      },
+      {
+        id: 'edges-invert',
+        from: { node: 'edges', port: 'edges' },
+        to: { node: 'invert', port: 'tensor' },
+      },
+      {
+        id: 'invert-sum',
+        from: { node: 'invert', port: 'tensor' },
+        to: { node: 'sum', port: 'tensor' },
+      },
+    ],
+  };
+}
+
+/**
+ * A graph the demo can load, the node to select, what runs
+ * `test:accel/cnn` for it (the CPU unless it says otherwise), and where
+ * `test:data/tensor` keeps its tensors (the CPU unless it says otherwise).
  */
 interface Demo {
   graph: GraphJson;
   select: string;
   accelerator?: () => Promise<Cnn>;
+  tensors?: () => Promise<Backend>;
 }
 
 const demos: Record<string, Demo> = {
@@ -359,6 +414,9 @@ const demos: Record<string, Demo> = {
   },
   webgpu: { graph: edgeGraph('WebGPU'), select: 'edges', accelerator: webgpu },
   webnn: { graph: edgeGraph('WebNN'), select: 'edges', accelerator: webnn },
+  tensors: { graph: tensorGraph('CPU'), select: 'edges' },
+  'tensors-webgpu': { graph: tensorGraph('WebGPU'), select: 'edges', tensors: webgpuTensors },
+  'tensors-webnn': { graph: tensorGraph('WebNN'), select: 'edges', tensors: webnnTensors },
 };
 
 // -- External capabilities (JS implementations for host-provided imports) -----
@@ -407,6 +465,12 @@ const clock = {
 /** What runs `test:accel/cnn`: chosen by the demo loaded. */
 let cnn: Cnn = cpu();
 
+/**
+ * `test:data/tensor`, over the backend the demo loaded chose: one import
+ * object for every node, so a tensor one node makes is one another takes.
+ */
+let tensorImport = tensors(cpuTensors());
+
 /** Per-node capability instances (fresh state per instantiation). */
 const capInstances = new Map<string, Record<string, object>>();
 
@@ -414,6 +478,7 @@ function capabilities(node: string, capability: Capability): object | undefined 
   const iface = capability.implements ?? capability.interface;
   if (iface.startsWith('test:video/clock')) return clock;
   if (iface.startsWith('test:accel/cnn')) return cnn;
+  if (iface.startsWith('test:data/tensor')) return tensorImport;
   if (iface.startsWith('test:math/ops')) {
     let instances = capInstances.get(node);
     if (!instances) {
@@ -470,6 +535,7 @@ async function loadDemo(): Promise<void> {
 
   try {
     if (demo.accelerator) cnn = await demo.accelerator();
+    if (demo.tensors) tensorImport = tensors(await demo.tensors());
     const components: ComponentSource[] = await Promise.all(
       GUESTS.map(async (guest) => ({
         id: `test:${guest}/${guest}@0.1.0`,

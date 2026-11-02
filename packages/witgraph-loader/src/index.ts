@@ -20,9 +20,15 @@ import initModule, {
 /** A port of a component, as the editor catalog describes one. */
 export interface Port {
   name: string;
-  kind: 'value' | 'stream' | 'future';
+  kind: 'value' | 'stream' | 'future' | 'handle';
   /** WIT-syntax rendering of the payload type, for display. */
   type_display: string;
+  /**
+   * Handle ports only: the resource the port carries, which a capability
+   * provides. An input borrows it for its `run`, an output hands it to the
+   * host, which disposes it (`[Symbol.dispose]()`) once nothing holds it.
+   */
+  handle?: { interface: string; resource: string };
   optional: boolean;
   docs?: string;
   /**
@@ -221,6 +227,17 @@ interface Transpiled {
   imports: string[];
 }
 
+/** Disposes a handle port's object, if it can be. */
+function dispose(object: unknown): void {
+  const free = (object as { [Symbol.dispose]?: () => void } | undefined)?.[Symbol.dispose];
+  if (typeof free !== 'function') return;
+  try {
+    free.call(object);
+  } catch (error) {
+    console.error('disposing a handle threw:', error);
+  }
+}
+
 /** A node's component, and what each of its imports is (`null`: the built-in host). */
 interface NodeComponent {
   transpiled: Transpiled;
@@ -309,13 +326,22 @@ export class Session {
   /** Per node, the stream outputs of its runs still open. */
   #streams = new Map<string, Set<Tap>>();
   #disposed = false;
+  /** Set once the scheduler's module trapped: see {@link broken}. */
+  #trapped: { broken?: Error } = {};
+  /** What fails each tick still running, should the scheduler trap. */
+  #ticking = new Set<(error: Error) => void>();
+  /** Every session not yet disposed: a trap breaks them all. */
+  static #live = new Set<Session>();
+  static #watching = false;
 
   private constructor(
     graph: WebGraph,
     options: SessionOptions,
     components: Map<string, NodeComponent>,
   ) {
-    this.graph = graph;
+    this.graph = watchTraps(graph, this.#trapped);
+    Session.#live.add(this);
+    Session.#watchUncaught();
     this.#options = options;
     this.#components = components;
     // The contracts the graph was loaded with: lowered once, by `WebGraph.load`.
@@ -393,9 +419,22 @@ export class Session {
   dispose(): void {
     if (this.#disposed) return;
     this.#disposed = true;
+    Session.#live.delete(this);
     for (const node of [...this.#streams.keys()]) this.#close(node);
     this.#instances.clear();
-    this.graph.free();
+    // A graph the scheduler trapped in is still held by the call that
+    // trapped: freeing it throws. Its memory stays with the module.
+    if (!this.#trapped.broken) this.graph.free();
+  }
+
+  /**
+   * Why the session can no longer be used, once the scheduler's
+   * WebAssembly module has trapped (run out of memory, say): an error
+   * naming the call it trapped in. Every call to {@link graph} throws it
+   * from then on. Load the graph again in a new session.
+   */
+  get broken(): Error | undefined {
+    return this.#trapped.broken;
   }
 
   /**
@@ -404,7 +443,53 @@ export class Session {
    */
   tick(stop?: Promise<unknown>): Promise<TickResult> {
     if (this.#disposed) return Promise.reject(new Error('the session is disposed'));
-    return this.graph.tick(stop) as Promise<TickResult>;
+    return new Promise<TickResult>((resolve, reject) => {
+      // Should the scheduler trap while the tick runs, the tick's own
+      // promise never settles: this rejects it instead.
+      this.#ticking.add(reject);
+      (this.graph.tick(stop) as Promise<TickResult>)
+        .then(resolve, reject)
+        .finally(() => this.#ticking.delete(reject));
+    });
+  }
+
+  /** Breaks the session (see {@link broken}) and fails its ticks still running. */
+  #break(error: Error): void {
+    this.#trapped.broken ??= error;
+    for (const fail of this.#ticking) fail(this.#trapped.broken);
+    this.#ticking.clear();
+  }
+
+  /**
+   * Watches for a trap of the scheduler's module that no call sees: one in
+   * the work of a tick, which the module runs from microtasks, so it is
+   * thrown into the host (the browser's `error` event; Node's
+   * `uncaughtExceptionMonitor`, which leaves Node's own handling as it is)
+   * and the tick never settles. Every live session shares the module, so
+   * every one is broken. A guest's trap is not the scheduler's: it is the
+   * fault of its node.
+   */
+  static #watchUncaught(): void {
+    if (Session.#watching) return;
+    Session.#watching = true;
+    const seen = (error: unknown) => {
+      if (!(error instanceof WebAssembly.RuntimeError)) return;
+      if (!/witgraph_web/.test(error.stack ?? '')) return;
+      const broken = new Error(
+        `the scheduler stopped while running a tick (${error.message}): ` +
+          'the session can no longer be used; load the graph again',
+        { cause: error },
+      );
+      for (const session of Session.#live) session.#break(broken);
+    };
+    const host = globalThis as {
+      addEventListener?: (type: 'error', listener: (event: { error?: unknown }) => void) => void;
+      process?: {
+        on?: (event: 'uncaughtExceptionMonitor', listener: (error: unknown) => void) => void;
+      };
+    };
+    host.addEventListener?.('error', (event) => seen(event.error));
+    host.process?.on?.('uncaughtExceptionMonitor', seen);
   }
 
   /** Ticks until the graph is idle, at most `limit` times; returns the ticks run. */
@@ -488,6 +573,8 @@ export class Session {
       // stop now, rather than run on for nobody.
       for (const port of this.contracts.get(node)?.outputs ?? []) {
         if (port.kind === 'stream') closeUnread(outputs[camelCase(port.name)]);
+        // Nothing will hold it, so nothing else would dispose it.
+        if (port.kind === 'handle') dispose(outputs[camelCase(port.name)]);
       }
       return outputs;
     }
@@ -552,6 +639,53 @@ function closeUnread(value: any): void {
       () => {},
     );
   }
+}
+
+/**
+ * `graph`, every method call of which is watched for a trap of the
+ * scheduler's WebAssembly module (`WebAssembly.RuntimeError`: out of
+ * memory, say). A trap stops the scheduler mid-call, skipping the code
+ * that would let go of what the call held, the graph among it: every later
+ * call would fail on that. So the first trap is recorded in `state` as an
+ * error naming the call, and it is thrown for the trap and for every call
+ * after. Other errors pass through as they are.
+ */
+export function watchTraps<T extends object>(graph: T, state: { broken?: Error }): T {
+  const show = (arg: unknown) =>
+    typeof arg === 'string'
+      ? JSON.stringify(arg)
+      : typeof arg === 'number'
+        ? String(arg)
+        : typeof arg;
+  return new Proxy(graph, {
+    get(target, key) {
+      const member: unknown = Reflect.get(target, key, target);
+      if (typeof member !== 'function') return member;
+      return (...args: unknown[]) => {
+        if (state.broken) throw state.broken;
+        const seen = (error: unknown) => {
+          if (!(error instanceof WebAssembly.RuntimeError)) return error;
+          state.broken = new Error(
+            `the scheduler stopped in \`${String(key)}(${args.map(show).join(', ')})\` ` +
+              `(${error.message}): the session can no longer be used; load the graph again`,
+            { cause: error },
+          );
+          return state.broken;
+        };
+        try {
+          const result: unknown = member.apply(target, args);
+          if (result instanceof Promise) {
+            return result.catch((error: unknown) => {
+              throw seen(error);
+            });
+          }
+          return result;
+        } catch (error) {
+          throw seen(error);
+        }
+      };
+    },
+  });
 }
 
 /** A component's `node` export: inline, or a named `…/node` interface. */
@@ -670,9 +804,40 @@ async function transpileComponent(id: string, bytes: Uint8Array): Promise<Transp
     else if (name.endsWith('.js')) source = new TextDecoder().decode(contents);
   }
   if (source === undefined) throw new Error(`\`${id}\` transpiled to no JavaScript`);
+  source = fastListLift(source);
   const url = `data:text/javascript;base64,${base64(new TextEncoder().encode(source))}`;
   const { instantiate } = await import(/* @vite-ignore */ url);
   return { instantiate, modules, imports };
+}
+
+/**
+ * The loop with which jco lifts every element of a list a guest returns,
+ * one call (and one `DataView`) per element: a `list<u8>` of a few
+ * megabytes takes seconds. A list of numbers is its elements' bytes as
+ * they are in linear memory, so it is lifted here in one copy instead, with
+ * the same effect on jco's lifting context; anything else (a list too long
+ * for the storage left, which jco reports) goes through jco's loop.
+ */
+const LIST_LOOP = `        ctx.storagePtr = dataPtr;
+        const val = [];
+        for (var i = 0; i < len; i++) {`;
+const LIST_COPY = `        if (
+          typedArray !== undefined &&
+          elemSize32 === typedArray.BYTES_PER_ELEMENT &&
+          (ctx.storageLen === undefined || ctx.storageLen >= len * elemSize32)
+        ) {
+          const end = dataPtr + len * elemSize32;
+          const copied = new typedArray(ctx.memory.buffer.slice(dataPtr, end));
+          ctx.storagePtr = originalPtr !== null ? originalPtr : end;
+          if (originalLen !== null) ctx.storageLen = originalLen;
+          else if (ctx.storageLen !== undefined) ctx.storageLen -= len * elemSize32;
+          return [copied, ctx];
+        }
+`;
+
+/** `source`, jco's output, with {@link LIST_COPY} ahead of its list loop, if it has one. */
+export function fastListLift(source: string): string {
+  return source.includes(LIST_LOOP) ? source.replace(LIST_LOOP, LIST_COPY + LIST_LOOP) : source;
 }
 
 function base64(bytes: Uint8Array): string {

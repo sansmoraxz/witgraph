@@ -51,5 +51,5 @@ pub use schedule::{FaultReport, TickResult};
 pub use scheduler::{
     DEFAULT_MAX_STEPS_PER_TICK, Scheduler, check_max_steps_per_tick, check_resources,
 };
-pub use snapshot::{IslandSnapshot, PortValues, Snapshot};
+pub use snapshot::{IslandSnapshot, PortValues, Snapshot, SnapshotError};
 pub use witgraph_ir;

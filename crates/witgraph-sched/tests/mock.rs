@@ -114,8 +114,8 @@ impl Executor for Closures {
         text.parse().map_err(|e| format!("{e}"))
     }
 
-    fn to_wave(&self, value: &u32) -> String {
-        value.to_string()
+    fn to_wave(&self, value: &u32) -> Result<String, String> {
+        Ok(value.to_string())
     }
 }
 
@@ -264,7 +264,7 @@ fn a_snapshot_restores_onto_a_fresh_scheduler() {
     for _ in 0..3 {
         let _ = block_on(sched.tick());
     }
-    let snapshot = sched.snapshot();
+    let snapshot = sched.snapshot().unwrap();
     assert_eq!(snapshot.outputs[&NodeId::from("n")][&"out".into()], "3");
 
     let Loaded {
