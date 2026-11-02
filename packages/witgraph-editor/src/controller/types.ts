@@ -119,7 +119,8 @@ export interface OutputView {
   kind: PortVisual['kind'];
   /**
    * A Value output's current value, the last item of a stream, or what a
-   * future resolved to; `undefined` before there is one.
+   * future resolved to; `undefined` before there is one. For a stream or
+   * future of handles, what the viewer kept of it ({@link PortViewer.keep}).
    */
   latest: unknown;
   /**

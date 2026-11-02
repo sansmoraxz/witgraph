@@ -1,0 +1,20 @@
+package test:tensor-future-sink@0.1.0;
+
+/// `first` is the first byte of the future's tensor. Told to `ignore` it, the
+/// node drops the future unread, and `first` is 1000.
+world tensor-future-sink {
+    import test:data/tensor@0.1.0;
+    import witgraph:runtime/host@0.1.0;
+
+    export node: interface {
+        use test:data/tensor@0.1.0.{tensor};
+        record inputs {
+            tensor: future<tensor>,
+            ignore: option<bool>,
+        }
+        record outputs {
+            first: u32,
+        }
+        run: async func(inputs: inputs) -> outputs;
+    }
+}

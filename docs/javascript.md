@@ -64,6 +64,14 @@ the TypeScript and let `init` fetch the module from beside the script.
 - **Warnings.** `session.warnings` lists what was wrong with the components
   but did not stop the load (a viewer hint naming an output the component
   does not have, say); each is also written to the console.
+- **Streams and futures of handles.** A `stream<own<R>>` or `future<own<R>>`
+  port has a `handle` too. `onStreamItem` and `onFutureValue` are given the
+  object itself, which is its reader's, and may be disposed as soon as the
+  reader is done: to keep it, take your own reference, through the resource's
+  API, before returning. The loader disposes what no reader takes.
+  In Chromium such a stream costs about 14 ms a frame through jco, whatever the
+  frame's size and however many nodes it passes (measured up to 10), so expect
+  at most about 70 frames a second, less whatever the work itself takes.
 - **Futures.** `onFutureValue` sees what each future output resolves to. With
   it, a future is read as soon as its node's run returns (its reader still
   gets the value).

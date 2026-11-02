@@ -193,3 +193,40 @@ pub const TENSOR_KEEP: Guest = guest!("TENSOR_KEEP_WASM", "tensor-keep");
 /// (`conv3x3`). Calls `fatal` with the host's reason when it cannot. Previews
 /// `edges` as `tensor`.
 pub const TENSOR_EDGE: Guest = guest!("TENSOR_EDGE_WASM", "tensor-edge");
+
+/// `data: future<u32>`, dropped unread → `done: bool`.
+pub const FUTURE_DROPPER: Guest = guest!("FUTURE_DROPPER_WASM", "future-dropper");
+
+/// Imports `test:data/tensor` and `witgraph:runtime/host`. `frames`, `width`,
+/// `height`: `option<u32>`, `reuse`: `option<bool>` → `tensors: stream<tensor>`,
+/// `frames` tensors (forever when absent), 16 x 16 when not given. With `reuse`,
+/// it makes one and hands out references to it, as from a camera the host owns.
+/// Previews `tensors` as `tensor`.
+pub const TENSOR_STREAM_SOURCE: Guest = guest!("TENSOR_STREAM_SOURCE_WASM", "tensor-stream-source");
+
+/// Imports `test:data/tensor`. `tensors: stream<tensor>` → `tensors:
+/// stream<tensor>`, each inverted by the host. Previews `tensors` as `tensor`.
+pub const TENSOR_STREAM_INVERT: Guest = guest!("TENSOR_STREAM_INVERT_WASM", "tensor-stream-invert");
+
+/// Imports `test:data/tensor` and `witgraph:runtime/host`. `tensors:
+/// stream<tensor>` → `tensors: stream<tensor>`, the edges of each, found by the
+/// host. Previews `tensors` as `tensor`.
+pub const TENSOR_STREAM_EDGE: Guest = guest!("TENSOR_STREAM_EDGE_WASM", "tensor-stream-edge");
+
+/// Imports `test:camera/camera`, `test:data/tensor` and `witgraph:runtime/host`.
+/// `frames`: `option<u32>` → `tensors: stream<tensor>`, the host's camera, whose
+/// pixels never enter the node. Previews `tensors` as `tensor`.
+pub const CAMERA_SOURCE: Guest = guest!("CAMERA_SOURCE_WASM", "camera-source");
+
+/// Imports `test:data/tensor`. `tensors: stream<tensor>`, `take`: `option<u32>`,
+/// `read-last`: `option<bool>` → `count: u32`, `sum: u64`: reads `take` tensors
+/// (all when absent), summing each one's first byte, or only the last's.
+pub const TENSOR_STREAM_SINK: Guest = guest!("TENSOR_STREAM_SINK_WASM", "tensor-stream-sink");
+
+/// Imports `test:data/tensor` and `witgraph:runtime/host`. `seed`:
+/// `option<u32>` → `tensor: future<tensor>`, filled with `seed`.
+pub const TENSOR_FUTURE_SOURCE: Guest = guest!("TENSOR_FUTURE_SOURCE_WASM", "tensor-future-source");
+
+/// Imports `test:data/tensor`. `tensor: future<tensor>`, `ignore`: `option<bool>`
+/// → `first: u32`, its first byte, or 1000 when told to drop the future unread.
+pub const TENSOR_FUTURE_SINK: Guest = guest!("TENSOR_FUTURE_SINK_WASM", "tensor-future-sink");

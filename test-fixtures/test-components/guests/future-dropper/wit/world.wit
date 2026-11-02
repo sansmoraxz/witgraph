@@ -1,0 +1,14 @@
+package test:future-dropper@0.1.0;
+
+/// Drops a future of plain data unread.
+world future-dropper {
+    export node: interface {
+        record inputs {
+            data: future<u32>,
+        }
+        record outputs {
+            done: bool,
+        }
+        run: async func(inputs: inputs) -> outputs;
+    }
+}

@@ -11,6 +11,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import type { Capability, ComponentSource } from 'witgraph-loader';
 import { EditorController } from '../src/controller/editor-controller.ts';
 import type { EditorLoadOptions, GraphJson } from '../src/controller/types.ts';
+import { registerViewer } from '../src/viewers/registry.ts';
 
 // ---------------------------------------------------------------------------
 // Helpers (same pattern as witgraph-loader/test/session.test.ts)
@@ -55,6 +56,12 @@ const ids: Record<string, string> = {
   'stream-consumer': 'test:stream-consumer/stream-consumer@0.1.0',
   'future-writer': 'test:future-writer/future-writer@0.1.0',
   'future-reader': 'test:future-reader/future-reader@0.1.0',
+  'tensor-source': 'test:tensor-source/tensor-source@0.1.0',
+  'tensor-stream-source': 'test:tensor-stream-source/tensor-stream-source@0.1.0',
+  'tensor-stream-invert': 'test:tensor-stream-invert/tensor-stream-invert@0.1.0',
+  'tensor-stream-sink': 'test:tensor-stream-sink/tensor-stream-sink@0.1.0',
+  'tensor-future-source': 'test:tensor-future-source/tensor-future-source@0.1.0',
+  'tensor-future-sink': 'test:tensor-future-sink/tensor-future-sink@0.1.0',
 };
 
 function componentRef(id: string) {
@@ -493,4 +500,175 @@ test('only what is previewed or selected is recorded', async () => {
   assert.equal(controller.isObserved('n', 'out'), true);
   await controller.step();
   assert.equal(controller.observe('n', 'out').count, 1);
+});
+
+/** `test:data/tensor` in host memory, counting what is left undisposed. */
+function cpuTensors() {
+  const live = new Set<object>();
+  class Tensor {
+    readonly label: string;
+    constructor(label = 'made') {
+      this.label = label;
+      live.add(this);
+    }
+    static async fromBytes() {
+      return new Tensor();
+    }
+    dtype() {
+      return 'uint8';
+    }
+    shape() {
+      return [1];
+    }
+    async read() {
+      return new Uint8Array(1);
+    }
+    clone() {
+      return new Tensor('kept');
+    }
+    async invert() {
+      return new Tensor();
+    }
+    [Symbol.dispose]() {
+      live.delete(this);
+    }
+  }
+  return {
+    live,
+    capabilities: (_: string, capability: Capability) =>
+      capability.interface === 'test:data/tensor@0.1.0' ? { Tensor } : undefined,
+  };
+}
+
+const streamOfTensors: [[string, string][], Connection[]] = [
+  [
+    ['src', 'tensor-stream-source'],
+    ['inv', 'tensor-stream-invert'],
+    ['sink', 'tensor-stream-sink'],
+  ],
+  [
+    ['a', 'src.tensors', 'inv.tensors'],
+    ['b', 'inv.tensors', 'sink.tensors'],
+  ],
+];
+
+const settled = async (controller: EditorController) => {
+  for (let i = 0; i < 20; i++) await controller.step();
+};
+
+test('a stream of handles connects only to a stream of that resource', async () => {
+  const tensors = cpuTensors();
+  const controller = await loadController(
+    [
+      ['src', 'tensor-stream-source'],
+      ['inv', 'tensor-stream-invert'],
+      ['one', 'tensor-source'],
+      ['fut', 'tensor-future-source'],
+      ['nums', 'stream-producer'],
+      ['sink', 'tensor-stream-sink'],
+      ['take', 'stream-consumer'],
+    ],
+    [
+      ['a', 'src.tensors', 'inv.tensors'],
+      ['b', 'inv.tensors', 'sink.tensors'],
+      ['c', 'nums.items', 'take.items'],
+    ],
+    { capabilities: tensors.capabilities },
+  );
+  const port = controller.nodes.get('src')?.outputs.find((p) => p.name === 'tensors');
+  assert.equal(port?.kind, 'stream');
+  assert.equal(port?.typeDisplay, 'tensor');
+  assert.equal(controller.canConnect('src', 'tensors', 'sink', 'tensors').ok, true);
+  assert.match(
+    controller.canConnect('one', 'tensor', 'sink', 'tensors').reason ?? '',
+    /kind mismatch/,
+    'a handle port is not a stream',
+  );
+  assert.match(
+    controller.canConnect('fut', 'tensor', 'sink', 'tensors').reason ?? '',
+    /kind mismatch/,
+    'nor is a future',
+  );
+  assert.match(
+    controller.canConnect('nums', 'items', 'sink', 'tensors').reason ?? '',
+    /resource mismatch/,
+    'a stream of numbers is not a stream of tensors',
+  );
+  assert.equal(controller.canConnect('src', 'tensors', 'take', 'items').ok, false);
+  assert.deepEqual(
+    controller.compatibleOutputsForInput('sink', 'tensors').map((o) => o.node),
+    ['src', 'inv'],
+  );
+  assert.equal(controller.canBeFeedback('src', 'tensors'), false);
+});
+
+test('a preview keeps a reference to a stream of handles, one at a time', async () => {
+  const tensors = cpuTensors();
+  const kept: unknown[] = [];
+  registerViewer({
+    id: 'tensor',
+    mount: () => ({ update() {}, dispose() {} }),
+    keep(item) {
+      const reference = (item as { clone(): unknown }).clone();
+      kept.push(reference);
+      return reference;
+    },
+  });
+  const controller = await loadController(...streamOfTensors, {
+    capabilities: tensors.capabilities,
+  });
+  controller.injectValue('src', 'frames', '4');
+  await settled(controller);
+  const view = controller.observe('src', 'tensors');
+  assert.equal(view.count, 4);
+  assert.equal(kept.length >= 4, true, 'each node previewing its stream keeps its own');
+  assert.ok(kept.includes(view.latest));
+  assert.equal((view.latest as { label: string }).label, 'kept');
+  assert.deepEqual(view.recent, [view.latest], 'no history holding on to them');
+  // Only the previews' latest references are left, not what the nodes passed.
+  assert.equal(tensors.live.size, 2, 'the latest of `src` and of `inv`');
+  assert.ok(tensors.live.has(view.latest as object));
+
+  controller.dispose();
+  controllers.splice(controllers.indexOf(controller), 1);
+  assert.equal(tensors.live.size, 0, 'what was kept goes with the graph');
+});
+
+test('without a way to keep them, a preview describes a stream of handles', async () => {
+  const tensors = cpuTensors();
+  registerViewer({ id: 'tensor', mount: () => ({ update() {}, dispose() {} }) });
+  const controller = await loadController(...streamOfTensors, {
+    capabilities: tensors.capabilities,
+  });
+  controller.injectValue('src', 'frames', '2');
+  await settled(controller);
+  const view = controller.observe('src', 'tensors');
+  assert.equal(view.count, 2);
+  assert.equal(view.latest, '<tensor>');
+  assert.equal(tensors.live.size, 0, 'it holds on to none');
+});
+
+test('a future of a handle is kept and released like a stream item', async () => {
+  const tensors = cpuTensors();
+  registerViewer({
+    id: 'tensor',
+    mount: () => ({ update() {}, dispose() {} }),
+    keep: (item) => (item as { clone(): unknown }).clone(),
+  });
+  const controller = await loadController(
+    [
+      ['src', 'tensor-future-source'],
+      ['sink', 'tensor-future-sink'],
+    ],
+    [['a', 'src.tensor', 'sink.tensor']],
+    { capabilities: tensors.capabilities },
+  );
+  controller.setPreview('src', 'tensor');
+  controller.select('src');
+  await settled(controller);
+  const view = controller.observe('src', 'tensor');
+  assert.equal(view.count, 1);
+  assert.equal(view.pending, false);
+  assert.equal(typeof view.latest, 'string', 'its component names no viewer: described');
+  assert.equal(tensors.live.size, 0);
 });

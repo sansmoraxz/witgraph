@@ -28,6 +28,7 @@ import type { Capability, ComponentSource } from 'witgraph-loader';
 import { type Cnn, cpu } from './accel/cnn.ts';
 import { webgpu } from './accel/webgpu.ts';
 import { webnn } from './accel/webnn.ts';
+import { camera } from './data/camera.ts';
 import { type Backend, cpu as cpuTensors, tensors } from './data/tensors.ts';
 import { tensorViewer } from './data/viewer.ts';
 import { webgpu as webgpuTensors } from './data/webgpu.ts';
@@ -143,6 +144,10 @@ const GUESTS = [
   'tensor-edge',
   'tensor-invert',
   'tensor-sink',
+  'tensor-stream-invert',
+  'tensor-stream-edge',
+  'tensor-stream-sink',
+  'camera-source',
 ];
 
 const allComponents = GUESTS.map((guest) => ({
@@ -392,6 +397,49 @@ function tensorGraph(where: string): GraphJson {
 }
 
 /**
+ * The page's camera through edge detection and inversion, on `where`: a
+ * stream of tensors. Nodes pass only handles, and a preview samples what it
+ * can read back. The sink reads nothing, so nothing else leaves the device.
+ */
+function cameraGraph(where: string): GraphJson {
+  return {
+    metadata: {
+      name: `demo-camera-${where.toLowerCase()}`,
+      description: `The camera on ${where}: a stream of handles, operations run where the frames live.`,
+    },
+    components: allComponents,
+    nodes: [
+      { id: 'camera', component: tensorRef('camera-source'), label: 'Camera' },
+      { id: 'edges', component: tensorRef('tensor-stream-edge'), label: `Edges (${where})` },
+      { id: 'invert', component: tensorRef('tensor-stream-invert'), label: 'Invert' },
+      {
+        id: 'sink',
+        component: tensorRef('tensor-stream-sink'),
+        label: 'Sink',
+        attrs: { 'inject.read-last': 'true' },
+      },
+    ],
+    connections: [
+      {
+        id: 'camera-edges',
+        from: { node: 'camera', port: 'tensors' },
+        to: { node: 'edges', port: 'tensors' },
+      },
+      {
+        id: 'edges-invert',
+        from: { node: 'edges', port: 'tensors' },
+        to: { node: 'invert', port: 'tensors' },
+      },
+      {
+        id: 'invert-sink',
+        from: { node: 'invert', port: 'tensors' },
+        to: { node: 'sink', port: 'tensors' },
+      },
+    ],
+  };
+}
+
+/**
  * A graph the demo can load, the node to select, what runs
  * `test:accel/cnn` for it (the CPU unless it says otherwise), and where
  * `test:data/tensor` keeps its tensors (the CPU unless it says otherwise).
@@ -417,6 +465,9 @@ const demos: Record<string, Demo> = {
   tensors: { graph: tensorGraph('CPU'), select: 'edges' },
   'tensors-webgpu': { graph: tensorGraph('WebGPU'), select: 'edges', tensors: webgpuTensors },
   'tensors-webnn': { graph: tensorGraph('WebNN'), select: 'edges', tensors: webnnTensors },
+  camera: { graph: cameraGraph('CPU'), select: 'edges' },
+  'camera-webgpu': { graph: cameraGraph('WebGPU'), select: 'edges', tensors: webgpuTensors },
+  'camera-webnn': { graph: cameraGraph('WebNN'), select: 'edges', tensors: webnnTensors },
 };
 
 // -- External capabilities (JS implementations for host-provided imports) -----
@@ -469,7 +520,11 @@ let cnn: Cnn = cpu();
  * `test:data/tensor`, over the backend the demo loaded chose: one import
  * object for every node, so a tensor one node makes is one another takes.
  */
-let tensorImport = tensors(cpuTensors());
+let tensorBackend = cpuTensors();
+let tensorImport = tensors(tensorBackend);
+
+/** `test:camera/camera`, its frames among those tensors. */
+let cameraImport = camera(tensorBackend, tensorImport.Tensor);
 
 /** Per-node capability instances (fresh state per instantiation). */
 const capInstances = new Map<string, Record<string, object>>();
@@ -479,6 +534,7 @@ function capabilities(node: string, capability: Capability): object | undefined 
   if (iface.startsWith('test:video/clock')) return clock;
   if (iface.startsWith('test:accel/cnn')) return cnn;
   if (iface.startsWith('test:data/tensor')) return tensorImport;
+  if (iface.startsWith('test:camera/camera')) return cameraImport;
   if (iface.startsWith('test:math/ops')) {
     let instances = capInstances.get(node);
     if (!instances) {
@@ -535,7 +591,11 @@ async function loadDemo(): Promise<void> {
 
   try {
     if (demo.accelerator) cnn = await demo.accelerator();
-    if (demo.tensors) tensorImport = tensors(await demo.tensors());
+    if (demo.tensors) {
+      tensorBackend = await demo.tensors();
+      tensorImport = tensors(tensorBackend);
+      cameraImport = camera(tensorBackend, tensorImport.Tensor);
+    }
     const components: ComponentSource[] = await Promise.all(
       GUESTS.map(async (guest) => ({
         id: `test:${guest}/${guest}@0.1.0`,

@@ -142,6 +142,11 @@ lets go: its `Drop` frees what it holds. `RuntimeConfig::max_shared_memory`
 (4 GiB by default) bounds the bytes plugins report for all of a graph's
 objects; making one past it faults the node making it.
 
+`max_shared_memory` also counts what a stream of handles has in flight.
+Backpressure holds a fast writer back, so an endless stream stays within a
+small limit, but going over still faults the island: it doesn't wait. Allow a
+few objects per node in the stream.
+
 ## Ticks
 
 Nothing runs between ticks. A tick runs every node that has new input until

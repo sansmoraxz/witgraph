@@ -1,0 +1,9 @@
+package witgraph:runtime@0.1.0;
+
+/// Services every witgraph host provides. Importing this interface is not a
+/// capability requirement.
+interface host {
+    /// Signals a graph-fatal condition: the calling node's island faults and
+    /// the current tick is aborted. Does not return.
+    fatal: func(message: string);
+}

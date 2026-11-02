@@ -1,0 +1,19 @@
+package test:tensor-future-source@0.1.0;
+
+/// A future of a `[16, 16, 3]` `uint8` tensor filled with `seed`, written after
+/// `run` returns. Calls `fatal` with the host's reason when it cannot make one.
+world tensor-future-source {
+    import test:data/tensor@0.1.0;
+    import witgraph:runtime/host@0.1.0;
+
+    export node: interface {
+        use test:data/tensor@0.1.0.{tensor};
+        record inputs {
+            seed: option<u32>,
+        }
+        record outputs {
+            tensor: future<tensor>,
+        }
+        run: async func(inputs: inputs) -> outputs;
+    }
+}

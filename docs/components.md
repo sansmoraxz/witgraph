@@ -79,6 +79,29 @@ snapshots leave handles out (see [Snapshots](running.md#snapshots)). Which
 resources ports may carry is the host's to say: see
 [Sharing resources](running.md#sharing-resources).
 
+### Streams and futures of handles
+
+A stream or future can carry owned handles, such as frames from a camera:
+
+```wit
+record inputs  { frames: stream<tensor> }  // stream<own<tensor>>
+record outputs { edges: stream<tensor>, first: future<tensor> }
+```
+
+Each handle moves to whoever reads it, and that node owns it until it passes it
+on or drops it. Unlike a handle port, nothing else holds it, so a stream of
+handles has one reader per item, like any other stream. To send frames to two
+nodes, have a node `clone` them, if the resource offers that. Handles must be at
+the top of the payload: `stream<list<tensor>>` isn't supported, and the
+component model doesn't allow `stream<borrow<tensor>>` at all.
+
+Whatever is in flight is freed however the pipeline ends: when the stream runs
+out, a reader stops early, nothing reads it, the graph stops, or a node faults.
+
+Nodes joined by a stream of handles run in one Store, so they don't run in
+parallel, and a fault in one stops them all. On wasmtime its report names no
+culprit.
+
 ## `run`
 
 `run` must be an `async func` that takes `inputs` and returns `outputs`. It can

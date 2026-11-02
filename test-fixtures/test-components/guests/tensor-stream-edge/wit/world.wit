@@ -1,0 +1,20 @@
+package test:tensor-stream-edge@0.1.0;
+
+/// The edges of each `[height, width, channels]` `uint8` tensor of its input,
+/// found by the host (`conv3x3`), on its output. No byte enters the node.
+/// Calls `fatal` with the host's reason when it cannot find them.
+world tensor-stream-edge {
+    import test:data/tensor@0.1.0;
+    import witgraph:runtime/host@0.1.0;
+
+    export node: interface {
+        use test:data/tensor@0.1.0.{tensor};
+        record inputs {
+            tensors: stream<tensor>,
+        }
+        record outputs {
+            tensors: stream<tensor>,
+        }
+        run: async func(inputs: inputs) -> outputs;
+    }
+}

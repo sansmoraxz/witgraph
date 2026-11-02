@@ -1,0 +1,36 @@
+package test:data@0.1.0;
+
+/// An n-dimensional array the host keeps. Where its data lives (host
+/// memory, a GPU buffer, an ML runtime's tensor) is the host's choice:
+/// nodes pass handles to it, run operations on it where it lives, and copy
+/// its bytes only to compute on them themselves. What touches the data is
+/// async, as device work is.
+interface tensor {
+    /// The element type.
+    enum dtype {
+        /// One byte, unsigned.
+        uint8,
+        /// Four bytes, an IEEE 754 single, little-endian.
+        float32,
+    }
+
+    resource tensor {
+        /// A tensor of `shape` holding `data`: exactly as many bytes as
+        /// the shape has elements times the element size.
+        from-bytes: static async func(dtype: dtype, shape: list<u32>, data: list<u8>) -> result<tensor, string>;
+        dtype: func() -> dtype;
+        shape: func() -> list<u32>;
+        /// Copies up to `len` bytes from `offset` into the caller.
+        read: async func(offset: u64, len: u64) -> list<u8>;
+        /// Another reference to the same tensor, the caller's to keep.
+        clone: func() -> tensor;
+        /// A new tensor of the same shape, each element `max - x` (255 for
+        /// `uint8`, 1.0 for `float32`), computed where the data lives.
+        invert: async func() -> tensor;
+        /// A new `uint8` tensor: each channel of a `[height, width,
+        /// channels]` `uint8` tensor convolved with the 3x3 kernel
+        /// `weights` (row by row), zero-padded, each sum truncated toward
+        /// zero and clamped to 0..=255, computed where the data lives.
+        conv3x3: async func(weights: list<f32>) -> result<tensor, string>;
+    }
+}

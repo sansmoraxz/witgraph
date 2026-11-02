@@ -66,6 +66,12 @@ const ids: Record<string, string> = {
   labelled: 'test:labelled/labelled@0.1.0',
   'future-writer': 'test:future-writer/future-writer@0.1.0',
   'future-reader': 'test:future-reader/future-reader@0.1.0',
+  'future-dropper': 'test:future-dropper/future-dropper@0.1.0',
+  'tensor-stream-source': 'test:tensor-stream-source/tensor-stream-source@0.1.0',
+  'tensor-stream-invert': 'test:tensor-stream-invert/tensor-stream-invert@0.1.0',
+  'tensor-stream-sink': 'test:tensor-stream-sink/tensor-stream-sink@0.1.0',
+  'tensor-future-source': 'test:tensor-future-source/tensor-future-source@0.1.0',
+  'tensor-future-sink': 'test:tensor-future-sink/tensor-future-sink@0.1.0',
   calc: 'test:calc/calc@0.1.0',
   math: 'test:math/math@0.1.0',
   'video-source': 'test:video-source/video-source@0.1.0',
@@ -1476,7 +1482,7 @@ test('a link whose provider was not given fails the load by name', async () => {
  * so a tensor one node makes is one another accepts. Counts how often each
  * tensor is disposed.
  */
-function cpuTensors() {
+function cpuTensors(ready: () => Promise<unknown> = async () => {}) {
   const disposed = new Map<object, number>();
   const made: object[] = [];
   class Tensor {
@@ -1490,6 +1496,7 @@ function cpuTensors() {
       made.push(this);
     }
     static async fromBytes(dtype: string, shape: ArrayLike<number>, data: Uint8Array) {
+      await ready();
       return new Tensor(dtype, shape, data.slice());
     }
     dtype() {
@@ -1599,4 +1606,215 @@ test('a node keeps its own reference to a tensor across runs', async () => {
   assert.ok((session.graph.readOutput('keep', 'previous') as bigint) > 0n);
   // The latched second tensor, and `keep`'s clone of it.
   assert.equal(tensors.live(), 2);
+});
+
+test('a future its reader drops unread does not leave its writer waiting', async () => {
+  const session = await load(
+    [
+      ['w', 'future-writer'],
+      ['d', 'future-dropper'],
+    ],
+    [['a', 'w.done', 'd.data']],
+  );
+  await within(session.settle());
+  assert.equal(session.graph.readOutput('d', 'done'), true);
+  // `last` is how the previous run's write ended: 0 until one has. As for an
+  // unread future, its value was read and discarded, so it reads as taken.
+  await within(
+    (async () => {
+      let last = 0;
+      for (let again = 1; last === 0; again++) {
+        session.graph.inject('w', 'again', again);
+        await session.settle();
+        last = session.graph.readOutput('w', 'last') as number;
+        await tick();
+      }
+      assert.equal(last, 1);
+    })(),
+  );
+});
+
+const tensorsFor = (tensors: ReturnType<typeof cpuTensors>) => ({
+  capabilities: (_: string, capability: Capability) =>
+    capability.interface === 'test:data/tensor@0.1.0' ? tensors.imports : undefined,
+});
+
+/** Waits for every tensor made to be disposed, each once. */
+async function allDisposed(tensors: ReturnType<typeof cpuTensors>) {
+  for (let i = 0; i < 100 && tensors.live() > 0; i++) await tick();
+  assert.ok(tensors.made.length > 0, 'tensors were made');
+  assert.equal(tensors.live(), 0, 'none left undisposed');
+  assert.ok(
+    [...tensors.disposed.values()].every((times) => times === 1),
+    'each once',
+  );
+}
+
+const streamChain = (
+  tensors: ReturnType<typeof cpuTensors>,
+  options: Partial<SessionOptions> = {},
+) =>
+  load(
+    [
+      ['src', 'tensor-stream-source'],
+      ['inv', 'tensor-stream-invert'],
+      ['sink', 'tensor-stream-sink'],
+    ],
+    [
+      ['a', 'src.tensors', 'inv.tensors'],
+      ['b', 'inv.tensors', 'sink.tensors'],
+    ],
+    { ...tensorsFor(tensors), ...options },
+  );
+
+const futureChain = (tensors: ReturnType<typeof cpuTensors>) =>
+  load(
+    [
+      ['src', 'tensor-future-source'],
+      ['sink', 'tensor-future-sink'],
+    ],
+    [['a', 'src.tensor', 'sink.tensor']],
+    tensorsFor(tensors),
+  );
+
+test('a stream of tensors flows, and each is disposed once', async () => {
+  const tensors = cpuTensors();
+  const session = await streamChain(tensors);
+  const [output] = session.contracts.get('src')?.outputs ?? [];
+  assert.equal(output?.kind, 'stream');
+  assert.deepEqual(output?.handle, { interface: 'test:data/tensor@0.1.0', resource: 'tensor' });
+  session.graph.inject('src', 'frames', 20);
+  await within(session.settle(), 20000);
+  assert.equal(session.graph.readOutput('sink', 'count'), 20);
+  let sum = 0n;
+  for (let i = 0n; i < 20n; i++) sum += 255n - i;
+  assert.equal(session.graph.readOutput('sink', 'sum'), sum, 'inverted by the host');
+  assert.equal(tensors.made.length, 40, 'each frame, and each inverted');
+  await allDisposed(tensors);
+});
+
+test('onStreamItem sees each tensor of a stream, before its reader has it', async () => {
+  const tensors = cpuTensors();
+  const seen: unknown[] = [];
+  const session = await streamChain(tensors, {
+    onStreamItem: ({ port, node, items }) => {
+      if (node !== 'src' || port !== 'tensors') return;
+      assert.equal(items.length, 1);
+      assert.ok(items[0] instanceof tensors.imports.Tensor, 'the object its maker returned');
+      assert.equal(tensors.disposed.has(items[0] as object), false, 'alive as it passes');
+      seen.push(items[0]);
+    },
+  });
+  session.graph.inject('src', 'frames', 5);
+  await within(session.settle(), 20000);
+  assert.equal(seen.length, 5);
+  await allDisposed(tensors);
+});
+
+test('a reader stopping early frees the tensors in flight', async () => {
+  const tensors = cpuTensors();
+  const session = await streamChain(tensors);
+  session.graph.inject('sink', 'take', 3);
+  await within(session.settle(), 20000);
+  assert.equal(session.graph.readOutput('sink', 'count'), 3);
+  await allDisposed(tensors);
+});
+
+test('disposing a session frees the tensors in flight', async () => {
+  const tensors = cpuTensors();
+  const session = await streamChain(tensors);
+  void session.settle().catch(() => {});
+  for (let i = 0; i < 10; i++) await tick();
+  session.dispose();
+  sessions.splice(sessions.indexOf(session), 1);
+  await allDisposed(tensors);
+});
+
+test('a tensor read as its stream closes is disposed', async () => {
+  // A stream the host writes: unlike a guest's write, its item arrives anyway.
+  const tensors = cpuTensors();
+  const held = gate();
+  let reading = false;
+  const late = new tensors.imports.Tensor('uint8', [1], new Uint8Array(1));
+  const session = await load(
+    [
+      ['src', 'tensor-stream-source'],
+      ['sink', 'tensor-stream-sink'],
+    ],
+    [['a', 'src.tensors', 'sink.tensors']],
+    {
+      ...tensorsFor(tensors),
+      mocks: {
+        src: () => ({
+          tensors: {
+            [Symbol.asyncIterator]: () => ({
+              next: async () => {
+                reading = true;
+                await held.promise;
+                return { done: false, value: late };
+              },
+              return: async () => ({ done: true, value: undefined }),
+            }),
+          },
+        }),
+      },
+    },
+  );
+  void session.settle().catch(() => {});
+  for (let i = 0; i < 50 && !reading; i++) await tick();
+  assert.ok(reading, 'its reader is waiting for it');
+  session.dispose();
+  sessions.splice(sessions.indexOf(session), 1);
+  held.open();
+  await allDisposed(tensors);
+});
+
+test('a stream nothing reads frees its tensors', async () => {
+  const tensors = cpuTensors();
+  const session = await load([['src', 'tensor-stream-source']], [], tensorsFor(tensors));
+  await within(session.settle(), 20000);
+  await allDisposed(tensors);
+});
+
+test('a future moves its tensor to its reader', async () => {
+  const tensors = cpuTensors();
+  const session = await futureChain(tensors);
+  session.graph.inject('src', 'seed', 42);
+  await within(session.settle(), 20000);
+  assert.equal(session.graph.readOutput('sink', 'first'), 42);
+  await allDisposed(tensors);
+});
+
+test('a future its reader drops frees its tensor', async () => {
+  const tensors = cpuTensors();
+  const session = await futureChain(tensors);
+  session.graph.inject('sink', 'ignore', true);
+  await within(session.settle(), 20000);
+  assert.equal(session.graph.readOutput('sink', 'first'), 1000);
+  await allDisposed(tensors);
+});
+
+test('a future nothing reads frees its tensor', async () => {
+  const tensors = cpuTensors();
+  const session = await load([['src', 'tensor-future-source']], [], tensorsFor(tensors));
+  await within(session.settle(), 20000);
+  await allDisposed(tensors);
+});
+
+test('a future read to watch it still reaches its reader, and frees its tensor', async () => {
+  const tensors = cpuTensors();
+  const watched: unknown[] = [];
+  const session = await load(
+    [
+      ['src', 'tensor-future-source'],
+      ['sink', 'tensor-future-sink'],
+    ],
+    [['a', 'src.tensor', 'sink.tensor']],
+    { ...tensorsFor(tensors), onFutureValue: ({ value }) => void watched.push(value) },
+  );
+  session.graph.inject('src', 'seed', 9);
+  await within(session.settle(), 20000);
+  assert.equal(session.graph.readOutput('sink', 'first'), 9);
+  assert.ok(watched[0] instanceof tensors.imports.Tensor);
+  await allDisposed(tensors);
 });

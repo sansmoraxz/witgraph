@@ -9,7 +9,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use test_components::{
-    Guest, TENSOR_COPY_INVERT, TENSOR_EDGE, TENSOR_INVERT, TENSOR_KEEP, TENSOR_SINK, TENSOR_SOURCE,
+    Guest, TENSOR_COPY_INVERT, TENSOR_EDGE, TENSOR_FUTURE_SINK, TENSOR_FUTURE_SOURCE,
+    TENSOR_INVERT, TENSOR_KEEP, TENSOR_SINK, TENSOR_SOURCE, TENSOR_STREAM_EDGE,
+    TENSOR_STREAM_INVERT, TENSOR_STREAM_SINK, TENSOR_STREAM_SOURCE,
 };
 use wasmtime::StoreContextMut;
 use wasmtime::component::{ComponentType, Lift, Linker, Lower, ResourceDynamic};
@@ -246,6 +248,12 @@ impl Kit {
             TENSOR_SINK,
             TENSOR_KEEP,
             TENSOR_EDGE,
+            TENSOR_STREAM_SOURCE,
+            TENSOR_STREAM_EDGE,
+            TENSOR_STREAM_INVERT,
+            TENSOR_STREAM_SINK,
+            TENSOR_FUTURE_SOURCE,
+            TENSOR_FUTURE_SINK,
         ] {
             let c = contract(guest);
             kit.wasm.insert(c.id.clone(), guest.wasm);
@@ -566,4 +574,303 @@ async fn edges_are_found_where_the_data_lives() {
         cpu.data.len()
     );
     assert_eq!(u64_of(&rt, "sink", "len"), SOURCE_BYTES as u64);
+}
+
+// Streams and futures of handles.
+
+/// The bytes of a tensor the stream and future guests make.
+const FRAME: usize = 16 * 16 * 3;
+
+fn u32_of(rt: &RuntimeGraph<Perf, Plugins>, node: &str, port: &str) -> u32 {
+    match rt.read_output(&node.into(), &port.into()).unwrap() {
+        Some(Val::U32(v)) => v,
+        other => panic!("{node}.{port}: {other:?}"),
+    }
+}
+
+fn no_faults(rt: &mut RuntimeGraph<Perf, Plugins>) {
+    assert_eq!(format!("{:?}", rt.take_faults()), "[]");
+}
+
+/// Source → invert → sink, over `stream<tensor>`.
+fn stream_chain(kit: &Kit) -> Graph {
+    kit.builder()
+        .add_node("src", of(TENSOR_STREAM_SOURCE))
+        .add_node("inv", of(TENSOR_STREAM_INVERT))
+        .add_node("sink", of(TENSOR_STREAM_SINK))
+        .connect(
+            "a",
+            PortRef::new("src", "tensors"),
+            PortRef::new("inv", "tensors"),
+        )
+        .connect(
+            "b",
+            PortRef::new("inv", "tensors"),
+            PortRef::new("sink", "tensors"),
+        )
+        .build()
+}
+
+#[test]
+fn stream_and_future_ports_carry_a_resource() {
+    let handle = |guest, port: &str, inputs: bool| {
+        let c = contract(guest);
+        let ports = if inputs { c.inputs } else { c.outputs };
+        let port = ports.into_iter().find(|p| p.name == port.into()).unwrap();
+        (
+            port.kind,
+            port.ty.is_none(),
+            port.handle.unwrap().to_string(),
+        )
+    };
+    let tensor = format!("{TENSOR}.tensor");
+    assert_eq!(
+        handle(TENSOR_STREAM_SOURCE, "tensors", false),
+        (witgraph_ir::PortKind::Stream, true, tensor.clone())
+    );
+    assert_eq!(
+        handle(TENSOR_STREAM_SINK, "tensors", true),
+        (witgraph_ir::PortKind::Stream, true, tensor.clone())
+    );
+    assert_eq!(
+        handle(TENSOR_FUTURE_SINK, "tensor", true),
+        (witgraph_ir::PortKind::Future, true, tensor)
+    );
+}
+
+#[tokio::test]
+async fn a_stream_of_tensors_flows_and_frees_them() {
+    let kit = Kit::new();
+    let mut rt = kit
+        .load(stream_chain(&kit), RuntimeConfig::default(), true)
+        .await
+        .unwrap();
+    rt.inject(&"src".into(), &"frames".into(), Val::U32(20))
+        .unwrap();
+    settle(&mut rt).await;
+    no_faults(&mut rt);
+    assert_eq!(u32_of(&rt, "sink", "count"), 20);
+    let sum: u64 = (0..20).map(|i| 255 - i).sum();
+    assert_eq!(u64_of(&rt, "sink", "sum"), sum, "inverted by the host");
+    assert_eq!(rt.shared_memory(), 0, "every tensor is freed");
+
+    // And again, in the same Store.
+    rt.inject(&"src".into(), &"frames".into(), Val::U32(5))
+        .unwrap();
+    settle(&mut rt).await;
+    no_faults(&mut rt);
+    assert_eq!(u32_of(&rt, "sink", "count"), 5);
+    assert_eq!(rt.shared_memory(), 0);
+}
+
+#[tokio::test]
+async fn a_reader_stopping_early_frees_whats_in_flight() {
+    let kit = Kit::new();
+    let mut rt = kit
+        .load(stream_chain(&kit), RuntimeConfig::default(), true)
+        .await
+        .unwrap();
+    // Endless: only the reader letting go can stop it.
+    rt.inject(&"sink".into(), &"take".into(), Val::U32(3))
+        .unwrap();
+    settle(&mut rt).await;
+    no_faults(&mut rt);
+    assert_eq!(u32_of(&rt, "sink", "count"), 3);
+    for _ in 0..50 {
+        if rt.shared_memory() == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let _ = tokio::time::timeout(Duration::from_millis(10), rt.tick()).await;
+    }
+    assert_eq!(rt.shared_memory(), 0, "the writers' tensors are dropped");
+}
+
+#[tokio::test]
+async fn backpressure_keeps_an_endless_stream_within_a_small_budget() {
+    let kit = Kit::new();
+    let config = RuntimeConfig {
+        // In flight: one made and one being written per writer, plus the
+        // one being inverted.
+        max_shared_memory: Some(6 * FRAME),
+        ..RuntimeConfig::default()
+    };
+    let mut rt = kit.load(stream_chain(&kit), config, true).await.unwrap();
+    rt.inject(&"sink".into(), &"take".into(), Val::U32(500))
+        .unwrap();
+    settle(&mut rt).await;
+    no_faults(&mut rt);
+    assert_eq!(u32_of(&rt, "sink", "count"), 500);
+}
+
+#[tokio::test]
+async fn a_stream_nothing_reads_frees_its_tensors() {
+    let kit = Kit::new();
+    let graph = kit
+        .builder()
+        .add_node("src", of(TENSOR_STREAM_SOURCE))
+        .build();
+    let mut rt = kit
+        .load(graph, RuntimeConfig::default(), true)
+        .await
+        .unwrap();
+    settle(&mut rt).await;
+    no_faults(&mut rt);
+    assert_eq!(rt.shared_memory(), 0);
+}
+
+#[tokio::test]
+async fn shutting_down_mid_stream_frees_every_tensor() {
+    let kit = Kit::new();
+    let mut rt = kit
+        .load(stream_chain(&kit), RuntimeConfig::default(), true)
+        .await
+        .unwrap();
+    // Endless, and read for as long as it goes. Between two frames, nothing
+    // may be in flight: stop it once something is.
+    let mut held = 0;
+    for _ in 0..1000 {
+        let _ = tokio::time::timeout(Duration::from_millis(10), rt.tick()).await;
+        held = rt.shared_memory();
+        if held > 0 {
+            break;
+        }
+    }
+    assert!(held > 0, "it is running, with tensors in flight");
+    rt.shutdown();
+    let _ = tokio::time::timeout(Duration::from_millis(100), rt.tick()).await;
+    assert_eq!(rt.shared_memory(), 0, "held {held} before");
+}
+
+#[tokio::test]
+async fn a_future_of_a_tensor_moves_it_to_its_reader() {
+    let kit = Kit::new();
+    let graph = kit
+        .builder()
+        .add_node("src", of(TENSOR_FUTURE_SOURCE))
+        .add_node("sink", of(TENSOR_FUTURE_SINK))
+        .connect(
+            "a",
+            PortRef::new("src", "tensor"),
+            PortRef::new("sink", "tensor"),
+        )
+        .build();
+    let mut rt = kit
+        .load(graph, RuntimeConfig::default(), true)
+        .await
+        .unwrap();
+    rt.inject(&"src".into(), &"seed".into(), Val::U32(42))
+        .unwrap();
+    settle(&mut rt).await;
+    no_faults(&mut rt);
+    assert_eq!(u32_of(&rt, "sink", "first"), 42);
+    assert_eq!(rt.shared_memory(), 0);
+
+    // A reader that drops the future: the writer's tensor is its own again.
+    rt.inject(&"sink".into(), &"ignore".into(), Val::Bool(true))
+        .unwrap();
+    settle(&mut rt).await;
+    no_faults(&mut rt);
+    assert_eq!(u32_of(&rt, "sink", "first"), 1000);
+    assert_eq!(rt.shared_memory(), 0);
+}
+
+#[tokio::test]
+async fn a_future_nothing_reads_frees_its_tensor() {
+    let kit = Kit::new();
+    let graph = kit
+        .builder()
+        .add_node("src", of(TENSOR_FUTURE_SOURCE))
+        .build();
+    let mut rt = kit
+        .load(graph, RuntimeConfig::default(), true)
+        .await
+        .unwrap();
+    settle(&mut rt).await;
+    no_faults(&mut rt);
+    assert_eq!(rt.shared_memory(), 0);
+}
+
+#[tokio::test]
+async fn a_host_that_does_not_share_the_resource_refuses_the_stream() {
+    let kit = Kit::new();
+    let err = kit
+        .load(stream_chain(&kit), RuntimeConfig::default(), false)
+        .await
+        .err()
+        .expect("not shareable");
+    assert!(matches!(err, LoadError::NotShareable { .. }), "{err}");
+}
+
+/// The maker faults when the budget runs out, with tensors in flight in the
+/// other members of its Store.
+#[tokio::test]
+async fn a_fault_mid_stream_frees_every_tensor() {
+    let kit = Kit::new();
+    let config = RuntimeConfig {
+        max_shared_memory: Some(FRAME),
+        ..RuntimeConfig::default()
+    };
+    let mut rt = kit.load(stream_chain(&kit), config, true).await.unwrap();
+    rt.inject(&"src".into(), &"frames".into(), Val::U32(5))
+        .unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(10), rt.tick()).await;
+    let faults = rt.take_faults();
+    assert!(!faults.is_empty(), "the second tensor is past the budget");
+    assert_eq!(rt.shared_memory(), 0, "the island's Store went with them");
+}
+
+#[tokio::test]
+async fn a_restore_runs_a_stream_of_tensors_again() {
+    let kit = Kit::new();
+    let mut rt = kit
+        .load(stream_chain(&kit), RuntimeConfig::default(), true)
+        .await
+        .unwrap();
+    rt.inject(&"src".into(), &"frames".into(), Val::U32(3))
+        .unwrap();
+    settle(&mut rt).await;
+    assert_eq!(u32_of(&rt, "sink", "count"), 3);
+    let snapshot = rt.snapshot().unwrap();
+
+    let mut restored = kit
+        .load(stream_chain(&kit), RuntimeConfig::default(), true)
+        .await
+        .unwrap();
+    restored.restore(&snapshot).unwrap();
+    settle(&mut restored).await;
+    no_faults(&mut restored);
+    assert_eq!(u32_of(&restored, "sink", "count"), 3);
+    assert_eq!(restored.shared_memory(), 0);
+}
+
+#[tokio::test]
+async fn a_stream_of_tensors_is_processed_where_they_live() {
+    let kit = Kit::new();
+    let graph = kit
+        .builder()
+        .add_node("src", of(TENSOR_STREAM_SOURCE))
+        .add_node("edge", of(TENSOR_STREAM_EDGE))
+        .add_node("sink", of(TENSOR_STREAM_SINK))
+        .connect(
+            "a",
+            PortRef::new("src", "tensors"),
+            PortRef::new("edge", "tensors"),
+        )
+        .connect(
+            "b",
+            PortRef::new("edge", "tensors"),
+            PortRef::new("sink", "tensors"),
+        )
+        .build();
+    let mut rt = kit
+        .load(graph, RuntimeConfig::default(), true)
+        .await
+        .unwrap();
+    rt.inject(&"src".into(), &"frames".into(), Val::U32(4))
+        .unwrap();
+    settle(&mut rt).await;
+    no_faults(&mut rt);
+    assert_eq!(u32_of(&rt, "sink", "count"), 4);
+    assert_eq!(rt.shared_memory(), 0);
 }

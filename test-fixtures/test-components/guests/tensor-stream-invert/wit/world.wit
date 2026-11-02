@@ -1,0 +1,19 @@
+package test:tensor-stream-invert@0.1.0;
+
+/// Each tensor of its input, inverted by the host (`invert`), on its output.
+/// No byte enters the node.
+world tensor-stream-invert {
+    import test:data/tensor@0.1.0;
+    import witgraph:runtime/host@0.1.0;
+
+    export node: interface {
+        use test:data/tensor@0.1.0.{tensor};
+        record inputs {
+            tensors: stream<tensor>,
+        }
+        record outputs {
+            tensors: stream<tensor>,
+        }
+        run: async func(inputs: inputs) -> outputs;
+    }
+}

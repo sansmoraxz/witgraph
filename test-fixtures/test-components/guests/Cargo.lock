@@ -57,6 +57,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "camera-source-guest"
+version = "0.1.0"
+dependencies = [
+ "wit-bindgen",
+]
+
+[[package]]
 name = "configurable-guest"
 version = "0.1.0"
 dependencies = [
@@ -98,6 +105,13 @@ dependencies = [
 
 [[package]]
 name = "frame-invert-guest"
+version = "0.1.0"
+dependencies = [
+ "wit-bindgen",
+]
+
+[[package]]
+name = "future-dropper-guest"
 version = "0.1.0"
 dependencies = [
  "wit-bindgen",
@@ -458,6 +472,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "tensor-future-sink-guest"
+version = "0.1.0"
+dependencies = [
+ "wit-bindgen",
+]
+
+[[package]]
+name = "tensor-future-source-guest"
+version = "0.1.0"
+dependencies = [
+ "wit-bindgen",
+]
+
+[[package]]
 name = "tensor-invert-guest"
 version = "0.1.0"
 dependencies = [
@@ -480,6 +508,34 @@ dependencies = [
 
 [[package]]
 name = "tensor-source-guest"
+version = "0.1.0"
+dependencies = [
+ "wit-bindgen",
+]
+
+[[package]]
+name = "tensor-stream-edge-guest"
+version = "0.1.0"
+dependencies = [
+ "wit-bindgen",
+]
+
+[[package]]
+name = "tensor-stream-invert-guest"
+version = "0.1.0"
+dependencies = [
+ "wit-bindgen",
+]
+
+[[package]]
+name = "tensor-stream-sink-guest"
+version = "0.1.0"
+dependencies = [
+ "wit-bindgen",
+]
+
+[[package]]
+name = "tensor-stream-source-guest"
 version = "0.1.0"
 dependencies = [
  "wit-bindgen",

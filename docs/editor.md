@@ -85,6 +85,14 @@ node previews the first one it names.
   object's own methods, and must expect it to be disposed once the next one
   replaces it. The inspector shows a handle by the object's `toString`, or by
   its resource, and offers no inject box for a handle input.
+- **Streams and futures of handles.** An item is its reader's, and may be
+  disposed before anything is drawn, so a viewer takes what it wants as the item
+  passes, with `keep` (below). The editor shows it what it kept as `latest`, and
+  disposes that when the next replaces it, so a viewer still using it later
+  needs another reference of its own. A viewer with no `keep` is shown the
+  item's description. There's no history, since each kept item would hold on to
+  what it refers to. Read back only what you draw: on a GPU, reading every
+  frame can halve the frame rate.
 - **Viewers.** `image` draws RGBA frames and PNG, JPEG, GIF or WebP bytes;
   `series` plots recent numbers; `text` shows any value, a stream's recent
   items, or a pending future. Add your own with `registerViewer`; it is
@@ -102,6 +110,18 @@ registerViewer({
       update: ({ latest }) => (bar.value = Number(latest ?? 0)),
       dispose: () => bar.remove(),
     };
+  },
+});
+```
+
+A viewer for a stream or future of handles also says what to keep of each item:
+
+```ts
+registerViewer({
+  id: 'tensor',
+  keep: (item) => (item as Tensor).clone(),
+  mount(host) {
+    /* `latest` is what `keep` returned, disposed when the next replaces it. */
   },
 });
 ```
@@ -172,14 +192,17 @@ The demo opens a graph of every port kind, whose nodes preview a Value, a
 stream of numbers, a stream of bytes, a future and a video stream. The
 picker at the top right switches to another graph:
 
-| Graph                   | What it shows                                                                                                                             |
-| ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| `?graph=video`          | Video pipelines alone: frames streamed through grayscale and invert filters.                                                              |
-| `?graph=webgpu`         | Edge detection on WebGPU: the `edge-detect` component runs a small CNN with fixed weights through `test:accel/cnn`, here compute shaders. |
-| `?graph=webnn`          | The same on WebNN.                                                                                                                        |
-| `?graph=tensors`        | Tensors on the CPU: an image made once, its edges found and inverted by the tensors' own operations, nodes passing only handles.          |
-| `?graph=tensors-webgpu` | The same with the tensors kept in WebGPU storage buffers, and their operations run as compute shaders.                                    |
-| `?graph=tensors-webnn`  | The same with the tensors kept as WebNN tensors, and their operations run as WebNN graphs.                                                |
+| Graph                   | What it shows                                                                                                                                          |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `?graph=video`          | Video pipelines alone: frames streamed through grayscale and invert filters.                                                                           |
+| `?graph=webgpu`         | Edge detection on WebGPU: the `edge-detect` component runs a small CNN with fixed weights through `test:accel/cnn`, here compute shaders.              |
+| `?graph=webnn`          | The same on WebNN.                                                                                                                                     |
+| `?graph=tensors`        | Tensors on the CPU: an image made once, its edges found and inverted by the tensors' own operations, nodes passing only handles.                       |
+| `?graph=tensors-webgpu` | The same with the tensors kept in WebGPU storage buffers, and their operations run as compute shaders.                                                 |
+| `?graph=tensors-webnn`  | The same with the tensors kept as WebNN tensors, and their operations run as WebNN graphs.                                                             |
+| `?graph=camera`         | The page's camera on the CPU: a stream of tensors through edge detection and inversion, with nodes passing only handles. Asks for the camera when run. |
+| `?graph=camera-webgpu`  | The same on WebGPU, where a frame goes straight from the video to a storage buffer, without the page's memory.                                         |
+| `?graph=camera-webnn`   | The same on WebNN, whose frames pass through a canvas.                                                                                                 |
 
 What runs `test:accel/cnn` is the browser's, so a browser without WebGPU or
 WebNN still loads its graph: the edge node faults when run, saying the
@@ -193,4 +216,9 @@ graphs, and the tensor graphs but the CPU one, must fault, saying so), and
 `chromium-accelerated`, started with the flags turning both on (WebGPU on the
 SwiftShader software renderer, so no GPU is needed), where the edges must be
 computed and match a CPU reference, and the tensors must stay on their
-device.
+device. Both use Chromium's fake camera. SwiftShader can't take a video frame
+directly, so there the camera graph's frames pass through a canvas too.
+
+Playwright reuses a server already on its port, whichever checkout it serves.
+To test a worktree while another checkout's dev server is running, set
+`DEMO_PORT`.
