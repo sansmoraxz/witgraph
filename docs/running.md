@@ -54,15 +54,49 @@ let prepared = unsafe { PreparedComponent::deserialize(&engine, &contract, &byte
 let rt = RuntimeGraph::load_prepared(compiled, &[prepared], config, Perf, host).await?;
 ```
 
-A saved file holds native code that can't be checked, which is why
-`deserialize` is `unsafe`. Treat it like an executable: load only files you
-built, from storage only you can write to.
+In a build that also has `compile`, `load_or_compile` does both: it loads the
+file if it's still good, and otherwise compiles the bytes and replaces it.
 
-A file works only with the same wasmtime version, CPU features and engine
-settings, such as `memory_reservation`. Anything else fails with
-`BadComponent`, so rebuild the file. It records the contract's hash, and a
-different contract fails with `ContractMismatch`. Links are composed in before
-saving, so loading doesn't need the providers' bytes.
+```rust
+// SAFETY: only we can write to this path.
+let prepared = unsafe {
+    PreparedComponent::load_or_compile(&engine, &contract, wasm, &[], "sensor.bin")
+}?;
+```
+
+It also notices a component rebuilt with the same contract, or a changed link,
+because the file records a hash of what it was compiled from. `deserialize`
+doesn't check that, since it isn't given the bytes.
+
+Links are composed in before saving, so `deserialize` doesn't need the
+providers' bytes. A different contract fails with `ContractMismatch`.
+
+> [!WARNING]
+> **A saved file is native code for one exact build and machine.** It isn't a
+> portable format like a `.wasm`. To load, all of these must match the build
+> that made it:
+>
+> - the exact wasmtime version, so `50.0.0` can't load a file from `50.0.1`
+> - the CPU architecture and operating system
+> - the compiler settings
+> - the CPU features it was compiled to use
+> - engine settings, such as `memory_reservation`, and enabled wasm features
+>
+> A mismatch fails cleanly with `BadComponent`, or makes `load_or_compile`
+> recompile. So:
+>
+> - Keep the `.wasm` as your source, and treat saved files as build output.
+> - Build them in the same CI job and from the same `Cargo.lock` as the binary
+>   that loads them. A `cargo update` can make every file stale.
+> - Build on the oldest CPU you deploy to. By default the compiler uses every
+>   feature of the CPU it runs on.
+> - A build with no compiler can't recover from a stale file. You have to deploy
+>   matching files.
+>
+> **These checks catch mistakes, not tampering.** A modified file can pass them
+> and then run as native code, which is why `deserialize` and `load_or_compile`
+> are `unsafe`. Treat a saved file like an executable: load only files you
+> built, from storage only you can write to.
 
 ## Giving nodes capabilities
 
@@ -201,7 +235,7 @@ loaded:
 | Feature       | Default | What it does                                                                                         |
 | ------------- | ------- | ---------------------------------------------------------------------------------------------------- |
 | `compile`     | yes     | Compiling components with Cranelift, and composing links: `load`, `load_with_host`, `PreparedComponent::new`. |
-| `precompiled` | no      | `PreparedComponent::serialize` and `deserialize`.                                                    |
+| `precompiled` | no      | `PreparedComponent::serialize` and `deserialize`, plus `load_or_compile` with `compile`.             |
 
 To drop the compiler from a build that only loads saved components, use
 `default-features = false, features = ["precompiled"]`.
