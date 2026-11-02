@@ -113,7 +113,8 @@ nodes, snapshots, undo and redo, and JSON import and export. See
 ## Building
 
 ```sh
-cargo test --workspace
+cargo nextest run --workspace
+cargo test --workspace --doc
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 

@@ -46,9 +46,15 @@ jobs:
             test-fixtures/test-components/guests
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - run: cargo nextest run --workspace
+      # nextest does not run doctests.
+      - run: cargo test --workspace --doc
       # Every wasmtime feature that witgraph-runtime passes through.
-      - run: cargo test -p witgraph-runtime --all-features
+      - run: cargo nextest run -p witgraph-runtime --all-features
+      - run: cargo test -p witgraph-runtime --all-features --doc
       # A build with no compiler runs what a build with one saved.
       - run: cargo clippy -p witgraph-runtime --no-default-features --features precompiled -- -D warnings
       - run: cargo run -p witgraph-runtime --example precompiled --features precompiled -- save target/echo.bin

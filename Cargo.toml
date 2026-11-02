@@ -53,3 +53,6 @@ wit-component = "0.261"
 wasmparser = { version = "0.261", default-features = false }
 wac-graph = "0.12"
 wasm-wave = { version = "0.261", default-features = false, features = ["std"] }
+
+[profile.dev.package."*"]
+opt-level = 1
