@@ -272,6 +272,23 @@ test.describe('WIT Graph Editor Demo', () => {
     expect(await edge()).toBe(await themed('--wg-error'));
   });
 
+  test('the status follows a run', async ({ page }) => {
+    const status = page.locator('#status');
+    const controls = page.locator('witgraph-controls');
+    await controls.locator('button.run').click();
+    await expect(status).toContainText('Running');
+    await expect(status).toHaveClass(/running/);
+    // It counts the ticks as they are made.
+    const tick = async () => Number(/tick (\d+)/.exec((await status.textContent()) ?? '')?.[1]);
+    await expect.poll(tick).toBeGreaterThan(0);
+    const before = await tick();
+    await expect.poll(tick).toBeGreaterThan(before);
+
+    await controls.locator('button.stop').click();
+    await expect(status).toContainText('Graph compiles');
+    await expect(status).toHaveClass(/ready/);
+  });
+
   test('the inspector describes the selected node by its component', async ({ page }) => {
     await page.locator('witgraph-canvas').locator('[data-node-id="relay-a"]').click();
     await expect(page.locator('witgraph-inspector').locator('.node-docs')).toContainText(

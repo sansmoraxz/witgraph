@@ -180,6 +180,10 @@ export class EditorController extends EventTarget {
   get lastRunTicks(): number {
     return this.#lastRunTicks;
   }
+  /** The ticks made since the graph was loaded or reset. */
+  get tickCount(): number {
+    return this.#tickCount;
+  }
 
   /**
    * The most ticks a second a run makes; `0` (the default) for as many as

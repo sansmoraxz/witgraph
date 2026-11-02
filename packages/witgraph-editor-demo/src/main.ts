@@ -631,14 +631,30 @@ async function loadDemo(): Promise<void> {
 
 function updateStatus(): void {
   const error = controller.compileError;
-  statusEl.classList.remove('ready', 'error');
+  const mode = controller.mode;
+  let state: 'ready' | 'running' | 'paused' | 'error';
+  let text: string;
   if (error) {
-    statusEl.textContent = `Graph error: ${error}`;
-    statusEl.classList.add('error');
+    state = 'error';
+    text = `Graph error: ${error}`;
+  } else if (mode === 'running') {
+    state = 'running';
+    text = `Running — tick ${controller.tickCount}. Click Stop to end the run.`;
+  } else if (mode === 'paused') {
+    state = 'paused';
+    const node = controller.pausedNode;
+    text = `Paused${node ? ` at ${node}` : ''}. Click Resume to continue.`;
+  } else if (mode === 'error') {
+    state = 'error';
+    text = 'The run stopped on an error. The timeline says what failed.';
   } else {
-    statusEl.textContent = `Graph compiles — ${controller.nodes.size} nodes, ${controller.edges.length} edges. Click Run or Step to execute.`;
-    statusEl.classList.add('ready');
+    state = 'ready';
+    text = `Graph compiles — ${controller.nodes.size} nodes, ${controller.edges.length} edges. Click Run or Step to execute.`;
   }
+  // A run changes this every tick: touch the page only when it differs.
+  if (statusEl.textContent !== text) statusEl.textContent = text;
+  for (const name of ['ready', 'running', 'paused', 'error'])
+    statusEl.classList.toggle(name, name === state);
 }
 
 function showError(err: unknown): void {
