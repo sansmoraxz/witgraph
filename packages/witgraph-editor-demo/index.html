@@ -24,6 +24,13 @@
     .resize-bottom     { grid-column: 1 / -1; grid-row: 3; cursor: row-resize; background: var(--wg-surface); }
     .resize-bottom:hover, .resize-bottom.active { background: var(--wg-primary); }
     witgraph-timeline  { grid-column: 1 / -1; grid-row: 4; }
+    /* The status, marked by state the way the timeline marks its events. */
+    #status            { border-left: 3px solid var(--wg-primary); }
+    #status.ready      { border-left-color: var(--wg-success); }
+    #status.paused     { border-left-color: var(--wg-warning); }
+    #status.error      { border-left-color: var(--wg-error); }
+    #status.error strong { color: var(--wg-error); }
+    #status pre        { margin: 6px 0 0; font-size: 11px; color: var(--wg-text-dim); }
   </style>
 </head>
 <body class="bg-wg-bg text-wg-text font-sans text-sm overflow-hidden m-0 p-0">
@@ -54,7 +61,7 @@
       </select>
     </label>
 
-    <div id="status" class="z-10 px-4 py-2.5 bg-wg-surface border border-wg-surface-hover rounded-md text-xs leading-relaxed text-wg-text transition-opacity"
+    <div id="status" class="z-10 px-3 py-1.5 bg-wg-surface border border-wg-surface-hover rounded-md text-xs leading-relaxed text-wg-text transition-opacity"
          style="grid-column: 3; grid-row: 2; align-self: end; justify-self: center; margin-bottom: 8px; pointer-events: none; max-width: calc(100% - 16px);">
       Initializing...
     </div>

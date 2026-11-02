@@ -1,3 +1,4 @@
+import { createElement, History, Trash2 } from 'lucide';
 import type { EditorController } from '../controller/editor-controller.ts';
 import type { NodeVisual, PortVisual } from '../controller/types.ts';
 import { defaultViewer, describeHandle } from '../controller/visual.ts';
@@ -29,7 +30,16 @@ const MAX_WAVE_BYTES = 64 * 1024;
 const EXTRA_CSS = `
   :host { display: block; height: 100%; overflow-y: auto; overflow-x: hidden; background-color: var(--wg-bg);
     --_input-radius: var(--wg-input-radius, 4px);
-    --_toggle-radius: var(--wg-toggle-radius, 10px); }
+    --_toggle-radius: var(--wg-toggle-radius, 10px);
+    --_btn-radius: var(--wg-btn-radius, 4px); }
+  .icon-btn { display: inline-flex; align-items: center; justify-content: center; padding: 5px;
+    background: transparent; color: var(--wg-text-dim); border: none; border-radius: var(--_btn-radius);
+    cursor: pointer; transition: all 0.12s ease; }
+  .icon-btn svg { width: 14px; height: 14px; stroke-width: 2; }
+  .icon-btn:hover { background: var(--wg-surface-hover); color: var(--wg-text); }
+  .icon-btn.danger:hover { background: color-mix(in srgb, var(--wg-error) 15%, transparent); color: var(--wg-error); }
+  .locked .toggle-track[data-structural] { opacity: 0.4; pointer-events: none; }
+  .locked :disabled { opacity: 0.5; cursor: not-allowed; }
   :host::-webkit-scrollbar { width: 6px; }
   :host::-webkit-scrollbar-track { background: var(--wg-bg); }
   :host::-webkit-scrollbar-thumb { background: var(--wg-surface-hover); border-radius: 3px; }
@@ -150,6 +160,26 @@ export class WitgraphInspector extends HTMLElement {
 
   /** The inspector for the selected edge or node, or else the graph's properties. */
   #build(): HTMLElement {
+    const built = this.#buildSelection();
+    // What changes the graph waits while it runs (see `EditorController.editable`).
+    // A pane with none of it is left as it is.
+    const structural = built.querySelectorAll<HTMLElement>('[data-structural]');
+    if (this.#controller && !this.#controller.editable && structural.length > 0) {
+      built.classList.add('locked');
+      for (const el of structural) {
+        if (
+          el instanceof HTMLInputElement ||
+          el instanceof HTMLSelectElement ||
+          el instanceof HTMLButtonElement
+        )
+          el.disabled = true;
+        el.title = 'Stop the run to edit the graph';
+      }
+    }
+    return built;
+  }
+
+  #buildSelection(): HTMLElement {
     const controller = this.#controller;
     if (!controller) return this.#buildGraphProperties();
     const edgeId = controller.selectedEdge;
@@ -294,6 +324,22 @@ export class WitgraphInspector extends HTMLElement {
     return wrap;
   }
 
+  /** A small button showing an icon, as the toolbar's do. */
+  #iconButton(
+    icon: Parameters<typeof createElement>[0],
+    title: string,
+    cls: string,
+    onClick: () => void,
+  ): HTMLButtonElement {
+    const button = document.createElement('button');
+    button.className = `icon-btn ${cls}`.trim();
+    button.title = title;
+    button.setAttribute('aria-label', title);
+    button.appendChild(createElement(icon) as unknown as SVGSVGElement);
+    button.addEventListener('click', onClick);
+    return button;
+  }
+
   #buildSnapshotsSection(): HTMLElement {
     const section = this.#el('div', 'mb-3');
     const snaps = this.#controller?.savedSnapshots ?? [];
@@ -325,20 +371,16 @@ export class WitgraphInspector extends HTMLElement {
         info.appendChild(this.#el('div', 'text-2xs text-wg-text-dim', timeStr));
         row.appendChild(info);
 
-        const restoreBtn = this.#el(
-          'button',
-          'bg-wg-surface text-wg-text border border-wg-text-dim rounded px-2 py-0.5 cursor-pointer text-2xs hover:bg-wg-surface-hover transition-all',
-          'Restore',
+        row.appendChild(
+          this.#iconButton(History, `Restore ${snap.name}`, '', () => {
+            try {
+              this.#controller?.restoreNamedSnapshot(snap.name);
+            } catch {}
+          }),
         );
-        restoreBtn.addEventListener('click', () => {
-          try {
-            this.#controller?.restoreNamedSnapshot(snap.name);
-          } catch {}
-        });
-        row.appendChild(restoreBtn);
-
-        const delBtn = this.#el('button', 'text-wg-error cursor-pointer text-xs', '×');
-        delBtn.addEventListener('click', () => this.#controller?.deleteSnapshot(snap.name));
+        const delBtn = this.#iconButton(Trash2, `Delete ${snap.name}`, 'danger', () =>
+          this.#controller?.deleteSnapshot(snap.name),
+        );
         row.appendChild(delBtn);
         section.appendChild(row);
       }
@@ -443,6 +485,7 @@ export class WitgraphInspector extends HTMLElement {
     idInput.className =
       'node-id focus-ring flex-1 bg-wg-surface text-wg-text border border-wg-text-dim rounded-md px-2 py-1 font-mono text-sm';
     idInput.style.minWidth = '0';
+    idInput.dataset.structural = '';
     idInput.addEventListener('change', () => {
       const newId = idInput.value.trim();
       if (newId && newId !== node.id) this.#controller?.renameNode(node.id, newId);
@@ -475,6 +518,8 @@ export class WitgraphInspector extends HTMLElement {
         .filter(Boolean)
         .join('');
       compInfo.appendChild(this.#el('div', 'font-mono text-wg-primary truncate', compId));
+      if (node.docs)
+        compInfo.appendChild(this.#el('div', 'node-docs text-wg-text mt-1', node.docs));
       wrap.appendChild(compInfo);
     }
 
@@ -649,6 +694,7 @@ export class WitgraphInspector extends HTMLElement {
     const isMocked = this.#controller?.isMocked(node.id) ?? false;
     const track = this.#el('div', `toggle-track ${isMocked ? 'on' : ''}`);
     track.appendChild(this.#el('div', 'toggle-knob'));
+    track.dataset.structural = '';
     track.addEventListener('click', () => this.#controller?.toggleMock(node.id));
     header.appendChild(track);
     section.appendChild(header);
@@ -685,6 +731,7 @@ export class WitgraphInspector extends HTMLElement {
           'bg-wg-surface text-wg-text border border-wg-text-dim rounded px-2 py-1 cursor-pointer text-xs hover:bg-wg-surface-hover transition-all shadow-sm',
           'Set',
         );
+        setBtn.dataset.structural = '';
         setBtn.addEventListener('click', () => {
           if (input.value) this.#controller?.setMockOutput(node.id, port.name, input.value);
           else this.#controller?.clearMockOutput(node.id, port.name);
@@ -809,6 +856,7 @@ export class WitgraphInspector extends HTMLElement {
       fbCheck.type = 'checkbox';
       fbCheck.checked = conn?.feedback ?? false;
       fbCheck.id = `fb-${node.id}-${port.name}`;
+      fbCheck.dataset.structural = '';
       if (conn) {
         fbCheck.addEventListener('change', () =>
           this.#controller?.setConnectionFeedback(conn.id, fbCheck!.checked),
@@ -830,6 +878,7 @@ export class WitgraphInspector extends HTMLElement {
       );
     }
 
+    select.dataset.structural = '';
     select.addEventListener('change', () => {
       const val = select.value;
       if (!val) {
@@ -947,6 +996,7 @@ export class WitgraphInspector extends HTMLElement {
       const fbRow = this.#el('div', 'flex items-center gap-3 p-2 bg-wg-surface rounded-md');
       const track = this.#el('div', `toggle-track ${edge.feedback ? 'on' : ''}`);
       track.appendChild(this.#el('div', 'toggle-knob'));
+      track.dataset.structural = '';
       track.addEventListener('click', () => {
         this.#controller?.setConnectionFeedback(edge.id, !edge.feedback);
       });

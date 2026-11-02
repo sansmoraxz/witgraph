@@ -87,6 +87,7 @@ export function nodeSize(
 export interface NodeVisualSource {
   id: string;
   label?: string;
+  docs?: string;
   attrs?: Readonly<Record<string, string>>;
   inputs: readonly PortVisual[];
   outputs: readonly PortVisual[];
@@ -103,6 +104,7 @@ export function nodeVisual(source: NodeVisualSource): NodeVisual {
     y: numberAttr(attrs, 'editor.y') ?? 0,
     ...nodeSize(source.inputs, source.outputs, attrs),
     label: source.label ?? source.id,
+    docs: source.docs,
     phase: source.phase,
     breakpoint: source.breakpoint,
     inputs: [...source.inputs],

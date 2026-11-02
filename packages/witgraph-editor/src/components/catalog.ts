@@ -56,17 +56,18 @@ export class WitgraphCatalog extends HTMLElement {
   }
 
   /**
-   * Shows the components. The cards are drawn from each component's id
-   * and ports only, so they are drawn again only when those change: not on
-   * each of a running graph's many state changes.
+   * Shows the components. The cards are drawn from each component's id,
+   * docs and ports only, so they are drawn again only when those change: not
+   * on each of a running graph's many state changes.
    */
   #render(): void {
     const root = this.shadowRoot!;
     const sources = this.#controller?.componentSources;
     const shown = JSON.stringify(
-      sources?.map(({ id, index, inputs, outputs }) => [
+      sources?.map(({ id, index, docs, inputs, outputs }) => [
         id,
         index,
+        docs,
         inputs.map((p) => [p.name, p.kind]),
         outputs.map((p) => [p.name, p.kind]),
       ]) ?? null,
@@ -108,6 +109,11 @@ export class WitgraphCatalog extends HTMLElement {
       );
       card.draggable = true;
       card.addEventListener('dragstart', (e) => {
+        // A run uses the graph: nothing is added to it until it stops.
+        if (this.#controller && !this.#controller.editable) {
+          e.preventDefault();
+          return;
+        }
         e.dataTransfer?.setData('witgraph/component-index', String(source.index));
       });
 
@@ -115,6 +121,9 @@ export class WitgraphCatalog extends HTMLElement {
       const worldName = worldMatch ? worldMatch[1] : source.id;
       card.appendChild(this.#el('div', 'font-bold text-sm mb-0.5', worldName));
       card.appendChild(this.#el('div', 'text-2xs text-wg-text-dim truncate mb-2', source.id));
+      if (source.docs) {
+        card.appendChild(this.#el('div', 'docs text-xs text-wg-text mb-2', source.docs));
+      }
 
       const allPorts = [...source.inputs, ...source.outputs];
       if (allPorts.length > 0) {

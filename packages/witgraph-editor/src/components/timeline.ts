@@ -25,6 +25,9 @@ function eventColor(event: string): string {
   }
 }
 
+/** How far from the end of the rows still counts as being at it. */
+const FOLLOW_SLACK_PX = 8;
+
 const EXTRA_CSS = `
   :host { display: block; height: 100%; overflow: hidden; }
   .event { padding: 3px 8px; border-left: 3px solid var(--wg-text-dim); margin-bottom: 2px; }
@@ -39,14 +42,18 @@ const EXTRA_CSS = `
 
 export class WitgraphTimeline extends HTMLElement {
   #controller: EditorController | null = null;
-  #renderedCount = 0;
+  #lastRendered: TraceEntry | null = null;
   #eventsContainer: HTMLDivElement | null = null;
 
-  #onTraceEvent = () => this.#appendNew();
-  #onStateChanged = () => this.#appendNew();
+  #onTraceEvent = () => this.#sync();
+  #onStateChanged = () => this.#sync();
 
   connectedCallback(): void {
-    if (this.shadowRoot) return;
+    // Moved in the page: listen again, and draw what it missed.
+    if (this.shadowRoot) {
+      this.#listen();
+      return;
+    }
     const shadow = this.attachShadow({ mode: 'open' });
     adoptStyles(shadow, EXTRA_CSS);
 
@@ -63,41 +70,61 @@ export class WitgraphTimeline extends HTMLElement {
     timeline.appendChild(this.#eventsContainer);
 
     shadow.appendChild(timeline);
+    this.#listen();
   }
 
   disconnectedCallback(): void {
-    this.#detach();
+    this.#unlisten();
   }
 
   set controller(ctrl: EditorController) {
-    this.#detach();
+    this.#unlisten();
     this.#controller = ctrl;
-    this.#renderedCount = 0;
+    this.#lastRendered = null;
     if (this.#eventsContainer) this.#eventsContainer.innerHTML = '';
-    ctrl.addEventListener('trace-event', this.#onTraceEvent);
-    ctrl.addEventListener('state-changed', this.#onStateChanged);
-    this.#appendNew();
+    if (this.isConnected && this.shadowRoot) this.#listen();
   }
 
   get controller(): EditorController | null {
     return this.#controller;
   }
 
-  #detach(): void {
+  /** Follows the controller's trace, and draws it as it is now. */
+  #listen(): void {
+    this.#controller?.addEventListener('trace-event', this.#onTraceEvent);
+    this.#controller?.addEventListener('state-changed', this.#onStateChanged);
+    this.#sync();
+  }
+
+  #unlisten(): void {
     this.#controller?.removeEventListener('trace-event', this.#onTraceEvent);
     this.#controller?.removeEventListener('state-changed', this.#onStateChanged);
   }
 
-  #appendNew(): void {
+  #sync(): void {
     if (!this.#controller || !this.#eventsContainer) return;
     const events = this.#controller.traceEvents;
-    if (events.length <= this.#renderedCount) return;
+    const newest = events.at(-1) ?? null;
+    if (newest === this.#lastRendered) return;
 
-    for (let i = this.#renderedCount; i < events.length; i++) {
+    // Rows are followed as they come only by a reader at the end of them: one
+    // who has scrolled up to read is left where they are.
+    const box = this.#eventsContainer;
+    const following = box.scrollHeight - box.scrollTop - box.clientHeight <= FOLLOW_SLACK_PX;
+
+    // A full trace drops its oldest entries, so its length stops changing:
+    // what is new is whatever follows the last entry shown.
+    const shown = this.#lastRendered ? events.lastIndexOf(this.#lastRendered) : -1;
+    // Not there: the trace started over, or has moved on past every row.
+    if (shown === -1) this.#eventsContainer.innerHTML = '';
+    for (let i = shown + 1; i < events.length; i++) {
       this.#eventsContainer.appendChild(this.#createEventEl(events[i]));
     }
-    this.#renderedCount = events.length;
-    this.#eventsContainer.scrollTop = this.#eventsContainer.scrollHeight;
+    while (this.#eventsContainer.childElementCount > events.length) {
+      this.#eventsContainer.firstElementChild?.remove();
+    }
+    this.#lastRendered = newest;
+    if (following) box.scrollTop = box.scrollHeight;
   }
 
   #createEventEl(entry: TraceEntry): HTMLDivElement {

@@ -199,6 +199,32 @@ viewer!(b"output.frames=image\n");
 The linker joins sections with the same name, so end every line, the last
 included, with a newline.
 
+## Describing a component
+
+A component can say what it does, for an editor to show beside it, the way
+the catalog of the [editor](editor.md) does. Its bytes keep no doc comments,
+so the description lives in a custom section of the component called
+`witgraph-docs`: UTF-8 text, the description whole.
+
+```rust
+macro_rules! docs {
+    ($text:literal) => {
+        #[used]
+        #[unsafe(link_section = "witgraph-docs")]
+        static DOCS: [u8; $text.len()] = *$text;
+    };
+}
+
+docs!(b"Adds `add` to what it is given.");
+```
+
+It is found where a `witgraph-viewer` section is, and several sections of the
+same name read as one. A section that can't be read (it is not text) is
+skipped and never stops the component from loading; what was skipped is in
+`Lowered::warnings`. In JavaScript the description is the `docs` of the
+contract `describeComponent` returns. When a contract is lowered from WIT
+source, the doc comment of its world is its description instead.
+
 The `image` viewer shows either a record of raw pixels or the bytes of an
 encoded image:
 

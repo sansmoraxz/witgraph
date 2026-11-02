@@ -1,5 +1,5 @@
 import { expect, type Page, test } from '@playwright/test';
-import type { WitgraphCanvas } from 'witgraph-editor';
+import type { WitgraphCanvas, WitgraphTimeline } from 'witgraph-editor';
 
 test.describe('WIT Graph Editor Demo', () => {
   test.beforeEach(async ({ page }) => {
@@ -218,6 +218,112 @@ test.describe('WIT Graph Editor Demo', () => {
     await expect(canvas.locator('[data-node-id="relay-b"] .node-label')).toHaveText('Moved');
   });
 
+  test('the catalog describes a component by its world docs', async ({ page }) => {
+    const catalog = page.locator('witgraph-catalog');
+    for (const [world, docs] of [
+      ['relay', 'Passes a u32 through'],
+      ['stream-producer', 'Streams 0, 1, 2'],
+      // None of the default graph's nodes is a camera.
+      ['camera-source', "Streams the host's camera"],
+    ]) {
+      const card = catalog.locator('.card', { hasText: `${world}@` });
+      await expect(card.locator('.docs')).toContainText(docs);
+    }
+  });
+
+  test('the inspector lists snapshots, each with icon buttons to restore and delete it', async ({
+    page,
+  }) => {
+    const save = page.locator('witgraph-controls').locator('button.snap-save');
+    await save.click();
+    await save.click();
+    await page
+      .locator('witgraph-canvas')
+      .evaluate((el: WitgraphCanvas) => el.controller?.select(null));
+    const inspector = page.locator('witgraph-inspector');
+    await expect(inspector).toContainText('Snapshots (2)');
+    // An icon each, not text.
+    await expect(inspector.locator('button.icon-btn svg')).toHaveCount(4);
+    await expect(inspector.getByRole('button', { name: 'Restore snap-1' })).toBeVisible();
+    await inspector.getByRole('button', { name: 'Delete snap-1' }).click();
+    await expect(inspector).toContainText('Snapshots (1)');
+    await expect(inspector.getByRole('button', { name: 'Delete snap-1' })).toHaveCount(0);
+  });
+
+  test("the status is marked by its state in the theme's colours", async ({ page }) => {
+    // The colour a theme variable has, as the page computes it.
+    const themed = (variable: string) =>
+      page.evaluate((variable) => {
+        const probe = document.createElement('div');
+        probe.style.color = `var(${variable})`;
+        document.body.appendChild(probe);
+        const colour = getComputedStyle(probe).color;
+        probe.remove();
+        return colour;
+      }, variable);
+    const edge = () =>
+      page.locator('#status').evaluate((el) => getComputedStyle(el).borderLeftColor);
+    await expect(page.locator('#status')).toHaveClass(/ready/);
+    expect(await edge()).toBe(await themed('--wg-success'));
+    await page.locator('#status').evaluate((el) => {
+      el.classList.remove('ready');
+      el.classList.add('error');
+    });
+    expect(await edge()).toBe(await themed('--wg-error'));
+  });
+
+  test('what changes the graph is disabled while it runs', async ({ page }) => {
+    const controls = page.locator('witgraph-controls');
+    const inspector = page.locator('witgraph-inspector');
+    await page.locator('witgraph-canvas').locator('[data-node-id="relay-a"]').click();
+    const rename = inspector.locator('input.node-id');
+    await expect(rename).toBeEnabled();
+    await expect(controls.locator('button.reset')).toBeEnabled();
+
+    await controls.locator('button.run').click();
+    await expect(controls.locator('button.reset')).toBeDisabled();
+    await expect(controls.locator('button.load')).toBeDisabled();
+    await expect(controls.locator('button.undo')).toBeDisabled();
+    await expect(rename).toBeDisabled();
+    // The graph itself is not touched by an attempt.
+    const nodes = () =>
+      page.locator('witgraph-canvas').evaluate((el: WitgraphCanvas) => el.controller?.nodes.size);
+    expect(await nodes()).toBe(16);
+    await page.locator('witgraph-canvas').evaluate((el: WitgraphCanvas) => {
+      el.controller?.removeNode('relay-c');
+    });
+    expect(await nodes()).toBe(16);
+
+    await controls.locator('button.stop').click();
+    await expect(controls.locator('button.reset')).toBeEnabled();
+    await expect(controls.locator('button.load')).toBeEnabled();
+    await expect(rename).toBeEnabled();
+  });
+
+  test('the status follows a run', async ({ page }) => {
+    const status = page.locator('#status');
+    const controls = page.locator('witgraph-controls');
+    await controls.locator('button.run').click();
+    await expect(status).toContainText('Running');
+    await expect(status).toHaveClass(/running/);
+    // It counts the ticks as they are made.
+    const tick = async () => Number(/tick (\d+)/.exec((await status.textContent()) ?? '')?.[1]);
+    await expect.poll(tick).toBeGreaterThan(0);
+    const before = await tick();
+    await expect.poll(tick).toBeGreaterThan(before);
+
+    await controls.locator('button.stop').click();
+    await expect(status).toContainText('Graph compiles');
+    await expect(status).toHaveClass(/ready/);
+  });
+
+  test('the inspector describes the selected node by its component', async ({ page }) => {
+    await page.locator('witgraph-canvas').locator('[data-node-id="relay-a"]').click();
+    await expect(page.locator('witgraph-inspector').locator('.node-docs')).toContainText(
+      'Passes a u32 through',
+    );
+  });
+
   test('the timeline names the nodes of a generation', async ({ page }) => {
     await page.locator('witgraph-controls').locator('button.step').click();
     const timeline = page.locator('witgraph-timeline');
@@ -230,6 +336,94 @@ test.describe('WIT Graph Editor Demo', () => {
     await expect(
       timeline.locator('.event', { hasText: 'camera, grayscale, invert, video-sink' }).first(),
     ).toBeVisible();
+  });
+
+  test('the timeline keeps up once the trace is full', async ({ page }) => {
+    test.setTimeout(60_000);
+    const timeline = page.locator('witgraph-timeline');
+    const traceLength = () =>
+      timeline.evaluate((el: WitgraphTimeline) => el.controller?.traceEvents.length);
+    /** The trace's newest entry, and the row the timeline shows last. */
+    const newest = () =>
+      timeline.evaluate((el: WitgraphTimeline) => ({
+        entry: el.controller?.traceEvents.at(-1)?.timestamp,
+        row: el.shadowRoot?.querySelector('.event:last-child')?.firstChild?.textContent,
+        rows: el.shadowRoot?.querySelectorAll('.event').length,
+      }));
+
+    const controls = page.locator('witgraph-controls');
+    await controls.locator('button.run').click();
+    // The trace holds 1000 entries, and from there on only its contents change.
+    await expect.poll(traceLength, { timeout: 40_000 }).toBe(1000);
+
+    const full = (await newest()).entry ?? 0;
+    await expect.poll(async () => (await newest()).entry).toBeGreaterThan(full);
+    const { entry, row, rows } = await newest();
+    expect(row).toBe(`${((entry ?? 0) / 1000).toFixed(2)}s `);
+    // One row an entry: the oldest go when their entries do.
+    expect(rows).toBe(1000);
+
+    await controls.locator('button.stop').click();
+    // A trace started over takes its rows with it.
+    await timeline.evaluate(async (el: WitgraphTimeline) => {
+      const controller = el.controller;
+      await controller?.importGraph(controller.exportGraph());
+    });
+    await expect.poll(async () => (await newest()).rows).toBeLessThan(1000);
+  });
+
+  test('the timeline follows the trace still after it is moved in the page', async ({ page }) => {
+    const timeline = page.locator('witgraph-timeline');
+    const rows = () =>
+      timeline.evaluate((el: HTMLElement) => el.shadowRoot?.querySelectorAll('.event').length ?? 0);
+    const controls = page.locator('witgraph-controls');
+    await controls.locator('button.run').click();
+    await expect.poll(rows).toBeGreaterThan(0);
+
+    await page.evaluate(() => {
+      const el = document.querySelector('witgraph-timeline') as HTMLElement;
+      const parent = el.parentElement as HTMLElement;
+      el.remove();
+      parent.appendChild(el);
+    });
+    const moved = await rows();
+    await expect.poll(rows).toBeGreaterThan(moved);
+    await controls.locator('button.stop').click();
+  });
+
+  test('the timeline leaves a reader who scrolled up where they are', async ({ page }) => {
+    const timeline = page.locator('witgraph-timeline');
+    const scroll = () =>
+      timeline.evaluate((el: HTMLElement) => {
+        const box = el.shadowRoot?.querySelector('.events-wrap') as HTMLElement;
+        return {
+          top: box.scrollTop,
+          toEnd: box.scrollHeight - box.scrollTop - box.clientHeight,
+          rows: box.querySelectorAll('.event').length,
+        };
+      });
+    const controls = page.locator('witgraph-controls');
+    await controls.locator('button.run').click();
+    // Rows enough to scroll through, which stay at the end while followed.
+    await expect.poll(async () => (await scroll()).rows, { timeout: 20_000 }).toBeGreaterThan(60);
+    expect((await scroll()).toEnd).toBeLessThanOrEqual(8);
+
+    await timeline.evaluate((el: HTMLElement) => {
+      (el.shadowRoot?.querySelector('.events-wrap') as HTMLElement).scrollTop = 0;
+    });
+    const { rows } = await scroll();
+    await expect.poll(async () => (await scroll()).rows).toBeGreaterThan(rows);
+    expect((await scroll()).top).toBe(0);
+
+    // Back at the end, it follows again.
+    await timeline.evaluate((el: HTMLElement) => {
+      const box = el.shadowRoot?.querySelector('.events-wrap') as HTMLElement;
+      box.scrollTop = box.scrollHeight;
+    });
+    const { rows: before } = await scroll();
+    await expect.poll(async () => (await scroll()).rows).toBeGreaterThan(before);
+    expect((await scroll()).toEnd).toBeLessThanOrEqual(8);
+    await controls.locator('button.stop').click();
   });
 
   test('injected values from attrs are visible', async ({ page }) => {

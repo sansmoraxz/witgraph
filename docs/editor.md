@@ -43,6 +43,13 @@ Put them anywhere on your page. They all share one `EditorController`.
   an endless stream runs until you stop it. **Step** runs a single tick.
   **Stop** halts a run and everything it left running, endless streams
   included, and **Reset** reloads the graph from scratch.
+- **Editing waits for the run.** While a graph runs, or is paused in a run,
+  what loads it again is refused: adding, removing, connecting, renaming,
+  pasting, undoing and redoing, mock mode, importing and **Reset**. The
+  toolbar and inspector disable them, and `controller.editable` tells a host
+  of your own; an edit tried anyway does nothing but add a warning to the
+  timeline. Stop the run first. Moving, resizing and labelling nodes, the tick
+  rate, injected values and breakpoints go on working.
 - **Rate** sets the most ticks a second a run makes (`controller.tickRate`),
   from one a second to _Max_, a tick a frame. Slow it down to watch a graph
   work; it can be changed while running.
@@ -161,6 +168,10 @@ the graph as JSON, the component bytes, the scheduler's `wasm`, and a
 `state-changed`, `trace-event`, `fault` and `output-changed` events, so you can
 show your own status or react to edits. `output-changed` fires at most once a
 frame while streams carry items.
+
+The catalog describes each component with the description it carries, a
+`witgraph-docs` section of its bytes
+([Describing a component](components.md#describing-a-component)).
 
 ## Styling
 

@@ -115,6 +115,7 @@ export class WitgraphControls extends HTMLElement {
   #btnLayout!: HTMLButtonElement;
   #btnSnapSave!: HTMLButtonElement;
   #btnSnapRestore!: HTMLButtonElement;
+  #btnLoad!: HTMLButtonElement;
   #badge!: HTMLSpanElement;
   /** Shows a tick rate on the slider; set once the toolbar is built. */
   #showRate: ((rate: number) => void) | null = null;
@@ -189,9 +190,9 @@ export class WitgraphControls extends HTMLElement {
     sep();
 
     // Load
-    const btnLoad = mkBtn('load', 'Load graph from JSON file', 'upload', 'Load');
-    group(btnLoad);
-    btnLoad.addEventListener('click', () => this.#controller?.importGraphFile());
+    this.#btnLoad = mkBtn('load', 'Load graph from JSON file', 'upload', 'Load');
+    group(this.#btnLoad);
+    this.#btnLoad.addEventListener('click', () => this.#controller?.importGraphFile());
 
     sep();
 
@@ -302,12 +303,15 @@ export class WitgraphControls extends HTMLElement {
     this.#btnRun.disabled = mode === 'running';
     this.#btnStep.disabled = mode === 'running';
     this.#btnStop.disabled = mode === 'idle' || mode === 'error';
-    this.#btnReset.disabled = false;
+    // What changes the graph waits while it runs.
+    const editable = this.#controller?.editable ?? true;
+    this.#btnReset.disabled = !editable;
+    this.#btnLoad.disabled = !editable;
     this.#btnBreakpoint.disabled = !hasSelection;
     this.#btnResume.disabled = mode !== 'paused';
     this.#btnLayout.disabled = mode === 'running';
-    this.#btnUndo.disabled = !(this.#controller?.canUndo ?? false);
-    this.#btnRedo.disabled = !(this.#controller?.canRedo ?? false);
+    this.#btnUndo.disabled = !editable || !(this.#controller?.canUndo ?? false);
+    this.#btnRedo.disabled = !editable || !(this.#controller?.canRedo ?? false);
     this.#btnSnapSave.disabled = !this.#controller || mode === 'running';
     this.#btnSnapRestore.disabled =
       !this.#controller || this.#controller.savedSnapshots.length === 0 || mode === 'running';

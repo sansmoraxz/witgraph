@@ -164,3 +164,25 @@ jobs:
       - run: pnpm exec vite build
       - run: pnpm exec playwright install --with-deps chromium
       - run: pnpm test
+      - uses: actions/upload-pages-artifact@v5
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        with:
+          path: packages/witgraph-editor-demo/dist
+
+  pages:
+    name: Publish demo
+    needs: demo
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5
