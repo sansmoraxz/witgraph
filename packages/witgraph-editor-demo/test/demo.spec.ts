@@ -250,6 +250,28 @@ test.describe('WIT Graph Editor Demo', () => {
     await expect(inspector.getByRole('button', { name: 'Delete snap-1' })).toHaveCount(0);
   });
 
+  test("the status is marked by its state in the theme's colours", async ({ page }) => {
+    // The colour a theme variable has, as the page computes it.
+    const themed = (variable: string) =>
+      page.evaluate((variable) => {
+        const probe = document.createElement('div');
+        probe.style.color = `var(${variable})`;
+        document.body.appendChild(probe);
+        const colour = getComputedStyle(probe).color;
+        probe.remove();
+        return colour;
+      }, variable);
+    const edge = () =>
+      page.locator('#status').evaluate((el) => getComputedStyle(el).borderLeftColor);
+    await expect(page.locator('#status')).toHaveClass(/ready/);
+    expect(await edge()).toBe(await themed('--wg-success'));
+    await page.locator('#status').evaluate((el) => {
+      el.classList.remove('ready');
+      el.classList.add('error');
+    });
+    expect(await edge()).toBe(await themed('--wg-error'));
+  });
+
   test('the inspector describes the selected node by its component', async ({ page }) => {
     await page.locator('witgraph-canvas').locator('[data-node-id="relay-a"]').click();
     await expect(page.locator('witgraph-inspector').locator('.node-docs')).toContainText(

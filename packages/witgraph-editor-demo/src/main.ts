@@ -636,7 +636,7 @@ function updateStatus(): void {
     statusEl.textContent = `Graph error: ${error}`;
     statusEl.classList.add('error');
   } else {
-    statusEl.textContent = `Graph compiles -- ${controller.nodes.size} nodes, ${controller.edges.length} edges. Click Run or Step to execute.`;
+    statusEl.textContent = `Graph compiles — ${controller.nodes.size} nodes, ${controller.edges.length} edges. Click Run or Step to execute.`;
     statusEl.classList.add('ready');
   }
 }
