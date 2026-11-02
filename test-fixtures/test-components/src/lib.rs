@@ -193,3 +193,6 @@ pub const TENSOR_KEEP: Guest = guest!("TENSOR_KEEP_WASM", "tensor-keep");
 /// (`conv3x3`). Calls `fatal` with the host's reason when it cannot. Previews
 /// `edges` as `tensor`.
 pub const TENSOR_EDGE: Guest = guest!("TENSOR_EDGE_WASM", "tensor-edge");
+
+/// `data: future<u32>`, dropped unread → `done: bool`.
+pub const FUTURE_DROPPER: Guest = guest!("FUTURE_DROPPER_WASM", "future-dropper");

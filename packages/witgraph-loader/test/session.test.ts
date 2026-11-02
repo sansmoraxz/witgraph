@@ -66,6 +66,7 @@ const ids: Record<string, string> = {
   labelled: 'test:labelled/labelled@0.1.0',
   'future-writer': 'test:future-writer/future-writer@0.1.0',
   'future-reader': 'test:future-reader/future-reader@0.1.0',
+  'future-dropper': 'test:future-dropper/future-dropper@0.1.0',
   calc: 'test:calc/calc@0.1.0',
   math: 'test:math/math@0.1.0',
   'video-source': 'test:video-source/video-source@0.1.0',
@@ -1599,4 +1600,30 @@ test('a node keeps its own reference to a tensor across runs', async () => {
   assert.ok((session.graph.readOutput('keep', 'previous') as bigint) > 0n);
   // The latched second tensor, and `keep`'s clone of it.
   assert.equal(tensors.live(), 2);
+});
+
+test('a future its reader drops unread does not leave its writer waiting', async () => {
+  const session = await load(
+    [
+      ['w', 'future-writer'],
+      ['d', 'future-dropper'],
+    ],
+    [['a', 'w.done', 'd.data']],
+  );
+  await within(session.settle());
+  assert.equal(session.graph.readOutput('d', 'done'), true);
+  // `last` is how the previous run's write ended: 0 until one has. As for an
+  // unread future, its value was read and discarded, so it reads as taken.
+  await within(
+    (async () => {
+      let last = 0;
+      for (let again = 1; last === 0; again++) {
+        session.graph.inject('w', 'again', again);
+        await session.settle();
+        last = session.graph.readOutput('w', 'last') as number;
+        await tick();
+      }
+      assert.equal(last, 1);
+    })(),
+  );
 });

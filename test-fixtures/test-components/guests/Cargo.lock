@@ -104,6 +104,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "future-dropper-guest"
+version = "0.1.0"
+dependencies = [
+ "wit-bindgen",
+]
+
+[[package]]
 name = "future-reader-guest"
 version = "0.1.0"
 dependencies = [

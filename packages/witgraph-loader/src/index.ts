@@ -582,6 +582,13 @@ export class Session {
     // generation is abandoned or the session disposed.
     for (const port of this.contracts.get(node)?.outputs ?? []) {
       const key = camelCase(port.name);
+      if (port.kind === 'future') {
+        // jco disposes a future its reader drops unread, but its writer's
+        // write still waits, on a timer that keeps the process alive. Reading
+        // the future ends the write.
+        const future = outputs[key] as (PromiseLike<unknown> & Disposable) | undefined;
+        if (future) future[Symbol.dispose] = () => closeUnread(future);
+      }
       if (port.kind === 'future' && options.onFutureValue) {
         // jco's future settles once, and its reader is given the same
         // value: watching it takes nothing from the reader.
@@ -625,10 +632,10 @@ export class Session {
 }
 
 /**
- * Drops a stream or future output nothing reads. A stream is closed, so its
- * writer's next write fails, as on wasmtime. jco's future has no way to be
- * dropped, so it is read and its value discarded: its writer's write
- * succeeds, where on wasmtime it fails.
+ * Drops a stream or future output nothing reads, or a future its reader
+ * dropped. A stream is closed, so its writer's next write fails, as on
+ * wasmtime. jco's future has no way to be dropped, so it is read and its value
+ * discarded: its writer's write succeeds, where on wasmtime it fails.
  */
 function closeUnread(value: any): void {
   if (typeof value?.[Symbol.asyncIterator] === 'function') {
