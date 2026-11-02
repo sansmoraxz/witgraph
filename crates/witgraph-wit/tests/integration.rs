@@ -141,10 +141,21 @@ fn demo_graph_compiles_and_aggregates_capabilities() {
     assert_eq!(
         capabilities,
         [
-            ("demo:caps/clock@0.1.0", vec![("now", "func()->u64")]),
             (
-                "demo:caps/log@0.1.0",
-                vec![("emit", r#"func("msg":string)"#)]
+                "wasi:clocks/monotonic-clock@0.3.2",
+                vec![
+                    ("get-resolution", "func()->u64"),
+                    ("now", "func()->u64"),
+                    ("wait-for", r#"async func("how-long":u64)"#),
+                    ("wait-until", r#"async func("when":u64)"#),
+                ]
+            ),
+            (
+                "wasi:logging/logging@0.1.0-draft",
+                vec![(
+                    "log",
+                    r#"func("level":enum{"trace","debug","info","warn","error","critical"},"context":string,"message":string)"#
+                )]
             ),
         ]
     );

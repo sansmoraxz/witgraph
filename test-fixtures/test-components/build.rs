@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::{env, fs};
 
-const GUESTS: [&str; 43] = [
+const GUESTS: [&str; 44] = [
     "echo",
     "configurable",
     "relay",
@@ -29,6 +29,7 @@ const GUESTS: [&str; 43] = [
     "frame-invert",
     "video-sink",
     "edge-detect",
+    "edge-detect-webgpu",
     "blob-source",
     "blob-relay",
     "blob-sink",

@@ -13,6 +13,7 @@
  * (setup.mjs is cross-platform — no bash required)
  */
 
+import { monotonicClock } from '@bytecodealliance/preview3-shim/clocks';
 import {
   EditorController,
   type GraphJson,
@@ -140,6 +141,7 @@ const GUESTS = [
   'frame-invert',
   'video-sink',
   'edge-detect',
+  'edge-detect-webgpu',
   'tensor-source',
   'tensor-edge',
   'tensor-invert',
@@ -315,16 +317,18 @@ const video: GraphJson = {
   ],
 };
 
-const edgeDetectRef = {
-  package: { namespace: 'test', name: 'edge-detect', version: '0.1.0' },
-  world: 'edge-detect',
+/** The edge node of an accelerator: WebGPU's runs its own shaders on it. */
+const edgeDetectRef = (accelerator: string) => {
+  const name = accelerator === 'WebGPU' ? 'edge-detect-webgpu' : 'edge-detect';
+  return { package: { namespace: 'test', name, version: '0.1.0' }, world: name };
 };
 
 /**
  * A camera's frames through edge detection: a small convolutional network
- * with fixed weights, run on the browser's accelerator (`test:accel/cnn`,
- * provided here by WebGPU or WebNN). A browser without the accelerator
- * still loads the graph; the edge node faults when run, saying so.
+ * with fixed weights, run on the browser's accelerator: compute shaders of
+ * the node's own through `wasi:webgpu`, or WebNN behind `test:accel/cnn`. A
+ * browser without the accelerator still loads the graph; the edge node faults
+ * when run, saying so.
  */
 function edgeGraph(accelerator: string): GraphJson {
   return {
@@ -335,7 +339,7 @@ function edgeGraph(accelerator: string): GraphJson {
     components: allComponents,
     nodes: [
       { id: 'camera', component: videoSourceRef, label: 'Camera', attrs: { 'inject.fps': '15' } },
-      { id: 'edges', component: edgeDetectRef, label: `Edges (${accelerator})` },
+      { id: 'edges', component: edgeDetectRef(accelerator), label: `Edges (${accelerator})` },
       { id: 'sink', component: videoSinkRef, label: 'Sink' },
     ],
     connections: [
@@ -460,7 +464,7 @@ const demos: Record<string, Demo> = {
     graph: video,
     select: 'gray',
   },
-  webgpu: { graph: edgeGraph('WebGPU'), select: 'edges', accelerator: webgpu },
+  webgpu: { graph: edgeGraph('WebGPU'), select: 'edges' },
   webnn: { graph: edgeGraph('WebNN'), select: 'edges', accelerator: webnn },
   tensors: { graph: tensorGraph('CPU'), select: 'edges' },
   'tensors-webgpu': { graph: tensorGraph('WebGPU'), select: 'edges', tensors: webgpuTensors },
@@ -508,11 +512,6 @@ function mqttSource() {
   };
 }
 
-/** Implements `test:video/clock@0.1.0` for the `video-source` component. */
-const clock = {
-  sleep: (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
-};
-
 /** What runs `test:accel/cnn`: chosen by the demo loaded. */
 let cnn: Cnn = cpu();
 
@@ -531,7 +530,8 @@ const capInstances = new Map<string, Record<string, object>>();
 
 function capabilities(node: string, capability: Capability): object | undefined {
   const iface = capability.implements ?? capability.interface;
-  if (iface.startsWith('test:video/clock')) return clock;
+  if (iface.startsWith('wasi:clocks/monotonic-clock')) return monotonicClock;
+  if (iface.startsWith('wasi:webgpu/webgpu')) return webgpu;
   if (iface.startsWith('test:accel/cnn')) return cnn;
   if (iface.startsWith('test:data/tensor')) return tensorImport;
   if (iface.startsWith('test:camera/camera')) return cameraImport;

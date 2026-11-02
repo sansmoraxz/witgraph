@@ -12,6 +12,7 @@ use test_components::{
     STREAM_DRAIN, STREAM_PRODUCER, STREAM_RELAY, VIDEO_SINK, VIDEO_SOURCE,
 };
 use wasmtime::StoreContextMut;
+use wasmtime::component::{ComponentType, Lift, Lower, Resource, ResourceType};
 use witgraph_ir::{
     Capability, ComponentContract, ComponentRef, Graph, GraphBuilder, NodeId, PortDirection,
     PortRef, ResourceClaim,
@@ -776,8 +777,8 @@ async fn capability_import_feeds_a_stream() {
     assert!(feed.lock().unwrap().is_empty());
 }
 
-/// Provides `test:video/clock` to the nodes that import it: `sleep` waits
-/// on tokio's clock, from a concurrent host function (the import is an
+/// Provides `wasi:clocks/monotonic-clock` to the nodes that import it:
+/// `wait-for` waits on tokio's clock, from a concurrent host function (the import is an
 /// `async func`).
 struct Clock;
 
@@ -790,15 +791,15 @@ impl Host for Clock {
         contract: &ComponentContract,
         linker: &mut wasmtime::component::Linker<HostState>,
     ) -> wasmtime::Result<()> {
-        const CLOCK: &str = "test:video/clock@0.1.0";
+        const CLOCK: &str = "wasi:clocks/monotonic-clock@0.3.2";
         if !contract.capabilities.iter().any(|c| c.interface == CLOCK) {
             return Ok(());
         }
         linker
             .instance(CLOCK)?
-            .func_wrap_concurrent("sleep", |_, (ms,): (u32,)| {
+            .func_wrap_concurrent("wait-for", |_, (nanos,): (u64,)| {
                 Box::pin(async move {
-                    tokio::time::sleep(Duration::from_millis(ms.into())).await;
+                    tokio::time::sleep(Duration::from_nanos(nanos)).await;
                     Ok(())
                 })
             })
@@ -875,7 +876,7 @@ async fn a_video_pipeline_filters_frames_as_they_stream() {
 
 /// `test:accel/cnn`'s types, as the host sees them.
 mod cnn {
-    use wasmtime::component::{ComponentType, Lift, Lower};
+    use super::{ComponentType, Lift, Lower};
 
     #[derive(ComponentType, Lift, Lower, Clone, Debug)]
     #[component(record)]
@@ -1136,13 +1137,31 @@ fn a_wrong_viewer_hint_is_skipped_not_fatal() {
     witgraph_wit::verify::verify_component(&contract(VIDEO_SOURCE), &bytes).expect("verifies");
 }
 
-/// Serves `test:kv/store`. `get` answers `<plugin id>:<key>#<n>`, where `n`
-/// counts the calls made in the island so far, by any store: the count
-/// lives in the island's plugin state.
+/// The interface `labelled` imports twice.
+const KEYVALUE: &str = "wasi:keyvalue/store@0.2.0-draft2";
+
+/// Serves `wasi:keyvalue/store`. A bucket's `get` answers
+/// `<plugin id>:<key>#<n>`, where `n` counts the calls made in the island so
+/// far, by any store: the count lives in the island's plugin state.
 struct KvStore(&'static str);
 
 #[derive(Default)]
 struct Calls(u32);
+
+/// The `bucket` resource; `open` answers one, whatever its name.
+struct Bucket;
+
+/// `wasi:keyvalue/store`'s `error`.
+#[derive(ComponentType, Lift, Lower)]
+#[component(variant)]
+enum KvError {
+    #[component(name = "no-such-store")]
+    NoSuchStore,
+    #[component(name = "access-denied")]
+    AccessDenied,
+    #[component(name = "other")]
+    Other(String),
+}
 
 impl CapabilityPlugin for KvStore {
     fn id(&self) -> &str {
@@ -1150,7 +1169,7 @@ impl CapabilityPlugin for KvStore {
     }
 
     fn provides(&self) -> Vec<String> {
-        vec!["test:kv/store@0.1.0".into()]
+        vec![KEYVALUE.into()]
     }
 
     fn link(
@@ -1160,13 +1179,20 @@ impl CapabilityPlugin for KvStore {
         linker: &mut wasmtime::component::Linker<PluginData>,
     ) -> wasmtime::Result<()> {
         let id = self.0;
-        linker.instance(&capability.interface)?.func_wrap(
-            "get",
-            move |mut store: StoreContextMut<'_, PluginData>, (key,): (String,)| {
+        let mut instance = linker.instance(&capability.interface)?;
+        instance.resource("bucket", ResourceType::host::<Bucket>(), |_, _| Ok(()))?;
+        instance.func_wrap("open", |_, (_identifier,): (String,)| {
+            Ok((Ok::<_, KvError>(Resource::<Bucket>::new_own(0)),))
+        })?;
+        instance.func_wrap(
+            "[method]bucket.get",
+            move |mut store: StoreContextMut<'_, PluginData>,
+                  (_bucket, key): (Resource<Bucket>, String)| {
                 let extensions = store.data_mut().extensions();
                 let calls = extensions.get::<Calls>().map_or(0, |c| c.0) + 1;
                 extensions.insert(Calls(calls));
-                Ok((format!("{id}:{key}#{calls}"),))
+                let value = format!("{id}:{key}#{calls}").into_bytes();
+                Ok((Ok::<_, KvError>(Some(value)),))
             },
         )?;
         Ok(())
@@ -1234,13 +1260,13 @@ async fn a_capability_no_plugin_provides_fails_the_load_by_name() {
         } => {
             assert_eq!(node.as_str(), "n");
             assert_eq!(capability, "backup");
-            assert_eq!(implements.as_deref(), Some("test:kv/store@0.1.0"));
+            assert_eq!(implements.as_deref(), Some(KEYVALUE));
         }
         other => panic!("expected MissingCapability, got {other}"),
     }
     assert_eq!(
         err.to_string(),
-        "node `n` imports capability `backup` (`test:kv/store@0.1.0`), which the host does not provide"
+        "node `n` imports capability `backup` (`wasi:keyvalue/store@0.2.0-draft2`), which the host does not provide"
     );
 }
 

@@ -126,7 +126,9 @@ formatting.
 
 `test-components` builds the guests listed in `GUESTS` in
 `test-fixtures/test-components/build.rs`; a new directory under `guests/` is
-not picked up until it is added there.
+not picked up until it is added there. Where a guest imports a standard WASI
+interface, its `wit/deps` holds a copy of the upstream package: `just fetch-wit`
+downloads the latest of each and moves the guests' imports to its version.
 
 ## Docs
 

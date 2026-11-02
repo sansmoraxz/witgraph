@@ -8,6 +8,7 @@ import { execFileSync } from 'node:child_process';
 import { readdir, readFile, stat } from 'node:fs/promises';
 import { afterEach, test } from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { monotonicClock } from '@bytecodealliance/preview3-shim/clocks';
 import type { Capability, ComponentSource } from 'witgraph-loader';
 import { EditorController } from '../src/controller/editor-controller.ts';
 import type { EditorLoadOptions, GraphJson } from '../src/controller/types.ts';
@@ -255,11 +256,9 @@ test('trace events are collected', async () => {
 // Previews
 // ---------------------------------------------------------------------------
 
-/** `test:video/clock`, sleeping on the event loop. */
+/** `wasi:clocks/monotonic-clock`, as the WASI shim provides it. */
 const clock = (_node: string, capability: Capability) =>
-  capability.interface === 'test:video/clock@0.1.0'
-    ? { sleep: (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)) }
-    : undefined;
+  capability.interface === 'wasi:clocks/monotonic-clock@0.3.2' ? monotonicClock : undefined;
 
 interface Frame {
   width: number;

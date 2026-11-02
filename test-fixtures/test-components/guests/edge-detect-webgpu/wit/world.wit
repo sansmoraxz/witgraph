@@ -1,0 +1,29 @@
+package test:edge-detect-webgpu@0.1.0;
+
+/// Edge detection by a small convolutional network with fixed weights, its
+/// layers compute shaders this node runs on the host's GPU through
+/// `wasi:webgpu`, on every frame of its input stream: `edges` are the frames'
+/// edges, white on black. `backend` is `webgpu`; with no GPU, the node faults,
+/// saying so.
+world edge-detect-webgpu {
+    import wasi:webgpu/webgpu@0.3.0-rc.2;
+    import witgraph:runtime/host@0.1.0;
+
+    export node: interface {
+        /// An image: `width` x `height` pixels, row by row, four bytes
+        /// (red, green, blue, alpha) each.
+        record frame {
+            width: u32,
+            height: u32,
+            pixels: list<u8>,
+        }
+        record inputs {
+            frames: stream<frame>,
+        }
+        record outputs {
+            edges: stream<frame>,
+            backend: string,
+        }
+        run: async func(inputs: inputs) -> outputs;
+    }
+}

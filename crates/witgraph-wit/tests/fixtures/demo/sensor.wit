@@ -2,7 +2,7 @@ package demo:graph@0.1.0;
 
 /// Periodically samples a sensor and publishes readings.
 world sensor {
-    import demo:caps/clock@0.1.0;
+    import wasi:clocks/monotonic-clock@0.3.2;
 
     export node: interface {
         /// A single timestamped sensor reading.

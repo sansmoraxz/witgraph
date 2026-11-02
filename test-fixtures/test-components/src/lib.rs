@@ -95,7 +95,7 @@ pub const RELAY_WIDE: Guest = guest!("RELAY_WIDE_WASM", "relay-wide");
 /// `in: option<f64>` → `out: f64 = in * 2` (absent reads as 0.0).
 pub const NAMED_ECHO: Guest = guest!("NAMED_ECHO_WASM", "named-echo");
 
-/// Imports `test:kv/store` under the labels `primary` and `backup`.
+/// Imports `wasi:keyvalue/store` under the labels `primary` and `backup`.
 /// `key: option<string>` (default empty) → `primary: string`,
 /// `backup: string`: what each store returns for the key.
 pub const LABELLED: Guest = guest!("LABELLED_WASM", "labelled");
@@ -118,7 +118,7 @@ pub const READING_PRODUCER: Guest = guest!("READING_PRODUCER_WASM", "reading-pro
 /// `count: u32`.
 pub const READING_CONSUMER: Guest = guest!("READING_CONSUMER_WASM", "reading-consumer");
 
-/// Imports `test:video/clock` (`sleep: async func(ms: u32)`).
+/// Imports `wasi:clocks/monotonic-clock` (`wait-for`).
 /// `frames: option<u32>`, `fps: option<u32>` → `frames: stream<frame>`
 /// (a record `{ width, height, pixels: list<u8> }`, 96x64 RGBA): an
 /// animated gradient, `frames` of them (forever when absent), sleeping
@@ -146,6 +146,12 @@ pub const VIDEO_SINK: Guest = guest!("VIDEO_SINK_WASM", "video-sink");
 /// Faults, saying why, when the host has no accelerator. Previews `edges`
 /// as `image`.
 pub const EDGE_DETECT: Guest = guest!("EDGE_DETECT_WASM", "edge-detect");
+
+/// Imports `wasi:webgpu/webgpu` and `witgraph:runtime/host`. The same network
+/// as `EDGE_DETECT`, as compute shaders of its own on the host's GPU: `frames:
+/// stream<frame>` → `edges: stream<frame>`, `backend: string` (`webgpu`).
+/// Faults, saying why, when the host has no GPU. Previews `edges` as `image`.
+pub const EDGE_DETECT_WEBGPU: Guest = guest!("EDGE_DETECT_WEBGPU_WASM", "edge-detect-webgpu");
 
 /// `size: option<u32>`, `seed: option<u32>` (both default 0) →
 /// `blob: list<u8>`, `size` bytes of `(i + seed) % 256`. For measuring how
