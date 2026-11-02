@@ -33,6 +33,7 @@
     "@bytecodealliance/jco": "^1.40.0"
   },
   "devDependencies": {
+    "@bytecodealliance/preview3-shim": "^0.13.0",
     "typescript": "^7.0.2"
   },
   "files": [

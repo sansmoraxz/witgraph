@@ -1,7 +1,7 @@
 wit_bindgen::generate!({ path: "wit", world: "video-source", generate_all });
 
 use exports::node::{Frame, Guest, Inputs, Outputs};
-use test::video::clock;
+use wasi::clocks::monotonic_clock;
 
 /// Declares how an editor previews this node's outputs (the
 /// `witgraph-viewer` custom section).
@@ -32,7 +32,7 @@ impl Guest for Source {
                 if t > 0
                     && let Some(fps) = inputs.fps.filter(|&fps| fps > 0)
                 {
-                    clock::sleep(1000 / fps).await;
+                    monotonic_clock::wait_for(1_000_000_000 / u64::from(fps)).await;
                 }
                 // `Some` back means the reader was dropped.
                 if tx.write_one(render(t)).await.is_some() {

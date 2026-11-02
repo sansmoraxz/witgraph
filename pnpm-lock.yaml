@@ -182,12 +182,21 @@ importers:
         specifier: workspace:*
         version: link:../witgraph-loader
     devDependencies:
+      '@bytecodealliance/preview3-shim':
+        specifier: ^0.13.0
+        version: 0.13.0
       typescript:
         specifier: ^7.0.2
         version: 7.0.2
 
   packages/witgraph-editor-demo:
     dependencies:
+      '@bytecodealliance/preview3-shim':
+        specifier: ^0.13.0
+        version: 0.13.0
+      '@wasi-gfx/wasi-gfx-shim':
+        specifier: ^0.1.0
+        version: 0.1.0
       witgraph-editor:
         specifier: workspace:*
         version: link:../witgraph-editor
@@ -217,6 +226,9 @@ importers:
         specifier: ^1.40.0
         version: 1.40.0
     devDependencies:
+      '@bytecodealliance/preview3-shim':
+        specifier: ^0.13.0
+        version: 0.13.0
       typescript:
         specifier: ^7.0.2
         version: 7.0.2
@@ -428,6 +440,9 @@ packages:
 
   '@bytecodealliance/preview3-shim@0.12.0':
     resolution: {integrity: sha512-qZ7rXS0++63x4O9YVsRhF+qlHdChoD61MGDiBpQWR5edmXxzguXTPttKFbyZSWHwisxBUSXKujBZNIIbU/MnLA==}
+
+  '@bytecodealliance/preview3-shim@0.13.0':
+    resolution: {integrity: sha512-XcpvwlsjlVqzV1NeHItgdWCQMPq/imPSoCsB/6vh1eLnB/GjsbApEHXPoAH5h7mdkug2RPlmA+DWI5PEtg8cBg==}
 
   '@bytecodealliance/weval@0.5.1':
     resolution: {integrity: sha512-Hb8qRoF3b2UgkZqeDTzaTKGITa31KCLcoyfFstE/uO/aYVUyHweaNDchF4SNrPQfEpiBwRnMUilI4Jbbl8Hl6w==}
@@ -1182,6 +1197,9 @@ packages:
     cpu: [x64]
     os: [win32]
 
+  '@wasi-gfx/wasi-gfx-shim@0.1.0':
+    resolution: {integrity: sha512-Q0gi8lH4c8yBrpy+S7FdNEyV9txD5nO0r7awsyqWu9sXDaBxiYQ5+0K8/bw3Cn3aC17pK/5+gD15fxLpSTZ/kA==}
+
   abort-controller@3.0.0:
     resolution: {integrity: sha512-h8lQ8tacZYnR3vNQTgibj+tODHI5/+l06Au2Pcriv/Gmet0eaj4TwWH41sO9wnHDiQsEj19q0drzdWdeAHtweg==}
     engines: {node: '>=6.5'}
@@ -1812,6 +1830,11 @@ snapshots:
       '@bytecodealliance/jco-node-fs': 0.3.2
       '@bytecodealliance/preview2-shim': 0.31.0
 
+  '@bytecodealliance/preview3-shim@0.13.0':
+    dependencies:
+      '@bytecodealliance/jco-node-fs': 0.3.2
+      '@bytecodealliance/preview2-shim': 0.31.0
+
   '@bytecodealliance/weval@0.5.1':
     dependencies:
       '@napi-rs/lzma': 1.5.1
@@ -2282,6 +2305,8 @@ snapshots:
 
   '@typescript/typescript-win32-x64@7.0.2':
     optional: true
+
+  '@wasi-gfx/wasi-gfx-shim@0.1.0': {}
 
   abort-controller@3.0.0:
     dependencies:

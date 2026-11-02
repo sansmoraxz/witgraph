@@ -5,7 +5,7 @@ package test:video-source@0.1.0;
 /// by the host's clock when given, as fast as the reader takes them when
 /// not. Stops once the reader is dropped.
 world video-source {
-    import test:video/clock@0.1.0;
+    import wasi:clocks/monotonic-clock@0.3.2;
 
     export node: interface {
         /// An image: `width` x `height` pixels, row by row, four bytes

@@ -11,6 +11,8 @@
     "test": "npx playwright test"
   },
   "dependencies": {
+    "@bytecodealliance/preview3-shim": "^0.13.0",
+    "@wasi-gfx/wasi-gfx-shim": "^0.1.0",
     "witgraph-editor": "workspace:*",
     "witgraph-loader": "workspace:*"
   },

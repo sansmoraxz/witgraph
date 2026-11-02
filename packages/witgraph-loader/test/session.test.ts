@@ -7,9 +7,9 @@ import { execFileSync } from 'node:child_process';
 import { readdir, readFile, stat } from 'node:fs/promises';
 import { afterEach, test } from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-
 import { parse } from '@bytecodealliance/jco';
 import { transpile } from '@bytecodealliance/jco/component';
+import { monotonicClock } from '@bytecodealliance/preview3-shim/clocks';
 
 import {
   type Capability,
@@ -357,11 +357,9 @@ test('a stream passes between two nodes of an island, and a tap sees its items',
   assert.deepEqual(items, [0, 1, 2, 3, 4]);
 });
 
-/** `test:video/clock`, sleeping on the event loop. */
+/** `wasi:clocks/monotonic-clock`, as the WASI shim provides it. */
 const clock = (_node: string, capability: Capability) =>
-  capability.interface === 'test:video/clock@0.1.0'
-    ? { sleep: (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)) }
-    : undefined;
+  capability.interface === 'wasi:clocks/monotonic-clock@0.3.2' ? monotonicClock : undefined;
 
 /** A frame as jco hands one over. */
 interface Frame {
@@ -590,8 +588,13 @@ test('capabilities and labelled imports come from the registry, named as on wasm
         if (capability.interface === 'test:mqtt/source@0.1.0') {
           return { nextMessage: () => feed.shift() };
         }
-        if (capability.implements === 'test:kv/store@0.1.0') {
-          return { get: (key: string) => `${capability.interface}:${key}@${node}` };
+        if (capability.implements === 'wasi:keyvalue/store@0.2.0-draft2') {
+          class Bucket {
+            get(key: string) {
+              return new TextEncoder().encode(`${capability.interface}:${key}@${node}`);
+            }
+          }
+          return { Bucket, open: () => new Bucket() };
         }
       },
     },
@@ -607,8 +610,8 @@ test('capabilities and labelled imports come from the registry, named as on wasm
   // the built-in host is never asked for.
   const seen = asked.map(([node, { interface: name, implements: of }]) => [node, name, of]);
   assert.deepEqual(seen.sort(), [
-    ['kv', 'backup', 'test:kv/store@0.1.0'],
-    ['kv', 'primary', 'test:kv/store@0.1.0'],
+    ['kv', 'backup', 'wasi:keyvalue/store@0.2.0-draft2'],
+    ['kv', 'primary', 'wasi:keyvalue/store@0.2.0-draft2'],
     ['mqtt', 'test:mqtt/source@0.1.0', undefined],
   ]);
   assert.ok(asked.every(([, capability]) => capability.items !== undefined));

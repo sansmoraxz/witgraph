@@ -34,6 +34,7 @@ const GUESTS = [
   'frame-invert',
   'video-sink',
   'edge-detect',
+  'edge-detect-webgpu',
   'tensor-source',
   'tensor-edge',
   'tensor-invert',

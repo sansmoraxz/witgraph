@@ -2,7 +2,7 @@ package demo:graph@0.1.0;
 
 /// Smooths a stream of readings.
 world filter {
-    import demo:caps/log@0.1.0;
+    import wasi:logging/logging@0.1.0-draft;
 
     export node: interface {
         record reading {

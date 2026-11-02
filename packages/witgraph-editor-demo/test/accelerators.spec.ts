@@ -74,6 +74,15 @@ for (const { graph, name } of ACCELERATORS) {
     test('computes what the CPU reference computes', async ({ page }) => {
       test.skip(!accelerated(), `needs ${name}`);
       await open(page, graph);
+      if (graph === 'webgpu') {
+        // The shaders are the node's own: compare what it makes of frames.
+        const largest = await page.evaluate(async () => {
+          const { edgesOnBoth } = await import('/test/edges-on-both.ts');
+          return edgesOnBoth(4);
+        });
+        expect(largest).toBeLessThanOrEqual(1);
+        return;
+      }
       // In the page, through Vite: the demo's own providers.
       const difference = await page.evaluate(async (graph) => {
         const { cpu } = await import('/src/accel/cnn.ts');

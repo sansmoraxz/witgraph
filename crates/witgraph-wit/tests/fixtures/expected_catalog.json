@@ -117,10 +117,10 @@
       ]
     },
     {
-      "id": "demo:graph/filter@0.1.0#5330dd7d10112417b40395b6c53b496567f0f96acbfdab46a0424ec583d7ad2c",
+      "id": "demo:graph/filter@0.1.0#f1c06171189ccd1a0a10deca4d88e55f55865d5d93ac6b8d32b54210d47ce6f2",
       "package": "demo:graph@0.1.0",
       "world": "filter",
-      "content_hash": "5330dd7d10112417b40395b6c53b496567f0f96acbfdab46a0424ec583d7ad2c",
+      "content_hash": "f1c06171189ccd1a0a10deca4d88e55f55865d5d93ac6b8d32b54210d47ce6f2",
       "docs": "Smooths a stream of readings.",
       "inputs": [
         {
@@ -147,7 +147,7 @@
       ],
       "capabilities": [
         {
-          "name": "demo:caps/log@0.1.0"
+          "name": "wasi:logging/logging@0.1.0-draft"
         }
       ],
       "types": [
@@ -158,10 +158,10 @@
       ]
     },
     {
-      "id": "demo:graph/sensor@0.1.0#e9a635ca8a27b152312810114691625e06642efe64feb4e4c5f9dd43fcc3284c",
+      "id": "demo:graph/sensor@0.1.0#c84e88838d1ac1760e8478045099d82b17135a82de753f3d544984ba0be91783",
       "package": "demo:graph@0.1.0",
       "world": "sensor",
-      "content_hash": "e9a635ca8a27b152312810114691625e06642efe64feb4e4c5f9dd43fcc3284c",
+      "content_hash": "c84e88838d1ac1760e8478045099d82b17135a82de753f3d544984ba0be91783",
       "docs": "Periodically samples a sensor and publishes readings.",
       "inputs": [
         {
@@ -197,7 +197,7 @@
       ],
       "capabilities": [
         {
-          "name": "demo:caps/clock@0.1.0"
+          "name": "wasi:clocks/monotonic-clock@0.3.2"
         }
       ],
       "types": [
