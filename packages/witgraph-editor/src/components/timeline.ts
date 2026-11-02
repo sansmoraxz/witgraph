@@ -25,6 +25,9 @@ function eventColor(event: string): string {
   }
 }
 
+/** How far from the end of the rows still counts as being at it. */
+const FOLLOW_SLACK_PX = 8;
+
 const EXTRA_CSS = `
   :host { display: block; height: 100%; overflow: hidden; }
   .event { padding: 3px 8px; border-left: 3px solid var(--wg-text-dim); margin-bottom: 2px; }
@@ -104,6 +107,11 @@ export class WitgraphTimeline extends HTMLElement {
     const newest = events.at(-1) ?? null;
     if (newest === this.#lastRendered) return;
 
+    // Rows are followed as they come only by a reader at the end of them: one
+    // who has scrolled up to read is left where they are.
+    const box = this.#eventsContainer;
+    const following = box.scrollHeight - box.scrollTop - box.clientHeight <= FOLLOW_SLACK_PX;
+
     // A full trace drops its oldest entries, so its length stops changing:
     // what is new is whatever follows the last entry shown.
     const shown = this.#lastRendered ? events.lastIndexOf(this.#lastRendered) : -1;
@@ -116,7 +124,7 @@ export class WitgraphTimeline extends HTMLElement {
       this.#eventsContainer.firstElementChild?.remove();
     }
     this.#lastRendered = newest;
-    this.#eventsContainer.scrollTop = this.#eventsContainer.scrollHeight;
+    if (following) box.scrollTop = box.scrollHeight;
   }
 
   #createEventEl(entry: TraceEntry): HTMLDivElement {

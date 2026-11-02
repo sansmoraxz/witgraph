@@ -275,13 +275,48 @@ test.describe('WIT Graph Editor Demo', () => {
     await expect.poll(rows).toBeGreaterThan(0);
 
     await page.evaluate(() => {
-      const el = document.querySelector('witgraph-timeline')!;
-      const parent = el.parentElement!;
+      const el = document.querySelector('witgraph-timeline') as HTMLElement;
+      const parent = el.parentElement as HTMLElement;
       el.remove();
       parent.appendChild(el);
     });
     const moved = await rows();
     await expect.poll(rows).toBeGreaterThan(moved);
+    await controls.locator('button.stop').click();
+  });
+
+  test('the timeline leaves a reader who scrolled up where they are', async ({ page }) => {
+    const timeline = page.locator('witgraph-timeline');
+    const scroll = () =>
+      timeline.evaluate((el: HTMLElement) => {
+        const box = el.shadowRoot?.querySelector('.events-wrap') as HTMLElement;
+        return {
+          top: box.scrollTop,
+          toEnd: box.scrollHeight - box.scrollTop - box.clientHeight,
+          rows: box.querySelectorAll('.event').length,
+        };
+      });
+    const controls = page.locator('witgraph-controls');
+    await controls.locator('button.run').click();
+    // Rows enough to scroll through, which stay at the end while followed.
+    await expect.poll(async () => (await scroll()).rows, { timeout: 20_000 }).toBeGreaterThan(60);
+    expect((await scroll()).toEnd).toBeLessThanOrEqual(8);
+
+    await timeline.evaluate((el: HTMLElement) => {
+      (el.shadowRoot?.querySelector('.events-wrap') as HTMLElement).scrollTop = 0;
+    });
+    const { rows } = await scroll();
+    await expect.poll(async () => (await scroll()).rows).toBeGreaterThan(rows);
+    expect((await scroll()).top).toBe(0);
+
+    // Back at the end, it follows again.
+    await timeline.evaluate((el: HTMLElement) => {
+      const box = el.shadowRoot?.querySelector('.events-wrap') as HTMLElement;
+      box.scrollTop = box.scrollHeight;
+    });
+    const { rows: before } = await scroll();
+    await expect.poll(async () => (await scroll()).rows).toBeGreaterThan(before);
+    expect((await scroll()).toEnd).toBeLessThanOrEqual(8);
     await controls.locator('button.stop').click();
   });
 
