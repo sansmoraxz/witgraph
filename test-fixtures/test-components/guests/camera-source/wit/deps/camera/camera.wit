@@ -1,0 +1,10 @@
+package test:camera@0.1.0;
+
+/// A camera the host owns.
+interface camera {
+    use test:data/tensor@0.1.0.{tensor};
+
+    /// Its next frame, as a `[height, width, 3]` `uint8` tensor kept where
+    /// the host keeps tensors: the frame's pixels never enter the node.
+    next-frame: async func() -> result<tensor, string>;
+}

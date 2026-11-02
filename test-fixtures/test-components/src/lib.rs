@@ -208,6 +208,16 @@ pub const TENSOR_STREAM_SOURCE: Guest = guest!("TENSOR_STREAM_SOURCE_WASM", "ten
 /// stream<tensor>`, each inverted by the host. Previews `tensors` as `tensor`.
 pub const TENSOR_STREAM_INVERT: Guest = guest!("TENSOR_STREAM_INVERT_WASM", "tensor-stream-invert");
 
+/// Imports `test:data/tensor` and `witgraph:runtime/host`. `tensors:
+/// stream<tensor>` → `tensors: stream<tensor>`, the edges of each, found by the
+/// host. Previews `tensors` as `tensor`.
+pub const TENSOR_STREAM_EDGE: Guest = guest!("TENSOR_STREAM_EDGE_WASM", "tensor-stream-edge");
+
+/// Imports `test:camera/camera`, `test:data/tensor` and `witgraph:runtime/host`.
+/// `frames`: `option<u32>` → `tensors: stream<tensor>`, the host's camera, whose
+/// pixels never enter the node. Previews `tensors` as `tensor`.
+pub const CAMERA_SOURCE: Guest = guest!("CAMERA_SOURCE_WASM", "camera-source");
+
 /// Imports `test:data/tensor`. `tensors: stream<tensor>`, `take`: `option<u32>`,
 /// `read-last`: `option<bool>` → `count: u32`, `sum: u64`: reads `take` tensors
 /// (all when absent), summing each one's first byte, or only the last's.

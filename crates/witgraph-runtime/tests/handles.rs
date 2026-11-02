@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use test_components::{
     Guest, TENSOR_COPY_INVERT, TENSOR_EDGE, TENSOR_FUTURE_SINK, TENSOR_FUTURE_SOURCE,
-    TENSOR_INVERT, TENSOR_KEEP, TENSOR_SINK, TENSOR_SOURCE, TENSOR_STREAM_INVERT,
-    TENSOR_STREAM_SINK, TENSOR_STREAM_SOURCE,
+    TENSOR_INVERT, TENSOR_KEEP, TENSOR_SINK, TENSOR_SOURCE, TENSOR_STREAM_EDGE,
+    TENSOR_STREAM_INVERT, TENSOR_STREAM_SINK, TENSOR_STREAM_SOURCE,
 };
 use wasmtime::StoreContextMut;
 use wasmtime::component::{ComponentType, Lift, Linker, Lower, ResourceDynamic};
@@ -249,6 +249,7 @@ impl Kit {
             TENSOR_KEEP,
             TENSOR_EDGE,
             TENSOR_STREAM_SOURCE,
+            TENSOR_STREAM_EDGE,
             TENSOR_STREAM_INVERT,
             TENSOR_STREAM_SINK,
             TENSOR_FUTURE_SOURCE,
@@ -841,4 +842,35 @@ async fn a_restore_runs_a_stream_of_tensors_again() {
     no_faults(&mut restored);
     assert_eq!(u32_of(&restored, "sink", "count"), 3);
     assert_eq!(restored.shared_memory(), 0);
+}
+
+#[tokio::test]
+async fn a_stream_of_tensors_is_processed_where_they_live() {
+    let kit = Kit::new();
+    let graph = kit
+        .builder()
+        .add_node("src", of(TENSOR_STREAM_SOURCE))
+        .add_node("edge", of(TENSOR_STREAM_EDGE))
+        .add_node("sink", of(TENSOR_STREAM_SINK))
+        .connect(
+            "a",
+            PortRef::new("src", "tensors"),
+            PortRef::new("edge", "tensors"),
+        )
+        .connect(
+            "b",
+            PortRef::new("edge", "tensors"),
+            PortRef::new("sink", "tensors"),
+        )
+        .build();
+    let mut rt = kit
+        .load(graph, RuntimeConfig::default(), true)
+        .await
+        .unwrap();
+    rt.inject(&"src".into(), &"frames".into(), Val::U32(4))
+        .unwrap();
+    settle(&mut rt).await;
+    no_faults(&mut rt);
+    assert_eq!(u32_of(&rt, "sink", "count"), 4);
+    assert_eq!(rt.shared_memory(), 0);
 }

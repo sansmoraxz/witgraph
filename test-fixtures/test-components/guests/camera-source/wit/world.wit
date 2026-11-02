@@ -1,0 +1,21 @@
+package test:camera-source@0.1.0;
+
+/// Streams the host's camera, `frames` frames of it (forever when absent).
+/// Stops once the reader is dropped. Calls `fatal` with the host's reason
+/// when there is no camera.
+world camera-source {
+    import test:camera/camera@0.1.0;
+    import test:data/tensor@0.1.0;
+    import witgraph:runtime/host@0.1.0;
+
+    export node: interface {
+        use test:data/tensor@0.1.0.{tensor};
+        record inputs {
+            frames: option<u32>,
+        }
+        record outputs {
+            tensors: stream<tensor>,
+        }
+        run: async func(inputs: inputs) -> outputs;
+    }
+}
