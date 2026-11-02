@@ -572,7 +572,9 @@ export class Session {
       // Nothing reads what an abandoned run returns: its streams' writers
       // stop now, rather than run on for nobody.
       for (const port of this.contracts.get(node)?.outputs ?? []) {
-        if (port.kind === 'stream') closeUnread(outputs[camelCase(port.name)]);
+        if (port.kind === 'stream' || port.kind === 'future') {
+          closeUnread(outputs[camelCase(port.name)]);
+        }
         // Nothing will hold it, so nothing else would dispose it.
         if (port.kind === 'handle') dispose(outputs[camelCase(port.name)]);
       }
@@ -585,7 +587,7 @@ export class Session {
       if (port.kind === 'future') {
         // jco disposes a future its reader drops unread, but its writer's
         // write still waits, on a timer that keeps the process alive. Reading
-        // the future ends the write.
+        // the future ends the write, and hands over any handle it carries.
         const future = outputs[key] as (PromiseLike<unknown> & Disposable) | undefined;
         if (future) future[Symbol.dispose] = () => closeUnread(future);
       }
@@ -641,10 +643,8 @@ function closeUnread(value: any): void {
   if (typeof value?.[Symbol.asyncIterator] === 'function') {
     void Promise.resolve(value[Symbol.asyncIterator]().return?.()).catch(() => {});
   } else if (typeof value?.then === 'function') {
-    value.then(
-      () => {},
-      () => {},
-    );
+    // A handle it carried is nobody else's now.
+    value.then(dispose, () => {});
   }
 }
 
@@ -762,7 +762,11 @@ function tapped(
             if (closed) return done;
             throw error;
           }
-          if (closed) return done;
+          if (closed) {
+            // Read as it closed, so no reader takes it: a handle is ours to drop.
+            if (!step.done) dispose(step.value);
+            return done;
+          }
           if (step.done) end();
           else seen(step.value);
           return step;
