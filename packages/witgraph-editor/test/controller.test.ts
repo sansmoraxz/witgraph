@@ -349,6 +349,41 @@ test('a node is resized and its preview picked by undoable edits', async () => {
   assert.equal(controller.nodes.get('source')!.preview, undefined);
 });
 
+test('a graph is not edited while it runs, until the run stops', async () => {
+  const controller = await loadVideo();
+  // Endless, paced: a run lasts until it is stopped.
+  controller.injectValue('source', 'fps', '200');
+  assert.equal(controller.editable, true);
+
+  const running = controller.run();
+  while (controller.mode !== 'running') await pause(5);
+  assert.equal(controller.editable, false);
+
+  // What would load the graph again waits, and the trace says why.
+  const before = controller.nodes.size;
+  controller.removeNode('sink');
+  controller.renameNode('gray', 'grey');
+  controller.undo();
+  await controller.reset();
+  assert.equal(controller.nodes.size, before);
+  assert.ok(controller.nodes.has('sink'));
+  assert.ok(controller.nodes.has('gray'));
+  assert.equal(controller.mode, 'running', 'the run goes on');
+  const warnings = controller.traceEvents.filter(
+    (e) => e.event === 'warning' && e.message?.includes('cannot be edited while it runs'),
+  );
+  assert.equal(warnings.length, 1, 'said once, however many edits');
+  // What does not load it again does not wait: moving a node, say.
+  controller.moveNode('gray', 321, 123);
+  assert.equal(controller.nodes.get('gray')?.x, 321);
+
+  controller.stop();
+  await running;
+  assert.equal(controller.editable, true);
+  controller.removeNode('sink');
+  assert.equal(controller.nodes.has('sink'), false);
+});
+
 test('stop ends a stream still being written, and run starts it again', async () => {
   const controller = await loadVideo();
   // Endless, paced: a run lasts until it is stopped.

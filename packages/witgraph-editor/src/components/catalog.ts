@@ -109,6 +109,11 @@ export class WitgraphCatalog extends HTMLElement {
       );
       card.draggable = true;
       card.addEventListener('dragstart', (e) => {
+        // A run uses the graph: nothing is added to it until it stops.
+        if (this.#controller && !this.#controller.editable) {
+          e.preventDefault();
+          return;
+        }
         e.dataTransfer?.setData('witgraph/component-index', String(source.index));
       });
 

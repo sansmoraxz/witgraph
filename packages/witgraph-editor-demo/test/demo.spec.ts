@@ -272,6 +272,34 @@ test.describe('WIT Graph Editor Demo', () => {
     expect(await edge()).toBe(await themed('--wg-error'));
   });
 
+  test('what changes the graph is disabled while it runs', async ({ page }) => {
+    const controls = page.locator('witgraph-controls');
+    const inspector = page.locator('witgraph-inspector');
+    await page.locator('witgraph-canvas').locator('[data-node-id="relay-a"]').click();
+    const rename = inspector.locator('input.node-id');
+    await expect(rename).toBeEnabled();
+    await expect(controls.locator('button.reset')).toBeEnabled();
+
+    await controls.locator('button.run').click();
+    await expect(controls.locator('button.reset')).toBeDisabled();
+    await expect(controls.locator('button.load')).toBeDisabled();
+    await expect(controls.locator('button.undo')).toBeDisabled();
+    await expect(rename).toBeDisabled();
+    // The graph itself is not touched by an attempt.
+    const nodes = () =>
+      page.locator('witgraph-canvas').evaluate((el: WitgraphCanvas) => el.controller?.nodes.size);
+    expect(await nodes()).toBe(16);
+    await page.locator('witgraph-canvas').evaluate((el: WitgraphCanvas) => {
+      el.controller?.removeNode('relay-c');
+    });
+    expect(await nodes()).toBe(16);
+
+    await controls.locator('button.stop').click();
+    await expect(controls.locator('button.reset')).toBeEnabled();
+    await expect(controls.locator('button.load')).toBeEnabled();
+    await expect(rename).toBeEnabled();
+  });
+
   test('the status follows a run', async ({ page }) => {
     const status = page.locator('#status');
     const controls = page.locator('witgraph-controls');

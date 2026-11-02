@@ -38,6 +38,8 @@ const EXTRA_CSS = `
   .icon-btn svg { width: 14px; height: 14px; stroke-width: 2; }
   .icon-btn:hover { background: var(--wg-surface-hover); color: var(--wg-text); }
   .icon-btn.danger:hover { background: color-mix(in srgb, var(--wg-error) 15%, transparent); color: var(--wg-error); }
+  .locked .toggle-track[data-structural] { opacity: 0.4; pointer-events: none; }
+  .locked :disabled { opacity: 0.5; cursor: not-allowed; }
   :host::-webkit-scrollbar { width: 6px; }
   :host::-webkit-scrollbar-track { background: var(--wg-bg); }
   :host::-webkit-scrollbar-thumb { background: var(--wg-surface-hover); border-radius: 3px; }
@@ -158,6 +160,26 @@ export class WitgraphInspector extends HTMLElement {
 
   /** The inspector for the selected edge or node, or else the graph's properties. */
   #build(): HTMLElement {
+    const built = this.#buildSelection();
+    // What changes the graph waits while it runs (see `EditorController.editable`).
+    // A pane with none of it is left as it is.
+    const structural = built.querySelectorAll<HTMLElement>('[data-structural]');
+    if (this.#controller && !this.#controller.editable && structural.length > 0) {
+      built.classList.add('locked');
+      for (const el of structural) {
+        if (
+          el instanceof HTMLInputElement ||
+          el instanceof HTMLSelectElement ||
+          el instanceof HTMLButtonElement
+        )
+          el.disabled = true;
+        el.title = 'Stop the run to edit the graph';
+      }
+    }
+    return built;
+  }
+
+  #buildSelection(): HTMLElement {
     const controller = this.#controller;
     if (!controller) return this.#buildGraphProperties();
     const edgeId = controller.selectedEdge;
@@ -463,6 +485,7 @@ export class WitgraphInspector extends HTMLElement {
     idInput.className =
       'node-id focus-ring flex-1 bg-wg-surface text-wg-text border border-wg-text-dim rounded-md px-2 py-1 font-mono text-sm';
     idInput.style.minWidth = '0';
+    idInput.dataset.structural = '';
     idInput.addEventListener('change', () => {
       const newId = idInput.value.trim();
       if (newId && newId !== node.id) this.#controller?.renameNode(node.id, newId);
@@ -671,6 +694,7 @@ export class WitgraphInspector extends HTMLElement {
     const isMocked = this.#controller?.isMocked(node.id) ?? false;
     const track = this.#el('div', `toggle-track ${isMocked ? 'on' : ''}`);
     track.appendChild(this.#el('div', 'toggle-knob'));
+    track.dataset.structural = '';
     track.addEventListener('click', () => this.#controller?.toggleMock(node.id));
     header.appendChild(track);
     section.appendChild(header);
@@ -707,6 +731,7 @@ export class WitgraphInspector extends HTMLElement {
           'bg-wg-surface text-wg-text border border-wg-text-dim rounded px-2 py-1 cursor-pointer text-xs hover:bg-wg-surface-hover transition-all shadow-sm',
           'Set',
         );
+        setBtn.dataset.structural = '';
         setBtn.addEventListener('click', () => {
           if (input.value) this.#controller?.setMockOutput(node.id, port.name, input.value);
           else this.#controller?.clearMockOutput(node.id, port.name);
@@ -831,6 +856,7 @@ export class WitgraphInspector extends HTMLElement {
       fbCheck.type = 'checkbox';
       fbCheck.checked = conn?.feedback ?? false;
       fbCheck.id = `fb-${node.id}-${port.name}`;
+      fbCheck.dataset.structural = '';
       if (conn) {
         fbCheck.addEventListener('change', () =>
           this.#controller?.setConnectionFeedback(conn.id, fbCheck!.checked),
@@ -852,6 +878,7 @@ export class WitgraphInspector extends HTMLElement {
       );
     }
 
+    select.dataset.structural = '';
     select.addEventListener('change', () => {
       const val = select.value;
       if (!val) {
@@ -969,6 +996,7 @@ export class WitgraphInspector extends HTMLElement {
       const fbRow = this.#el('div', 'flex items-center gap-3 p-2 bg-wg-surface rounded-md');
       const track = this.#el('div', `toggle-track ${edge.feedback ? 'on' : ''}`);
       track.appendChild(this.#el('div', 'toggle-knob'));
+      track.dataset.structural = '';
       track.addEventListener('click', () => {
         this.#controller?.setConnectionFeedback(edge.id, !edge.feedback);
       });

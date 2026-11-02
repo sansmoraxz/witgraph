@@ -184,6 +184,15 @@ export class EditorController extends EventTarget {
   get tickCount(): number {
     return this.#tickCount;
   }
+  /**
+   * Whether the graph can be changed: not while it runs, or is paused in a
+   * run. Its edits (adding, removing, connecting, renaming, pasting, undoing,
+   * mocking, importing, resetting) load the graph again, which a run is
+   * using: they are refused until it stops, with a warning in the trace.
+   */
+  get editable(): boolean {
+    return this.#mode !== 'running' && this.#mode !== 'paused';
+  }
 
   /**
    * The most ticks a second a run makes; `0` (the default) for as many as
@@ -429,6 +438,7 @@ export class EditorController extends EventTarget {
   }
 
   addNodeFromCatalog(componentIndex: number, x: number, y: number): void {
+    if (this.#locked()) return;
     if (!this.#graphJson || !this.#originalOptions) throw new Error('no graph loaded');
     const comp = this.#originalOptions.components[componentIndex];
     if (!comp) throw new Error(`no component at index ${componentIndex}`);
@@ -546,6 +556,7 @@ export class EditorController extends EventTarget {
   }
 
   renameNode(oldId: string, newId: string): void {
+    if (this.#locked()) return;
     if (!this.#graphJson) throw new Error('no graph loaded');
     if (oldId === newId) return;
     if (this.#nodes.has(newId)) {
@@ -725,6 +736,7 @@ export class EditorController extends EventTarget {
   }
 
   setConnectionFeedback(connId: string, feedback: boolean): void {
+    if (this.#locked()) return;
     const edge = this.#edges.find((e) => e.id === connId);
     if (!edge) return;
     if (feedback && !this.canBeFeedback(edge.fromNode, edge.fromPort)) {
@@ -740,6 +752,7 @@ export class EditorController extends EventTarget {
   // -- Import / Load -----------------------------------------------------------
 
   async importGraph(json: string): Promise<void> {
+    if (this.#locked()) return;
     if (!this.#originalOptions) throw new Error('no session loaded');
     const graphJson = JSON.parse(json) as GraphJson;
     this.#graphJson = graphJson;
@@ -756,6 +769,7 @@ export class EditorController extends EventTarget {
   }
 
   async importBundle(json: string): Promise<void> {
+    if (this.#locked()) return;
     const prev = this.#originalOptions;
     const bundle = JSON.parse(json) as {
       version: number;
@@ -779,6 +793,7 @@ export class EditorController extends EventTarget {
   }
 
   async importGraphFile(): Promise<void> {
+    if (this.#locked()) return;
     const input = document.createElement('input');
     input.type = 'file';
     input.accept = '.json';
@@ -853,6 +868,7 @@ export class EditorController extends EventTarget {
   }
 
   async reset(): Promise<void> {
+    if (this.#locked()) return;
     if (!this.#originalOptions) return;
     const emptyGraph: GraphJson = {
       metadata: {
@@ -1066,6 +1082,7 @@ export class EditorController extends EventTarget {
   // -- Undo / Redo ------------------------------------------------------------
 
   undo(): void {
+    if (this.#locked()) return;
     const cmd = this.#undoStack.pop();
     if (!cmd) return;
     cmd.undo();
@@ -1074,6 +1091,7 @@ export class EditorController extends EventTarget {
   }
 
   redo(): void {
+    if (this.#locked()) return;
     const cmd = this.#redoStack.pop();
     if (!cmd) return;
     cmd.execute();
@@ -1121,6 +1139,7 @@ export class EditorController extends EventTarget {
   }
 
   paste(x: number, y: number): void {
+    if (this.#locked()) return;
     if (!this.#clipboard || !this.#graphJson) return;
     const suffix = `-${Date.now().toString(36)}`;
     for (const node of this.#clipboard.nodes) {
@@ -1227,6 +1246,7 @@ export class EditorController extends EventTarget {
   }
 
   toggleMock(nodeId: string): void {
+    if (this.#locked()) return;
     const graphNode = this.#graphJson?.nodes.find((n) => n.id === nodeId);
     if (!graphNode) return;
     if (!graphNode.attrs) graphNode.attrs = {};
@@ -1239,6 +1259,7 @@ export class EditorController extends EventTarget {
   }
 
   setMockOutput(nodeId: string, port: string, wave: string): void {
+    if (this.#locked()) return;
     const graphNode = this.#graphJson?.nodes.find((n) => n.id === nodeId);
     if (!graphNode) return;
     if (!graphNode.attrs) graphNode.attrs = {};
@@ -1248,6 +1269,7 @@ export class EditorController extends EventTarget {
   }
 
   clearMockOutput(nodeId: string, port: string): void {
+    if (this.#locked()) return;
     const graphNode = this.#graphJson?.nodes.find((n) => n.id === nodeId);
     if (graphNode?.attrs) {
       delete graphNode.attrs[`mock.${port}`];
@@ -1338,6 +1360,7 @@ export class EditorController extends EventTarget {
   }
 
   addNode(id: string, componentRef: object, x: number, y: number): void {
+    if (this.#locked()) return;
     if (!this.#graphJson) throw new Error('no graph loaded');
     const node: GraphJsonNode = {
       id,
@@ -1360,6 +1383,7 @@ export class EditorController extends EventTarget {
   }
 
   removeNode(id: string): void {
+    if (this.#locked()) return;
     if (!this.#graphJson) throw new Error('no graph loaded');
     const savedNode = this.#graphJson.nodes.find((n) => n.id === id);
     const savedConns = this.#graphJson.connections.filter(
@@ -1400,6 +1424,7 @@ export class EditorController extends EventTarget {
   }
 
   addConnection(id: string, from: GraphJsonPortRef, to: GraphJsonPortRef, feedback = false): void {
+    if (this.#locked()) return;
     if (!this.#graphJson) throw new Error('no graph loaded');
     const check = this.canConnect(from.node, from.port, to.node, to.port);
     if (!check.ok) {
@@ -1431,6 +1456,7 @@ export class EditorController extends EventTarget {
   }
 
   removeConnection(id: string): void {
+    if (this.#locked()) return;
     if (!this.#graphJson) throw new Error('no graph loaded');
     const savedConn = this.#graphJson.connections.find((c) => c.id === id);
     const savedEdge = this.#edges.find((e) => e.id === id);
@@ -1790,6 +1816,21 @@ export class EditorController extends EventTarget {
     } else {
       this.dispatchEvent(new CustomEvent(type));
     }
+  }
+
+  /** Whether an edit is refused for a run: it is, and the trace says so. */
+  #locked(): boolean {
+    if (this.editable) return false;
+    const message = 'The graph cannot be edited while it runs: stop it first';
+    const last = this.#traceEvents.at(-1);
+    // A key held down, say, says it once.
+    if (last?.event === 'warning' && last.message === message) return true;
+    this.#traceEvents.push({ event: 'warning', message, timestamp: performance.now() });
+    if (this.#traceEvents.length > MAX_TRACE_ENTRIES) {
+      this.#traceEvents = this.#traceEvents.slice(-MAX_TRACE_ENTRIES);
+    }
+    this.#dispatch('trace-event');
+    return true;
   }
 
   #pushError(message: string): void {
