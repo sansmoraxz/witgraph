@@ -231,6 +231,25 @@ test.describe('WIT Graph Editor Demo', () => {
     }
   });
 
+  test('the inspector lists snapshots, each with icon buttons to restore and delete it', async ({
+    page,
+  }) => {
+    const save = page.locator('witgraph-controls').locator('button.snap-save');
+    await save.click();
+    await save.click();
+    await page
+      .locator('witgraph-canvas')
+      .evaluate((el: WitgraphCanvas) => el.controller?.select(null));
+    const inspector = page.locator('witgraph-inspector');
+    await expect(inspector).toContainText('Snapshots (2)');
+    // An icon each, not text.
+    await expect(inspector.locator('button.icon-btn svg')).toHaveCount(4);
+    await expect(inspector.getByRole('button', { name: 'Restore snap-1' })).toBeVisible();
+    await inspector.getByRole('button', { name: 'Delete snap-1' }).click();
+    await expect(inspector).toContainText('Snapshots (1)');
+    await expect(inspector.getByRole('button', { name: 'Delete snap-1' })).toHaveCount(0);
+  });
+
   test('the inspector describes the selected node by its component', async ({ page }) => {
     await page.locator('witgraph-canvas').locator('[data-node-id="relay-a"]').click();
     await expect(page.locator('witgraph-inspector').locator('.node-docs')).toContainText(
