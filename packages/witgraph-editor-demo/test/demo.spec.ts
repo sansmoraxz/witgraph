@@ -1,5 +1,5 @@
 import { expect, type Page, test } from '@playwright/test';
-import type { WitgraphCanvas } from 'witgraph-editor';
+import type { WitgraphCanvas, WitgraphTimeline } from 'witgraph-editor';
 
 test.describe('WIT Graph Editor Demo', () => {
   test.beforeEach(async ({ page }) => {
@@ -230,6 +230,40 @@ test.describe('WIT Graph Editor Demo', () => {
     await expect(
       timeline.locator('.event', { hasText: 'camera, grayscale, invert, video-sink' }).first(),
     ).toBeVisible();
+  });
+
+  test('the timeline keeps up once the trace is full', async ({ page }) => {
+    test.setTimeout(60_000);
+    const timeline = page.locator('witgraph-timeline');
+    const traceLength = () =>
+      timeline.evaluate((el: WitgraphTimeline) => el.controller?.traceEvents.length);
+    /** The trace's newest entry, and the row the timeline shows last. */
+    const newest = () =>
+      timeline.evaluate((el: WitgraphTimeline) => ({
+        entry: el.controller?.traceEvents.at(-1)?.timestamp,
+        row: el.shadowRoot?.querySelector('.event:last-child')?.firstChild?.textContent,
+        rows: el.shadowRoot?.querySelectorAll('.event').length,
+      }));
+
+    const controls = page.locator('witgraph-controls');
+    await controls.locator('button.run').click();
+    // The trace holds 1000 entries, and from there on only its contents change.
+    await expect.poll(traceLength, { timeout: 40_000 }).toBe(1000);
+
+    const full = (await newest()).entry ?? 0;
+    await expect.poll(async () => (await newest()).entry).toBeGreaterThan(full);
+    const { entry, row, rows } = await newest();
+    expect(row).toBe(`${((entry ?? 0) / 1000).toFixed(2)}s `);
+    // One row an entry: the oldest go when their entries do.
+    expect(rows).toBe(1000);
+
+    await controls.locator('button.stop').click();
+    // A trace started over takes its rows with it.
+    await timeline.evaluate(async (el: WitgraphTimeline) => {
+      const controller = el.controller;
+      await controller?.importGraph(controller.exportGraph());
+    });
+    await expect.poll(async () => (await newest()).rows).toBeLessThan(1000);
   });
 
   test('injected values from attrs are visible', async ({ page }) => {

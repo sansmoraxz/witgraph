@@ -39,11 +39,11 @@ const EXTRA_CSS = `
 
 export class WitgraphTimeline extends HTMLElement {
   #controller: EditorController | null = null;
-  #renderedCount = 0;
+  #lastRendered: TraceEntry | null = null;
   #eventsContainer: HTMLDivElement | null = null;
 
-  #onTraceEvent = () => this.#appendNew();
-  #onStateChanged = () => this.#appendNew();
+  #onTraceEvent = () => this.#sync();
+  #onStateChanged = () => this.#sync();
 
   connectedCallback(): void {
     if (this.shadowRoot) return;
@@ -72,11 +72,11 @@ export class WitgraphTimeline extends HTMLElement {
   set controller(ctrl: EditorController) {
     this.#detach();
     this.#controller = ctrl;
-    this.#renderedCount = 0;
+    this.#lastRendered = null;
     if (this.#eventsContainer) this.#eventsContainer.innerHTML = '';
     ctrl.addEventListener('trace-event', this.#onTraceEvent);
     ctrl.addEventListener('state-changed', this.#onStateChanged);
-    this.#appendNew();
+    this.#sync();
   }
 
   get controller(): EditorController | null {
@@ -88,15 +88,24 @@ export class WitgraphTimeline extends HTMLElement {
     this.#controller?.removeEventListener('state-changed', this.#onStateChanged);
   }
 
-  #appendNew(): void {
+  #sync(): void {
     if (!this.#controller || !this.#eventsContainer) return;
     const events = this.#controller.traceEvents;
-    if (events.length <= this.#renderedCount) return;
+    const newest = events.at(-1) ?? null;
+    if (newest === this.#lastRendered) return;
 
-    for (let i = this.#renderedCount; i < events.length; i++) {
+    // A full trace drops its oldest entries, so its length stops changing:
+    // what is new is whatever follows the last entry shown.
+    const shown = this.#lastRendered ? events.lastIndexOf(this.#lastRendered) : -1;
+    // Not there: the trace started over, or has moved on past every row.
+    if (shown === -1) this.#eventsContainer.innerHTML = '';
+    for (let i = shown + 1; i < events.length; i++) {
       this.#eventsContainer.appendChild(this.#createEventEl(events[i]));
     }
-    this.#renderedCount = events.length;
+    while (this.#eventsContainer.childElementCount > events.length) {
+      this.#eventsContainer.firstElementChild?.remove();
+    }
+    this.#lastRendered = newest;
     this.#eventsContainer.scrollTop = this.#eventsContainer.scrollHeight;
   }
 
