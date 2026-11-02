@@ -135,6 +135,36 @@ deterministic.
 Handles aren't captured either: the islands that produced them are recorded as
 owing a run, so after a restore they make new ones.
 
+## Choosing an allocator
+
+witgraph uses your program's global allocator. The choice matters for values
+made of many small pieces, such as a `list<record>` with one record per pixel,
+because every hop allocates several times per item. A list of numbers, or a
+record holding one, is packed and barely notices.
+
+Time for one run of source → relay → relay → sink on Linux:
+
+| Value                  | Size   | glibc    | mimalloc |
+| ---------------------- | ------ | -------- | -------- |
+| list of 4-byte records | 1 MiB  | 1,129 ms | 405 ms   |
+| list of 4-byte records | 4 MiB  | 4,657 ms | 1,628 ms |
+| `list<u8>`             | 1 MiB  | 205 ms   | 189 ms   |
+| `list<u8>`             | 16 MiB | 3,181 ms | 3,230 ms |
+
+On glibc, such a graph also slows down over its first dozen or so runs, then
+levels off: from about 870 ms to 1,600 ms at 1 MiB. Memory use stays flat, so
+this isn't a leak. It doesn't happen on mimalloc.
+
+To switch, set the allocator in your binary:
+
+```rust
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+```
+
+For bulk data, a list of numbers or a [handle](#sharing-resources) still beats
+any allocator.
+
 ## Cargo features
 
 `witgraph-runtime` always enables what it needs from wasmtime: the Cranelift
