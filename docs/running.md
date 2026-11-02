@@ -37,6 +37,33 @@ error if something doesn't fit. Compiling components is slow, so on a shared
 async executor prepare them first with `PreparedComponent::new` on a blocking
 thread, then call `load_prepared`.
 
+### Precompiled components
+
+With the `precompiled` feature you can compile once, save the result, and skip
+compiling on every later load:
+
+```rust
+// At build time.
+let prepared = PreparedComponent::new(&engine, &contract, wasm)?;
+std::fs::write("sensor.bin", prepared.serialize()?)?;
+
+// At startup, possibly in a build with no compiler.
+let bytes = std::fs::read("sensor.bin")?;
+// SAFETY: we built this file, and only we can write to it.
+let prepared = unsafe { PreparedComponent::deserialize(&engine, &contract, &bytes) }?;
+let rt = RuntimeGraph::load_prepared(compiled, &[prepared], config, Perf, host).await?;
+```
+
+A saved file holds native code that can't be checked, which is why
+`deserialize` is `unsafe`. Treat it like an executable: load only files you
+built, from storage only you can write to.
+
+A file works only with the same wasmtime version, CPU features and engine
+settings, such as `memory_reservation`. Anything else fails with
+`BadComponent`, so rebuild the file. It records the contract's hash, and a
+different contract fails with `ContractMismatch`. Links are composed in before
+saving, so loading doesn't need the providers' bytes.
+
 ## Giving nodes capabilities
 
 Nodes that import capabilities load with `load_with_host`. The simplest host is
@@ -167,9 +194,19 @@ any allocator.
 
 ## Cargo features
 
-`witgraph-runtime` always enables what it needs from wasmtime: the Cranelift
-compiler, the component model with async, and WAVE support. Everything else is
-opt-in, so you only compile what you use:
+`witgraph-runtime` always enables what it needs from wasmtime: the component
+model with async, and WAVE support. Two features decide how components get
+loaded:
+
+| Feature       | Default | What it does                                                                                         |
+| ------------- | ------- | ---------------------------------------------------------------------------------------------------- |
+| `compile`     | yes     | Compiling components with Cranelift, and composing links: `load`, `load_with_host`, `PreparedComponent::new`. |
+| `precompiled` | no      | `PreparedComponent::serialize` and `deserialize`.                                                    |
+
+To drop the compiler from a build that only loads saved components, use
+`default-features = false, features = ["precompiled"]`.
+
+The rest is opt-in too, so you only compile what you use:
 
 | Feature                | Default | What it turns on in wasmtime                         |
 | ---------------------- | ------- | ---------------------------------------------------- |
