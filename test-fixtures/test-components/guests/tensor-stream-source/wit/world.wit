@@ -1,0 +1,26 @@
+package test:tensor-stream-source@0.1.0;
+
+/// Streams `frames` `[height, width, 3]` `uint8` tensors (forever when absent),
+/// `width` x `height` (16 x 16 when absent), each filled with its index. Stops
+/// once the reader is dropped. Calls `fatal` with the host's reason when it
+/// cannot make one.
+world tensor-stream-source {
+    import test:data/tensor@0.1.0;
+    import witgraph:runtime/host@0.1.0;
+
+    export node: interface {
+        use test:data/tensor@0.1.0.{tensor};
+        record inputs {
+            frames: option<u32>,
+            width: option<u32>,
+            height: option<u32>,
+            /// Make one tensor and hand out references to it: frames that
+            /// never pass through this node, as from a camera the host owns.
+            reuse: option<bool>,
+        }
+        record outputs {
+            tensors: stream<tensor>,
+        }
+        run: async func(inputs: inputs) -> outputs;
+    }
+}

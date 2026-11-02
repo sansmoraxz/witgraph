@@ -1891,6 +1891,46 @@ mod tests {
     }
 
     #[test]
+    fn a_stream_of_handles_connects_only_to_a_stream_of_that_resource() {
+        let carrying = |kind: PortKind, resource: &str| {
+            let mut port = PortDef::handle(
+                "t",
+                crate::HandleType {
+                    interface: "test:data/tensor@0.1.0".into(),
+                    resource: resource.into(),
+                },
+            );
+            port.kind = kind;
+            port
+        };
+        let graph = |input: PortDef| {
+            builder("t")
+                .add_component(contract(
+                    "make",
+                    vec![],
+                    vec![carrying(PortKind::Stream, "tensor")],
+                    &[],
+                ))
+                .add_component(contract("take", vec![input], vec![], &[]))
+                .add_node("m", cref("make"))
+                .add_node("t", cref("take"))
+                .connect("c1", PortRef::new("m", "t"), PortRef::new("t", "t"))
+                .build()
+        };
+        graph(carrying(PortKind::Stream, "tensor"))
+            .compile()
+            .expect("a stream of the same resource");
+        assert!(!diags(graph(carrying(PortKind::Stream, "blob")).compile()).is_empty());
+        assert!(!diags(graph(carrying(PortKind::Future, "tensor")).compile()).is_empty());
+        assert!(!diags(graph(carrying(PortKind::Handle, "tensor")).compile()).is_empty());
+        let data = PortDef::new("t", PortKind::Stream, wasm_wave::value::Type::U32);
+        assert!(
+            !diags(graph(data).compile()).is_empty(),
+            "data, not handles"
+        );
+    }
+
+    #[test]
     fn handles_connect_only_to_the_same_resource() {
         let handle = |resource: &str, version: &str| {
             PortDef::handle(

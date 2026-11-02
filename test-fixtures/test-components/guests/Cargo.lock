@@ -465,6 +465,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "tensor-future-sink-guest"
+version = "0.1.0"
+dependencies = [
+ "wit-bindgen",
+]
+
+[[package]]
+name = "tensor-future-source-guest"
+version = "0.1.0"
+dependencies = [
+ "wit-bindgen",
+]
+
+[[package]]
 name = "tensor-invert-guest"
 version = "0.1.0"
 dependencies = [
@@ -487,6 +501,27 @@ dependencies = [
 
 [[package]]
 name = "tensor-source-guest"
+version = "0.1.0"
+dependencies = [
+ "wit-bindgen",
+]
+
+[[package]]
+name = "tensor-stream-invert-guest"
+version = "0.1.0"
+dependencies = [
+ "wit-bindgen",
+]
+
+[[package]]
+name = "tensor-stream-sink-guest"
+version = "0.1.0"
+dependencies = [
+ "wit-bindgen",
+]
+
+[[package]]
+name = "tensor-stream-source-guest"
 version = "0.1.0"
 dependencies = [
  "wit-bindgen",

@@ -1,0 +1,23 @@
+package test:tensor-stream-sink@0.1.0;
+
+/// Reads `take` tensors (all when absent) and lets go of the stream: `count`
+/// is how many it read, `sum` the sum of their first bytes.
+world tensor-stream-sink {
+    import test:data/tensor@0.1.0;
+    import witgraph:runtime/host@0.1.0;
+
+    export node: interface {
+        use test:data/tensor@0.1.0.{tensor};
+        record inputs {
+            tensors: stream<tensor>,
+            take: option<u32>,
+            /// Read only the last of `take` tensors, rather than each.
+            read-last: option<bool>,
+        }
+        record outputs {
+            count: u32,
+            sum: u64,
+        }
+        run: async func(inputs: inputs) -> outputs;
+    }
+}

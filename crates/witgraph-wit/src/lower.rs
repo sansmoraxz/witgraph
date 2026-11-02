@@ -23,6 +23,7 @@
 //! | `future<T>`  | Future    | a bare `future` carries no payload (`ty: None`)  |
 //! | `borrow<R>`  | Handle    | on `inputs` only; `option<borrow<R>>` is optional |
 //! | `own<R>`     | Handle    | on `outputs` only                              |
+//! | `stream<own<R>>`, `future<own<R>>` | Stream, Future | each handle moves to its reader |
 //!
 //! A handle port carries a resource the host provides, and `R` must be
 //! declared in a named interface the world imports, so every node
@@ -43,7 +44,8 @@
 //!
 //! Payload types are resolved by wasm-wave
 //! ([`wasm_wave::value::resolve_wit_type`]), so a payload is exactly what WAVE
-//! can represent. Resources, handles below the top level of a field, `map`,
+//! can represent. Resources, handles below the top level of a field (or of a
+//! stream or future's payload), `map`,
 //! `error-context`, nested `stream`/`future`, and fixed-length lists (whose
 //! length the contract hash cannot observe) are rejected.
 //!
@@ -1181,22 +1183,16 @@ fn lower_field(
 ) -> Result<PortDef, FieldErrorKind> {
     let mut handle = None;
     let (kind, optional, ty) = match top_kind(resolve, &field.ty) {
-        Some(wp::TypeDefKind::Stream(payload)) => (
-            PortKind::Stream,
-            false,
-            payload
-                .as_ref()
-                .map(|t| payload_type(resolve, t))
-                .transpose()?,
-        ),
-        Some(wp::TypeDefKind::Future(payload)) => (
-            PortKind::Future,
-            false,
-            payload
-                .as_ref()
-                .map(|t| payload_type(resolve, t))
-                .transpose()?,
-        ),
+        Some(wp::TypeDefKind::Stream(payload)) => {
+            let (ty, carried) = async_payload(resolve, world, payload.as_ref())?;
+            handle = carried;
+            (PortKind::Stream, false, ty)
+        }
+        Some(wp::TypeDefKind::Future(payload)) => {
+            let (ty, carried) = async_payload(resolve, world, payload.as_ref())?;
+            handle = carried;
+            (PortKind::Future, false, ty)
+        }
         Some(wp::TypeDefKind::Handle(h)) => {
             handle = Some(lower_handle(resolve, world, h, direction)?);
             (PortKind::Handle, false, None)
@@ -1225,6 +1221,24 @@ fn lower_field(
         docs: field.docs.contents.clone(),
         viewer: None,
     })
+}
+
+/// What a stream or future carries: data, or at the top level an owned
+/// handle, which moves to whoever reads it.
+fn async_payload(
+    resolve: &Resolve,
+    world: &wp::World,
+    payload: Option<&wp::Type>,
+) -> Result<(Option<Type>, Option<HandleType>), FieldErrorKind> {
+    let Some(payload) = payload else {
+        return Ok((None, None));
+    };
+    if let Some(wp::TypeDefKind::Handle(h)) = top_kind(resolve, payload) {
+        // Owned in either direction: reading takes it from the writer.
+        let handle = lower_handle(resolve, world, h, PortDirection::Output)?;
+        return Ok((None, Some(handle)));
+    }
+    Ok((Some(payload_type(resolve, payload)?), None))
 }
 
 /// The resource a top-level handle field carries. An input borrows it (the
@@ -2025,6 +2039,102 @@ mod tests {
                 "{fields}: {nested}"
             );
         }
+    }
+
+    #[test]
+    fn streams_and_futures_carry_owned_handles() {
+        let contract = lower_one(&handle_world(
+            "record inputs { a: stream<tensor>, b: future<own<blob>> }
+             record outputs { c: stream<own<tensor>>, d: future<tensor> }",
+            "",
+        ));
+        for (ports, name, kind, resource) in [
+            (&contract.inputs, "a", PortKind::Stream, "tensor"),
+            (&contract.inputs, "b", PortKind::Future, "blob"),
+            (&contract.outputs, "c", PortKind::Stream, "tensor"),
+            (&contract.outputs, "d", PortKind::Future, "tensor"),
+        ] {
+            let port = port(ports, name);
+            assert_eq!((port.kind, &port.ty), (kind, &None), "{name}");
+            assert_eq!(
+                port.handle.as_ref().map(|h| h.resource.as_str()),
+                Some(resource),
+                "{name}"
+            );
+        }
+        assert_eq!(contract.shape(), NodeShape::Streaming);
+        assert_eq!(capability_names(&contract), ["test:data/tensor@0.1.0"]);
+
+        // Data still lowers as data.
+        let data = lower_one(&handle_world(
+            "record inputs { a: stream<u32> } record outputs { b: future<u8>, c: stream }",
+            "",
+        ));
+        assert!(port(&data.inputs, "a").handle.is_none());
+        assert!(port(&data.outputs, "b").ty.is_some());
+        let unit = port(&data.outputs, "c");
+        assert!(unit.ty.is_none() && unit.handle.is_none());
+    }
+
+    #[test]
+    fn streams_and_futures_carry_handles_only_at_the_top() {
+        for fields in [
+            "record inputs { a: stream<list<tensor>> } record outputs { b: u32 }",
+            "record inputs { a: u32 } record outputs { b: future<option<tensor>> }",
+            "record inputs { a: u32 } record outputs { b: stream<tuple<tensor, u32>> }",
+        ] {
+            let nested = lower_err(&handle_world(fields, ""));
+            assert!(
+                nested.contains("not supported in port payloads"),
+                "{fields}: {nested}"
+            );
+        }
+        // A reader cannot be lent an item for longer than the write takes.
+        let borrowed = lower_err(&handle_world(
+            "record inputs { a: stream<borrow<tensor>> } record outputs { b: u32 }",
+            "",
+        ));
+        assert!(borrowed.contains("borrow"), "{borrowed}");
+        // Declared by the node itself: no other node can name it.
+        let local = lower_err(
+            r#"
+            package demo:test@0.1.0;
+            interface node {
+                resource mine;
+                record inputs { a: u32 }
+                record outputs { b: stream<mine> }
+                run: async func(inputs: inputs) -> outputs;
+            }
+            world w { export node; }
+            "#,
+        );
+        assert!(
+            local.contains("resource `mine`") && local.contains("imports"),
+            "{local}"
+        );
+    }
+
+    #[test]
+    fn a_stream_of_handles_hashes_apart_from_a_handle_port() {
+        let hash = |fields: &str| {
+            lower_one(&handle_world(fields, ""))
+                .id
+                .content_hash
+                .unwrap()
+        };
+        let stream = hash("record inputs { a: u32 } record outputs { b: stream<tensor> }");
+        assert_ne!(
+            stream,
+            hash("record inputs { a: u32 } record outputs { b: tensor }")
+        );
+        assert_ne!(
+            stream,
+            hash("record inputs { a: u32 } record outputs { b: future<tensor> }")
+        );
+        assert_ne!(
+            stream,
+            hash("record inputs { a: u32 } record outputs { b: stream<blob> }")
+        );
     }
 
     #[test]
