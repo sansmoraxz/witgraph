@@ -46,7 +46,11 @@ export class WitgraphTimeline extends HTMLElement {
   #onStateChanged = () => this.#sync();
 
   connectedCallback(): void {
-    if (this.shadowRoot) return;
+    // Moved in the page: listen again, and draw what it missed.
+    if (this.shadowRoot) {
+      this.#listen();
+      return;
+    }
     const shadow = this.attachShadow({ mode: 'open' });
     adoptStyles(shadow, EXTRA_CSS);
 
@@ -63,27 +67,33 @@ export class WitgraphTimeline extends HTMLElement {
     timeline.appendChild(this.#eventsContainer);
 
     shadow.appendChild(timeline);
+    this.#listen();
   }
 
   disconnectedCallback(): void {
-    this.#detach();
+    this.#unlisten();
   }
 
   set controller(ctrl: EditorController) {
-    this.#detach();
+    this.#unlisten();
     this.#controller = ctrl;
     this.#lastRendered = null;
     if (this.#eventsContainer) this.#eventsContainer.innerHTML = '';
-    ctrl.addEventListener('trace-event', this.#onTraceEvent);
-    ctrl.addEventListener('state-changed', this.#onStateChanged);
-    this.#sync();
+    if (this.isConnected && this.shadowRoot) this.#listen();
   }
 
   get controller(): EditorController | null {
     return this.#controller;
   }
 
-  #detach(): void {
+  /** Follows the controller's trace, and draws it as it is now. */
+  #listen(): void {
+    this.#controller?.addEventListener('trace-event', this.#onTraceEvent);
+    this.#controller?.addEventListener('state-changed', this.#onStateChanged);
+    this.#sync();
+  }
+
+  #unlisten(): void {
     this.#controller?.removeEventListener('trace-event', this.#onTraceEvent);
     this.#controller?.removeEventListener('state-changed', this.#onStateChanged);
   }

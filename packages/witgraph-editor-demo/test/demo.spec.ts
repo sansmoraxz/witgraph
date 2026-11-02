@@ -266,6 +266,25 @@ test.describe('WIT Graph Editor Demo', () => {
     await expect.poll(async () => (await newest()).rows).toBeLessThan(1000);
   });
 
+  test('the timeline follows the trace still after it is moved in the page', async ({ page }) => {
+    const timeline = page.locator('witgraph-timeline');
+    const rows = () =>
+      timeline.evaluate((el: HTMLElement) => el.shadowRoot?.querySelectorAll('.event').length ?? 0);
+    const controls = page.locator('witgraph-controls');
+    await controls.locator('button.run').click();
+    await expect.poll(rows).toBeGreaterThan(0);
+
+    await page.evaluate(() => {
+      const el = document.querySelector('witgraph-timeline')!;
+      const parent = el.parentElement!;
+      el.remove();
+      parent.appendChild(el);
+    });
+    const moved = await rows();
+    await expect.poll(rows).toBeGreaterThan(moved);
+    await controls.locator('button.stop').click();
+  });
+
   test('injected values from attrs are visible', async ({ page }) => {
     const inspector = page.locator('witgraph-inspector');
     const text = await inspector.evaluate((el: HTMLElement) => el.shadowRoot?.textContent ?? '');
