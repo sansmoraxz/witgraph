@@ -1,6 +1,6 @@
 import type { EditorController } from '../controller/editor-controller.ts';
 import type { NodeVisual, PortVisual } from '../controller/types.ts';
-import { defaultViewer } from '../controller/visual.ts';
+import { defaultViewer, describeHandle } from '../controller/visual.ts';
 import { weight } from '../util/weight.ts';
 import { summarize } from '../viewers/text.ts';
 import { adoptStyles } from './shared-styles.ts';
@@ -12,14 +12,6 @@ const PHASE_BG: Record<string, string> = {
   faulted: 'bg-wg-phase-faulted',
   cancelled: 'bg-wg-phase-cancelled',
 };
-
-/** A handle's object as its own `toString` describes it, else by its resource. */
-function describeHandle(value: unknown, resource: string): string {
-  const own = (value as { toString?: unknown } | null)?.toString;
-  return typeof own === 'function' && own !== Object.prototype.toString
-    ? String(value)
-    : `<${resource}>`;
-}
 
 const KIND_BG: Record<string, string> = {
   value: 'bg-wg-port-value',

@@ -7,6 +7,7 @@ import {
 } from 'witgraph-loader';
 import { NODE_HEADER_HEIGHT } from '../components/styles.ts';
 import { weight } from '../util/weight.ts';
+import { viewerFor } from '../viewers/registry.ts';
 import { autoLayout, type LayoutEdge, type LayoutNode } from './layout.ts';
 import type {
   BreakpointState,
@@ -27,7 +28,7 @@ import type {
   SavedSnapshot,
   TraceEntry,
 } from './types.ts';
-import { nodeSize, nodeVisual, portVisual } from './visual.ts';
+import { describeHandle, nodeSize, nodeVisual, portVisual } from './visual.ts';
 
 const MAX_TRACE_ENTRIES = 1000;
 /**
@@ -58,6 +59,8 @@ interface Observation {
   pending: boolean;
   /** Value outputs only: the tick its latest value was recorded at. */
   tick: number;
+  /** Whether `latest` is ours to dispose: a reference a viewer kept. */
+  kept: boolean;
   bytes: number;
 }
 
@@ -71,6 +74,18 @@ function sameResource(a: PortVisual, b: PortVisual): boolean {
   return (
     a.handle.resource === b.handle.resource && base(a.handle.interface) === base(b.handle.interface)
   );
+}
+
+/** Disposes what a viewer kept of an output's latest item. */
+function release(seen: Observation): void {
+  if (!seen.kept) return;
+  seen.kept = false;
+  const kept = seen.latest as Partial<Disposable> | null | undefined;
+  try {
+    kept?.[Symbol.dispose]?.();
+  } catch (error) {
+    console.error('disposing what a viewer kept threw:', error);
+  }
 }
 
 /** The most edits undo goes back over. */
@@ -249,13 +264,26 @@ export class EditorController extends EventTarget {
     return this.observe(node, port).latest;
   }
 
+  /** The resource an output carries, if it carries one. */
+  #resourceOf(node: string, port: string): string | undefined {
+    return this.#nodes.get(node)?.outputs.find((p) => p.name === port)?.handle?.resource;
+  }
+
   /** The record of what `node`'s `port` carried, made on first use. */
   #observation(node: string, port: string): Observation {
     const ports = this.#observed.get(node) ?? new Map<string, Observation>();
     this.#observed.set(node, ports);
     let seen = ports.get(port);
     if (!seen) {
-      seen = { latest: undefined, recent: [], count: 0, pending: false, tick: -1, bytes: 0 };
+      seen = {
+        latest: undefined,
+        recent: [],
+        count: 0,
+        pending: false,
+        tick: -1,
+        bytes: 0,
+        kept: false,
+      };
       ports.set(port, seen);
     }
     return seen;
@@ -269,6 +297,34 @@ export class EditorController extends EventTarget {
     const from = Math.max(0, items.length - MAX_RECENT);
     this.#observation(node, port).count += from;
     for (let i = from; i < items.length; i++) this.#record(node, port, items[i]);
+  }
+
+  /**
+   * Records a handle a stream or future carried. It is its reader's, and may
+   * be gone by the time anything is drawn, so what stays is what the preview's
+   * viewer keeps of it, or else a description. No history: each would hold on
+   * to what the handle holds.
+   */
+  #recordHandle(node: string, port: string, item: unknown, resource: string): void {
+    const visual = this.#nodes.get(node);
+    const viewer = visual?.preview?.port === port ? viewerFor(visual.preview.viewer) : undefined;
+    const kept = viewer?.keep?.(item);
+    const seen = this.#observation(node, port);
+    release(seen);
+    seen.latest = kept ?? describeHandle(item, resource);
+    seen.kept = kept !== undefined;
+    seen.recent = [seen.latest];
+    seen.pending = false;
+    seen.count += 1;
+    this.#dispatch('output-changed');
+  }
+
+  /** Forgets what outputs carried, disposing what was kept of it. */
+  #forgetObserved(node?: string): void {
+    const nodes = node === undefined ? [...this.#observed.values()] : [this.#observed.get(node)];
+    for (const ports of nodes) for (const seen of ports?.values() ?? []) release(seen);
+    if (node === undefined) this.#observed.clear();
+    else this.#observed.delete(node);
   }
 
   /** Records a value `node`'s `port` carried, within the history's bounds. */
@@ -668,7 +724,7 @@ export class EditorController extends EventTarget {
     this.#undoStack = [];
     this.#redoStack = [];
     this.#traceEvents = [];
-    this.#observed.clear();
+    this.#forgetObserved();
     this.#tickCount = 0;
     this.#lastRunDurationMs = null;
     this.#lastRunTicks = 0;
@@ -761,7 +817,7 @@ export class EditorController extends EventTarget {
     this.#pausedNode = null;
     this.#breakpointState = null;
     this.#tickCount = 0;
-    this.#observed.clear();
+    this.#forgetObserved();
     this.#injectedValues.clear();
     this.#undoStack.length = 0;
     this.#redoStack.length = 0;
@@ -1314,7 +1370,7 @@ export class EditorController extends EventTarget {
       (c) => c.from.node !== id && c.to.node !== id,
     );
     this.#nodes.delete(id);
-    this.#observed.delete(id);
+    this.#forgetObserved(id);
     this.#edges = this.#edges.filter((e) => e.fromNode !== id && e.toNode !== id);
     if (this.#selectedNode === id) this.#selectedNode = null;
     void this.#reloadAfterEdit();
@@ -1513,15 +1569,17 @@ export class EditorController extends EventTarget {
       afterRun: (): void => {},
 
       onStreamItem: ({ node, port, items }): void => {
-        if (this.#session === session && this.isObserved(node, port)) {
-          this.#recordItems(node, port, items);
-        }
+        if (this.#session !== session || !this.isObserved(node, port)) return;
+        const resource = this.#resourceOf(node, port);
+        if (resource === undefined) this.#recordItems(node, port, items);
+        else for (const item of Array.from(items)) this.#recordHandle(node, port, item, resource);
       },
 
       onFutureValue: ({ node, port, value }): void => {
-        if (this.#session === session && this.isObserved(node, port)) {
-          this.#record(node, port, value);
-        }
+        if (this.#session !== session || !this.isObserved(node, port)) return;
+        const resource = this.#resourceOf(node, port);
+        if (resource === undefined) this.#record(node, port, value);
+        else this.#recordHandle(node, port, value, resource);
       },
     };
 
