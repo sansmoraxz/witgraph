@@ -1,3 +1,4 @@
+import { failure } from '../accel/cnn.ts';
 import { type Backend, type Storage, unavailable } from './tensors.ts';
 
 /** `GPUBufferUsage` and `GPUMapMode` flags, as the WebGPU specification fixes them. */
@@ -42,11 +43,35 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   output[i] = clamp(trunc(sum), 0.0, 255.0);
 }`;
 
+/** A video frame's RGB, 0 to 255, for each pixel of a `[h, w, 3]` tensor. */
+const CAPTURE = /* wgsl */ `
+@group(0) @binding(0) var<uniform> d: vec4<u32>;
+@group(0) @binding(1) var frame: texture_external;
+@group(0) @binding(2) var<storage, read_write> output: array<f32>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+  let h = d.x; let w = d.y;
+  let i = id.x;
+  if (i >= h * w) { return; }
+  let color = textureLoad(frame, vec2<u32>(i % w, i / w));
+  output[i * 3u] = round(color.r * 255.0);
+  output[i * 3u + 1u] = round(color.g * 255.0);
+  output[i * 3u + 2u] = round(color.b * 255.0);
+}`;
+
 /** Tensors in WebGPU storage buffers, an `f32` per element. */
 export async function webgpu(): Promise<Backend> {
   const adapter = await navigator.gpu?.requestAdapter().catch(() => null);
   if (!adapter) return unavailable('WebGPU is not available in this browser');
   const device = await adapter.requestDevice();
+  // Work on a lost device does nothing, and says nothing: fail instead.
+  let lost: string | undefined;
+  device.lost.then((info) => {
+    lost = info.message;
+  });
+  // SwiftShader loses the device on being given a video frame.
+  const software = adapter.info.architecture === 'swiftshader';
   const pipeline = (code: string) =>
     device.createComputePipeline({
       layout: 'auto',
@@ -54,6 +79,7 @@ export async function webgpu(): Promise<Backend> {
     });
   const invert = pipeline(INVERT);
   const conv = pipeline(CONV);
+  const capture = pipeline(CAPTURE);
   const STORAGE = USAGE.STORAGE | USAGE.COPY_DST | USAGE.COPY_SRC;
   const elements = (shape: number[]) => shape.reduce((n, d) => n * d, 1);
   // Bindings want at least 16 bytes.
@@ -93,7 +119,10 @@ export async function webgpu(): Promise<Backend> {
     return output;
   };
   return {
-    name: () => 'webgpu',
+    name() {
+      if (lost !== undefined) failure(`the WebGPU device was lost: ${lost}`);
+      return 'webgpu';
+    },
     async upload(_, data) {
       return buffer(data.length * 4, STORAGE, Float32Array.from(data));
     },
@@ -122,5 +151,30 @@ export async function webgpu(): Promise<Backend> {
       return out;
     },
     destroy: (storage) => (storage as GPUBuffer).destroy(),
+    capture: software
+      ? undefined
+      : async (video, [h, w]) => {
+          const output = buffer(h * w * 3 * 4, STORAGE);
+          const params = buffer(16, USAGE.UNIFORM | USAGE.COPY_DST, Uint32Array.of(h, w, 0, 0));
+          const encoder = device.createCommandEncoder();
+          const pass = encoder.beginComputePass();
+          pass.setPipeline(capture);
+          pass.setBindGroup(
+            0,
+            device.createBindGroup({
+              layout: capture.getBindGroupLayout(0),
+              entries: [
+                { binding: 0, resource: { buffer: params } },
+                { binding: 1, resource: device.importExternalTexture({ source: video }) },
+                { binding: 2, resource: { buffer: output } },
+              ],
+            }),
+          );
+          pass.dispatchWorkgroups(Math.ceil((h * w) / 64));
+          pass.end();
+          device.queue.submit([encoder.finish()]);
+          params.destroy();
+          return output;
+        },
   };
 }

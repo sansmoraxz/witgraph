@@ -25,6 +25,11 @@ export interface Backend {
   /** Of a `[height, width, channels]` tensor, as the interface says. */
   conv3x3(storage: Storage, shape: number[], weights: Float32Array): Promise<Storage>;
   destroy(storage: Storage): void;
+  /**
+   * A `[height, width, 3]` frame of `video` as elements here, if the backend
+   * can take one without the page's memory in between.
+   */
+  capture?(video: HTMLVideoElement, shape: number[]): Promise<Storage>;
 }
 
 /** A tensor's elements, shared by every reference to it. */
@@ -37,8 +42,13 @@ interface Data {
   bytes?: Promise<Uint8Array>;
 }
 
+/** The tensor class of a {@link tensors} import, as a provider of tensors uses it. */
+export interface TensorClass {
+  fromStorage(storage: Storage, shape: number[]): object;
+}
+
 /** The `test:data/tensor` import for jco, over `backend`. */
-export function tensors(backend: Backend): { Tensor: unknown } {
+export function tensors(backend: Backend): { Tensor: TensorClass } {
   const elements = (shape: number[]) => shape.reduce((n, d) => n * d, 1);
   /** Runs a backend's operation; a failure is the operation's `err`. */
   const attempt = async <T>(what: () => Promise<T>): Promise<T> => {
@@ -60,6 +70,11 @@ export function tensors(backend: Backend): { Tensor: unknown } {
 
     static #made(storage: Storage, shape: number[]): Tensor {
       return new Tensor({ storage, shape, refs: 1 });
+    }
+
+    /** A tensor of elements the backend already holds, for another provider. */
+    static fromStorage(storage: Storage, shape: number[]): Tensor {
+      return Tensor.#made(storage, shape);
     }
 
     static async fromBytes(dtype: string, shape: ArrayLike<number>, data: Uint8Array) {
@@ -112,7 +127,11 @@ export function tensors(backend: Backend): { Tensor: unknown } {
     }
 
     toString(): string {
-      return `uint8[${this.#data.shape.join(', ')}] on ${backend.name()}`;
+      let where = 'a lost backend';
+      try {
+        where = backend.name();
+      } catch {}
+      return `uint8[${this.#data.shape.join(', ')}] on ${where}`;
     }
 
     [Symbol.dispose](): void {
