@@ -121,3 +121,17 @@ nightly toolchain with `rust-src` (the standard library is built from
 source), and a host with the memory64 proposal (recent Chromium and Node,
 for instance). The guests stay 32-bit: components have no 64-bit ABI
 yet.
+
+`pnpm build:wasm:addr2line` builds the scheduler with its `addr2line` feature:
+a trap's fault message then lists the WebAssembly frames of its stack, the
+innermost first, as far as the engine's stack limit goes. Without the feature
+the message is the trap's alone. To turn a frame's offset into a source line,
+build the guest with debug info, transpile it, and look the offset up in the
+core module jco emits:
+
+```sh
+wasm-tools addr2line node.core.wasm 0x1d47
+```
+
+An optimized guest may resolve to a file with no line, so build it with
+`opt-level = 0` for the exact one.

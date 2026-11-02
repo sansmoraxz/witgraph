@@ -18,6 +18,12 @@ workspace = true
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+# A trap's fault message lists the WebAssembly frames of its stack, with the
+# offsets `wasm-tools addr2line` takes. Without it the message is the trap's
+# alone.
+addr2line = []
+
 # Everything here is for WebAssembly (`wasm32`, or `wasm64` opting in): on
 # other targets the crate is empty.
 [target.'cfg(target_family = "wasm")'.dependencies]
