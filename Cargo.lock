@@ -3528,11 +3528,13 @@ name = "witgraph-wit"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "semver",
  "serde",
  "serde_json",
  "sha2 0.11.1",
  "thiserror 2.0.21",
  "wac-graph",
+ "wasm-encoder 0.263.0",
  "wasm-wave",
  "wasmparser 0.263.0",
  "wat",

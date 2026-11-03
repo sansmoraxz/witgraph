@@ -1,0 +1,12 @@
+package test:corpus-flat@0.1.0;
+
+/// Passes a variant through whose cases share core values of different types,
+/// in a record small enough to be passed flat.
+world corpus-flat {
+    export node: interface {
+        variant mixed { whole(u64), ratio(f32), name(string), nothing }
+        record inputs { mixed: option<mixed> }
+        record outputs { mixed: option<mixed> }
+        run: async func(inputs: inputs) -> outputs;
+    }
+}

@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::{env, fs};
 
-const GUESTS: [&str; 44] = [
+const GUESTS: [&str; 46] = [
     "echo",
     "configurable",
     "relay",
@@ -47,6 +47,8 @@ const GUESTS: [&str; 44] = [
     "camera-source",
     "tensor-future-source",
     "tensor-future-sink",
+    "corpus-relay",
+    "corpus-flat",
 ];
 
 /// The doc comment of the first world in `wit`, as the text WIT gives it.

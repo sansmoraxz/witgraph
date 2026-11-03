@@ -51,6 +51,13 @@ macro_rules! index_type {
             }
         }
 
+        impl $name {
+            /// The index at `position`.
+            pub fn from_position(position: usize) -> Self {
+                <Self as Idx>::at(position)
+            }
+        }
+
         const _: () = assert!(size_of::<$name>() == size_of::<u32>());
     };
 }

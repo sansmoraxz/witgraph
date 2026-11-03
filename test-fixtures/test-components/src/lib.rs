@@ -236,3 +236,11 @@ pub const TENSOR_FUTURE_SOURCE: Guest = guest!("TENSOR_FUTURE_SOURCE_WASM", "ten
 /// Imports `test:data/tensor`. `tensor: future<tensor>`, `ignore`: `option<bool>`
 /// → `first: u32`, its first byte, or 1000 when told to drop the future unread.
 pub const TENSOR_FUTURE_SINK: Guest = guest!("TENSOR_FUTURE_SINK_WASM", "tensor-future-sink");
+
+/// `value`, `other` passed through unchanged: a value of every kind a port can
+/// hold, in a record too big to be passed flat.
+pub const CORPUS_RELAY: Guest = guest!("CORPUS_RELAY_WASM", "corpus-relay");
+
+/// `mixed` passed through unchanged: a variant whose cases share core
+/// values of different types, in a record small enough to be passed flat.
+pub const CORPUS_FLAT: Guest = guest!("CORPUS_FLAT_WASM", "corpus-flat");

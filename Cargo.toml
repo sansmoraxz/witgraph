@@ -56,6 +56,7 @@ wasmtime = { git = "https://github.com/bytecodealliance/wasmtime", rev = "4c1c3f
 wit-parser = "0.263"
 wit-component = "0.263"
 wasmparser = { version = "0.263", default-features = false }
+wasm-encoder = "0.263"
 wac-graph = "0.12"
 wasm-wave = { version = "0.263", default-features = false, features = ["std"] }
 

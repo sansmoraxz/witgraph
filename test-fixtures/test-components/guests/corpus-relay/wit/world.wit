@@ -1,0 +1,46 @@
+package test:corpus-relay@0.1.0;
+
+/// Passes a value of every kind a port can hold through, unchanged. Its record
+/// is far too big to be passed flat.
+world corpus-relay {
+    export node: interface {
+        enum color { red, green, blue }
+        flags perms { read, write, exec }
+        record point { x: f32, y: f64, tag: u8 }
+        variant shape {
+            empty,
+            dot(point),
+            label(string),
+            many(list<point>),
+            nested(option<list<string>>),
+        }
+        record packed { a: u16, b: u16, c: u32 }
+        record values {
+            boolean: bool,
+            small: s8,
+            medium: u16,
+            word: s32,
+            big: u64,
+            real: f32,
+            double: f64,
+            letter: char,
+            text: string,
+            bytes: list<u8>,
+            numbers: list<f32>,
+            words: list<string>,
+            color: color,
+            perms: perms,
+            point: point,
+            packed: list<packed>,
+            shape: shape,
+            maybe: option<point>,
+            outcome: result<string, color>,
+            pair: tuple<u8, string>,
+            grid: list<list<u16>>,
+            shapes: list<shape>,
+        }
+        record inputs { value: option<values>, other: option<string> }
+        record outputs { value: option<values>, other: option<string> }
+        run: async func(inputs: inputs) -> outputs;
+    }
+}

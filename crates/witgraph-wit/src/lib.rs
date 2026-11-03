@@ -4,6 +4,8 @@
 pub mod compose;
 pub mod docs;
 pub mod hash;
+#[cfg(feature = "compose")]
+pub mod hub;
 pub mod load;
 pub mod lower;
 pub mod metadata;

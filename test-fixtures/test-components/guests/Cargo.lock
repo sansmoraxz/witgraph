@@ -71,6 +71,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "corpus-flat-guest"
+version = "0.1.0"
+dependencies = [
+ "wit-bindgen",
+]
+
+[[package]]
+name = "corpus-relay-guest"
+version = "0.1.0"
+dependencies = [
+ "wit-bindgen",
+]
+
+[[package]]
 name = "echo-guest"
 version = "0.1.0"
 dependencies = [

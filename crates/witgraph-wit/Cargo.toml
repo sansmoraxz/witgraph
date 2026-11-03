@@ -24,10 +24,13 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 wasmparser = { workspace = true, features = ["std", "validate", "component-model", "features"] }
 wac-graph = { workspace = true, optional = true }
+wasm-encoder = { workspace = true, optional = true }
+wit-component = { workspace = true, optional = true }
+semver = { workspace = true, optional = true, features = ["std"] }
 
 [features]
 # Composing a node with the providers its links name (`compose`).
-compose = ["dep:wac-graph"]
+compose = ["dep:wac-graph", "dep:wasm-encoder", "dep:wit-component", "dep:semver"]
 
 [dev-dependencies]
 wat = "1"
