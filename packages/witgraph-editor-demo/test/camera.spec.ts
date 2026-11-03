@@ -97,3 +97,27 @@ test('without a camera, its node faults saying why', async ({ page }) => {
     'no camera: Requested device not found',
   );
 });
+
+test('a fault message with a long word wraps inside the inspector', async ({ page }) => {
+  test.skip(accelerated(), 'runs in the plain project');
+  const word = 'x'.repeat(400);
+  await page.addInitScript((word) => {
+    navigator.mediaDevices.getUserMedia = () => Promise.reject(new Error(word));
+  }, word);
+  await open(page, 'camera');
+  await run(page);
+  const canvas = page.locator('witgraph-canvas');
+  await expect(canvas.locator('[data-node-id="camera"] .node-header')).toHaveClass(/faulted/, {
+    timeout: 15_000,
+  });
+  await canvas.locator('[data-node-id="camera"]').click();
+  const inspector = page.locator('witgraph-inspector');
+  const message = inspector.locator('.whitespace-pre-wrap', { hasText: word });
+  const panel = await inspector.evaluate((el) => el.getBoundingClientRect().right);
+  const text = await message.evaluate((el) => {
+    const range = document.createRange();
+    range.selectNodeContents(el);
+    return range.getBoundingClientRect().right;
+  });
+  expect(text).toBeLessThanOrEqual(panel);
+});

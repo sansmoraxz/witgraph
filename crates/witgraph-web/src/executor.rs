@@ -110,9 +110,32 @@ fn thrown(error: &JsValue) -> String {
             .ok()
             .and_then(|message| message.as_string())
     {
+        #[cfg(feature = "addr2line")]
+        let message = with_wasm_frames(error, message);
         return message;
     }
     describe(error)
+}
+
+/// `message`, then the WebAssembly frames of a trap's stack, one per line:
+/// each function with its offset in the core module, which
+/// `wasm-tools addr2line` takes. The JavaScript frames are left out: the
+/// loader imports jco's output from a `data:` URL, and each of them names
+/// all of it.
+#[cfg(feature = "addr2line")]
+fn with_wasm_frames(error: &JsValue, mut message: String) -> String {
+    if !error.is_instance_of::<js_sys::WebAssembly::RuntimeError>() {
+        return message;
+    }
+    let stack = Reflect::get(error, &JsValue::from_str("stack"))
+        .ok()
+        .and_then(|stack| stack.as_string())
+        .unwrap_or_default();
+    for frame in stack.lines().filter(|l| l.contains("wasm-function[")) {
+        message.push('\n');
+        message.push_str(frame.trim());
+    }
+    message
 }
 
 /// Whether a thrown JavaScript value is the page's `fatal`: an error

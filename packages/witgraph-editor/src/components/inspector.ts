@@ -569,7 +569,11 @@ export class WitgraphInspector extends HTMLElement {
         this.#el('div', 'font-semibold text-wg-error text-sm mb-1', `⚠ ${node.fault.kind}`),
       );
       fault.appendChild(
-        this.#el('div', 'font-mono text-xs whitespace-pre-wrap text-wg-text', node.fault.message),
+        this.#el(
+          'div',
+          'font-mono text-xs whitespace-pre-wrap wrap-anywhere text-wg-text',
+          node.fault.message,
+        ),
       );
       if (node.culprit)
         fault.appendChild(

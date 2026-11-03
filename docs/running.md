@@ -260,10 +260,15 @@ The rest is opt-in too, so you only compile what you use:
 | `demangle`             | no      | Demangled names in backtraces.                       |
 | `addr2line`            | no      | Source locations in backtraces.                      |
 
-These matter if you reach wasmtime through the `witgraph_runtime::wasmtime`
-re-export, for example to build your own `Engine` and pass it in
-`RuntimeConfig`. The engine witgraph builds itself uses none of them, apart
-from `parallel-compilation`, which only makes compiling faster.
+Most of these matter if you reach wasmtime through the
+`witgraph_runtime::wasmtime` re-export, for example to build your own `Engine`
+and pass it in `RuntimeConfig`. The engine witgraph builds itself uses only
+three of them: `parallel-compilation`, which only makes compiling faster, and
+`addr2line` and `demangle`, which change a trap's backtrace in its fault
+message. With `addr2line` on, `WASMTIME_BACKTRACE_DETAILS=1` set and a guest
+built with debug info, each frame gets its source location; an optimized guest
+may resolve to a file with no line, so build it with `opt-level = 0` for the
+exact one. `demangle` makes the frames' function names readable.
 
 ## Tracing
 

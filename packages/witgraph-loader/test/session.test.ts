@@ -544,6 +544,25 @@ test('a mock replaces a node, and the hooks see every run', async () => {
   ]);
 });
 
+test('a trap names its frames only in a scheduler built with `addr2line`', async () => {
+  const session = await load([['busy', 'busy-loop']]);
+  session.graph.inject('busy', 'action', 'trap');
+  await session.settle();
+  const [{ fault }] = session.graph.takeFaults();
+  const [trap, ...frames] = fault.message.split('\n');
+  assert.match(trap, /`unreachable`/);
+  // The feature compiles in the text that picks the frames out.
+  if (wasm.includes('wasm-function[')) {
+    assert.ok(frames.length > 0, fault.message);
+    for (const frame of frames) {
+      assert.match(frame, /wasm-function\[\d+\]:0x[0-9a-f]+/);
+      assert.doesNotMatch(frame, /^data:|base64/);
+    }
+  } else {
+    assert.deepEqual(frames, []);
+  }
+});
+
 test('a trap faults its island, and fatal aborts the tick', async () => {
   const session = await load([
     ['busy', 'busy-loop'],
