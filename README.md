@@ -83,6 +83,11 @@ repeats until nothing more can run. Nodes that need host features (a clock, a
 key-value store) get them through capability plugins. See
 [docs/running.md](docs/running.md).
 
+A graph runs as one composed component: a generated hub holds its values and moves
+them between nodes, so they don't pass through the host, which reads one only when
+it asks. That makes it fast, and makes the graph one fault domain: a trap stops all
+of it.
+
 The same scheduler runs in a browser or in Node.js through `witgraph-web` and
 `packages/witgraph-loader`, with the same calls: both hosts implement
 `RunningGraph` from `witgraph-traits`. See [docs/javascript.md](docs/javascript.md).
@@ -98,19 +103,19 @@ nodes, snapshots, undo and redo, and JSON import and export. See
 
 ## Crates
 
-| Crate                           | What it does                                                                   |
-| ------------------------------- | ------------------------------------------------------------------------------ |
-| `witgraph-ir`                   | Graph types, validation, and the `GraphBuilder → Graph → CompiledGraph` chain. |
-| `witgraph-wit`                  | Reads WIT and produces component contracts and the editor catalog.             |
-| `witgraph-traits`               | What the hosts have in common: the API of a running graph, and what runs one.  |
-| `witgraph-sched`                | The scheduler. It has no engine in it and also builds for `wasm32`.            |
-| `witgraph-runtime`              | The scheduler on wasmtime.                                                     |
-| `witgraph-web`                  | The scheduler for JavaScript hosts, via `wasm-bindgen`.                        |
-| `witgraph-source`               | Fetches component bytes from files and OCI registries, pinned by digest.       |
-| `packages/witgraph-loader`      | TypeScript loader that runs a graph in a browser or Node.                      |
-| `packages/witgraph-editor`      | Web Components for editing, running and debugging graphs visually.             |
-| `packages/witgraph-editor-demo` | Demo app for the editor.                                                       |
-| `test-fixtures/test-components` | Guest components for the tests. Not published.                                 |
+| Crate                           | What it does                                                                     |
+| ------------------------------- | -------------------------------------------------------------------------------- |
+| `witgraph-ir`                   | Graph types, validation, and the `GraphBuilder → Graph → CompiledGraph` chain.   |
+| `witgraph-wit`                  | Reads WIT into contracts and the editor catalog, and generates a graph's hub.    |
+| `witgraph-traits`               | What the hosts have in common: the API of a running graph, and what runs one.    |
+| `witgraph-sched`                | The scheduler. It holds no values, has no engine in it, and builds for `wasm32`. |
+| `witgraph-runtime`              | The scheduler on wasmtime.                                                       |
+| `witgraph-web`                  | The scheduler for JavaScript hosts, via `wasm-bindgen`.                          |
+| `witgraph-source`               | Fetches component bytes from files and OCI registries, pinned by digest.         |
+| `packages/witgraph-loader`      | TypeScript loader that runs a graph in a browser or Node.                        |
+| `packages/witgraph-editor`      | Web Components for editing, running and debugging graphs visually.               |
+| `packages/witgraph-editor-demo` | Demo app for the editor.                                                         |
+| `test-fixtures/test-components` | Guest components for the tests. Not published.                                   |
 
 ## Building
 

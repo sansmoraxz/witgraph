@@ -68,7 +68,7 @@ memory, a GPU buffer, an ML runtime's tensor), is up to the host, and so are
 its operations: a node calls them, and they run where the data lives. Only a
 node that reads the data into its own memory copies it.
 
-The host owns every shared object between runs. An input borrows its handle,
+The graph holds every shared object between runs. An input borrows its handle,
 so a node can neither keep nor destroy what other nodes hold, and an output
 hands its handle over. A node that wants to keep a value past its `run` asks
 the resource for a reference of its own, if the resource offers one (a
@@ -98,9 +98,9 @@ component model doesn't allow `stream<borrow<tensor>>` at all.
 Whatever is in flight is freed however the pipeline ends: when the stream runs
 out, a reader stops early, nothing reads it, the graph stops, or a node faults.
 
-Nodes joined by a stream of handles run in one Store, so they don't run in
-parallel, and a fault in one stops them all. On wasmtime its report names no
-culprit.
+On JavaScript hosts, a future of a handle can't pass between nodes yet: a graph
+connecting one fails to load (see
+[Differences from wasmtime](javascript.md#differences-from-wasmtime)).
 
 ## `run`
 

@@ -400,6 +400,35 @@ async fn tensors_pass_between_groups_as_handles() {
 }
 
 #[tokio::test]
+async fn a_handle_port_reads_the_object_the_hub_holds() {
+    let kit = Kit::new();
+    let mut rt = kit
+        .load(fan_out(&kit), RuntimeConfig::default(), true)
+        .await
+        .unwrap();
+    let port = rt
+        .handle_output(&"src".into(), &"tensor".into())
+        .expect("a handle output");
+    assert!(rt.get_handle(&port).await.unwrap().is_none(), "not run yet");
+    settle(&mut rt).await;
+    let shared = rt.get_handle(&port).await.unwrap().expect("it has run");
+    assert_eq!(shared.bytes(), SOURCE_BYTES);
+    assert_eq!(
+        rt.read_handle(&"src".into(), &"tensor".into())
+            .await
+            .unwrap(),
+        Some(shared),
+        "the same object, read by name"
+    );
+    assert!(rt.handle_output(&"direct".into(), &"sum".into()).is_err());
+    assert!(
+        rt.output::<u64>(&"src".into(), &"tensor".into())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
 async fn a_node_keeps_its_own_reference() {
     let kit = Kit::new();
     let graph = kit

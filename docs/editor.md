@@ -57,7 +57,8 @@ Put them anywhere on your page. They all share one `EditorController`.
   that is shorter: work still running then (an endless stream, say) carries
   on into the next tick, so the rest of the graph keeps advancing beside it.
 - Each node shows its state: pending, running, idle, faulted or cancelled. A
-  fault shows its cause and, when it is known, which node caused it.
+  fault stops the whole graph, so every node shows it, with its cause and, when it
+  is known, which node caused it. The next change or run starts every node again.
 - **Breakpoints.** Toggle one on a node (toolbar _BP_ button or right-click).
   The run pauses before that node, and _Resume_ continues.
 - **Values.** Select a node to see the current value of each output port.
@@ -168,7 +169,8 @@ await controller.autoLayout();
 
 `load` takes the same things as `Session.load` in [the loader](javascript.md):
 the graph as JSON, the component bytes, the scheduler's `wasm`, and a
-`capabilities` callback for anything the nodes import. The controller emits
+`capabilities` callback for anything the graph imports, which is asked each time
+the graph is instantiated. The controller emits
 `state-changed`, `trace-event`, `fault` and `output-changed` events, so you can
 show your own status or react to edits. `output-changed` fires at most once a
 frame while streams carry items.

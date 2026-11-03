@@ -23,7 +23,7 @@ let compiled = graph.compile(&contracts)?;
 
 Compiling checks the graph against the contracts and reports every problem at
 once, not just the first. On success you get a `CompiledGraph`, which you can
-inspect (execution order, islands, required capabilities) and then run.
+inspect (execution order, stream groups, required capabilities) and then run.
 
 ## Connection rules
 

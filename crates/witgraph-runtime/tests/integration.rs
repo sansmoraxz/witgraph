@@ -3920,3 +3920,145 @@ async fn two_million_runs_fault_nothing_and_stay_flat() {
     let (settled, end) = (settled.unwrap(), resident_kib());
     assert!(end < settled + 64 * 1024, "{settled} KiB grew to {end} KiB");
 }
+
+#[tokio::test]
+async fn a_typed_port_writes_and_reads_with_no_val() {
+    let kit = Kit::new(&[ECHO]);
+    let graph = kit.builder("typed").add_node("e", kit.get(ECHO)).build();
+    let mut rt = kit
+        .load(graph, RuntimeConfig::default(), Trace::new())
+        .await;
+    let input = rt.input::<f64>(&id("e"), &"in".into()).await.unwrap();
+    let output = rt.output::<f64>(&id("e"), &"out".into()).await.unwrap();
+    assert_eq!(input.node(), &id("e"));
+    assert_eq!(output.name().as_str(), "out");
+    assert_eq!(rt.get(&output).await.unwrap(), None, "not run yet");
+
+    rt.set(&input, 2.5).await.unwrap();
+    settle(&mut rt).await;
+    assert_eq!(rt.get(&output).await.unwrap(), Some(2.5));
+    let runs = runs_of(&rt.mode().trace(), "e");
+    rt.set(&input, 2.5).await.unwrap();
+    settle(&mut rt).await;
+    assert_eq!(
+        runs_of(&rt.mode().trace(), "e"),
+        runs,
+        "an equal value is no change"
+    );
+}
+
+#[tokio::test]
+async fn binding_a_port_to_the_wrong_type_is_an_error() {
+    let kit = Kit::new(&[ECHO]);
+    let graph = kit.builder("typed").add_node("e", kit.get(ECHO)).build();
+    let mut rt = kit.load(graph, RuntimeConfig::default(), Perf).await;
+    assert!(matches!(
+        rt.input::<u32>(&id("e"), &"in".into()).await,
+        Err(RuntimeError::ValueType { .. })
+    ));
+    assert!(matches!(
+        rt.output::<String>(&id("e"), &"out".into()).await,
+        Err(RuntimeError::ValueType { .. })
+    ));
+    assert!(matches!(
+        rt.output::<f64>(&id("e"), &"in".into()).await,
+        Err(RuntimeError::NotAValuePort { .. })
+    ));
+    assert!(matches!(
+        rt.input::<f64>(&id("ghost"), &"in".into()).await,
+        Err(RuntimeError::UnknownNode { .. })
+    ));
+}
+
+#[tokio::test]
+async fn a_typed_input_a_connection_writes_is_refused() {
+    let kit = Kit::new(&[ECHO]);
+    let graph = kit
+        .builder("typed")
+        .add_node("a", kit.get(ECHO))
+        .add_node("b", kit.get(ECHO))
+        .connect("c", port("a", "out"), port("b", "in"))
+        .build();
+    let mut rt = kit.load(graph, RuntimeConfig::default(), Perf).await;
+    assert!(matches!(
+        rt.input::<f64>(&id("b"), &"in".into()).await,
+        Err(RuntimeError::ConnectedInput { .. })
+    ));
+}
+
+#[tokio::test]
+async fn a_port_of_another_graph_is_an_error() {
+    let kit = Kit::new(&[ECHO]);
+    let graph = || kit.builder("typed").add_node("e", kit.get(ECHO)).build();
+    let mut one = kit.load(graph(), RuntimeConfig::default(), Perf).await;
+    let mut other = kit.load(graph(), RuntimeConfig::default(), Perf).await;
+    let input = one.input::<f64>(&id("e"), &"in".into()).await.unwrap();
+    let output = one.output::<f64>(&id("e"), &"out".into()).await.unwrap();
+    assert!(matches!(
+        other.set(&input, 1.0).await,
+        Err(RuntimeError::InvalidConfig { .. })
+    ));
+    assert!(matches!(
+        other.get(&output).await,
+        Err(RuntimeError::InvalidConfig { .. })
+    ));
+}
+
+#[tokio::test]
+async fn a_typed_port_binds_again_after_a_rebuild_and_keeps_its_value() {
+    let kit = Kit::new(&[ECHO, BUSY_LOOP]);
+    let graph = kit
+        .builder("typed")
+        .add_node("e", kit.get(ECHO))
+        .add_node("busy", kit.get(BUSY_LOOP))
+        .build();
+    let mut rt = kit.load(graph, RuntimeConfig::default(), Perf).await;
+    let input = rt.input::<f64>(&id("e"), &"in".into()).await.unwrap();
+    let output = rt.output::<f64>(&id("e"), &"out".into()).await.unwrap();
+    rt.set(&input, 1.5).await.unwrap();
+    inject(&mut rt, "busy", "action", Val::Enum("trap".into())).await;
+    settle(&mut rt).await;
+    assert_eq!(phase(&rt, "e"), NodePhase::Faulted);
+    assert_eq!(rt.get(&output).await.unwrap(), None, "gone with the Store");
+
+    // Written while stopped, kept for the next instance, and it starts one.
+    rt.set(&input, 3.5).await.unwrap();
+    inject(&mut rt, "busy", "action", Val::Enum("finish".into())).await;
+    settle(&mut rt).await;
+    assert_eq!(rt.get(&output).await.unwrap(), Some(3.5));
+    // The first value written through it survives a rebuild too.
+    rt.shutdown();
+    rt.rerun(&id("e")).unwrap();
+    settle(&mut rt).await;
+    assert_eq!(rt.get(&output).await.unwrap(), Some(3.5));
+}
+
+#[tokio::test]
+async fn a_preview_reads_bytes_as_bytes_and_anything_else_as_a_val() {
+    use witgraph_runtime::Preview;
+    let kit = Kit::new(&[BLOB_SOURCE, ECHO]);
+    let graph = kit
+        .builder("previews")
+        .add_node("b", kit.get(BLOB_SOURCE))
+        .add_node("e", kit.get(ECHO))
+        .build();
+    let mut rt = kit.load(graph, RuntimeConfig::default(), Perf).await;
+    let (blob, out) = ("blob".into(), "out".into());
+    assert_eq!(rt.preview(&id("b"), &blob).await.unwrap(), None);
+    inject(&mut rt, "b", "size", Val::U32(3)).await;
+    inject(&mut rt, "b", "seed", Val::U32(5)).await;
+    inject(&mut rt, "e", "in", Val::Float64(1.5)).await;
+    settle(&mut rt).await;
+    assert_eq!(
+        rt.preview(&id("b"), &blob).await.unwrap(),
+        Some(Preview::Bytes(vec![5, 6, 7]))
+    );
+    assert_eq!(
+        rt.preview(&id("e"), &out).await.unwrap(),
+        Some(Preview::Val(Val::Float64(1.5)))
+    );
+    assert_eq!(
+        rt.preview_wave(&id("e"), &out).await.unwrap().as_deref(),
+        Some("1.5")
+    );
+}
