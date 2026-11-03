@@ -2,110 +2,70 @@
 //! up (an event a dropped tick left behind, a generation started between
 //! two host writes), over an executor whose nodes are closures.
 
-use std::collections::HashSet;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use futures::FutureExt;
+use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
 use futures::executor::block_on;
 use witgraph_ir::{
-    ComponentContract, ComponentRef, Graph, HandleType, NodeId, PortDef, PortDirection, PortKind,
-    PortName, PortRef, Type,
+    ComponentContract, ComponentRef, Graph, HandleType, NodeId, NodeIdx, PortDef, PortDirection,
+    PortKind, PortName, PortRef, Type,
 };
 
+use crate::control::SchedulerCore;
 use crate::executor::{
-    Canonical, EventSink, Executor, Generation, GenerationFuture, IslandEvent, IslandEventKind,
-    NodeCaller, OptionPayload, drive,
+    BoxFuture, CallFuture, Canonical, Command, ControlEvent, ControlKind, DataPlane, Executor,
+    Incarnation, OptionPayload, Outcome, Returned, Serving, boxed,
 };
-use crate::plan::RunShape;
+use crate::plan::{MemberPlan, RunShape};
 use crate::{NodeFault, NodePhase, Perf, Scheduler, TickResult};
 
 /// Runs every node as `out = in + add + 1` (absent inputs read as 0). A
-/// call of the `held` node never returns, and rebuilds fail while
-/// `fail_rebuilds` is set.
+/// call of the `held` node never returns, and that many rebuilds fail.
 struct Adders {
     held: Option<NodeId>,
-    fail_rebuilds: Arc<AtomicBool>,
+    fail_rebuilds: Arc<AtomicUsize>,
     ports: HashSet<(PortRef, PortDirection)>,
-}
-
-struct Members<'a> {
-    generation: &'a Generation<u32>,
-    held: Option<&'a NodeId>,
-}
-
-impl NodeCaller<u32> for Members<'_> {
-    type Error = String;
-
-    async fn call(
-        &self,
-        member: usize,
-        args: Vec<Option<u32>>,
-    ) -> Result<Vec<(String, u32)>, String> {
-        if self.held == Some(&self.generation.plan.members[member].node) {
-            futures::future::pending::<()>().await;
-        }
-        let sum = args.iter().flatten().sum::<u32>() + 1;
-        let plan = &self.generation.plan.members[member];
-        Ok(plan
-            .outputs
-            .keys()
-            .map(|port| (port.to_string(), sum))
-            .collect())
-    }
-
-    fn close(&self, _: u32) -> Result<(), String> {
-        Ok(())
-    }
-
-    fn missing_input(&self, _: usize, field: &PortName) -> String {
-        format!("no value for `{field}`")
-    }
-}
-
-impl Adders {
-    fn generation(&self, mut generation: Generation<u32>) -> GenerationFuture<()> {
-        let held = self.held.clone();
-        async move {
-            let external = std::mem::take(&mut generation.external);
-            let members = Members {
-                generation: &generation,
-                held: held.as_ref(),
-            };
-            let send = |kind| generation.send(kind);
-            drive(
-                &members,
-                &generation.plan,
-                external,
-                Self::option_payload,
-                &send,
-            )
-            .await
-            .map_err(|message| (NodeFault::WasmTrap { message }, None))
-        }
-        .boxed()
-    }
 }
 
 impl Executor for Adders {
     type Value = u32;
     type Type = ();
-    type Island = ();
 
-    fn run(&self, (): (), generation: Generation<u32>) -> GenerationFuture<()> {
-        self.generation(generation)
+    fn call(&self, member: Arc<MemberPlan>, args: Vec<Option<u32>>) -> CallFuture<u32> {
+        let held = self.held.as_ref() == Some(&member.node);
+        boxed(async move {
+            if held {
+                futures::future::pending::<()>().await;
+            }
+            let sum = args.iter().flatten().sum::<u32>() + 1;
+            Ok(member
+                .outputs
+                .keys()
+                .map(|port| (port.to_string(), sum))
+                .collect())
+        })
     }
 
-    fn rebuild_and_run(&self, generation: Generation<u32>) -> GenerationFuture<()> {
-        if self.fail_rebuilds.load(Ordering::SeqCst) {
-            let fault = NodeFault::Restart {
-                message: "no data".into(),
-            };
-            return async move { Err((fault, None)) }.boxed();
-        }
-        generation.send(IslandEventKind::Rebuilt);
-        self.generation(generation)
+    fn rebuild(&self) -> BoxFuture<Outcome> {
+        let failing = self
+            .fail_rebuilds
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok();
+        boxed(async move {
+            if failing {
+                let message = "no data".to_string();
+                return Err((NodeFault::Restart { message }, None));
+            }
+            Ok(())
+        })
     }
+
+    fn close(&self, _: u32) {}
+
+    fn abandon(&self, _: &[NodeId]) {}
 
     fn option_payload(_: &u32) -> OptionPayload<'_, u32> {
         OptionPayload::NotOption
@@ -150,7 +110,7 @@ fn adder() -> ComponentContract {
 }
 
 /// Loads `a → b` (`a.out` into `b.in`).
-fn load(held: Option<&str>, fail_rebuilds: &Arc<AtomicBool>) -> Scheduler<Perf, Adders> {
+fn load(held: Option<&str>, fail_rebuilds: &Arc<AtomicUsize>) -> Scheduler<Perf, Adders> {
     let contract = adder();
     let compiled = Graph::builder("t")
         .add_component(&contract)
@@ -171,17 +131,16 @@ fn load(held: Option<&str>, fail_rebuilds: &Arc<AtomicBool>) -> Scheduler<Perf, 
         inputs: Some(vec!["in".into(), "add".into()]),
         has_result: true,
     };
-    let islands = compiled
-        .islands()
-        .iter()
-        .map(|members| ((), vec![shape.clone(); members.len()]))
+    let shapes: HashMap<NodeId, RunShape> = ["a", "b"]
+        .into_iter()
+        .map(|node| (NodeId::from(node), shape.clone()))
         .collect();
     let executor = Adders {
         held: held.map(NodeId::from),
         fail_rebuilds: fail_rebuilds.clone(),
         ports,
     };
-    Scheduler::new(compiled, Perf, executor, islands, 100).unwrap()
+    Scheduler::new(compiled, Perf, executor, &shapes, 100).unwrap()
 }
 
 fn settle(sched: &mut Scheduler<Perf, Adders>) {
@@ -200,53 +159,48 @@ fn out(sched: &Scheduler<Perf, Adders>, node: &str) -> Option<u32> {
 }
 
 #[test]
-fn cancel_handles_events_a_dropped_tick_left_behind() {
-    let mut sched = load(Some("a"), &Arc::new(AtomicBool::new(false)));
-    // `a`'s generation is in flight when the tick is dropped.
+fn what_a_dropped_tick_left_behind_is_handled_first() {
+    let mut sched = load(Some("a"), &Arc::new(AtomicUsize::new(0)));
+    // `a`'s `run` is in flight when the tick is dropped.
     assert!(sched.tick().now_or_never().is_none());
     let a = NodeId::from("a");
-    let island = sched.compiled().island_of(&a).unwrap();
-    let slot = &sched.core.slots[island];
-    let generation = slot.state.running_generation().unwrap();
-    let member = slot.plan.members.iter().position(|m| m.node == a).unwrap();
+    assert_eq!(sched.node_state(&a).unwrap().phase(), NodePhase::Running);
+    let index = sched.core.ports().node(&a).unwrap();
+    let output = sched.core.ports().output(&a, &"out".into()).unwrap();
     // As if `a` returned during the dropped tick's last poll.
-    sched.core.plane.sink.send(IslandEvent {
-        island,
-        generation,
-        kind: IslandEventKind::RunReturned {
-            member,
-            values: vec![("out".into(), 5)],
-        },
-    });
-
-    sched.cancel(&a).unwrap();
-    assert_eq!(out(&sched, "a"), Some(5));
-    // `b` is not held: it runs on what `a` returned.
-    sched.executor_mut().held = None;
-    assert!(matches!(block_on(sched.tick()), TickResult::Progress));
-    assert_eq!(
-        out(&sched, "b"),
-        Some(6),
-        "the returned run's outputs were delivered"
-    );
+    sched
+        .core
+        .events_tx
+        .unbounded_send(ControlEvent {
+            incarnation: Incarnation::default(),
+            kind: ControlKind::RunReturned {
+                node: index,
+                returned: Returned {
+                    outputs_changed: vec![output],
+                    ..Returned::default()
+                },
+            },
+        })
+        .unwrap();
+    assert!(sched.take_faults().is_empty());
+    assert_eq!(sched.node_state(&a).unwrap().phase(), NodePhase::Idle);
+    assert!(sched.output_version(&a, &"out".into()).unwrap().get() > 0);
 }
 
 #[test]
 fn work_owed_during_a_failing_rebuild_survives_it() {
-    let fail = Arc::new(AtomicBool::new(false));
+    let fail = Arc::new(AtomicUsize::new(0));
     let mut sched = load(None, &fail);
     settle(&mut sched);
     let a = NodeId::from("a");
-    sched.cancel(&a).unwrap();
-    fail.store(true, Ordering::SeqCst);
+    sched.shutdown();
+    fail.store(1, Ordering::SeqCst);
     sched.inject(&a, &"add".into(), 1).unwrap();
     // The rebuild starts, then an input changes before it fails.
-    let island = sched.compiled().island_of(&a).unwrap();
-    sched.core().start_generation(island);
+    assert!(sched.core().rebuild_if_owed());
     sched.inject(&a, &"add".into(), 2).unwrap();
     // The attempt fails; the change it never saw is still owed, so the
-    // island is rebuilt again (successfully, now) and runs on it.
-    fail.store(false, Ordering::SeqCst);
+    // graph is rebuilt again (successfully, now) and runs on it.
     settle(&mut sched);
     let faults = sched.take_faults();
     assert!(
@@ -254,35 +208,31 @@ fn work_owed_during_a_failing_rebuild_survives_it() {
         "the first rebuild failed: {faults:?}"
     );
     assert_eq!(sched.node_state(&a).unwrap().phase(), NodePhase::Idle);
-    assert_eq!(
-        out(&sched, "a"),
-        Some(3),
-        "and the island ran on the change"
-    );
+    assert_eq!(out(&sched, "a"), Some(3), "and the graph ran on the change");
 }
 
 #[test]
-fn a_failed_rebuild_frees_downstream_in_the_same_tick() {
-    let fail = Arc::new(AtomicBool::new(false));
+fn a_failed_rebuild_is_not_retried_until_something_new_is_owed() {
+    let fail = Arc::new(AtomicUsize::new(0));
     let mut sched = load(None, &fail);
     settle(&mut sched);
     assert_eq!(out(&sched, "b"), Some(2));
 
     let a = NodeId::from("a");
-    fail.store(true, Ordering::SeqCst);
-    sched.cancel(&a).unwrap();
+    fail.store(1, Ordering::SeqCst);
+    sched.shutdown();
     sched.inject(&a, &"add".into(), 1).unwrap();
-    sched.inject(&"b".into(), &"add".into(), 5).unwrap();
-    // `a` comes first and holds `b` back until its rebuild (the start of
-    // its generation) fails; then `b` runs in the same tick.
-    sched.set_max_steps_per_tick(2).unwrap();
-
     assert!(matches!(block_on(sched.tick()), TickResult::Progress));
-    assert_eq!(out(&sched, "b"), Some(1 + 5 + 1));
     assert!(matches!(
         sched.node_state(&a).unwrap().fault_cause(),
         Some(NodeFault::Restart { message }) if message.contains("no data")
     ));
+    assert_eq!(out(&sched, "b"), None);
+    assert!(matches!(block_on(sched.tick()), TickResult::Idle));
+
+    sched.inject(&a, &"add".into(), 5).unwrap();
+    settle(&mut sched);
+    assert_eq!(out(&sched, "b"), Some(5 + 1 + 1));
 }
 
 fn tensor() -> HandleType {
@@ -331,35 +281,30 @@ fn load_handles() -> Scheduler<Perf, Adders> {
         (PortRef::new("a", "add"), PortDirection::Input),
         (PortRef::new("b", "out"), PortDirection::Output),
     ]);
-    let islands = compiled
-        .islands()
-        .iter()
-        .map(|members| {
-            let shapes = members
-                .iter()
-                .map(|node| RunShape {
-                    inputs: Some(vec![if node.as_str() == "a" { "add" } else { "t" }.into()]),
-                    has_result: true,
-                })
-                .collect();
-            ((), shapes)
+    let shapes: HashMap<NodeId, RunShape> = ["a", "b"]
+        .into_iter()
+        .map(|node| {
+            let shape = RunShape {
+                inputs: Some(vec![if node == "a" { "add" } else { "t" }.into()]),
+                has_result: true,
+            };
+            (NodeId::from(node), shape)
         })
         .collect();
     let executor = Adders {
         held: None,
-        fail_rebuilds: Arc::new(AtomicBool::new(false)),
+        fail_rebuilds: Arc::new(AtomicUsize::new(0)),
         ports,
     };
-    Scheduler::new(compiled, Perf, executor, islands, 100).unwrap()
+    Scheduler::new(compiled, Perf, executor, &shapes, 100).unwrap()
 }
 
 #[test]
 fn handles_are_delivered_and_read_like_values() {
     let mut sched = load_handles();
-    assert_eq!(
-        sched.compiled().islands().len(),
-        2,
-        "a handle, unlike a stream, does not join islands"
+    assert!(
+        sched.compiled().stream_groups().is_empty(),
+        "a handle, unlike a stream, joins no group"
     );
     sched.inject(&"a".into(), &"add".into(), 3).unwrap();
     settle(&mut sched);
@@ -391,15 +336,9 @@ fn snapshots_leave_handles_out_and_rerun_their_producers() {
     };
     assert_eq!(ports(&snapshot.inputs), ["a.add"]);
     assert_eq!(ports(&snapshot.outputs), ["b.out"]);
-    let queued: Vec<&[NodeId]> = snapshot
-        .islands
-        .iter()
-        .filter(|island| island.queued)
-        .map(|island| island.members.as_slice())
-        .collect();
     assert_eq!(
-        queued,
-        [&[NodeId::from("a")][..]],
+        snapshot.owed,
+        [NodeId::from("a")].into_iter().collect(),
         "the producer owes a run"
     );
 
@@ -420,7 +359,7 @@ fn snapshots_leave_handles_out_and_rerun_their_producers() {
 
 #[test]
 fn a_version_moves_when_a_run_writes_the_port() {
-    let mut sched = load(None, &Arc::new(AtomicBool::new(false)));
+    let mut sched = load(None, &Arc::new(AtomicUsize::new(0)));
     let (a, port) = (NodeId::from("a"), PortName::from("out"));
     assert_eq!(sched.output_version(&a, &port).unwrap().get(), 0);
     settle(&mut sched);
@@ -444,7 +383,7 @@ fn a_version_moves_when_a_run_writes_the_port() {
 
 #[test]
 fn a_restore_moves_every_version() {
-    let mut sched = load(None, &Arc::new(AtomicBool::new(false)));
+    let mut sched = load(None, &Arc::new(AtomicUsize::new(0)));
     settle(&mut sched);
     let (a, port) = (NodeId::from("a"), PortName::from("out"));
     let before = sched.output_version(&a, &port).unwrap();
@@ -455,7 +394,7 @@ fn a_restore_moves_every_version() {
 
 #[test]
 fn a_reader_reads_while_a_tick_holds_the_scheduler() {
-    let mut sched = load(Some("b"), &Arc::new(AtomicBool::new(false)));
+    let mut sched = load(Some("b"), &Arc::new(AtomicUsize::new(0)));
     let reader = sched.reader();
     let (a, out) = (NodeId::from("a"), PortName::from("out"));
     {
@@ -466,4 +405,239 @@ fn a_reader_reads_while_a_tick_holds_the_scheduler() {
         assert_eq!(reader.read_output(&a, &out).unwrap(), Some(1));
         assert!(reader.output_version(&a, &out).unwrap().get() > 0);
     }
+}
+
+/// A data plane a test answers by hand.
+#[derive(Clone, Default)]
+struct Scripted {
+    serving: Arc<Mutex<Vec<ScriptedInstance>>>,
+}
+
+/// An instance of a [`Scripted`] plane.
+type ScriptedInstance = (
+    Incarnation,
+    UnboundedReceiver<Command>,
+    UnboundedSender<ControlEvent>,
+);
+
+impl DataPlane for Scripted {
+    fn serve(&self, serving: Serving) -> BoxFuture<Outcome> {
+        self.serving
+            .lock()
+            .unwrap()
+            .push((serving.incarnation, serving.commands, serving.events));
+        boxed(futures::future::pending())
+    }
+
+    fn stopped(&self) {}
+}
+
+impl Scripted {
+    /// What the live instance has been asked, in order.
+    fn commands(&self) -> Vec<Command> {
+        let mut serving = self.serving.lock().unwrap();
+        let (_, commands, _) = serving.last_mut().unwrap();
+        let mut asked = Vec::new();
+        while let Ok(command) = commands.try_recv() {
+            asked.push(command);
+        }
+        asked
+    }
+
+    fn report(&self, kind: ControlKind) {
+        let serving = self.serving.lock().unwrap();
+        let (incarnation, _, events) = serving.last().unwrap();
+        events
+            .unbounded_send(ControlEvent {
+                incarnation: *incarnation,
+                kind,
+            })
+            .unwrap();
+    }
+
+    fn returned(&self, node: NodeIdx) {
+        self.report(ControlKind::RunReturned {
+            node,
+            returned: Returned::default(),
+        });
+    }
+}
+
+/// `p -> r` over a stream, `v` on its own, and `gpu` claims of `p` and `v` that
+/// do not fit together.
+fn stream_group(claims: bool) -> (SchedulerCore<Scripted>, Scripted) {
+    let contract = |world: &str, inputs, outputs| ComponentContract {
+        id: ComponentRef {
+            content_hash: Some("cc".into()),
+            ..(format!("test:nodes/{world}@0.1.0").parse().unwrap())
+        },
+        inputs,
+        outputs,
+        capabilities: vec![],
+        docs: None,
+    };
+    let producer = contract(
+        "producer",
+        vec![],
+        vec![PortDef::new("s", PortKind::Stream, Type::U32)],
+    );
+    let reader = contract(
+        "reader",
+        vec![PortDef::new("s", PortKind::Stream, Type::U32)],
+        vec![],
+    );
+    let lone = contract("lone", vec![], vec![]);
+    let contracts = [producer.clone(), reader.clone(), lone.clone()];
+    let mut builder = Graph::builder("t")
+        .add_component(&producer)
+        .add_component(&reader)
+        .add_component(&lone)
+        .add_node("p", producer.id.clone())
+        .add_node("r", reader.id.clone())
+        .add_node("v", lone.id.clone())
+        .connect("s", PortRef::new("p", "s"), PortRef::new("r", "s"));
+    if claims {
+        let claim = || witgraph_ir::ResourceClaim::new(0.6).unwrap();
+        builder = builder
+            .set_resource("p", "gpu", claim())
+            .unwrap()
+            .set_resource("v", "gpu", claim())
+            .unwrap();
+    }
+    let compiled = builder.build().compile(&contracts).unwrap();
+    let plane = Scripted::default();
+    let core = SchedulerCore::new(compiled, Arc::new(Perf), 100, |_, _| plane.clone()).unwrap();
+    (core, plane)
+}
+
+fn index(core: &SchedulerCore<Scripted>, node: &str) -> NodeIdx {
+    core.ports().node(&node.into()).unwrap()
+}
+
+/// Polls a tick once, and drops it.
+fn poll_tick(core: &mut SchedulerCore<dyn DataPlane>) -> Option<TickResult> {
+    core.tick().now_or_never()
+}
+
+#[test]
+fn a_group_re_runs_as_one_only_after_it_has_drained() {
+    let (mut core, plane) = stream_group(false);
+    let (p, r, v) = (index(&core, "p"), index(&core, "r"), index(&core, "v"));
+    assert!(poll_tick(&mut core).is_none());
+    // The reader's stream only exists once its producer returned.
+    assert_eq!(plane.commands(), [Command::Run(p), Command::Run(v)]);
+    plane.returned(p);
+    assert!(poll_tick(&mut core).is_none());
+    assert_eq!(plane.commands(), [Command::Run(r)]);
+    plane.returned(r);
+    plane.returned(v);
+    assert!(poll_tick(&mut core).is_none());
+    let [Command::AwaitQuiet(at)] = plane.commands()[..] else {
+        panic!("a tick ends when no guest work is left");
+    };
+
+    // Writers may be going on, so the group cannot start again yet.
+    let core_dyn: &mut SchedulerCore<dyn DataPlane> = &mut core;
+    core_dyn.rerun(&"r".into()).unwrap();
+    assert!(core_dyn.tick().now_or_never().is_none());
+    assert_eq!(plane.commands(), [], "still draining");
+
+    // Quiet at last, so all of it runs, though only the reader owed one.
+    plane.report(ControlKind::Quiet(at));
+    assert!(poll_tick(&mut core).is_none());
+    assert_eq!(plane.commands(), [Command::Run(p)]);
+    plane.returned(p);
+    assert!(poll_tick(&mut core).is_none());
+    assert_eq!(plane.commands(), [Command::Run(r)]);
+}
+
+#[test]
+fn a_value_node_beside_a_group_does_not_re_run_with_it() {
+    let (mut core, plane) = stream_group(false);
+    let (p, r, v) = (index(&core, "p"), index(&core, "r"), index(&core, "v"));
+    assert!(poll_tick(&mut core).is_none());
+    plane.commands();
+    plane.returned(p);
+    assert!(poll_tick(&mut core).is_none());
+    assert_eq!(plane.commands(), [Command::Run(r)]);
+    plane.returned(r);
+    plane.returned(v);
+    assert!(poll_tick(&mut core).is_none());
+    let [Command::AwaitQuiet(at)] = plane.commands()[..] else {
+        panic!("a tick ends when no guest work is left");
+    };
+    plane.report(ControlKind::Quiet(at));
+    assert!(poll_tick(&mut core).is_some(), "the tick is over");
+    let core_dyn: &mut SchedulerCore<dyn DataPlane> = &mut core;
+    core_dyn.rerun(&"p".into()).unwrap();
+    assert!(core_dyn.tick().now_or_never().is_none());
+    assert_eq!(plane.commands(), [Command::Run(p)]);
+}
+
+#[test]
+fn a_group_holds_its_claims_until_it_has_drained() {
+    let (mut core, plane) = stream_group(true);
+    let (p, r, v) = (index(&core, "p"), index(&core, "r"), index(&core, "v"));
+    assert!(poll_tick(&mut core).is_none());
+    assert_eq!(
+        plane.commands(),
+        [Command::Run(p)],
+        "`v` does not fit beside the group"
+    );
+    plane.returned(p);
+    assert!(poll_tick(&mut core).is_none());
+    assert_eq!(plane.commands(), [Command::Run(r)]);
+    plane.returned(r);
+    assert!(poll_tick(&mut core).is_none());
+    let [Command::AwaitQuiet(at)] = plane.commands()[..] else {
+        panic!("the group is draining");
+    };
+    assert!(poll_tick(&mut core).is_none());
+    assert_eq!(plane.commands(), [], "its writers may still use the claim");
+    plane.report(ControlKind::Quiet(at));
+    assert!(poll_tick(&mut core).is_none());
+    assert_eq!(plane.commands(), [Command::Run(v)]);
+}
+
+#[test]
+fn nothing_starts_until_every_command_is_answered() {
+    let contract = adder();
+    let compiled = Graph::builder("t")
+        .add_component(&contract)
+        .add_node("n", contract.id.clone())
+        .connect_feedback("loop", PortRef::new("n", "out"), PortRef::new("n", "in"))
+        .build()
+        .compile(std::slice::from_ref(&contract))
+        .unwrap();
+    let plane = Scripted::default();
+    let mut core = SchedulerCore::new(compiled, Arc::new(Perf), 100, |_, _| plane.clone()).unwrap();
+    let n = core.ports().node(&"n".into()).unwrap();
+    let connection = core.ports().feedback_index(&"loop".into()).unwrap();
+    assert!(poll_tick(&mut core).is_none());
+    assert_eq!(plane.commands(), [Command::Run(n)]);
+    plane.report(ControlKind::RunReturned {
+        node: n,
+        returned: Returned {
+            feedback_buffered: vec![connection],
+            ..Returned::default()
+        },
+    });
+    // Dropped, the tick latches as it ends: the iteration is over.
+    assert!(poll_tick(&mut core).is_none());
+    let commands = plane.commands();
+    assert!(
+        matches!(commands[..], [Command::AwaitQuiet(_), Command::LatchFeedback(c)] if c == connection),
+        "{commands:?}"
+    );
+    // The tick waits on the answer; so does the next one, with `n` owing a run.
+    let core_dyn: &mut SchedulerCore<dyn DataPlane> = &mut core;
+    core_dyn.rerun(&"n".into()).unwrap();
+    assert!(core_dyn.tick().now_or_never().is_none());
+    assert_eq!(plane.commands(), []);
+    plane.report(ControlKind::Latched {
+        connection,
+        latched: crate::Latched::Changed,
+    });
+    assert!(poll_tick(&mut core).is_none());
+    assert_eq!(plane.commands(), [Command::Run(n)]);
 }

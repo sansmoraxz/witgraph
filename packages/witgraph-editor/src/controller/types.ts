@@ -79,8 +79,7 @@ export interface TraceEntry {
   event: string;
   timestamp: number;
   node?: string;
-  island?: number;
-  generation?: number;
+  nodes?: string[];
   from?: string;
   to?: string;
   fault?: { kind: string; message: string };
@@ -91,7 +90,6 @@ export interface TraceEntry {
 
 /** A fault report taken from the scheduler after a tick. */
 export interface FaultReport {
-  members: string[];
   culprit?: string;
   fault: { kind: string; message: string };
 }

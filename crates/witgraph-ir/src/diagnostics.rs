@@ -32,8 +32,8 @@ pub enum Location {
     Link(LinkId),
     /// The nodes forming a cycle.
     Cycle(Vec<NodeId>),
-    /// The members of one island.
-    Island(Vec<NodeId>),
+    /// The members of one stream group, or of several on a cycle.
+    Group(Vec<NodeId>),
 }
 
 /// The items joined with `, `.
@@ -380,23 +380,40 @@ pub enum Diagnostic {
         /// The port.
         port: PortName,
     },
-    /// An island whose members' claims on one resource sum to more than
-    /// all of it. An island holds its members' claims together for its
-    /// whole generation, so it could never start.
+    /// A stream group whose members' claims on one resource sum to more than
+    /// all of it. A group holds its members' claims together from its first
+    /// start until it has drained, so it could never start.
     #[error(
-        "the island of {} claims more than all of resource `{resource}`",
+        "the stream group of {} claims more than all of resource `{resource}`",
         join_nodes(nodes)
     )]
     #[diagnostic(
-        code(witgraph::ir::island_overclaims),
+        code(witgraph::ir::group_overclaims),
         help(
-            "lower the claims, or split the island (its nodes share a stream or future connection, or were merged)"
+            "lower the claims, or split the group: its nodes share a stream or future connection"
         )
     )]
-    IslandOverclaims {
-        /// The island's members, in topological order.
+    GroupOverclaims {
+        /// The group's members, in topological order.
         nodes: Vec<NodeId>,
         /// The overclaimed resource.
+        resource: ResourceId,
+    },
+    /// Stream groups that each wait on a node of the next, on a cycle, whose
+    /// claims on one resource do not fit together. One holding the resource
+    /// would wait for one that cannot get it.
+    #[error(
+        "nodes {} are in stream groups waiting on each other, which claim more than all of resource `{resource}` between them",
+        join_nodes(nodes)
+    )]
+    #[diagnostic(
+        code(witgraph::ir::claims_can_deadlock),
+        help("lower the claims, or mark a connection between the groups `feedback`")
+    )]
+    ClaimsCanDeadlock {
+        /// The groups' members.
+        nodes: Vec<NodeId>,
+        /// The resource.
         resource: ResourceId,
     },
     /// A cycle in which no edge is marked as a feedback boundary. `nodes`
@@ -408,24 +425,7 @@ pub enum Diagnostic {
         /// The nodes forming the cycle, sorted.
         nodes: Vec<NodeId>,
     },
-    /// Stream islands that a non-feedback Value path leaves and re-enters
-    /// were merged into one island, so the islands form a DAG. The merged
-    /// island runs, faults and rebuilds as one: one fault stops all of it.
-    /// How its members share execution is the runtime's (the wasmtime
-    /// runtime keeps an island in one Store, whose members do not
-    /// interleave, unless it splits islands). Mark a connection on the path
-    /// `feedback` to keep the islands apart.
-    #[error(
-        "nodes {} share one island: a value path leaves a stream island and re-enters it",
-        join(nodes)
-    )]
-    #[diagnostic(code(witgraph::ir::merged_island), severity(Warning))]
-    MergedIsland {
-        /// The merged island's members, in topological order.
-        nodes: Vec<NodeId>,
-    },
-    /// A feedback-marked connection that lies on no cycle and does not keep
-    /// two islands apart (see [`Diagnostic::MergedIsland`]).
+    /// A feedback-marked connection that lies on no cycle.
     #[error("feedback connection `{conn}` is not part of any cycle")]
     #[diagnostic(code(witgraph::ir::useless_feedback), severity(Warning))]
     UselessFeedback {
@@ -495,9 +495,8 @@ impl Diagnostic {
                 Location::Component(component.clone())
             }
             Diagnostic::IllegalCycle { nodes } => Location::Cycle(nodes.clone()),
-            Diagnostic::MergedIsland { nodes } | Diagnostic::IslandOverclaims { nodes, .. } => {
-                Location::Island(nodes.clone())
-            }
+            Diagnostic::GroupOverclaims { nodes, .. }
+            | Diagnostic::ClaimsCanDeadlock { nodes, .. } => Location::Group(nodes.clone()),
         }
     }
 }

@@ -10,25 +10,20 @@ use crate::node::NodePhase;
 pub type PortValues = BTreeMap<NodeId, BTreeMap<PortName, String>>;
 
 /// The host-visible state of a runtime graph at one point in time, for
-/// point-in-time restores and debugging. Produced by
-/// `snapshot` (at any time), applied by
-/// `restore`.
+/// point-in-time restores and debugging.
 ///
-/// Values are WAVE text, parsed against the port types on restore. Only
-/// what the host sees is captured: latched Values, pending feedback, node
-/// phases, and the inputs each in-flight or queued generation starts with.
-/// Guest memory (including suspended tasks) is not captured either.
+/// Values are WAVE text, parsed against the port types on restore. Only what
+/// the host sees is captured: latched Values, pending feedback, node phases, and
+/// the runs in flight or owed. Guest memory (including suspended tasks) is not
+/// captured.
 ///
-/// Snapshots do not store stream or future contents. Restoring re-runs any
-/// generation that was in flight, which recreates its streams from the
-/// recorded inputs; the result matches the original only if the guests are
-/// deterministic.
+/// Snapshots do not store stream or future contents. Restoring re-runs what was
+/// in flight, on the latched inputs, which recreates its streams; the result
+/// matches the original only if the guests are deterministic.
 ///
 /// Nor do they store handles, which are the host's and not text: a latched
-/// handle is left out, and the island that produced it is recorded as
-/// queued, so after a restore it runs again and makes a new one. A
-/// generation in flight that started with a handle is recorded as queued
-/// instead of replayed: it runs once its producers have delivered.
+/// handle is left out, and the node that produced it is recorded as owing a run,
+/// so after a restore it makes a new one.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Snapshot {
@@ -47,54 +42,32 @@ pub struct Snapshot {
     /// the same code.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub links: Vec<Link>,
-    /// Whether no generation was in flight when the snapshot was taken. A
-    /// replay owed after a restore is not in flight, so it is listed in
-    /// [`islands`](Self::islands) while this is `true`.
+    /// Whether no `run` was in flight when the snapshot was taken.
     pub quiescent: bool,
-    /// Every node's phase when the snapshot was taken. Informational:
-    /// `restore` does not re-fault or re-cancel islands.
+    /// Every node's phase when the snapshot was taken. Informational: a restore
+    /// does not fault or cancel anything.
     pub phases: BTreeMap<NodeId, NodePhase>,
     /// Latched Value inputs: injected, delivered by connections, or latched
     /// from feedback.
     pub inputs: PortValues,
-    /// Latched Value outputs: what each node's `run` returned last
-    /// (including `run`s of an in-flight generation that already returned).
+    /// Latched Value outputs: what each node's `run` returned last.
     pub outputs: PortValues,
     /// Feedback values waiting for the next latch, by connection, as the
     /// source port produced them.
     pub feedback: BTreeMap<ConnectionId, String>,
-    /// Islands with an in-flight or queued generation.
-    pub islands: Vec<IslandSnapshot>,
-}
-
-/// An island with work outstanding when a [`Snapshot`] was taken.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct IslandSnapshot {
-    /// The island's members, sorted. `restore` matches
-    /// islands by their set of members, in any order.
-    pub members: Vec<NodeId>,
-    /// The external Value inputs the in-flight generation started with, by
-    /// member, or those of a restored replay not started yet; `None` when
-    /// there is neither.
-    pub running: Option<PortValues>,
-    /// Whether another generation was queued (an input changed since the
-    /// last start). It runs with the latched inputs.
-    pub queued: bool,
-    /// The feedback connections out of this island whose target the host
-    /// wrote after the [`running`](Self::running) generation started: what
-    /// that generation feeds back there is stale, and its replay drops it.
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
-    pub stale_feedback: BTreeSet<ConnectionId>,
+    /// The nodes with a `run` in flight.
+    pub in_flight: BTreeSet<NodeId>,
+    /// The nodes owing a run.
+    pub owed: BTreeSet<NodeId>,
 }
 
 /// Why a snapshot could not be taken: a value it holds could not be written
-/// as WAVE text (`Executor::to_wave`, for instance).
+/// as WAVE text.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{at}: {message}")]
 pub struct SnapshotError {
-    /// Which value: an output or input (`` `node.port` ``), a feedback
-    /// connection, or an input a generation started with.
+    /// Which value: an output or input (`` `node.port` ``), or a feedback
+    /// connection.
     pub at: String,
     /// Why it could not be written.
     pub message: String,

@@ -6,20 +6,19 @@
 //! cargo run --release -p witgraph-sched --example tick_overhead [nodes] [ticks]
 //! ```
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
+use std::sync::Arc;
 use std::time::Instant;
 
-use futures::FutureExt;
 use futures::executor::block_on;
 use witgraph_ir::{
-    ComponentContract, ComponentRef, Graph, PortDef, PortDirection, PortKind, PortName, PortRef,
-    Type,
+    ComponentContract, ComponentRef, Graph, NodeId, PortDef, PortDirection, PortKind, PortRef, Type,
 };
 use witgraph_sched::plan::RunShape;
 use witgraph_sched::{
-    Canonical, Executor, Generation, GenerationFuture, NodeCaller, NodeFault, OptionPayload, Perf,
-    Scheduler, drive,
+    BoxFuture, CallFuture, Canonical, Executor, MemberPlan, OptionPayload, Outcome, Perf,
+    Scheduler, boxed,
 };
 
 /// Every node is `out = in + add + 1`.
@@ -27,60 +26,28 @@ struct Adders {
     ports: HashSet<(PortRef, PortDirection)>,
 }
 
-struct Members<'a>(&'a Generation<u32>);
-
-impl NodeCaller<u32> for Members<'_> {
-    type Error = String;
-
-    async fn call(
-        &self,
-        member: usize,
-        args: Vec<Option<u32>>,
-    ) -> Result<Vec<(String, u32)>, String> {
-        let sum = args.iter().flatten().sum::<u32>() + 1;
-        let plan = &self.0.plan.members[member];
-        Ok(plan
-            .outputs
-            .keys()
-            .map(|port| (port.to_string(), sum))
-            .collect())
-    }
-
-    fn close(&self, _: u32) -> Result<(), String> {
-        Ok(())
-    }
-
-    fn missing_input(&self, _: usize, field: &PortName) -> String {
-        format!("no value for `{field}`")
-    }
-}
-
 impl Executor for Adders {
     type Value = u32;
     type Type = ();
-    type Island = ();
 
-    fn run(&self, (): (), mut generation: Generation<u32>) -> GenerationFuture<()> {
-        async move {
-            let external = std::mem::take(&mut generation.external);
-            let members = Members(&generation);
-            let send = |kind| generation.send(kind);
-            drive(
-                &members,
-                &generation.plan,
-                external,
-                Self::option_payload,
-                &send,
-            )
-            .await
-            .map_err(|message| (NodeFault::WasmTrap { message }, None))
-        }
-        .boxed()
+    fn call(&self, member: Arc<MemberPlan>, args: Vec<Option<u32>>) -> CallFuture<u32> {
+        boxed(async move {
+            let sum = args.iter().flatten().sum::<u32>() + 1;
+            Ok(member
+                .outputs
+                .keys()
+                .map(|port| (port.to_string(), sum))
+                .collect())
+        })
     }
 
-    fn rebuild_and_run(&self, generation: Generation<u32>) -> GenerationFuture<()> {
-        self.run((), generation)
+    fn rebuild(&self) -> BoxFuture<Outcome> {
+        boxed(async { Ok(()) })
     }
+
+    fn close(&self, _: u32) {}
+
+    fn abandon(&self, _: &[NodeId]) {}
 
     fn option_payload(_: &u32) -> OptionPayload<'_, u32> {
         OptionPayload::NotOption
@@ -150,12 +117,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         inputs: Some(vec!["in".into(), "add".into()]),
         has_result: true,
     };
-    let islands = compiled
-        .islands()
+    let shapes: HashMap<NodeId, RunShape> = compiled
+        .graph()
+        .nodes
         .iter()
-        .map(|members| ((), vec![shape.clone(); members.len()]))
+        .map(|node| (node.id.clone(), shape.clone()))
         .collect();
-    let mut sched = Scheduler::new(compiled, Perf, Adders { ports }, islands, 100_000)?;
+    let mut sched = Scheduler::new(compiled, Perf, Adders { ports }, &shapes, 100_000)?;
     let (first, add) = (name(0).into(), "add".into());
 
     let start = Instant::now();

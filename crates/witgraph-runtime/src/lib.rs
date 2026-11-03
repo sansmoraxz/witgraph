@@ -10,25 +10,23 @@
 //!
 //! Every node is a component whose world is its contract: an exported
 //! `node` interface with up to two records, `inputs` and `outputs` (at least
-//! one), and a `run` function. Nodes joined by stream/future connections
-//! form an *island*. Members whose handles the host cannot move share a
-//! wasmtime Store, so those handles pass directly between them; members
-//! joined only by streams of scalars or strings get a Store each, and the
-//! host pumps the items across. Value connections between islands go
-//! through the host. Islands run concurrently, in generations, on the task
-//! that calls [`RuntimeGraph::tick`]. The island is the unit with a
-//! lifecycle (a typestate); a node's [`NodeState`] is a view of its
-//! island's. See [`engine`] and [`graph`] for the invariants.
+//! one), and a `run` function. A graph is composed into one component, with a
+//! generated hub that holds its values, so they move from node to node without
+//! passing through the host. The host calls each node's `run` through the hub, on
+//! the task that calls [`RuntimeGraph::tick`], and reads and writes ports through
+//! typed exports of the hub when it chooses ([`Port`], [`RuntimeGraph::preview`]).
+//! One composite is one Store: any fault stops the whole graph. See [`engine`] and
+//! [`graph`] for the invariants.
 //!
 //! # Crate layout
 //!
-//! The scheduling itself (ticks, generations, latched Values, feedback,
-//! snapshots) is [`witgraph_sched`], which knows no engine; this crate is
-//! its wasmtime executor.
+//! The scheduling itself (ticks, stream groups, feedback) is [`witgraph_sched`],
+//! which knows no engine and holds no value; this crate is its wasmtime data
+//! plane.
 //!
-//! - [`graph`] — [`RuntimeGraph`], [`RuntimeConfig`], [`PreparedComponent`].
-//! - [`engine`] — island Stores and the generation driver; the embedder's
-//!   [`Host`] and its Store data ([`IslandData`], [`HostState`]).
+//! - [`graph`] — [`RuntimeGraph`], [`RuntimeConfig`], [`PreparedGraph`], [`Port`].
+//! - [`engine`] — the Store; the embedder's [`Host`] and its Store data
+//!   ([`StoreData`], [`HostState`]).
 //! - [`plugin`] — a [`Host`] made of capability providers ([`Plugins`],
 //!   [`CapabilityPlugin`]).
 //! - [`error`] — [`LoadError`].
@@ -47,22 +45,24 @@
 pub mod engine;
 pub mod error;
 pub mod graph;
+pub(crate) mod plane;
 pub mod plugin;
-pub(crate) mod pump;
 pub mod shared;
-pub(crate) mod value;
 
-pub use engine::{CapabilityGap, Host, HostState, IslandData, NoCapabilities};
+pub use engine::{CapabilityGap, Host, HostState, NoCapabilities, StoreData};
 pub use error::LoadError;
 #[cfg(feature = "compile")]
 pub use graph::LinkedProvider;
-pub use graph::{PreparedComponent, RuntimeConfig, RuntimeGraph, ValReader};
+pub use graph::{
+    ByteCount, Fuel, Handle, HandlePort, Input, InputPort, Output, OutputPort, Port, PreparedGraph,
+    Preview, RuntimeConfig, RuntimeGraph, ValReader, Value,
+};
 pub use plugin::{CapabilityPlugin, Extensions, PluginData, Plugins};
 pub use shared::Shared;
 pub use wasmtime::component::Val;
 pub use witgraph_sched::{
-    FaultReport, IslandSnapshot, NodeFault, NodePhase, NodeState, Perf, PortValues, PortVersion,
-    RuntimeError, RuntimeMode, Snapshot, SnapshotError, TickResult, Trace, TraceEvent,
+    FaultReport, NodeFault, NodePhase, NodeState, Perf, PortValues, PortVersion, RuntimeError,
+    RuntimeMode, Snapshot, SnapshotError, TickResult, Trace, TraceEvent,
 };
-pub use witgraph_traits::{OutputReader, RunningGraph};
+pub use witgraph_traits::{OutputReader, RunningGraph, until};
 pub use {wasmtime, witgraph_ir, witgraph_sched, witgraph_traits};

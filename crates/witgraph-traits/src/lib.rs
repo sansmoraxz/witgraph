@@ -18,14 +18,14 @@ pub mod snapshot;
 
 pub use error::{NodeFault, RuntimeError};
 pub use executor::{
-    Canonical, DataPlane, EventSink, Executor, Generation, GenerationFuture, IslandEvent,
-    IslandEventKind, Latched, LiveIsland, MaybeSend, MaybeSync, OptionPayload, OptionPayloadFn,
-    Outcome, PortValue, Reporter, Returned, StartGeneration,
+    BoxFuture, CallFuture, Canonical, Command, ControlEvent, ControlKind, DataPlane, Executor,
+    Incarnation, Latched, MaybeSend, MaybeSync, OptionPayload, OptionPayloadFn, Outcome, PortValue,
+    Returned, Serving, boxed,
 };
-pub use graph::{OutputReader, PortVersion, RunningGraph};
+pub use graph::{OutputReader, PortVersion, RunningGraph, until};
 pub use mode::{Perf, RuntimeMode, Trace, TraceEvent};
 pub use node::{NodePhase, NodeState};
-pub use plan::{IslandPlan, MemberPlan, RunShape};
+pub use plan::{MemberPlan, RunShape};
 pub use schedule::{FaultReport, TickResult};
-pub use snapshot::{IslandSnapshot, PortValues, Snapshot, SnapshotError};
+pub use snapshot::{PortValues, Snapshot, SnapshotError};
 pub use witgraph_ir;

@@ -4,16 +4,15 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use futures::FutureExt;
 use js_sys::{Array, Function, Object, Promise, Reflect};
+use std::sync::Arc;
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 use witgraph_ir::wasm_wave::value::Type;
-use witgraph_ir::{NodeId, PortDirection, PortKind, PortName, PortRef};
-use witgraph_sched::plan::IslandPlan;
+use witgraph_ir::{NodeId, PortDirection, PortKind, PortRef};
 use witgraph_sched::{
-    Canonical, Executor, Generation, GenerationFuture, IslandEventKind, NodeCaller, NodeFault,
-    OptionPayload, drive, missing_input_message,
+    BoxFuture, CallFuture, Canonical, Executor, MemberPlan, NodeFault, OptionPayload, Outcome,
+    boxed,
 };
 
 use crate::value::{
@@ -38,39 +37,13 @@ pub(crate) struct Callbacks {
     pub(crate) rebuild: Function,
     /// `close(value)`: drops a stream or future output nothing reads.
     pub(crate) close: Option<Function>,
-    /// `abandon(nodes)`: the generation of those nodes' island ended
-    /// before its calls did (a cancel, a shutdown, a restore, a sibling's
-    /// failed `run`): their `rebuild` and `run` calls still in flight
-    /// belong to nothing now.
+    /// `abandon(nodes)`: the instance of those nodes stopped before its calls
+    /// did (a shutdown, a restore, a fault): their `rebuild` and `run` calls
+    /// still in flight belong to nothing now.
     pub(crate) abandon: Option<Function>,
 }
 
-/// Tells the page, if a generation ends before its calls do, that those
-/// still in flight are abandoned.
-struct Abandon<'a> {
-    shared: &'a Shared,
-    plan: &'a IslandPlan,
-    finished: bool,
-}
-
-impl Drop for Abandon<'_> {
-    fn drop(&mut self) {
-        if self.finished {
-            return;
-        }
-        if let Some(abandon) = &self.shared.callbacks.abandon {
-            let nodes: Array = self
-                .plan
-                .members
-                .iter()
-                .map(|m| JsValue::from_str(m.node.as_str()))
-                .collect();
-            let _ = abandon.call1(&JsValue::NULL, &nodes);
-        }
-    }
-}
-
-/// What every generation shares.
+/// What every call shares.
 pub(crate) struct Shared {
     pub(crate) callbacks: Callbacks,
     /// Payload type of every Value input port (inner type when optional).
@@ -79,21 +52,14 @@ pub(crate) struct Shared {
     pub(crate) output_types: HashMap<PortRef, Type>,
     /// Every node's output ports.
     pub(crate) outputs: HashMap<NodeId, Vec<OutputPort>>,
+    /// Every node, in the graph's topological order.
+    pub(crate) nodes: Vec<NodeId>,
 }
 
-/// The executor: runs nodes through the page's callbacks. An island keeps
-/// no state on this side between generations (the page owns the node
-/// instances), so its live island is `()`.
+/// The executor: runs nodes through the page's callbacks. The page owns the node
+/// instances, so nothing is kept on this side between calls.
 pub(crate) struct Js {
     pub(crate) shared: Rc<Shared>,
-}
-
-/// What went wrong in a call: the message, and whether the node called
-/// `fatal`.
-pub(crate) struct CallError {
-    message: String,
-    fatal: bool,
-    node: Option<NodeId>,
 }
 
 /// The message of a thrown JavaScript value.
@@ -145,172 +111,92 @@ async fn settle(value: JsValue) -> Result<JsValue, JsValue> {
     }
 }
 
-struct Members<'a> {
-    shared: &'a Shared,
-    plan: &'a IslandPlan,
-}
-
-impl NodeCaller<WebValue> for Members<'_> {
-    type Error = CallError;
-
-    async fn call(
-        &self,
-        member: usize,
-        args: Vec<Option<WebValue>>,
-    ) -> Result<Vec<(String, WebValue)>, CallError> {
-        let plan = &self.plan.members[member];
-        let node = &plan.node;
-        // Each node is an instance of its own: what goes wrong in a call
-        // is that node's.
-        let fail = |message: String| CallError {
-            message,
-            fatal: false,
-            node: Some(node.clone()),
-        };
-        let inputs = Object::new();
-        let mut args = args.into_iter();
-        for field in plan.inputs.iter().flatten() {
-            // An optional field is the option; its value the payload.
-            let ty = self.shared.input_types.get(&field.port);
-            let js = match args.next().flatten() {
-                Some(WebValue::Handle(js)) => js,
-                // Lent: jco lowers it as the `borrow` the input is.
-                Some(WebValue::Resource(resource)) => resource.js().clone(),
-                // Passed on as it is: a guest's output converts nothing.
-                Some(WebValue::Data(data)) => match ty {
-                    Some(ty) if field.optional => some_js(&data, ty),
-                    Some(_) => data.js().clone(),
-                    None => JsValue::UNDEFINED,
-                },
-                // `drive` has checked that every required input has one.
-                None if field.optional => ty.map_or(JsValue::UNDEFINED, none_to_js),
-                None => return Err(fail(format!("`{node}.{}` has no value", field.name))),
-            };
-            set_field(&inputs, field.name.as_str(), &js);
-        }
-        let called = self.shared.callbacks.run.call2(
-            &JsValue::NULL,
-            &JsValue::from_str(node.as_str()),
-            &inputs,
-        );
-        let result = match called {
-            Ok(result) => settle(result).await,
-            Err(error) => Err(error),
-        };
-        let result = result.map_err(|error| CallError {
-            message: thrown(&error),
-            fatal: is_fatal(&error),
-            node: Some(node.clone()),
-        })?;
-        let mut outputs = Vec::new();
-        for port in self.shared.outputs.get(node).into_iter().flatten() {
-            let js = with_key(&port.name, |key| Reflect::get(&result, key))
-                .unwrap_or(JsValue::UNDEFINED);
-            let value = match (port.kind, &port.ty) {
-                (PortKind::Value, Some(ty)) => {
-                    WebValue::Data(Rc::new(Data::from_output(js, ty.clone()).map_err(|e| {
-                        fail(format!("`{node}` returned a bad `{}`: {e}", port.name))
-                    })?))
-                }
-                (PortKind::Handle, _) if js.is_object() => {
-                    WebValue::Resource(Rc::new(Resource::new(js)))
-                }
-                (PortKind::Handle, _) => {
-                    return Err(fail(format!(
-                        "`{node}` returned a bad `{}`: not a resource",
-                        port.name
-                    )));
-                }
-                _ => WebValue::Handle(js),
-            };
-            outputs.push((port.name.clone(), value));
-        }
-        Ok(outputs)
-    }
-
-    fn missing_input(&self, member: usize, field: &PortName) -> CallError {
-        let node = self.plan.members.get(member).map(|m| m.node.clone());
-        CallError {
-            message: missing_input_message(self.plan, member, field),
-            fatal: false,
-            node,
-        }
-    }
-
-    fn close(&self, value: WebValue) -> Result<(), CallError> {
-        if let (WebValue::Handle(js), Some(close)) = (value, &self.shared.callbacks.close) {
-            // Closing is best effort: nothing reads the value either way.
-            let _ = close.call1(&JsValue::NULL, &js);
-        }
-        Ok(())
-    }
-}
-
-/// Runs one generation: rebuilds its members first when `rebuild` is set,
-/// then calls every member's `run`, in dependency order.
-async fn run(
+/// Calls a node's `run`, with one value per field of its `inputs` record.
+async fn call(
     shared: Rc<Shared>,
-    mut generation: Generation<WebValue>,
-    rebuild: bool,
-) -> Result<(), (NodeFault, Option<NodeId>)> {
-    let external = std::mem::take(&mut generation.external);
-    let mut abandon = Abandon {
-        shared: &shared,
-        plan: &generation.plan,
-        finished: false,
-    };
-    if rebuild {
-        rebuild_members(&shared, &generation.plan)
-            .await
-            .inspect_err(|_| {
-                // Every rebuild has settled: nothing of this generation is
-                // left in flight.
-                abandon.finished = true;
-            })?;
-        generation.send(IslandEventKind::Rebuilt);
+    plan: Arc<MemberPlan>,
+    args: Vec<Option<WebValue>>,
+) -> Result<Vec<(String, WebValue)>, (NodeFault, Option<NodeId>)> {
+    let node = &plan.node;
+    // Each node is an instance of its own: what goes wrong in a call is that
+    // node's.
+    let fail = |message: String| (NodeFault::WasmTrap { message }, Some(node.clone()));
+    let inputs = Object::new();
+    let mut args = args.into_iter();
+    for field in plan.inputs.iter().flatten() {
+        // An optional field is the option; its value the payload.
+        let ty = shared.input_types.get(&field.port);
+        let js = match args.next().flatten() {
+            Some(WebValue::Handle(js)) => js,
+            // Lent: jco lowers it as the `borrow` the input is.
+            Some(WebValue::Resource(resource)) => resource.js().clone(),
+            // Passed on as it is: a guest's output converts nothing.
+            Some(WebValue::Data(data)) => match ty {
+                Some(ty) if field.optional => some_js(&data, ty),
+                Some(_) => data.js().clone(),
+                None => JsValue::UNDEFINED,
+            },
+            // The data plane has checked that every required input has one.
+            None if field.optional => ty.map_or(JsValue::UNDEFINED, none_to_js),
+            None => return Err(fail(format!("`{node}.{}` has no value", field.name))),
+        };
+        set_field(&inputs, field.name.as_str(), &js);
     }
-    let members = Members {
-        shared: &shared,
-        plan: &generation.plan,
+    let called =
+        shared
+            .callbacks
+            .run
+            .call2(&JsValue::NULL, &JsValue::from_str(node.as_str()), &inputs);
+    let result = match called {
+        Ok(result) => settle(result).await,
+        Err(error) => Err(error),
     };
-    let send = |kind| generation.send(kind);
-    let driven = drive(
-        &members,
-        &generation.plan,
-        external,
-        <Js as Executor>::option_payload,
-        &send,
-    )
-    .await;
-    // `drive` returns at the first failed call, dropping the calls still in
-    // flight: those are abandoned.
-    abandon.finished = driven.is_ok();
-    driven.map_err(|error| {
-        let CallError {
-            message,
-            fatal,
-            node,
-        } = error;
-        if fatal {
-            (NodeFault::Fatal { message }, node)
+    let result = result.map_err(|error| {
+        let message = thrown(&error);
+        let fault = if is_fatal(&error) {
+            NodeFault::Fatal { message }
         } else {
-            (NodeFault::WasmTrap { message }, node)
-        }
-    })
+            NodeFault::WasmTrap { message }
+        };
+        (fault, Some(node.clone()))
+    })?;
+    let mut outputs = Vec::new();
+    for port in shared.outputs.get(node).into_iter().flatten() {
+        let js =
+            with_key(&port.name, |key| Reflect::get(&result, key)).unwrap_or(JsValue::UNDEFINED);
+        let value = match (port.kind, &port.ty) {
+            (PortKind::Value, Some(ty)) => {
+                WebValue::Data(Rc::new(Data::from_output(js, ty.clone()).map_err(|e| {
+                    fail(format!("`{node}` returned a bad `{}`: {e}", port.name))
+                })?))
+            }
+            (PortKind::Handle, _) if js.is_object() => {
+                WebValue::Resource(Rc::new(Resource::new(js)))
+            }
+            (PortKind::Handle, _) => {
+                return Err(fail(format!(
+                    "`{node}` returned a bad `{}`: not a resource",
+                    port.name
+                )));
+            }
+            _ => WebValue::Handle(js),
+        };
+        outputs.push((port.name.clone(), value));
+    }
+    Ok(outputs)
 }
 
-/// Gives every member of `plan` fresh guest state through the page's
-/// `rebuild`, all at once. Once every rebuild has settled, the first
-/// member's in island order whose rebuild failed is the culprit: its fault
-/// is [`NodeFault::Fatal`] when its error is marked `witgraphFatal` (a
-/// start function called `fatal`), else [`NodeFault::Restart`].
-async fn rebuild_members(
-    shared: &Shared,
-    plan: &IslandPlan,
-) -> Result<(), (NodeFault, Option<NodeId>)> {
-    let rebuilds = plan.members.iter().map(|member| {
-        let node = JsValue::from_str(member.node.as_str());
-        let called = shared.callbacks.rebuild.call1(&JsValue::NULL, &node);
+/// Gives every node fresh guest state through the page's `rebuild`, all at once.
+/// Once every rebuild has settled, the first node whose rebuild failed is the
+/// culprit: its fault is [`NodeFault::Fatal`] when its error is marked
+/// `witgraphFatal` (a start function called `fatal`), else
+/// [`NodeFault::Restart`].
+async fn rebuild_nodes(shared: Rc<Shared>) -> Outcome {
+    let rebuilds = shared.nodes.iter().map(|node| {
+        let called = shared
+            .callbacks
+            .rebuild
+            .call1(&JsValue::NULL, &JsValue::from_str(node.as_str()));
         async move {
             match called {
                 Ok(result) => settle(result).await.map(|_| ()),
@@ -319,9 +205,8 @@ async fn rebuild_members(
         }
     });
     let rebuilt = futures::future::join_all(rebuilds).await;
-    for (member, result) in plan.members.iter().zip(rebuilt) {
+    for (node, result) in shared.nodes.iter().zip(rebuilt) {
         if let Err(error) = result {
-            let node = member.node.clone();
             let message = thrown(&error);
             let fault = if is_fatal(&error) {
                 NodeFault::Fatal { message }
@@ -330,7 +215,7 @@ async fn rebuild_members(
                     message: format!("`{node}`: {message}"),
                 }
             };
-            return Err((fault, Some(node)));
+            return Err((fault, Some(node.clone())));
         }
     }
     Ok(())
@@ -339,14 +224,30 @@ async fn rebuild_members(
 impl Executor for Js {
     type Value = WebValue;
     type Type = Type;
-    type Island = ();
 
-    fn run(&self, (): (), generation: Generation<WebValue>) -> GenerationFuture<()> {
-        run(self.shared.clone(), generation, false).boxed_local()
+    fn call(&self, member: Arc<MemberPlan>, args: Vec<Option<WebValue>>) -> CallFuture<WebValue> {
+        boxed(call(self.shared.clone(), member, args))
     }
 
-    fn rebuild_and_run(&self, generation: Generation<WebValue>) -> GenerationFuture<()> {
-        run(self.shared.clone(), generation, true).boxed_local()
+    fn rebuild(&self) -> BoxFuture<Outcome> {
+        boxed(rebuild_nodes(self.shared.clone()))
+    }
+
+    fn close(&self, value: WebValue) {
+        if let (WebValue::Handle(js), Some(close)) = (value, &self.shared.callbacks.close) {
+            // Closing is best effort: nothing reads the value either way.
+            let _ = close.call1(&JsValue::NULL, &js);
+        }
+    }
+
+    fn abandon(&self, nodes: &[NodeId]) {
+        if let Some(abandon) = &self.shared.callbacks.abandon {
+            let nodes: Array = nodes
+                .iter()
+                .map(|node| JsValue::from_str(node.as_str()))
+                .collect();
+            let _ = abandon.call1(&JsValue::NULL, &nodes);
+        }
     }
 
     fn option_payload(value: &WebValue) -> OptionPayload<'_, WebValue> {

@@ -2,37 +2,36 @@
 //! [`DataPlane`]. It knows ports by number, through its [`PortTable`], and is
 //! told what a `run` changed, never to what.
 //!
-//! [`SchedulerCore`] ends in its data plane, so that a typed wrapper
-//! ([`Scheduler`](crate::Scheduler)) keeps its own plane's type, while
-//! everything here is compiled once, for `dyn DataPlane`. See
-//! [`scheduler`](crate::scheduler) for the scheduling model.
+//! [`SchedulerCore`] ends in its data plane, so that a typed wrapper keeps its
+//! own plane's type, while everything here is compiled once, for
+//! `dyn DataPlane`. See [`scheduler`](crate::scheduler) for the scheduling model.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
+use std::future::{Future, poll_fn};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::task::Waker;
+use std::task::Poll;
 
 use futures::channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use futures::future::Either;
+use futures::stream::StreamExt;
 use witgraph_ir::{
     CompiledGraph, ComponentRef, Connection, ConnectionId, FeedbackIdx, Idx, IndexVec, InputIdx,
-    Link, NodeId, NodeIdx, OutputIdx, PortName, PortSet, PortTable, ResourceId,
+    Link, NodeId, NodeIdx, OutputIdx, PortKind, PortSet, PortTable, ResourceId,
+};
+use witgraph_traits::{
+    Command, ControlEvent, ControlKind, DataPlane, FaultReport, Incarnation, Latched, NodeFault,
+    NodePhase, NodeState, Outcome, PortVersion, Returned, RuntimeError, RuntimeMode, Serving,
+    Snapshot, TickResult,
 };
 
-use crate::RuntimeError;
-use crate::executor::{DataPlane, LiveIsland, Returned};
-use crate::island::{Island, IslandState, Owed, StopCause};
-use crate::mode::RuntimeMode;
-use crate::node::NodeState;
-use crate::plan::{self, IslandPlan, RunShape, Wiring};
+use crate::lifecycle::{GraphState, Group, GroupLife, Instance, Node, NodeLife, StopCause};
 use crate::resource::ResourcePool;
-use crate::run::{IslandWaker, WakeSet};
-use crate::schedule::FaultReport;
-use witgraph_traits::PortVersion;
 
 /// Every output port's version, shared: readable while a tick holds the
 /// scheduler.
 #[derive(Debug, Clone)]
-pub(crate) struct PortVersions(Arc<[AtomicU64]>);
+pub struct PortVersions(Arc<[AtomicU64]>);
 
 impl PortVersions {
     fn new(ports: usize) -> Self {
@@ -40,268 +39,226 @@ impl PortVersions {
     }
 
     /// The version of `output`.
-    pub(crate) fn get(&self, output: OutputIdx) -> PortVersion {
+    pub fn get(&self, output: OutputIdx) -> PortVersion {
         PortVersion::new(self.0[output.position()].load(Ordering::Relaxed))
     }
 
-    pub(crate) fn bump(&self, output: OutputIdx) {
+    fn bump(&self, output: OutputIdx) {
         self.0[output.position()].fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn bump_all(&self) {
+    fn bump_all(&self) {
         for version in self.0.iter() {
             version.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
 
-/// A report from an in-flight generation, as the scheduler takes it: what
-/// changed, and no values.
-#[derive(Debug)]
-pub(crate) struct ControlEvent {
-    pub(crate) island: usize,
-    pub(crate) generation: u64,
-    pub(crate) kind: ControlKind,
+/// One node's wiring and state.
+struct NodeEntry {
+    /// The nodes writing one of its inputs over a non-feedback connection.
+    preds: Box<[NodeIdx]>,
+    /// The nodes writing one of its inputs over a feedback connection.
+    feedback_sources: Box<[NodeIdx]>,
+    /// The feedback connections out of it.
+    feedback_out: Box<[FeedbackIdx]>,
+    /// The inputs that must hold a value before it may start: for a group's
+    /// member, those nothing in the group writes.
+    required: Box<[InputIdx]>,
+    group: Option<usize>,
+    life: NodeLife,
 }
 
-/// What happened in a generation, to the member at `member` in the island
-/// plan's order. See [`IslandEventKind`](crate::IslandEventKind).
-#[derive(Debug)]
-pub(crate) enum ControlKind {
-    RunStarted {
-        member: usize,
-    },
-    RunReturned {
-        member: usize,
-        returned: Returned,
-    },
-    Rebuilt,
-    StreamItems {
-        member: usize,
-        port: PortName,
-        count: usize,
-    },
+struct GroupEntry {
+    members: Box<[NodeIdx]>,
+    life: GroupLife,
 }
 
-/// One island: its static wiring, its lifecycle, and the work it owes.
-pub(crate) struct Slot {
-    pub(crate) plan: Arc<IslandPlan>,
-    /// Where the island's members start in the graph-wide node index (the
-    /// members are `offset..offset + members.len()`).
-    pub(crate) offset: NodeIdx,
-    /// Per member, in plan order: the nodes that write one of its inputs
-    /// over a non-feedback connection.
-    pub(crate) preds: Vec<Vec<NodeIdx>>,
-    /// The nodes that write one of the island's inputs over a feedback
-    /// connection.
-    pub(crate) feedback_sources: Vec<NodeIdx>,
-    /// The feedback connections out of the island's members.
-    pub(crate) feedback_out: Vec<FeedbackIdx>,
-    /// Every member's required external Value inputs: a run on the latched
-    /// inputs needs a value for each.
-    pub(crate) required: Vec<InputIdx>,
-    /// Per member, in plan order: whether its `run` is still to return in
-    /// the generation in flight. All `false` when nothing is in flight.
-    pub(crate) awaiting: Vec<bool>,
-    /// Feedback connections the generation in flight must not deliver:
-    /// the host wrote their target since it started (or, for a replay,
-    /// since the original generation started).
-    pub(crate) stale_feedback: PortSet<FeedbackIdx>,
-    /// Wakes the tick for this island's generation alone.
-    pub(crate) waker: Waker,
-    pub(crate) state: IslandState<Box<dyn LiveIsland>>,
-    pub(crate) owed: Owed,
+/// Proof that no reply to a command is outstanding: a start pass needs one, so
+/// that nothing starts on inputs a latch is yet to write.
+struct Drained(());
+
+/// What the tick loop woke up for.
+enum Wake {
+    Event(ControlEvent),
+    Stopped(Outcome),
+}
+
+/// What a start pass did.
+enum Started {
+    Nothing,
+    Some,
+    /// It hit `max_steps_per_tick` with work still waiting to start.
+    LimitReached,
 }
 
 /// The scheduling state of a compiled graph being run, ending in its data
 /// plane `P` (see the [module docs](self)).
-pub(crate) struct SchedulerCore<P: ?Sized> {
-    pub(crate) compiled: CompiledGraph,
-    pub(crate) mode: Arc<dyn RuntimeMode>,
-    /// Most generations one tick may start.
-    pub(crate) max_steps_per_tick: usize,
-    /// Islands, in the compiled graph's (topological) island order.
-    pub(crate) slots: Vec<Slot>,
-    /// How many islands have a generation in flight.
-    pub(crate) running: usize,
-    /// Each island's index, by its sorted members: how a snapshot names it.
-    pub(crate) island_index: HashMap<Vec<NodeId>, usize>,
-    /// Every port and feedback connection, numbered.
-    pub(crate) ports: Arc<PortTable>,
-    /// Each node's island.
-    pub(crate) island_of_node: IndexVec<NodeIdx, usize>,
-    /// The input ports holding a value. Only Value and handle ports ever
-    /// do.
-    pub(crate) presence: PortSet<InputIdx>,
-    /// The input ports written inside their own generation: a change to
-    /// one owes nothing.
-    pub(crate) internal: PortSet<InputIdx>,
+pub struct SchedulerCore<P: ?Sized> {
+    compiled: CompiledGraph,
+    mode: Arc<dyn RuntimeMode>,
+    max_steps_per_tick: usize,
+    ports: Arc<PortTable>,
+    nodes: IndexVec<NodeIdx, NodeEntry>,
+    groups: Vec<GroupEntry>,
+    /// The nodes owing a run.
+    owed: PortSet<NodeIdx>,
+    /// The input ports holding a value. Only Value and handle ports ever do,
+    /// and streams and futures until their reader starts.
+    presence: PortSet<InputIdx>,
+    /// The inputs written inside a stream group: a change owes nothing.
+    internal: PortSet<InputIdx>,
+    /// The inputs the host wrote: all that survives the instance.
+    host_written: PortSet<InputIdx>,
     /// Each output port's version.
-    pub(crate) versions: PortVersions,
-    /// The feedback connections into each input port, with the island of
-    /// their source.
-    pub(crate) feedback_into: IndexVec<InputIdx, Box<[(FeedbackIdx, usize)]>>,
-    /// The graph's connections, sorted by id: how snapshots name the
-    /// wiring.
-    pub(crate) connections: Vec<Connection>,
+    versions: PortVersions,
+    /// The feedback connections with a value waiting for the end-of-iteration
+    /// latch.
+    pending: PortSet<FeedbackIdx>,
+    /// Feedback connections whose target the host wrote since their source's
+    /// `run` in flight started: what it feeds back there is stale.
+    stale: PortSet<FeedbackIdx>,
+    /// The feedback connections into each input port.
+    feedback_into: IndexVec<InputIdx, Box<[FeedbackIdx]>>,
+    /// The non-feedback connection writing each input port, if one does: the
+    /// one writer the host may not compete with.
+    connected: IndexVec<InputIdx, Option<ConnectionId>>,
+    /// The graph's connections, sorted by id: how snapshots name the wiring.
+    connections: Vec<Connection>,
     /// Each node's resolved component: how snapshots name the nodes.
-    pub(crate) components: BTreeMap<NodeId, ComponentRef>,
-    /// The graph's links, sorted by id: how snapshots name what is
-    /// composed into the nodes.
-    pub(crate) links: Vec<Link>,
-    /// The non-feedback connection writing each input port, if one does:
-    /// the one writer [`inject`](Self::inject) may not compete with.
-    pub(crate) connected: IndexVec<InputIdx, Option<ConnectionId>>,
-    /// The feedback connections with a value waiting for the
-    /// end-of-iteration latch.
-    pub(crate) pending: PortSet<FeedbackIdx>,
-    /// The latest fault of each island not yet taken by
-    /// [`take_faults`](Self::take_faults).
-    pub(crate) faults: BTreeMap<usize, FaultReport>,
-    /// Which running islands to poll.
-    pub(crate) wakes: Arc<WakeSet>,
-    /// Whether anything changed since the last start pass that could let
-    /// an island start.
-    pub(crate) dirty: bool,
-    pub(crate) events_rx: UnboundedReceiver<ControlEvent>,
-    pub(crate) resources: ResourcePool,
+    components: BTreeMap<NodeId, ComponentRef>,
+    /// The graph's links, sorted by id.
+    links: Vec<Link>,
+    /// The latest fault not yet taken.
+    fault: Option<FaultReport>,
+    state: Option<GraphState>,
+    incarnation: Incarnation,
+    /// The nodes the host asked to run since the instance started, by writing
+    /// an input or `rerun`, and that have not started since. All that is still
+    /// owed after a fault: a new instance runs everything, and if it were built
+    /// for less, a node that always traps would rebuild the graph forever.
+    owed_by_host: PortSet<NodeIdx>,
+    /// Whether a new instance is yet to report it was built: what is asked of
+    /// it is queued, and has not started if its build fails.
+    building: bool,
+    /// How many `run`s are in flight.
+    running: usize,
+    /// How many commands are yet to be answered.
+    outstanding: usize,
+    /// How many `run`s were ever started: what a report of no guest work left
+    /// is good for.
+    runs_started: u64,
+    /// The `runs_started` a report of no guest work left was asked at, while
+    /// one is awaited.
+    quiet_asked: Option<u64>,
+    /// No guest work has been left since the last `run` started.
+    quiet: bool,
+    /// Whether anything changed since the last start pass that could let a node
+    /// start.
+    dirty: bool,
+    pub(crate) events_tx: UnboundedSender<ControlEvent>,
+    events_rx: UnboundedReceiver<ControlEvent>,
+    resources: ResourcePool,
     /// What holds the values and runs the nodes. Last, so that
     /// `SchedulerCore<P>` coerces to `SchedulerCore<dyn DataPlane>`.
-    pub(crate) plane: P,
+    pub plane: P,
 }
 
-impl SchedulerCore<dyn DataPlane> {
-    /// Records a host write that changed an input to a new value.
-    pub(crate) fn host_set(&mut self, input: InputIdx) {
-        self.presence.insert(input);
-        self.owe_for(input);
-        self.note_host_write(input);
-    }
+/// Ends a tick that did not run to its end (it was dropped, say) the way
+/// [`SchedulerCore::tick_until`] ends an interrupted one.
+struct TickGuard<'a> {
+    core: &'a mut SchedulerCore<dyn DataPlane>,
+    finished: bool,
+}
 
-    /// Records a host write that cleared an input.
-    pub(crate) fn host_cleared(&mut self, input: InputIdx) {
-        self.presence.remove(input);
-        self.owe_for(input);
-        self.note_host_write(input);
-    }
-
-    /// Makes the node's island owe a run on its latched inputs.
-    pub(crate) fn rerun(&mut self, node: &NodeId) -> Result<(), RuntimeError> {
-        self.drain_events();
-        let index = self.island(node)?;
-        self.slots[index].owed.push_latched();
-        self.dirty = true;
-        Ok(())
-    }
-
-    /// A node's current lifecycle state.
-    pub(crate) fn node_state(&self, node: &NodeId) -> Result<NodeState, RuntimeError> {
-        let index = self.island(node)?;
-        let state = &self.slots[index].state;
-        let contract = self
-            .compiled
-            .contract_for(node)
-            .ok_or_else(|| RuntimeError::UnknownNode { node: node.clone() })?;
-        Ok(NodeState::new(
-            node.clone(),
-            contract.shape(),
-            state.node_phase(),
-            state.fault().cloned(),
-            state.culprit().cloned(),
-        ))
-    }
-
-    /// Takes the faults reported since the last call.
-    pub(crate) fn take_faults(&mut self) -> Vec<FaultReport> {
-        self.drain_events();
-        std::mem::take(&mut self.faults).into_values().collect()
-    }
-
-    /// Cancels a node's island.
-    pub(crate) fn cancel(&mut self, node: &NodeId) -> Result<(), RuntimeError> {
-        let index = self.island(node)?;
-        self.drain_events();
-        self.stop_island(index, StopCause::Cancelled);
-        Ok(())
-    }
-
-    /// Stops everything.
-    pub(crate) fn shutdown(&mut self) {
-        self.drain_events();
-        for index in 0..self.slots.len() {
-            self.stop_island(index, StopCause::Shutdown);
+impl Drop for TickGuard<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.core.tick_interrupted();
         }
-        for connection in self.pending.iter() {
-            self.plane.drop_feedback(connection);
-        }
-        self.pending.clear();
-    }
-
-    /// The node's island index.
-    pub(crate) fn island(&self, node: &NodeId) -> Result<usize, RuntimeError> {
-        self.compiled
-            .island_of(node)
-            .ok_or_else(|| RuntimeError::UnknownNode { node: node.clone() })
     }
 }
 
 impl<P: DataPlane> SchedulerCore<P> {
-    /// A scheduler over a compiled graph whose islands are built, with the
-    /// data plane `make_plane` makes from the graph's numbered ports, its
-    /// islands' plans and the channel for what its generations report.
-    pub(crate) fn new(
+    /// A scheduler over a compiled graph, with the data plane `make_plane` makes
+    /// from its numbered ports. Every node owes its first run. An instance
+    /// starts being served at once.
+    pub fn new(
         compiled: CompiledGraph,
         mode: Arc<dyn RuntimeMode>,
-        islands: Vec<(Box<dyn LiveIsland>, Vec<RunShape>)>,
         max_steps_per_tick: usize,
-        make_plane: impl FnOnce(
-            &CompiledGraph,
-            &Arc<PortTable>,
-            &[Arc<IslandPlan>],
-            UnboundedSender<ControlEvent>,
-        ) -> P,
+        make_plane: impl FnOnce(&CompiledGraph, &Arc<PortTable>) -> P,
     ) -> Result<Self, RuntimeError> {
         check_max_steps_per_tick(max_steps_per_tick)?;
-        if islands.len() != compiled.islands().len() {
-            return Err(RuntimeError::InvalidConfig {
-                message: format!(
-                    "the executor built {} islands; the graph has {}",
-                    islands.len(),
-                    compiled.islands().len()
-                ),
-            });
-        }
-        let resources = register_resources(&compiled)?;
-        let graph = compiled.graph();
-        let wiring = Wiring::new(&compiled);
         let ports = Arc::new(PortTable::new(&compiled));
-        let island_of_node: IndexVec<NodeIdx, usize> = compiled
-            .islands()
-            .iter()
-            .enumerate()
-            .flat_map(|(island, members)| members.iter().map(move |_| island))
-            .collect();
+        let resources = register_resources(&compiled, &ports)?;
+        let graph = compiled.graph();
+
+        let node_of = |id: &NodeId| ports.node(id);
+        let mut preds: Vec<BTreeSet<NodeIdx>> = vec![BTreeSet::new(); ports.node_count()];
+        let mut feedback_sources: Vec<BTreeSet<NodeIdx>> =
+            vec![BTreeSet::new(); ports.node_count()];
+        let mut feedback_out: Vec<Vec<FeedbackIdx>> = vec![Vec::new(); ports.node_count()];
+        let mut feedback_into: Vec<Vec<FeedbackIdx>> = vec![Vec::new(); ports.inputs().len()];
         let mut internal = PortSet::new(ports.inputs().len());
-        let mut feedback_into: Vec<Vec<(FeedbackIdx, usize)>> =
-            vec![Vec::new(); ports.inputs().len()];
-        let island_of: Vec<usize> = compiled.nodes().map(|n| n.island).collect();
+        let mut connected: IndexVec<InputIdx, Option<ConnectionId>> =
+            IndexVec::from_fn(ports.inputs().len(), |_| None);
         for resolved in compiled.connections() {
             let conn = resolved.connection;
-            let (from, to) = (island_of[resolved.from_node], island_of[resolved.to_node]);
-            let Some(input) = ports.input(&conn.to.node, &conn.to.port) else {
+            let (Some(from), Some(to), Some(input)) = (
+                node_of(&conn.from.node),
+                node_of(&conn.to.node),
+                ports.input(&conn.to.node, &conn.to.port),
+            ) else {
                 continue;
             };
             match ports.feedback_index(&conn.id) {
-                Some(feedback) => feedback_into[input.position()].push((feedback, from)),
-                None if from == to => {
-                    internal.insert(input);
+                Some(feedback) => {
+                    feedback_sources[to.position()].insert(from);
+                    feedback_out[from.position()].push(feedback);
+                    feedback_into[input.position()].push(feedback);
                 }
-                None => {}
+                None => {
+                    preds[to.position()].insert(from);
+                    connected[input] = Some(conn.id.clone());
+                    let (a, b) = (
+                        compiled.group_of(&conn.from.node),
+                        compiled.group_of(&conn.to.node),
+                    );
+                    if a.is_some() && a == b {
+                        internal.insert(input);
+                    }
+                }
             }
         }
-        let feedback_into = feedback_into
-            .into_iter()
-            .map(Vec::into_boxed_slice)
+        let nodes: IndexVec<NodeIdx, NodeEntry> = (0..ports.node_count())
+            .map(|at| {
+                let id = ports.node_id(NodeIdx::from_position(at));
+                let contract = compiled.contract_for(id);
+                let required: Vec<InputIdx> = contract
+                    .into_iter()
+                    .flat_map(|c| &c.inputs)
+                    .filter(|port| port.kind.is_latched() && !port.optional)
+                    .filter_map(|port| ports.input(id, &port.name))
+                    .filter(|input| !internal.contains(*input))
+                    .collect();
+                NodeEntry {
+                    preds: preds[at].iter().copied().collect(),
+                    feedback_sources: feedback_sources[at].iter().copied().collect(),
+                    feedback_out: std::mem::take(&mut feedback_out[at]).into_boxed_slice(),
+                    required: required.into_boxed_slice(),
+                    group: compiled.group_of(id),
+                    life: NodeLife::Waiting(Node::fresh()),
+                }
+            })
+            .collect();
+        let groups = compiled
+            .stream_groups()
+            .iter()
+            .map(|members| GroupEntry {
+                members: members.iter().filter_map(node_of).collect(),
+                life: GroupLife::Quiet(Group::fresh()),
+            })
             .collect();
         let mut connections = graph.connections.clone();
         connections.sort_by(|a, b| a.id.cmp(&b.id));
@@ -312,85 +269,1003 @@ impl<P: DataPlane> SchedulerCore<P> {
             .iter()
             .filter_map(|n| Some((n.id.clone(), compiled.contract_for(&n.id)?.id.clone())))
             .collect();
-        let mut connected = IndexVec::from_fn(ports.inputs().len(), |_| None);
-        for (port, conn) in &wiring.writer {
-            if let Some(input) = ports.input(&port.node, &port.port) {
-                connected[input] = Some(conn.id.clone());
-            }
-        }
 
-        let wired = plan::node_wiring(&compiled, &wiring, &ports);
-        let wakes = Arc::new(WakeSet::new(islands.len()));
-        let mut slots = Vec::with_capacity(islands.len());
-        let members = compiled.islands().iter();
-        for (index, ((members, (live, shapes)), wired)) in
-            members.zip(islands).zip(wired).enumerate()
-        {
-            let plan = plan::plan_island(&compiled, &wiring, &ports, index, members, &shapes)?;
-            // A new island owes its first generation.
-            let mut owed = Owed::default();
-            owed.push_latched();
-            slots.push(Slot {
-                required: plan.required_inputs(),
-                awaiting: vec![false; plan.members.len()],
-                plan: Arc::new(plan),
-                offset: wired.offset,
-                preds: wired.preds,
-                feedback_sources: wired.feedback_sources,
-                feedback_out: wired.feedback_out,
-                stale_feedback: PortSet::new(ports.feedback().len()),
-                waker: futures::task::waker(Arc::new(IslandWaker {
-                    island: index,
-                    set: wakes.clone(),
-                })),
-                state: Island::new(live).into(),
-                owed,
-            });
-        }
-        drop(wiring);
-
-        let island_index = slots
-            .iter()
-            .enumerate()
-            .map(|(index, slot)| (slot.plan.sorted_members(), index))
-            .collect();
-        let plans: Vec<Arc<IslandPlan>> = slots.iter().map(|slot| slot.plan.clone()).collect();
+        let plane = make_plane(&compiled, &ports);
         let (events_tx, events_rx) = mpsc::unbounded();
-        let plane = make_plane(&compiled, &ports, &plans, events_tx);
+        let (commands_tx, commands_rx) = mpsc::unbounded();
+        let incarnation = Incarnation::default();
+        let server = plane.serve(Serving {
+            incarnation,
+            commands: commands_rx,
+            events: events_tx.clone(),
+            stream_items: mode.wants_stream_items(),
+        });
+        let mut owed = PortSet::new(ports.node_count());
+        for at in 0..ports.node_count() {
+            owed.insert(NodeIdx::from_position(at));
+        }
         Ok(Self {
             compiled,
             mode,
             max_steps_per_tick,
-            slots,
-            running: 0,
-            island_index,
+            nodes,
+            groups,
+            owed,
             presence: PortSet::new(ports.inputs().len()),
             internal,
+            host_written: PortSet::new(ports.inputs().len()),
             versions: PortVersions::new(ports.outputs().len()),
             pending: PortSet::new(ports.feedback().len()),
-            ports,
-            island_of_node,
-            feedback_into,
+            stale: PortSet::new(ports.feedback().len()),
+            feedback_into: feedback_into
+                .into_iter()
+                .map(Vec::into_boxed_slice)
+                .collect(),
+            connected,
             connections,
             components,
             links,
-            connected,
-            faults: BTreeMap::new(),
-            wakes,
+            fault: None,
+            state: Some(GraphState::Live(Instance::new(commands_tx, server))),
+            incarnation,
+            owed_by_host: PortSet::new(ports.node_count()),
+            building: false,
+            running: 0,
+            outstanding: 0,
+            runs_started: 0,
+            quiet_asked: None,
+            quiet: false,
             dirty: true,
+            events_tx,
             events_rx,
             resources,
+            ports,
             plane,
         })
     }
 }
 
-/// A good default for [`Scheduler::max_steps_per_tick`](crate::Scheduler::max_steps_per_tick): high enough that
-/// only a graph that keeps starting work reaches it.
+impl<P: ?Sized> SchedulerCore<P> {
+    /// The compiled graph being run.
+    pub fn compiled(&self) -> &CompiledGraph {
+        &self.compiled
+    }
+
+    /// Every port and feedback connection, numbered.
+    pub fn ports(&self) -> &Arc<PortTable> {
+        &self.ports
+    }
+
+    /// Every output port's version.
+    pub fn versions(&self) -> &PortVersions {
+        &self.versions
+    }
+
+    /// The most runs one tick may start before it returns
+    /// [`TickResult::StepLimitReached`].
+    pub fn max_steps_per_tick(&self) -> usize {
+        self.max_steps_per_tick
+    }
+
+    /// Sets [`max_steps_per_tick`](Self::max_steps_per_tick); at least 1
+    /// ([`RuntimeError::InvalidConfig`]).
+    pub fn set_max_steps_per_tick(&mut self, steps: usize) -> Result<(), RuntimeError> {
+        check_max_steps_per_tick(steps)?;
+        self.max_steps_per_tick = steps;
+        Ok(())
+    }
+
+    /// Whether an instance is up.
+    pub fn is_live(&self) -> bool {
+        matches!(self.state, Some(GraphState::Live(_)))
+    }
+
+    /// The non-feedback connection writing `input`, if one does.
+    pub fn connected(&self, input: InputIdx) -> Option<&ConnectionId> {
+        self.connected[input].as_ref()
+    }
+
+    /// Whether `input` holds a value.
+    pub fn is_present(&self, input: InputIdx) -> bool {
+        self.presence.contains(input)
+    }
+}
+
+impl SchedulerCore<dyn DataPlane> {
+    /// Sends a command, if an instance is up.
+    fn send(&mut self, command: Command) -> bool {
+        match &self.state {
+            Some(GraphState::Live(instance)) => {
+                instance.send(command);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn owe(&mut self, node: NodeIdx) {
+        self.dirty = true;
+        match self.nodes[node].group {
+            Some(group) => {
+                for at in 0..self.groups[group].members.len() {
+                    self.owed.insert(self.groups[group].members[at]);
+                }
+            }
+            None => {
+                self.owed.insert(node);
+            }
+        }
+    }
+
+    /// As [`owe`](Self::owe), because the host asked.
+    fn owe_host(&mut self, node: NodeIdx) {
+        self.owe(node);
+        self.owed_by_host.insert(node);
+    }
+
+    /// `input` holds a new value. A node about to start will read it, so only a
+    /// node past that owes another run.
+    fn owe_for(&mut self, input: InputIdx) {
+        let node = self.ports.inputs()[input].node;
+        if matches!(self.nodes[node].life, NodeLife::Scheduled(_)) {
+            self.dirty = true;
+            return;
+        }
+        self.owe(node);
+    }
+
+    /// Records a host write that changed an input to a new value. It wins over
+    /// feedback for this input computed before it.
+    pub fn host_set(&mut self, input: InputIdx) {
+        self.presence.insert(input);
+        self.host_written.insert(input);
+        self.owe_host(self.ports.inputs()[input].node);
+        self.note_host_write(input);
+    }
+
+    /// Records a host write that cleared an input.
+    pub fn host_cleared(&mut self, input: InputIdx) {
+        self.presence.remove(input);
+        self.host_written.remove(input);
+        self.owe_host(self.ports.inputs()[input].node);
+        self.note_host_write(input);
+    }
+
+    fn note_host_write(&mut self, input: InputIdx) {
+        for at in 0..self.feedback_into[input].len() {
+            let conn = self.feedback_into[input][at];
+            if self.pending.remove(conn) {
+                self.send(Command::DropFeedback(conn));
+            }
+            let source = self.ports.outputs()[self.ports.feedback()[conn].from].node;
+            if self.nodes[source].life.is_running() {
+                self.stale.insert(conn);
+            }
+        }
+    }
+
+    /// Makes the node owe a run on its latched inputs, as an input change
+    /// would; a stopped graph is rebuilt first. This is how a node whose inputs
+    /// the host cannot change (a source driven by a capability, say) runs again
+    /// after a fault or shutdown.
+    pub fn rerun(&mut self, node: &NodeId) -> Result<(), RuntimeError> {
+        self.drain();
+        let index = self
+            .ports
+            .node(node)
+            .ok_or_else(|| RuntimeError::UnknownNode { node: node.clone() })?;
+        self.owe_host(index);
+        Ok(())
+    }
+
+    /// A node's current lifecycle state. An unknown node is an error
+    /// ([`RuntimeError::UnknownNode`]).
+    pub fn node_state(&self, node: &NodeId) -> Result<NodeState, RuntimeError> {
+        let unknown = || RuntimeError::UnknownNode { node: node.clone() };
+        let index = self.ports.node(node).ok_or_else(unknown)?;
+        let contract = self.compiled.contract_for(node).ok_or_else(unknown)?;
+        let (phase, fault, culprit) = match &self.state {
+            Some(GraphState::Stopped(stopped)) => match stopped.cause() {
+                StopCause::Faulted(fault, culprit) => {
+                    (NodePhase::Faulted, Some(fault.clone()), culprit.clone())
+                }
+                StopCause::Shutdown => (NodePhase::Cancelled, None, None),
+            },
+            _ => (self.nodes[index].life.phase(), None, None),
+        };
+        Ok(NodeState::new(
+            node.clone(),
+            contract.shape(),
+            phase,
+            fault,
+            culprit,
+        ))
+    }
+
+    /// Takes the fault reported since the last call, if there is one. A tick
+    /// ends early only for `fatal` ([`TickResult::Aborted`]).
+    pub fn take_faults(&mut self) -> Vec<FaultReport> {
+        self.drain();
+        let polled = self.poll_server_once();
+        if let Some(outcome) = polled {
+            self.drain();
+            self.stopped(outcome);
+        }
+        self.fault.take().into_iter().collect()
+    }
+
+    /// Whether the server has ended, polled once: a pull may have ended it while
+    /// no tick was looking.
+    fn poll_server_once(&mut self) -> Option<Outcome> {
+        let Some(GraphState::Live(instance)) = &mut self.state else {
+            return None;
+        };
+        let waker = futures::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        match instance.poll(&mut cx) {
+            Poll::Ready(outcome) => Some(outcome),
+            Poll::Pending => None,
+        }
+    }
+
+    /// Stops everything: drops the instance, forgets all owed work, and a later
+    /// input change rebuilds the graph. A faulted graph keeps its fault.
+    pub fn shutdown(&mut self) {
+        self.drain();
+        self.owed.clear();
+        self.owed_by_host.clear();
+        if self.is_live() {
+            self.stop(StopCause::Shutdown);
+            for node in self.compiled.graph().nodes.iter().map(|n| n.id.clone()) {
+                self.mode.on_cancelled(&node);
+            }
+        }
+        self.dirty = true;
+    }
+
+    /// Handles every event already reported. Returns whether any did something.
+    pub fn drain(&mut self) -> bool {
+        let mut any = false;
+        while let Ok(event) = self.events_rx.try_recv() {
+            any |= self.handle_event(event);
+        }
+        any
+    }
+
+    fn drained(&self) -> Option<Drained> {
+        (self.outstanding == 0).then_some(Drained(()))
+    }
+
+    fn handle_event(&mut self, event: ControlEvent) -> bool {
+        if event.incarnation != self.incarnation {
+            return false;
+        }
+        match event.kind {
+            ControlKind::Built => {
+                self.building = false;
+                let started: Vec<NodeIdx> = self
+                    .owed_by_host
+                    .iter()
+                    .filter(|node| !self.owed.contains(*node))
+                    .collect();
+                for node in started {
+                    self.owed_by_host.remove(node);
+                }
+                let ids: Vec<NodeId> = self.ports_node_ids();
+                for node in &ids {
+                    self.mode.on_restarted(node);
+                }
+                false
+            }
+            ControlKind::RunReturned { node, returned } => {
+                self.run_returned(node, returned);
+                true
+            }
+            ControlKind::Latched {
+                connection,
+                latched,
+            } => {
+                self.outstanding = self.outstanding.saturating_sub(1);
+                self.dirty = true;
+                let to = self.ports.feedback()[connection].to;
+                match latched {
+                    Latched::Unchanged => false,
+                    Latched::Changed => {
+                        self.presence.insert(to);
+                        self.owe_for(to);
+                        true
+                    }
+                    Latched::Cleared => {
+                        self.presence.remove(to);
+                        self.owe_for(to);
+                        true
+                    }
+                }
+            }
+            ControlKind::Quiet(at) => {
+                self.quiet_asked = None;
+                if at == self.runs_started && self.running == 0 {
+                    self.quiet = true;
+                    self.end_draining();
+                }
+                false
+            }
+            ControlKind::StreamItems { node, port, count } => {
+                self.mode
+                    .on_stream_items(self.ports.node_id(node), &port, count);
+                true
+            }
+        }
+    }
+
+    fn ports_node_ids(&self) -> Vec<NodeId> {
+        (0..self.ports.node_count())
+            .map(|at| self.ports.node_id(NodeIdx::from_position(at)).clone())
+            .collect()
+    }
+
+    /// No guest work is left: every draining group may run again.
+    fn end_draining(&mut self) {
+        for at in 0..self.groups.len() {
+            if let GroupLife::Draining(group) = self.groups[at].life {
+                self.groups[at].life = GroupLife::Quiet(group.drained());
+                self.resources.release(self.ports.node_count() + at);
+                let nodes: Vec<NodeId> = self.groups[at]
+                    .members
+                    .iter()
+                    .map(|member| self.ports.node_id(*member).clone())
+                    .collect();
+                self.mode.on_group_drained(&nodes);
+                self.dirty = true;
+            }
+        }
+    }
+
+    fn set_life(&mut self, node: NodeIdx, life: NodeLife) {
+        let from = self.nodes[node].life.phase();
+        self.nodes[node].life = life;
+        let to = life.phase();
+        if from != to {
+            self.mode
+                .on_phase_transition(self.ports.node_id(node), from, to);
+        }
+    }
+
+    /// Records what a returned `run` changed.
+    fn run_returned(&mut self, node: NodeIdx, returned: Returned) {
+        let NodeLife::Running(running) = self.nodes[node].life else {
+            return;
+        };
+        self.running -= 1;
+        self.dirty = true;
+        self.set_life(node, NodeLife::Waiting(running.returned()));
+        self.mode.on_run_returned(self.ports.node_id(node));
+        match self.nodes[node].group {
+            Some(group) => {
+                if let GroupLife::Active(active) = self.groups[group].life {
+                    self.groups[group].life = active.returned();
+                }
+            }
+            None => self.resources.release(node.position()),
+        }
+        let Returned {
+            outputs_changed,
+            inputs_changed,
+            inputs_recorded,
+            inputs_cleared,
+            feedback_buffered,
+        } = returned;
+        for output in outputs_changed {
+            self.versions.bump(output);
+        }
+        for input in inputs_changed {
+            self.presence.insert(input);
+            self.owe_for(input);
+        }
+        for input in inputs_recorded {
+            self.presence.insert(input);
+        }
+        for input in inputs_cleared {
+            self.presence.remove(input);
+            if !self.internal.contains(input) {
+                self.owe_for(input);
+            }
+        }
+        for conn in feedback_buffered {
+            // Computed from inputs older than a host write to its target: the
+            // host's value stands.
+            if self.stale.contains(conn) {
+                self.send(Command::DropFeedback(conn));
+            } else {
+                self.pending.insert(conn);
+            }
+        }
+    }
+
+    /// Whether what `node` starts with is there: for a group's member, what
+    /// every member starts with. A draining group cannot start yet.
+    fn ready(&self, node: NodeIdx) -> bool {
+        let required = |at: NodeIdx| {
+            self.nodes[at]
+                .required
+                .iter()
+                .all(|input| self.presence.contains(*input))
+        };
+        match self.nodes[node].group {
+            Some(group) => {
+                let entry = &self.groups[group];
+                !matches!(entry.life, GroupLife::Draining(_))
+                    && entry.members.iter().all(|member| required(*member))
+            }
+            None => required(node),
+        }
+    }
+
+    /// Whether `node`'s stream group, if it has one, has nothing in flight.
+    fn group_is_quiet(&self, node: NodeIdx) -> bool {
+        self.nodes[node]
+            .group
+            .is_none_or(|group| matches!(self.groups[group].life, GroupLife::Quiet(_)))
+    }
+
+    /// The nodes that can still produce new outputs, and the nodes with one of
+    /// those upstream, which must not start yet. A node waits while what it
+    /// reads could change, which keeps it from running on half-updated inputs,
+    /// while a Value latched by a stream group that never finishes still wakes
+    /// what is downstream of it. Linear in the size of the graph.
+    fn unsettled(&self) -> (PortSet<NodeIdx>, PortSet<NodeIdx>) {
+        let count = self.ports.node_count();
+        let mut unsettled = PortSet::new(count);
+        let mut blocked = PortSet::new(count);
+        // Nodes are numbered in topological order.
+        for at in 0..count {
+            let node = NodeIdx::from_position(at);
+            let entry = &self.nodes[node];
+            let upstream = entry.preds.iter().any(|pred| unsettled.contains(*pred));
+            if upstream {
+                blocked.insert(node);
+            }
+            let own = match entry.life {
+                NodeLife::Running(_) | NodeLife::Scheduled(_) => true,
+                // A member owing a run of a group that has yet to drain cannot
+                // run until its group's readers have, so they must not wait.
+                NodeLife::Waiting(_) => {
+                    self.owed.contains(node) && self.ready(node) && self.group_is_quiet(node)
+                }
+            };
+            if own || upstream {
+                unsettled.insert(node);
+            }
+        }
+        (unsettled, blocked)
+    }
+
+    /// Builds a new instance, if work is owed that could start. Every node owes
+    /// a run in it: its values are gone with the last one.
+    pub(crate) fn rebuild_if_owed(&mut self) -> bool {
+        let wanted = self.owed.iter().any(|node| self.ready(node));
+        if !wanted {
+            return false;
+        }
+        let Some(GraphState::Stopped(stopped)) = self.state.take() else {
+            return false;
+        };
+        let (tx, rx) = mpsc::unbounded();
+        self.incarnation = self.incarnation.next();
+        let server = self.plane.serve(Serving {
+            incarnation: self.incarnation,
+            commands: rx,
+            events: self.events_tx.clone(),
+            stream_items: self.mode.wants_stream_items(),
+        });
+        self.state = Some(GraphState::Live(stopped.restart(tx, server)));
+        self.owed_by_host.clear();
+        self.building = true;
+        for at in 0..self.ports.node_count() {
+            self.owed.insert(NodeIdx::from_position(at));
+        }
+        true
+    }
+
+    /// Starts every node that can start, in topological order, in one pass:
+    /// starting one never lets another start. Each start counts as a step.
+    fn start_ready(&mut self, steps: &mut usize, _: Drained) -> Started {
+        if !self.dirty {
+            return Started::Nothing;
+        }
+        self.dirty = false;
+        if self.owed.is_empty()
+            && self
+                .groups
+                .iter()
+                .all(|g| !matches!(g.life, GroupLife::Active(_)))
+        {
+            return Started::Nothing;
+        }
+        if !self.is_live() && !self.rebuild_if_owed() {
+            return Started::Nothing;
+        }
+        let (_, blocked) = self.unsettled();
+        let mut started = Started::Nothing;
+        for at in 0..self.ports.node_count() {
+            let node = NodeIdx::from_position(at);
+            if blocked.contains(node) {
+                continue;
+            }
+            let activate = match self.nodes[node].life {
+                NodeLife::Running(_) => continue,
+                NodeLife::Scheduled(_) => false,
+                NodeLife::Waiting(_) => {
+                    if !self.owed.contains(node) || !self.ready(node) {
+                        continue;
+                    }
+                    // A group runs as one: its members start together, or not
+                    // until it has drained.
+                    if !self.group_is_quiet(node) {
+                        continue;
+                    }
+                    if !self.resources.can_acquire(self.unit(node)) {
+                        continue;
+                    }
+                    true
+                }
+            };
+            if *steps >= self.max_steps_per_tick {
+                // Work is still waiting to start.
+                self.dirty = true;
+                return Started::LimitReached;
+            }
+            if activate {
+                self.resources.acquire(self.unit(node));
+                self.schedule_group(node);
+            }
+            *steps += 1;
+            started = Started::Some;
+            self.start_run(node);
+        }
+        started
+    }
+
+    /// If `node` is in a stream group, every member is now to run, each when
+    /// what it reads has settled.
+    fn schedule_group(&mut self, node: NodeIdx) {
+        let Some(group) = self.nodes[node].group else {
+            return;
+        };
+        let GroupLife::Quiet(quiet) = self.groups[group].life else {
+            return;
+        };
+        let members = self.groups[group].members.clone();
+        self.groups[group].life = GroupLife::Active(quiet.start(members.len()));
+        for member in members {
+            self.owed.remove(member);
+            if let NodeLife::Waiting(waiting) = self.nodes[member].life {
+                self.set_life(member, NodeLife::Scheduled(waiting.schedule()));
+            }
+        }
+    }
+
+    /// What holds `node`'s claims: itself, or its group.
+    fn unit(&self, node: NodeIdx) -> usize {
+        match self.nodes[node].group {
+            Some(group) => self.ports.node_count() + group,
+            None => node.position(),
+        }
+    }
+
+    fn start_run(&mut self, node: NodeIdx) {
+        self.owed.remove(node);
+        if !self.building {
+            self.owed_by_host.remove(node);
+        }
+        let running = match self.nodes[node].life {
+            NodeLife::Waiting(waiting) => waiting.start(),
+            NodeLife::Scheduled(scheduled) => scheduled.start(),
+            NodeLife::Running(_) => return,
+        };
+        // Stale only for the run it was stale for.
+        for at in 0..self.nodes[node].feedback_out.len() {
+            let conn = self.nodes[node].feedback_out[at];
+            self.stale.remove(conn);
+        }
+        self.set_life(node, NodeLife::Running(running));
+        self.running += 1;
+        self.runs_started += 1;
+        self.quiet = false;
+        self.mode.on_run_started(self.ports.node_id(node));
+        self.send(Command::Run(node));
+    }
+
+    /// Stops the instance, and everything with it. All that survives is what
+    /// the host wrote.
+    fn stop(&mut self, cause: StopCause) {
+        if let Some(GraphState::Live(instance)) = self.state.take() {
+            self.state = Some(GraphState::Stopped(instance.stop(cause)));
+        } else {
+            return;
+        }
+        self.plane.stopped();
+        self.running = 0;
+        self.outstanding = 0;
+        self.quiet_asked = None;
+        self.quiet = false;
+        self.building = false;
+        for at in 0..self.ports.node_count() {
+            let node = NodeIdx::from_position(at);
+            self.nodes[node].life = NodeLife::Waiting(Node::fresh());
+            self.resources.release(self.unit(node));
+        }
+        for group in &mut self.groups {
+            group.life = GroupLife::Quiet(Group::fresh());
+        }
+        self.presence = self.host_written.clone();
+        self.pending.clear();
+        self.stale.clear();
+        self.versions.bump_all();
+        self.dirty = true;
+    }
+
+    /// An instance's server ended, with what stopped it.
+    fn stopped(&mut self, outcome: Outcome) -> Option<TickResult> {
+        let Err((fault, caller)) = outcome else {
+            // Only dropping what sends its commands ends one without a fault.
+            self.stop(StopCause::Shutdown);
+            return None;
+        };
+        // The one that called `fatal` or failed to build, or else the only one
+        // with a `run` in flight, unless a stream group's writers may be at work
+        // too.
+        let in_flight: Vec<NodeIdx> = (0..self.ports.node_count())
+            .map(NodeIdx::at)
+            .filter(|node| self.nodes[*node].life.is_running())
+            .collect();
+        let writers_may_run = self
+            .groups
+            .iter()
+            .any(|group| !matches!(group.life, GroupLife::Quiet(_)));
+        let culprit = caller.or_else(|| match in_flight.as_slice() {
+            [only] if !writers_may_run => Some(self.ports.node_id(*only).clone()),
+            _ => None,
+        });
+        let ids = self.ports_node_ids();
+        let phases: Vec<NodePhase> = (0..ids.len())
+            .map(|at| self.nodes[NodeIdx::from_position(at)].life.phase())
+            .collect();
+        self.stop(StopCause::Faulted(fault.clone(), culprit.clone()));
+        self.owed = self.owed_by_host.clone();
+        for (node, from) in ids.iter().zip(phases) {
+            if from != NodePhase::Faulted {
+                self.mode
+                    .on_phase_transition(node, from, NodePhase::Faulted);
+            }
+            self.mode.on_node_fault(node, &fault);
+        }
+        let abort = matches!(fault, NodeFault::Fatal { .. }).then(|| TickResult::Aborted {
+            node: culprit
+                .clone()
+                .or_else(|| ids.first().cloned())
+                .unwrap_or_else(|| NodeId::from("?")),
+            fault: fault.clone(),
+        });
+        self.fault = Some(FaultReport { culprit, fault });
+        abort
+    }
+
+    /// Waits for the next report, or the server ending.
+    async fn next_wake(&mut self) -> Wake {
+        let Self {
+            state, events_rx, ..
+        } = self;
+        poll_fn(|cx| {
+            if let Poll::Ready(Some(event)) = events_rx.poll_next_unpin(cx) {
+                return Poll::Ready(Wake::Event(event));
+            }
+            if let Some(GraphState::Live(instance)) = state
+                && let Poll::Ready(outcome) = instance.poll(cx)
+            {
+                return Poll::Ready(Wake::Stopped(outcome));
+            }
+            // What serving it just reported, with no trip through the waker.
+            match events_rx.poll_next_unpin(cx) {
+                Poll::Ready(Some(event)) => Poll::Ready(Wake::Event(event)),
+                _ => Poll::Pending,
+            }
+        })
+        .await
+    }
+
+    /// Runs one iteration of the graph: until it is quiescent, then latches
+    /// feedback connections.
+    ///
+    /// An instance whose work never finishes (an endless stream, say) keeps the
+    /// tick running: drive such a graph with [`tick_until`](Self::tick_until).
+    /// Dropping the tick's future is safe and ends it as `tick_until` ends an
+    /// interrupted one: what is in flight resumes on the next tick.
+    pub async fn tick(&mut self) -> TickResult {
+        self.tick_until(std::future::pending()).await
+    }
+
+    /// Like [`tick`](Self::tick), but ends early when `stop` completes (a
+    /// timer, say), with [`TickResult::Interrupted`]. What is in flight carries
+    /// on with the next tick. Every buffered feedback value whose iteration is
+    /// over is latched as the tick ends: the value's target has settled, and so
+    /// has every feedback source into it. So a feedback loop advances one
+    /// iteration per tick even beside work that never finishes.
+    pub async fn tick_until(&mut self, stop: impl Future<Output = ()>) -> TickResult {
+        let mut guard = TickGuard {
+            core: self,
+            finished: false,
+        };
+        let finished = {
+            let run = guard.core.run_tick();
+            futures::pin_mut!(run, stop);
+            match futures::future::select(run, stop).await {
+                Either::Left((result, _)) => Some(result),
+                Either::Right(((), _)) => None,
+            }
+        };
+        guard.finished = true;
+        match finished {
+            Some(result) => result,
+            None => {
+                guard.core.tick_interrupted();
+                TickResult::Interrupted
+            }
+        }
+    }
+
+    /// The body of a tick.
+    async fn run_tick(&mut self) -> TickResult {
+        let mut steps = 0usize;
+        let mut progressed = false;
+        if let Some(outcome) = self.poll_server_once() {
+            self.drain();
+            progressed = true;
+            if let Some(abort) = self.stopped(outcome) {
+                return abort;
+            }
+        }
+        loop {
+            progressed |= self.drain();
+            if let Some(drained) = self.drained() {
+                match self.start_ready(&mut steps, drained) {
+                    Started::Nothing => {}
+                    Started::Some => progressed = true,
+                    Started::LimitReached => return TickResult::StepLimitReached,
+                }
+            }
+            if !self.is_live() {
+                break;
+            }
+            if self.running == 0 && self.outstanding == 0 && self.quiet && !self.dirty {
+                break;
+            }
+            // Guest work left can only be told apart once no `run` is in flight.
+            if self.running == 0 && !self.quiet && self.quiet_asked.is_none() {
+                self.quiet_asked = Some(self.runs_started);
+                self.send(Command::AwaitQuiet(self.runs_started));
+            }
+            match self.next_wake().await {
+                Wake::Event(event) => progressed |= self.handle_event(event),
+                Wake::Stopped(outcome) => {
+                    self.drain();
+                    progressed = true;
+                    if let Some(abort) = self.stopped(outcome) {
+                        return abort;
+                    }
+                }
+            }
+        }
+        // One iteration of each feedback loop.
+        self.latch(|_| true);
+        while self.outstanding > 0 {
+            match self.next_wake().await {
+                Wake::Event(event) => progressed |= self.handle_event(event),
+                Wake::Stopped(outcome) => {
+                    progressed = true;
+                    if let Some(abort) = self.stopped(outcome) {
+                        return abort;
+                    }
+                }
+            }
+        }
+        if progressed {
+            TickResult::Progress
+        } else {
+            TickResult::Idle
+        }
+    }
+
+    /// Ends a tick that stopped short of quiescence (dropped or interrupted):
+    /// handles what its instance reported, and asks to latch the feedback of
+    /// every iteration that is over.
+    fn tick_interrupted(&mut self) {
+        self.drain();
+        if self.pending.is_empty() || !self.is_live() {
+            return;
+        }
+        let (unsettled, blocked) = self.unsettled();
+        let settled = |core: &Self, node: NodeIdx| {
+            let entry = &core.nodes[node];
+            !entry.life.is_running()
+                && !(core.owed.contains(node) && core.ready(node))
+                && !blocked.contains(node)
+                && entry
+                    .feedback_sources
+                    .iter()
+                    .all(|source| !unsettled.contains(*source))
+        };
+        let mut latch = PortSet::new(self.ports.feedback().len());
+        for conn in self.pending.iter() {
+            let target = self.ports.inputs()[self.ports.feedback()[conn].to].node;
+            if settled(self, target) {
+                latch.insert(conn);
+            }
+        }
+        self.latch(|conn| latch.contains(conn));
+    }
+
+    /// Asks to write the buffered feedback values `which` picks to their targets.
+    fn latch(&mut self, mut which: impl FnMut(FeedbackIdx) -> bool) {
+        let conns: Vec<FeedbackIdx> = self.pending.iter().filter(|conn| which(*conn)).collect();
+        for conn in conns {
+            if self.send(Command::LatchFeedback(conn)) {
+                self.pending.remove(conn);
+                self.outstanding += 1;
+            }
+        }
+    }
+
+    /// What a snapshot says besides values: for a wrapper to add them.
+    pub fn snapshot_base(&self) -> Snapshot {
+        let ids = self.ports_node_ids();
+        let mut in_flight = BTreeSet::new();
+        let mut owed = BTreeSet::new();
+        let mut phases = BTreeMap::new();
+        for (at, id) in ids.iter().enumerate() {
+            let node = NodeIdx::from_position(at);
+            let entry = &self.nodes[node];
+            phases.insert(
+                id.clone(),
+                self.node_state(id)
+                    .map_or(NodePhase::Pending, |s| s.phase()),
+            );
+            match entry.life {
+                NodeLife::Running(_) | NodeLife::Scheduled(_) => {
+                    in_flight.insert(id.clone());
+                }
+                NodeLife::Waiting(_) => {}
+            }
+            if self.owed.contains(node) {
+                owed.insert(id.clone());
+            }
+            // A handle is the host's, not text: what produced one owes a run,
+            // which makes a new one.
+            let makes_handle = self
+                .compiled
+                .contract_for(id)
+                .is_some_and(|c| c.outputs.iter().any(|p| p.kind == PortKind::Handle));
+            if makes_handle && entry.life.has_run() {
+                owed.insert(id.clone());
+            }
+        }
+        Snapshot {
+            nodes: self.components.clone(),
+            connections: self.connections.clone(),
+            links: self.links.clone(),
+            quiescent: self.running == 0,
+            phases,
+            inputs: BTreeMap::new(),
+            outputs: BTreeMap::new(),
+            feedback: BTreeMap::new(),
+            in_flight,
+            owed,
+        }
+    }
+
+    /// Checks that `snapshot` can be restored onto this graph: nothing is in
+    /// flight ([`RuntimeError::NotQuiescent`]), and it has exactly the snapshot's
+    /// nodes, components, connections and links
+    /// ([`RuntimeError::SnapshotMismatch`]).
+    pub fn check_snapshot(&mut self, snapshot: &Snapshot) -> Result<(), RuntimeError> {
+        self.drain();
+        if self.running > 0 {
+            return Err(RuntimeError::NotQuiescent);
+        }
+        let mismatch = |message: String| RuntimeError::SnapshotMismatch { message };
+        let ours = &self.components;
+        if snapshot.nodes != *ours {
+            let differs = ours
+                .keys()
+                .chain(snapshot.nodes.keys())
+                .find(|n| ours.get(*n) != snapshot.nodes.get(*n))
+                .map_or_else(|| "?".into(), |n| format!("node `{n}`"));
+            return Err(mismatch(format!(
+                "{differs} differs (missing, extra, or another component)"
+            )));
+        }
+        if !snapshot.phases.keys().eq(ours.keys()) {
+            return Err(mismatch(
+                "the phases are not those of the graph's nodes".into(),
+            ));
+        }
+        if snapshot.connections != self.connections {
+            return Err(mismatch("the graph's connections differ".into()));
+        }
+        if snapshot.links != self.links {
+            return Err(mismatch("the graph's links differ".into()));
+        }
+        if let Some(node) = snapshot
+            .in_flight
+            .iter()
+            .chain(&snapshot.owed)
+            .find(|node| !ours.contains_key(*node))
+        {
+            return Err(mismatch(format!("`{node}` is not a node of this graph")));
+        }
+        Ok(())
+    }
+
+    /// Replaces the instance with a new one, its nodes yet to run, for a restore
+    /// to write its values into. Its guest state outlives nothing.
+    pub fn restart_for_restore(&mut self) {
+        let was_live = self.is_live();
+        if was_live {
+            self.stop(StopCause::Shutdown);
+        }
+        let Some(GraphState::Stopped(stopped)) = self.state.take() else {
+            return;
+        };
+        let (tx, rx) = mpsc::unbounded();
+        self.incarnation = self.incarnation.next();
+        let server = self.plane.serve(Serving {
+            incarnation: self.incarnation,
+            commands: rx,
+            events: self.events_tx.clone(),
+            stream_items: self.mode.wants_stream_items(),
+        });
+        self.state = Some(GraphState::Live(stopped.restart(tx, server)));
+        self.owed_by_host.clear();
+        self.building = true;
+    }
+
+    /// Puts a restored state in place: `presence` holds a value, `pending`
+    /// feedback is buffered, and `snapshot`'s runs are owed.
+    pub fn apply_restore(
+        &mut self,
+        presence: &[InputIdx],
+        pending: &[FeedbackIdx],
+        snapshot: &Snapshot,
+    ) {
+        self.presence = PortSet::new(self.ports.inputs().len());
+        self.host_written = PortSet::new(self.ports.inputs().len());
+        for input in presence {
+            self.presence.insert(*input);
+            if self.connected[*input].is_none() {
+                self.host_written.insert(*input);
+            }
+        }
+        self.pending.clear();
+        for conn in pending {
+            self.pending.insert(*conn);
+        }
+        self.versions.bump_all();
+        self.owed = PortSet::new(self.ports.node_count());
+        self.fault = None;
+        for node in snapshot.in_flight.iter().chain(&snapshot.owed) {
+            if let Some(index) = self.ports.node(node) {
+                self.owe_host(index);
+            }
+        }
+        self.dirty = true;
+    }
+}
+
+/// A good default for `max_steps_per_tick`: high enough that only a graph that
+/// keeps starting work reaches it.
 pub const DEFAULT_MAX_STEPS_PER_TICK: usize = 10_000;
 
-/// Checks a [`Scheduler::max_steps_per_tick`](crate::Scheduler::max_steps_per_tick) as [`Scheduler::new`](crate::Scheduler::new) does:
-/// at least 1 ([`RuntimeError::InvalidConfig`]).
+/// Checks a `max_steps_per_tick`: at least 1 ([`RuntimeError::InvalidConfig`]).
 pub fn check_max_steps_per_tick(steps: usize) -> Result<(), RuntimeError> {
     if steps == 0 {
         return Err(RuntimeError::InvalidConfig {
@@ -400,47 +1275,58 @@ pub fn check_max_steps_per_tick(steps: usize) -> Result<(), RuntimeError> {
     Ok(())
 }
 
-/// Checks every island's resource claims as [`Scheduler::new`](crate::Scheduler::new) does, so an
-/// executor can reject a graph before it instantiates anything.
+/// Checks every node's and stream group's resource claims, so an executor can
+/// reject a graph before it instantiates anything.
 pub fn check_resources(compiled: &CompiledGraph) -> Result<(), RuntimeError> {
-    register_resources(compiled).map(|_| ())
+    let ports = PortTable::new(compiled);
+    register_resources(compiled, &ports).map(|_| ())
 }
 
-/// Every island's summed resource claims. Compilation already rejects an
-/// island whose own claims on a resource exceed all of it
-/// (`Diagnostic::IslandOverclaims`); one could never start, so it stays an
-/// error here ([`RuntimeError::InvalidConfig`]).
-fn register_resources(compiled: &CompiledGraph) -> Result<ResourcePool, RuntimeError> {
+/// Each unit's summed claims: a node, or a stream group after the nodes.
+/// Compilation already rejects a group whose own claims on a resource exceed all
+/// of it; one could never start, so it stays an error here
+/// ([`RuntimeError::InvalidConfig`]).
+fn register_resources(
+    compiled: &CompiledGraph,
+    ports: &PortTable,
+) -> Result<ResourcePool, RuntimeError> {
     let mut resources = ResourcePool::default();
-    let nodes: HashMap<&NodeId, &witgraph_ir::Node> =
-        compiled.graph().nodes.iter().map(|n| (&n.id, n)).collect();
-    for (index, members) in compiled.islands().iter().enumerate() {
-        let mut claims: BTreeMap<ResourceId, f64> = BTreeMap::new();
-        for node in members.iter().filter_map(|m| nodes.get(m)) {
-            for (resource, claim) in &node.resources {
-                *claims.entry(resource.clone()).or_insert(0.0) += claim.fraction.get();
+    let graph = compiled.graph();
+    let invalid = |node: &str, resource: ResourceId| RuntimeError::InvalidConfig {
+        message: format!(
+            "the stream group of `{node}` claims more than all of resource `{resource}`"
+        ),
+    };
+    let mut groups: Vec<BTreeMap<ResourceId, f64>> =
+        vec![BTreeMap::new(); compiled.stream_groups().len()];
+    for node in &graph.nodes {
+        let claims: BTreeMap<ResourceId, f64> = node
+            .resources
+            .iter()
+            .map(|(resource, claim)| (resource.clone(), claim.fraction.get()))
+            .collect();
+        match compiled.group_of(&node.id) {
+            Some(group) => {
+                for (resource, fraction) in claims {
+                    *groups[group].entry(resource).or_insert(0.0) += fraction;
+                }
+            }
+            None => {
+                if let Some(at) = ports.node(&node.id) {
+                    resources
+                        .register(at.position(), claims)
+                        .map_err(|resource| invalid(node.id.as_str(), resource))?;
+                }
             }
         }
+    }
+    for (group, claims) in groups.into_iter().enumerate() {
+        let first = compiled.stream_groups()[group]
+            .first()
+            .map_or("?", |n| n.as_str());
         resources
-            .register(index, claims)
-            .map_err(|resource| RuntimeError::InvalidConfig {
-                message: format!(
-                    "the island of `{}` claims more than all of resource `{resource}`",
-                    members.first().map_or("?", |n| n.as_str())
-                ),
-            })?;
+            .register(ports.node_count() + group, claims)
+            .map_err(|resource| invalid(first, resource))?;
     }
     Ok(resources)
-}
-
-/// Dropping a graph drops every generation in flight; each is reported
-/// stopped, so every `GenerationStarted` a mode saw has its end.
-impl<P: ?Sized> Drop for SchedulerCore<P> {
-    fn drop(&mut self) {
-        for (index, slot) in self.slots.iter().enumerate() {
-            if let Some(generation) = slot.state.running_generation() {
-                self.mode.on_generation_stopped(index, generation);
-            }
-        }
-    }
 }

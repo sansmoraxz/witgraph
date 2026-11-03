@@ -324,18 +324,12 @@ test.describe('WIT Graph Editor Demo', () => {
     );
   });
 
-  test('the timeline names the nodes of a generation', async ({ page }) => {
+  test('the timeline names the node of an event', async ({ page }) => {
     await page.locator('witgraph-controls').locator('button.step').click();
     const timeline = page.locator('witgraph-timeline');
-    const started = timeline.locator('.event', { hasText: 'generation-started' }).first();
+    const started = timeline.locator('.event', { hasText: 'run-started' }).first();
     await expect(started).toBeVisible({ timeout: 10_000 });
-    // Its island's nodes, and which generation.
     await expect(started.locator('.underline').first()).not.toBeEmpty();
-    await expect(started).toContainText(/\(generation \d+\)/);
-    // The video island's four nodes, together.
-    await expect(
-      timeline.locator('.event', { hasText: 'camera, grayscale, invert, video-sink' }).first(),
-    ).toBeVisible();
   });
 
   test('the timeline keeps up once the trace is full', async ({ page }) => {

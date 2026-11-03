@@ -86,10 +86,6 @@ impl Live {
 pub(crate) struct LiveMode(pub(crate) Arc<Live>);
 
 impl RuntimeMode for LiveMode {
-    fn on_generation_started(&self, island: usize, generation: u64) {
-        self.0.trace.on_generation_started(island, generation);
-    }
-
     fn on_run_started(&self, node: &NodeId) {
         self.0.trace.on_run_started(node);
     }
@@ -98,12 +94,8 @@ impl RuntimeMode for LiveMode {
         self.0.trace.on_run_returned(node);
     }
 
-    fn on_generation_finished(&self, island: usize, generation: u64) {
-        self.0.trace.on_generation_finished(island, generation);
-    }
-
-    fn on_generation_stopped(&self, island: usize, generation: u64) {
-        self.0.trace.on_generation_stopped(island, generation);
+    fn on_group_drained(&self, nodes: &[NodeId]) {
+        self.0.trace.on_group_drained(nodes);
     }
 
     fn on_phase_transition(&self, node: &NodeId, from: NodePhase, to: NodePhase) {

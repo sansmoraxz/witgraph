@@ -165,7 +165,7 @@ const portKinds: GraphJson = {
   },
   components: allComponents,
   nodes: [
-    // Value chain island
+    // Value chain
     {
       id: 'relay-a',
       component: relayRef,
@@ -174,7 +174,7 @@ const portKinds: GraphJson = {
     },
     { id: 'relay-b', component: relayRef, label: 'Relay B', attrs: { 'inject.add': '0' } },
     { id: 'relay-c', component: relayRef, label: 'Relay C', attrs: { 'inject.add': '0' } },
-    // Stream island
+    // Stream group
     {
       id: 'producer',
       component: streamProducerRef,
@@ -182,7 +182,7 @@ const portKinds: GraphJson = {
       attrs: { 'inject.burst-size': '5' },
     },
     { id: 'consumer', component: streamConsumerRef, label: 'Consumer' },
-    // Future island
+    // Future group
     { id: 'writer', component: futureWriterRef, label: 'Future Writer' },
     { id: 'reader', component: futureReaderRef, label: 'Future Reader' },
     // Display relay
@@ -200,7 +200,7 @@ const portKinds: GraphJson = {
     { id: 'mqtt', component: mqttNodeRef, label: 'MQTT Sensor' },
     // Bytes consumer (receives mqtt stream)
     { id: 'mqtt-sink', component: bytesConsumerRef, label: 'Msg Counter' },
-    // Video island: frames streamed through a filter, each node previewing them
+    // Video group: frames streamed through a filter, each node previewing them
     {
       id: 'camera',
       component: videoSourceRef,

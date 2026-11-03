@@ -22,14 +22,6 @@ use crate::node::NodePhase;
 /// A trace event recorded by [`Trace`] mode.
 #[derive(Debug, Clone)]
 pub enum TraceEvent {
-    /// An island started a generation.
-    GenerationStarted {
-        /// The island's index in
-        /// [`CompiledGraph::islands`](witgraph_ir::CompiledGraph::islands).
-        island: usize,
-        /// The island's generation counter, starting at 1.
-        generation: u64,
-    },
     /// A node's `run` was called.
     RunStarted {
         /// The node.
@@ -40,22 +32,11 @@ pub enum TraceEvent {
         /// The node.
         node: NodeId,
     },
-    /// Every `run` of an island's generation returned and no guest task is
-    /// left in its Store.
-    GenerationFinished {
-        /// The island's index.
-        island: usize,
-        /// The generation that finished.
-        generation: u64,
-    },
-    /// An island's generation ended without finishing: it faulted, or the
-    /// host cancelled it or shut the graph down. Every `GenerationStarted`
-    /// is paired with a `GenerationFinished` or a `GenerationStopped`.
-    GenerationStopped {
-        /// The island's index.
-        island: usize,
-        /// The generation that stopped.
-        generation: u64,
+    /// A stream group's runs returned, and no guest work was left: it may run
+    /// again.
+    GroupDrained {
+        /// The group's members.
+        nodes: Vec<NodeId>,
     },
     /// A node changed phase.
     PhaseTransition {
@@ -66,7 +47,7 @@ pub enum TraceEvent {
         /// The phase after the transition.
         to: NodePhase,
     },
-    /// A node faulted (every node of the faulting island is reported).
+    /// A node faulted (every node of the graph is reported).
     Fault {
         /// The faulting node.
         node: NodeId,
@@ -78,7 +59,7 @@ pub enum TraceEvent {
         /// The cancelled node.
         node: NodeId,
     },
-    /// A node's island was rebuilt into a fresh Store: after a fault, a
+    /// The graph was rebuilt into a fresh Store: after a fault, a
     /// cancel, a shutdown or a restore.
     Restarted {
         /// The restarted node.
@@ -90,7 +71,7 @@ pub enum TraceEvent {
     /// first may be reported before the node's
     /// [`RunReturned`](Self::RunReturned) and before its reader's
     /// [`RunStarted`](Self::RunStarted); they always belong to the
-    /// generation the stream was made in.
+    /// run the stream was made in.
     StreamItems {
         /// The node whose output the stream is.
         node: NodeId,
@@ -106,24 +87,19 @@ pub enum TraceEvent {
 /// Takes `&self`; implementations that record state use interior
 /// mutability (e.g. `Mutex`).
 pub trait RuntimeMode: Send + Sync + 'static {
-    /// An island started a generation.
-    fn on_generation_started(&self, _island: usize, _generation: u64) {}
     /// A node's `run` was called.
     fn on_run_started(&self, _node: &NodeId) {}
     /// A node's `run` returned.
     fn on_run_returned(&self, _node: &NodeId) {}
-    /// An island's generation finished.
-    fn on_generation_finished(&self, _island: usize, _generation: u64) {}
-    /// An island's generation ended without finishing (a fault, a cancel,
-    /// or shutdown).
-    fn on_generation_stopped(&self, _island: usize, _generation: u64) {}
+    /// A stream group's runs returned, and no guest work was left.
+    fn on_group_drained(&self, _nodes: &[NodeId]) {}
     /// A node changed phase.
     fn on_phase_transition(&self, _node: &NodeId, _from: NodePhase, _to: NodePhase) {}
     /// A node faulted.
     fn on_node_fault(&self, _node: &NodeId, _fault: &NodeFault) {}
     /// A node was cancelled.
     fn on_cancelled(&self, _node: &NodeId) {}
-    /// A node's island was rebuilt.
+    /// The graph was rebuilt, and this node with it.
     fn on_restarted(&self, _node: &NodeId) {}
     /// Whether [`on_stream_items`](Self::on_stream_items) is wanted. An
     /// executor that sees stream items pass (not every one does, and none
@@ -214,10 +190,6 @@ impl Default for Trace {
 }
 
 impl RuntimeMode for Trace {
-    fn on_generation_started(&self, island: usize, generation: u64) {
-        self.record(TraceEvent::GenerationStarted { island, generation });
-    }
-
     fn on_run_started(&self, node: &NodeId) {
         self.record(TraceEvent::RunStarted { node: node.clone() });
     }
@@ -226,12 +198,10 @@ impl RuntimeMode for Trace {
         self.record(TraceEvent::RunReturned { node: node.clone() });
     }
 
-    fn on_generation_finished(&self, island: usize, generation: u64) {
-        self.record(TraceEvent::GenerationFinished { island, generation });
-    }
-
-    fn on_generation_stopped(&self, island: usize, generation: u64) {
-        self.record(TraceEvent::GenerationStopped { island, generation });
+    fn on_group_drained(&self, nodes: &[NodeId]) {
+        self.record(TraceEvent::GroupDrained {
+            nodes: nodes.to_vec(),
+        });
     }
 
     fn on_phase_transition(&self, node: &NodeId, from: NodePhase, to: NodePhase) {
@@ -277,18 +247,18 @@ mod tests {
     #[test]
     fn a_bounded_trace_keeps_the_latest_events() {
         let trace = Trace::bounded(2);
-        for island in 0..5 {
-            trace.on_generation_started(island, 1);
+        for node in ["a", "b", "c", "d", "e"] {
+            trace.on_run_started(&node.into());
         }
-        let islands: Vec<usize> = trace
+        let nodes: Vec<NodeId> = trace
             .take_trace()
             .into_iter()
             .map(|event| match event {
-                TraceEvent::GenerationStarted { island, .. } => island,
+                TraceEvent::RunStarted { node } => node,
                 other => panic!("unexpected {other:?}"),
             })
             .collect();
-        assert_eq!(islands, [3, 4]);
+        assert_eq!(nodes, [NodeId::from("d"), NodeId::from("e")]);
         assert!(trace.take_trace().is_empty());
     }
 }

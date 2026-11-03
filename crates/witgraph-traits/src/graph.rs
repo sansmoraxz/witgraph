@@ -2,6 +2,7 @@
 
 use std::future::Future;
 
+use futures::future::Either;
 use witgraph_ir::{CompiledGraph, NodeId, PortName};
 
 use crate::error::RuntimeError;
@@ -26,6 +27,21 @@ impl PortVersion {
     /// The version as a number: 0 until the port is first written.
     pub fn get(self) -> u64 {
         self.0
+    }
+}
+
+/// `pull` (any of a graph's reads and writes), unless `stop` completes first,
+/// which is [`RuntimeError::PullStopped`]. A pull waits for the guest to suspend
+/// when one is spinning, forever with no fuel budget, so give it a timer here if
+/// that could matter. Stopping a pull is safe.
+pub async fn until<T>(
+    stop: impl Future<Output = ()>,
+    pull: impl Future<Output = Result<T, RuntimeError>>,
+) -> Result<T, RuntimeError> {
+    futures::pin_mut!(stop, pull);
+    match futures::future::select(pull, stop).await {
+        Either::Left((result, _)) => result,
+        Either::Right(((), _)) => Err(RuntimeError::PullStopped),
     }
 }
 
@@ -134,13 +150,14 @@ pub trait RunningGraph {
     fn output_version(&self, node: &NodeId, port: &PortName) -> Result<PortVersion, RuntimeError>;
 
     /// Makes the node owe a run on its latched inputs, as an input change
-    /// would; a stopped node is rebuilt first.
+    /// would; a stopped graph is rebuilt first.
     fn rerun(&mut self, node: &NodeId) -> Result<(), RuntimeError>;
 
     /// A node's current lifecycle state.
     fn node_state(&self, node: &NodeId) -> Result<NodeState, RuntimeError>;
 
-    /// Takes the faults reported since the last call.
+    /// Takes the fault reported since the last call, if there is one: any fault
+    /// stops the whole graph.
     fn take_faults(&mut self) -> Vec<FaultReport>;
 
     /// Stops everything: what is in flight is dropped and all owed work is

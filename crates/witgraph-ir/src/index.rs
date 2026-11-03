@@ -283,12 +283,11 @@ pub struct PortTable {
 }
 
 impl PortTable {
-    /// Numbers `compiled`'s nodes in the order of its islands and their
-    /// members, which is topological, each node's ports in the order its
+    /// Numbers `compiled`'s nodes in topological order, each node's ports in the order its
     /// contract declares them, and its feedback connections by id.
     pub fn new(compiled: &CompiledGraph) -> Self {
-        let order: Vec<&NodeId> = compiled.islands().iter().flatten().collect();
-        let nodes: IndexVec<NodeIdx, NodeId> = order.iter().map(|n| (*n).clone()).collect();
+        let nodes: IndexVec<NodeIdx, NodeId> =
+            compiled.topological_order().iter().cloned().collect();
         let index: HashMap<NodeId, NodeIdx> = nodes
             .iter_enumerated()
             .map(|(i, n)| (n.clone(), i))

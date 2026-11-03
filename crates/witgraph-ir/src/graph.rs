@@ -59,10 +59,10 @@ impl<'de> serde::Deserialize<'de> for Fraction {
 ///
 /// Each named resource pool has an implicit capacity of 1.0. The fraction
 /// is validated when the claim is constructed (or deserialized). The
-/// runtime sums the claims of every node in an island, holds them for as
-/// long as the island's generation runs, and defers starting an island
-/// while the sum of held claims on any resource would exceed 1.0; an island
-/// whose own claims exceed 1.0 is rejected when the graph is loaded.
+/// runtime holds a node's claims for as long as its `run` takes, and a stream
+/// group's together from its first start until it has drained, and defers a
+/// start while the sum of held claims on any resource would exceed 1.0. A group
+/// whose own claims exceed 1.0 is rejected when the graph is compiled.
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
@@ -110,9 +110,8 @@ pub struct Node {
     /// Display label, if it differs from the id.
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub label: Option<String>,
-    /// Fractional claims on named shared resources. The runtime sums them
-    /// per island and holds them while the island's generation runs; see
-    /// [`ResourceClaim`].
+    /// Fractional claims on named shared resources, held while the node runs;
+    /// see [`ResourceClaim`].
     #[cfg_attr(
         feature = "serde",
         serde(default, skip_serializing_if = "BTreeMap::is_empty")

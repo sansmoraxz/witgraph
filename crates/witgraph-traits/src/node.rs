@@ -1,22 +1,15 @@
-//! A node's lifecycle state, projected from its island.
+//! A node's lifecycle state.
 //!
-//! Every node of an island starts, finishes, faults and is cancelled
-//! together, so a node has no state machine of its own: the island carries
-//! the lifecycle (a typestate in the crate-private `island` module), and
-//! [`NodeState`] is a read-only view of where the node's island is.
+//! | node                            | phase                               |
+//! |---------------------------------|-------------------------------------|
+//! | not run since the graph was built | [`Pending`](NodePhase::Pending)   |
+//! | its `run` is in flight          | [`Running`](NodePhase::Running)     |
+//! | its `run` returned              | [`Idle`](NodePhase::Idle)           |
+//! | the graph was stopped by a fault | [`Faulted`](NodePhase::Faulted)    |
+//! | the graph was shut down         | [`Cancelled`](NodePhase::Cancelled) |
 //!
-//! | island phase               | node phase                         |
-//! |----------------------------|------------------------------------|
-//! | loaded or restored, not run | [`Pending`](NodePhase::Pending)   |
-//! | generation in flight       | [`Running`](NodePhase::Running)     |
-//! | generation finished        | [`Idle`](NodePhase::Idle)           |
-//! | stopped by a fault         | [`Faulted`](NodePhase::Faulted)     |
-//! | stopped by cancel/shutdown | [`Cancelled`](NodePhase::Cancelled) |
-//!
-//! `Running` covers the entire generation, including guest work that
-//! continues after the node's own `run` has returned (a stream writer,
-//! say). A stopped island is rebuilt at the start of its next generation,
-//! so its nodes go straight to `Running`.
+//! A fault stops the whole graph, so every node faults together. A stopped
+//! graph is rebuilt before its next run, and its nodes start over as `Pending`.
 
 use witgraph_ir::{NodeId, NodeShape};
 
@@ -26,33 +19,33 @@ use crate::error::NodeFault;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum NodePhase {
-    /// Its island has not run since the graph was loaded, or since a
+    /// It has not run since the graph was loaded, or since a
     /// restore.
     Pending,
-    /// Its island's generation is in flight.
+    /// Its `run` is in flight.
     Running,
-    /// Its island finished its last generation; it runs again when an
+    /// Its `run` returned; it runs again when an
     /// input changes.
     Idle,
-    /// Its island faulted. Restartable: new input, or
-    /// `rerun`, rebuilds the island.
+    /// The graph faulted. Restartable: new input, or
+    /// `rerun`, rebuilds the graph.
     Faulted,
-    /// Its island was cancelled or shut down. Restartable: new input, or
-    /// `rerun`, rebuilds the island.
+    /// The graph was shut down. Restartable: new input, or
+    /// `rerun`, rebuilds the graph.
     Cancelled,
 }
 
 impl NodePhase {
     /// Returns `true` for [`Faulted`](Self::Faulted) and
-    /// [`Cancelled`](Self::Cancelled): the island was stopped and is rebuilt
-    /// before it runs again. An island stopped by a restore has no Store
+    /// [`Cancelled`](Self::Cancelled): the graph was stopped and is rebuilt
+    /// before it runs again. A restored graph has a new Store
     /// either, but reads as [`Pending`](Self::Pending).
     pub fn is_stopped(self) -> bool {
         matches!(self, NodePhase::Faulted | NodePhase::Cancelled)
     }
 }
 
-/// A node's lifecycle state: a read-only view of its island's state at the
+/// A node's lifecycle state: a read-only view of the scheduler's state at the
 /// moment it was taken.
 #[derive(Debug, Clone)]
 pub struct NodeState {
@@ -96,22 +89,17 @@ impl NodeState {
         self.phase
     }
 
-    /// Why the node's island faulted, if the node is
-    /// [`Faulted`](NodePhase::Faulted). Every member of the island carries
-    /// the same fault; see [`culprit`](Self::culprit) for which one caused
-    /// it.
+    /// Why the graph faulted, if the node is [`Faulted`](NodePhase::Faulted).
+    /// Every node carries the same fault; see [`culprit`](Self::culprit) for
+    /// which one caused it.
     pub fn fault_cause(&self) -> Option<&NodeFault> {
         self.fault.as_ref()
     }
 
-    /// The member of the node's island that caused its fault, when that is
-    /// known: the node that called `fatal`, the one that failed to
-    /// instantiate on a rebuild, the island's only member, or a member the
-    /// executor pins the fault on. The wasmtime runtime pins a fault in a
-    /// Store of one member (with `split_islands`) on that member, except a
-    /// memory-limit fault, since the island's Stores share the limit. A
-    /// fault in a Store several members share has no culprit: a member that
-    /// returned may still be running a task it spawned.
+    /// The node that caused the fault, when that is known: the one that called
+    /// `fatal`, or the only one with a `run` in flight, with no stream group at
+    /// work. Otherwise none: a node that returned may still be running a task it
+    /// spawned.
     pub fn culprit(&self) -> Option<&NodeId> {
         self.culprit.as_ref()
     }

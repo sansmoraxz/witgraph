@@ -5,7 +5,7 @@ use witgraph_ir::{ComponentRef, NodeId, PortName};
 use witgraph_sched::RuntimeError;
 
 /// Why a graph could not be loaded: its components, their links and
-/// capabilities, or instantiating its islands; or a [`RuntimeError`] (an
+/// capabilities, or instantiating it; or a [`RuntimeError`] (an
 /// invalid config, say).
 #[derive(Debug, Clone, thiserror::Error, miette::Diagnostic)]
 pub enum LoadError {
@@ -68,16 +68,30 @@ pub enum LoadError {
         /// What went wrong.
         message: String,
     },
-    /// A node failed to link or instantiate (a missing capability import,
-    /// a trapping start function, an island over its memory limit), or
-    /// the host failed to make the data of its
-    /// island.
-    #[error("failed to instantiate node `{node}`: {message}")]
+    /// The graph could not be instantiated (a missing import the host did not
+    /// link, a trapping start function, a Store over its memory limit), or the
+    /// host failed to make the data of its Store.
+    #[error("failed to instantiate the graph: {message}")]
     #[diagnostic(code(witgraph::load::instantiation))]
     Instantiation {
-        /// The node whose component could not be instantiated.
-        node: NodeId,
+        /// The node that failed, when it is known: one that called `fatal` from a
+        /// start function. A composed graph instantiates as one.
+        node: Option<NodeId>,
         /// The underlying error message.
+        message: String,
+    },
+    /// The graph could not be composed with its generated hub.
+    #[error("failed to compose the graph: {message}")]
+    #[diagnostic(code(witgraph::load::composition))]
+    Composition {
+        /// What went wrong.
+        message: String,
+    },
+    /// A prepared graph was given for another graph.
+    #[error("the prepared graph does not fit: {message}")]
+    #[diagnostic(code(witgraph::load::graph_mismatch))]
+    GraphMismatch {
+        /// What differs.
         message: String,
     },
     /// A node imports a capability the host does not provide

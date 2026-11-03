@@ -1,8 +1,8 @@
 //! Error types for the witgraph runtime.
 //!
 //! Two tiers: [`RuntimeError`] for failures the host sees when loading or
-//! driving the graph, and [`NodeFault`] for a failure inside an island,
-//! which faults every node of that island.
+//! driving the graph, and [`NodeFault`] for a failure inside the graph,
+//! which faults every node of it.
 
 use witgraph_ir::{ConnectionId, NodeId, PortDirection, PortName};
 
@@ -11,9 +11,17 @@ use witgraph_ir::{ConnectionId, NodeId, PortDirection, PortName};
 /// is the executor's (the wasmtime runtime's `LoadError`).
 #[derive(Debug, Clone, thiserror::Error, miette::Diagnostic)]
 pub enum RuntimeError {
-    /// A restore was attempted while a generation is in flight. Restore
+    /// A read or write was given up on ([`until`](crate::until)).
+    #[error("given up on: a guest may be spinning")]
+    #[diagnostic(code(witgraph::runtime::pull_stopped))]
+    PullStopped,
+    /// The instance stopped before a read or write was served.
+    #[error("the graph stopped before it was served")]
+    #[diagnostic(code(witgraph::runtime::instance_stopped))]
+    InstanceStopped,
+    /// A restore was attempted while a `run` is in flight. Restore
     /// onto a freshly loaded graph, or after `shutdown`/`cancel`.
-    #[error("a generation is in flight; restore needs a graph with nothing in flight")]
+    #[error("a `run` is in flight; restore needs a graph with nothing in flight")]
     #[diagnostic(code(witgraph::runtime::not_quiescent))]
     NotQuiescent,
     /// A snapshot was taken from a different graph.
@@ -93,25 +101,25 @@ pub enum RuntimeError {
     },
 }
 
-/// Why an island faulted. Every node of the island carries the same fault;
-/// a trap poisons the island's whole Store.
+/// Why a graph faulted. Every node of the graph carries the same fault;
+/// a trap poisons the whole Store.
 #[derive(Debug, Clone, thiserror::Error, miette::Diagnostic)]
 pub enum NodeFault {
-    /// A component in the island trapped (spawned tasks included).
+    /// A component in the graph trapped (spawned tasks included).
     #[error("WASM trap: {message}")]
     #[diagnostic(code(witgraph::runtime::wasm_trap))]
     WasmTrap {
         /// The trap message.
         message: String,
     },
-    /// Growing a linear memory or table would have taken the island past
-    /// `RuntimeConfig::max_island_memory`.
-    #[error("the island needs {requested} bytes of memory, over its limit of {limit}")]
+    /// Growing a linear memory or table would have taken the graph past
+    /// `RuntimeConfig::max_memory`.
+    #[error("the graph needs {requested} bytes of memory, over its limit of {limit}")]
     #[diagnostic(code(witgraph::runtime::memory_limit))]
     MemoryLimit {
-        /// The bytes the island would have held after the growth.
+        /// The bytes the graph would have held after the growth.
         requested: usize,
-        /// The island's limit.
+        /// The graph's limit.
         limit: usize,
     },
     /// One call copied more out of a guest than
@@ -120,7 +128,7 @@ pub enum NodeFault {
     #[error("a call copied more data out of the guest than `hostcall_fuel` allows")]
     #[diagnostic(code(witgraph::runtime::hostcall_fuel))]
     HostcallFuelExhausted,
-    /// The island burned its whole fuel budget
+    /// The graph burned its whole fuel budget
     /// (`RuntimeConfig::fuel_per_run`)
     /// before its next `run` started.
     #[error("fuel exhausted")]
@@ -134,13 +142,12 @@ pub enum NodeFault {
         /// The message passed to `fatal`.
         message: String,
     },
-    /// Rebuilding the stopped island, at the start of its next generation,
-    /// failed: a member failed to instantiate, or
-    /// making the island's data failed.
+    /// Rebuilding the stopped graph, before its next run, failed: it failed to
+    /// instantiate, or making its Store's data failed.
     #[error("restart failed: {message}")]
     #[diagnostic(code(witgraph::runtime::restart))]
     Restart {
-        /// Why the island could not be rebuilt.
+        /// Why the graph could not be rebuilt.
         message: String,
     },
 }

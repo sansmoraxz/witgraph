@@ -21,8 +21,8 @@ use witgraph_ir::{
 };
 use witgraph_runtime::shared::link_resource;
 use witgraph_runtime::{
-    CapabilityPlugin, IslandData, LoadError, NodeFault, Perf, PluginData, Plugins, RuntimeConfig,
-    RuntimeGraph, TickResult, Val,
+    CapabilityPlugin, LoadError, NodeFault, Perf, PluginData, Plugins, RuntimeConfig, RuntimeGraph,
+    StoreData, TickResult, Val,
 };
 
 const TENSOR: &str = "test:data/tensor@0.1.0";
@@ -125,7 +125,6 @@ impl CapabilityPlugin for Tensors {
 
     fn link(
         &self,
-        _: &NodeId,
         capability: &Capability,
         linker: &mut Linker<PluginData>,
     ) -> wasmtime::Result<()> {
@@ -348,7 +347,7 @@ fn fan_out(kit: &Kit) -> Graph {
 }
 
 #[tokio::test]
-async fn tensors_pass_between_islands_as_handles() {
+async fn tensors_pass_between_groups_as_handles() {
     let kit = Kit::new();
     let mut rt = kit
         .load(fan_out(&kit), RuntimeConfig::default(), true)
@@ -480,7 +479,7 @@ async fn making_tensors_past_the_limit_faults_the_maker() {
         )
         .build();
     let config = RuntimeConfig {
-        max_shared_memory: Some(SOURCE_BYTES - 1),
+        max_shared_memory: Some(witgraph_runtime::ByteCount(SOURCE_BYTES as u64 - 1)),
         ..RuntimeConfig::default()
     };
     let mut rt = kit.load(graph, config, true).await.unwrap();
@@ -712,7 +711,7 @@ async fn backpressure_keeps_an_endless_stream_within_a_small_budget() {
     let config = RuntimeConfig {
         // In flight: one made and one being written per writer, plus the
         // one being inverted.
-        max_shared_memory: Some(6 * FRAME),
+        max_shared_memory: Some(witgraph_runtime::ByteCount((6 * FRAME) as u64)),
         ..RuntimeConfig::default()
     };
     let mut rt = kit.load(stream_chain(&kit), config, true).await.unwrap();
@@ -831,7 +830,7 @@ async fn a_host_that_does_not_share_the_resource_refuses_the_stream() {
 async fn a_fault_mid_stream_frees_every_tensor() {
     let kit = Kit::new();
     let config = RuntimeConfig {
-        max_shared_memory: Some(FRAME),
+        max_shared_memory: Some(witgraph_runtime::ByteCount((FRAME) as u64)),
         ..RuntimeConfig::default()
     };
     let mut rt = kit.load(stream_chain(&kit), config, true).await.unwrap();
@@ -841,7 +840,7 @@ async fn a_fault_mid_stream_frees_every_tensor() {
     let _ = tokio::time::timeout(Duration::from_secs(10), rt.tick()).await;
     let faults = rt.take_faults();
     assert!(!faults.is_empty(), "the second tensor is past the budget");
-    assert_eq!(rt.shared_memory(), 0, "the island's Store went with them");
+    assert_eq!(rt.shared_memory(), 0, "the group's Store went with them");
 }
 
 #[tokio::test]

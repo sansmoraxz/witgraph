@@ -353,9 +353,9 @@ struct Edge {
 
 #[derive(Clone, Copy)]
 enum Target {
-    /// Inside the producer's own generation: recorded, owing nothing.
+    /// Inside the producer's stream group: recorded, owing nothing.
     Internal(InputIdx),
-    /// To another island.
+    /// Anywhere else, owing a run if it changes.
     External(InputIdx),
     /// Buffered until the end of the iteration.
     Feedback(FeedbackIdx),
@@ -575,7 +575,7 @@ impl<'a> Core<'a> {
             });
         }
 
-        let island_of: Vec<usize> = compiled.nodes().map(|n| n.island).collect();
+        let group_of: Vec<Option<usize>> = compiled.nodes().map(|n| n.group).collect();
         let mut edges: HashMap<OutputIdx, Vec<Edge>> = HashMap::new();
         let mut feedback_ty = BTreeMap::new();
         for resolved in compiled.connections() {
@@ -601,7 +601,9 @@ impl<'a> Core<'a> {
                     }
                     Target::Feedback(feedback)
                 }
-                None if island_of[resolved.from_node] == island_of[resolved.to_node] => {
+                None if group_of[resolved.from_node].is_some()
+                    && group_of[resolved.from_node] == group_of[resolved.to_node] =>
+                {
                     Target::Internal(input)
                 }
                 None => Target::External(input),

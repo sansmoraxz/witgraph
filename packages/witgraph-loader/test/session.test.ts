@@ -335,7 +335,7 @@ test('values flow between nodes and equal inputs do not rerun', async () => {
   );
 });
 
-test('a stream passes between two nodes of an island, and a tap sees its items', async () => {
+test('a stream passes between two nodes of a group, and a tap sees its items', async () => {
   const seen: StreamItem[] = [];
   const session = await load(
     [
@@ -345,7 +345,7 @@ test('a stream passes between two nodes of an island, and a tap sees its items',
     [['s', 'prod.items', 'cons.items']],
     { onStreamItem: (item) => seen.push(item) },
   );
-  assert.deepEqual(session.graph.islands(), [['prod', 'cons']]);
+  assert.deepEqual(session.graph.streamGroups(), [['prod', 'cons']]);
   await session.graph.inject('prod', 'burst-size', 5);
   await session.settle();
   assert.equal(await session.graph.readOutput('cons', 'count'), 5);
@@ -358,6 +358,8 @@ test('a stream passes between two nodes of an island, and a tap sees its items',
     return Array.from(items);
   });
   assert.deepEqual(items, [0, 1, 2, 3, 4]);
+  const drained = session.graph.takeTrace().find((e: any) => e.event === 'group-drained');
+  assert.deepEqual(drained.nodes, ['prod', 'cons'], 'a drained group names its nodes');
 });
 
 /** `wasi:clocks/monotonic-clock`, as the WASI shim provides it. */
@@ -566,7 +568,7 @@ test('a trap names its frames only in a scheduler built with `addr2line`', async
   }
 });
 
-test('a trap faults its island, and fatal aborts the tick', async () => {
+test('a trap stops the whole graph, and fatal aborts the tick', async () => {
   const session = await load([
     ['busy', 'busy-loop'],
     ['e', 'echo'],
@@ -575,10 +577,11 @@ test('a trap faults its island, and fatal aborts the tick', async () => {
   await session.graph.inject('busy', 'action', 'trap');
   assert.deepEqual(await session.tick(), { result: 'progress' });
   const [fault] = session.graph.takeFaults();
-  assert.deepEqual(fault.members, ['busy']);
+  assert.equal(fault.culprit, 'busy');
   assert.equal(fault.fault.kind, 'trap');
   assert.equal(session.graph.nodeState('busy').phase, 'faulted');
-  assert.equal(await session.graph.readOutput('e', 'out'), 1, 'the other island ran');
+  assert.equal(session.graph.nodeState('e').phase, 'faulted', 'one fault domain');
+  assert.equal(await session.graph.readOutput('e', 'out'), undefined, 'gone with it');
 
   await session.graph.inject('busy', 'action', 'fatal');
   const tick = await session.tick();
@@ -586,10 +589,11 @@ test('a trap faults its island, and fatal aborts the tick', async () => {
   assert.equal((tick as any).node, 'busy');
   assert.equal(session.graph.nodeState('busy').fault.kind, 'fatal');
 
-  // A new input rebuilds the island.
+  // A new input rebuilds the graph, and what the host wrote survives.
   await session.graph.inject('busy', 'action', 'finish');
   await session.settle();
   assert.equal(session.graph.nodeState('busy').phase, 'idle');
+  assert.equal(await session.graph.readOutput('e', 'out'), 1);
   assert.ok(session.graph.takeTrace().some((e: any) => e.event === 'restarted'));
 });
 
@@ -750,7 +754,7 @@ test('names are camel-cased as jco does, acronyms included', async () => {
   assert.throws(() => session.graph.islands());
 });
 
-test('a run whose generation is abandoned stops', async () => {
+test('a run whose instance is abandoned stops', async () => {
   let resume!: () => void;
   let paused!: () => void;
   const pause = new Promise<void>((resolve) => (paused = resolve));
@@ -764,14 +768,14 @@ test('a run whose generation is abandoned stops', async () => {
     afterRun: (node) => void after.push(node),
   });
   await session.graph.inject('a', 'in', 1);
-  // Interrupt the tick while `a` is held, then cancel `a`: its generation
-  // is dropped.
+  // Interrupt the tick while `a` is held, then shut down: its instance is
+  // dropped.
   let stop!: () => void;
   const tick = session.tick(new Promise<void>((resolve) => (stop = resolve)));
   await pause;
   stop();
   assert.equal((await tick).result, 'interrupted');
-  session.graph.cancel('a');
+  session.graph.shutdown();
   resume();
   await new Promise((resolve) => setTimeout(resolve, 10));
   assert.deepEqual(after, [], 'the abandoned run did not go on');
@@ -916,9 +920,9 @@ test('a value JavaScript fails to convert is an error, not a wedged graph', asyn
   await session.graph.inject('m', 'xs', [1]);
   assert.deepEqual(await within(session.tick()), { result: 'progress' });
   const [fault] = session.graph.takeFaults();
-  assert.deepEqual(fault.members, ['m']);
+  assert.equal(fault.culprit, 'm');
   assert.match(fault.fault.message, /returned a bad `xs`/);
-  assert.equal(await session.graph.readOutputWave('n', 'xs'), 'some([1])');
+  assert.equal(session.graph.nodeState('n').phase, 'faulted');
 });
 
 test('a tick started while one runs rejects at once', async () => {
@@ -949,7 +953,8 @@ test('a stop that is not a promise is refused, and the graph ticks on', async ()
 });
 
 test('a failed run abandons its siblings still in flight', async () => {
-  // Two producers whose consumers read each other's: one island, two roots.
+  // Two producers whose consumers read each other's: two groups, each waiting
+  // on the other.
   const held = gate();
   const paused = gate();
   const after: string[] = [];
@@ -983,7 +988,10 @@ test('a failed run abandons its siblings still in flight', async () => {
       afterRun: (node) => void after.push(node),
     },
   );
-  assert.deepEqual(session.graph.islands(), [['p1', 'm', 'c1', 'c2']]);
+  assert.deepEqual(session.graph.streamGroups(), [
+    ['p1', 'c1'],
+    ['m', 'c2'],
+  ]);
   await session.graph.inject('m', 'burst-size', 2);
   const ticked = session.tick();
   await paused.promise;
@@ -1028,7 +1036,7 @@ test('a fatal start function during a rebuild aborts the tick, naming its node',
   assert.deepEqual(await session.tick(), { result: 'progress' });
   assert.equal(await session.graph.readOutput('n', 'out'), 7);
   fail = true;
-  session.graph.cancel('n');
+  session.graph.shutdown();
   session.graph.rerun('n');
   const tick = await session.tick();
   assert.deepEqual(tick, { result: 'aborted', node: 'n', message: 'fatal: boom' });
@@ -1036,7 +1044,7 @@ test('a fatal start function during a rebuild aborts the tick, naming its node',
   assert.equal(session.graph.nodeState('n').culprit, 'n');
 });
 
-test('a failed rebuild names the member whose rebuild failed', async () => {
+test('a failed rebuild names the node whose rebuild failed', async () => {
   let provide = true;
   const session = await load(
     [
@@ -1053,11 +1061,10 @@ test('a failed rebuild names the member whose rebuild failed', async () => {
   );
   await session.settle();
   provide = false;
-  session.graph.cancel('cons');
+  session.graph.shutdown();
   session.graph.rerun('cons');
   assert.deepEqual(await session.tick(), { result: 'progress' });
   const [fault] = session.graph.takeFaults();
-  assert.deepEqual(fault.members, ['mqtt', 'cons']);
   assert.equal(fault.culprit, 'mqtt');
   assert.equal(fault.fault.kind, 'restart');
   assert.match(
@@ -1066,7 +1073,7 @@ test('a failed rebuild names the member whose rebuild failed', async () => {
   );
 });
 
-test('a generation dropped while it rebuilds is abandoned', async () => {
+test('an instance dropped while it rebuilds is abandoned', async () => {
   const { bytes } = await guestSource('echo');
   const graph = {
     metadata: { name: 'rebuild' },
@@ -1087,7 +1094,7 @@ test('a generation dropped while it rebuilds is abandoned', async () => {
   try {
     web.inject('a', 'in', 1);
     await web.tick();
-    web.cancel('a');
+    web.shutdown();
     web.rerun('a');
     let stop!: () => void;
     const ticked = web.tick(new Promise<void>((resolve) => (stop = resolve)));
@@ -1095,7 +1102,7 @@ test('a generation dropped while it rebuilds is abandoned', async () => {
     stop();
     assert.equal((await ticked).result, 'interrupted');
     assert.deepEqual(abandoned, []);
-    web.cancel('a');
+    web.shutdown();
     assert.deepEqual(abandoned, [['a']]);
   } finally {
     web.free();
@@ -1117,35 +1124,36 @@ test('mocks are own properties, called as methods, with an empty result as no ou
       });
     }
   }
-  const after: [string, string[]][] = [];
   const session = await load(
     [
       ['constructor', 'echo'],
       ['toString', 'echo'],
       ['scaled', 'echo'],
-      ['none', 'echo'],
     ],
     [],
-    {
-      mocks: Object.assign(new Mocks() as any, { none: () => undefined }),
-      afterRun: (node, outputs) => void after.push([node, Object.keys(outputs)]),
-    },
+    { mocks: new Mocks() as any },
   );
-  for (const node of ['constructor', 'toString', 'scaled', 'none'])
+  for (const node of ['constructor', 'toString', 'scaled'])
     await session.graph.inject(node, 'in', 2);
   await session.settle();
-  assert.deepEqual(
-    session.graph.takeFaults().map((f: any) => f.members),
-    [['none']],
-    'only the empty mock is short of `out`',
-  );
+  assert.deepEqual(session.graph.takeFaults(), []);
   assert.equal(await session.graph.readOutput('constructor', 'out'), 2, 'not mocked: it ran');
   assert.equal(await session.graph.readOutput('toString', 'out'), 2, 'not mocked: it ran');
   assert.equal(await session.graph.readOutput('scaled', 'out'), 20);
+
+  const after: [string, string[]][] = [];
+  const empty = await load([['none', 'echo']], [], {
+    mocks: { none: () => undefined },
+    afterRun: (node, outputs) => void after.push([node, Object.keys(outputs)]),
+  });
+  await empty.graph.inject('none', 'in', 2);
+  await empty.settle();
   assert.deepEqual(
-    after.find(([node]) => node === 'none'),
-    ['none', []],
+    empty.graph.takeFaults().map((f: any) => f.culprit),
+    ['none'],
+    'the empty mock is short of `out`',
   );
+  assert.deepEqual(after, [['none', []]]);
 });
 
 test('hooks are called as methods, and a throwing stream observer does not reach the reader', async () => {
@@ -1196,7 +1204,7 @@ test('hooks are called as methods, and a throwing stream observer does not reach
 test('a future output nothing reads is consumed, so its writer finishes', async () => {
   const session = await load([['w', 'future-writer']]);
   await session.settle();
-  // A generation here ends when `run` returns, before the writer's task
+  // A run here ends when `run` returns, before the writer's task
   // does: run again until a run reports an ended write.
   for (let again = 1; again <= 50 && (await session.graph.readOutput('w', 'last')) === 0; again++) {
     await new Promise((resolve) => setTimeout(resolve, 10));

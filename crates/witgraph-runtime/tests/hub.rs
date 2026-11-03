@@ -331,7 +331,7 @@ async fn a_value_flows_and_an_equal_one_stops_there() {
     assert_eq!(
         returned.inputs_changed,
         [d.idx_in("b", "in")],
-        "b is in another island"
+        "b is in another group"
     );
     let returned = d.run("b").await;
     assert_eq!(returned.outputs_changed, [d.idx_out("b", "out")]);

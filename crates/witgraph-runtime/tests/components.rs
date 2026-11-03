@@ -14,7 +14,7 @@ use wasmtime::component::{Linker, ResourceType, Val};
 use wit_component::{ComponentEncoder, StringEncoding};
 use wit_parser::{LiftLowerAbi, ManglingAndAbi, Resolve};
 use witgraph_ir::NodeId;
-use witgraph_ir::{ComponentContract, ComponentRef, Graph};
+use witgraph_ir::{Capability, ComponentContract, ComponentRef, Graph};
 use witgraph_runtime::{
     Host, HostState, LoadError, NodeFault, NodePhase, RuntimeConfig, RuntimeError, RuntimeGraph,
     TickResult,
@@ -74,14 +74,13 @@ where
 
     fn link(
         &self,
-        _node: &NodeId,
-        _contract: &ComponentContract,
+        _contract: &[Capability],
         linker: &mut Linker<HostState>,
     ) -> wasmtime::Result<()> {
         (self.0)(linker)
     }
 
-    fn island_data(&self, _members: &[NodeId], state: HostState) -> wasmtime::Result<HostState> {
+    fn store_data(&self, state: HostState) -> wasmtime::Result<HostState> {
         Ok(state)
     }
 }
@@ -261,11 +260,10 @@ async fn a_providers_own_imports_become_the_nodes_capabilities() {
 
         fn link(
             &self,
-            _: &NodeId,
-            contract: &ComponentContract,
+            capabilities: &[Capability],
             linker: &mut Linker<HostState>,
         ) -> wasmtime::Result<()> {
-            for capability in &contract.capabilities {
+            for capability in capabilities {
                 linker
                     .instance(&capability.interface)?
                     .func_wrap("now", |_, (): ()| Ok((1u64,)))?;
@@ -273,7 +271,7 @@ async fn a_providers_own_imports_become_the_nodes_capabilities() {
             Ok(())
         }
 
-        fn island_data(&self, _: &[NodeId], state: HostState) -> wasmtime::Result<HostState> {
+        fn store_data(&self, state: HostState) -> wasmtime::Result<HostState> {
             Ok(state)
         }
 
@@ -545,17 +543,17 @@ async fn flags_are_kept_in_declaration_order() {
     rt.inject(&"n".into(), &"p".into(), flags(&["read", "write"]))
         .await
         .unwrap();
-    // The stub traps, which settles the island with nothing owed.
+    // The stub traps, which settles the group with nothing owed.
     let _ = tokio::time::timeout(Duration::from_secs(30), rt.tick()).await;
     let snapshot = rt.snapshot().await.unwrap();
     assert_eq!(snapshot.inputs[&"n".into()][&"p".into()], "{write, read}");
-    assert!(snapshot.islands.is_empty());
+    assert!(snapshot.owed.is_empty());
 
     rt.inject(&"n".into(), &"p".into(), flags(&["write", "read"]))
         .await
         .unwrap();
     assert!(
-        rt.snapshot().await.unwrap().islands.is_empty(),
+        rt.snapshot().await.unwrap().owed.is_empty(),
         "the same set in another order is not a change"
     );
     rt.restore(&snapshot)
@@ -620,7 +618,6 @@ async fn a_plugin_serving_the_declared_version_serves_a_merged_import() {
 
         fn link(
             &self,
-            _: &NodeId,
             capability: &Capability,
             linker: &mut Linker<PluginData>,
         ) -> wasmtime::Result<()> {
@@ -794,7 +791,7 @@ async fn a_merged_import_is_checked_against_the_newest_compatible_declaration() 
 
 #[tokio::test]
 async fn two_links_on_imports_the_bytes_merged_are_refused() {
-    use witgraph_runtime::graph::{LinkedProvider, PreparedComponent};
+    use witgraph_runtime::graph::LinkedProvider;
     let wit = format!(
         "package demo:app@0.1.0;
         package demo:caps@0.1.0 {{
@@ -826,15 +823,19 @@ async fn two_links_on_imports_the_bytes_merged_are_refused() {
         bytes: &provider_bytes,
         export: "demo:caps/clock@0.1.3",
     });
-    let engine = RuntimeConfig::default().new_engine().unwrap();
     // Even links that agree: a graph never has them (`ImportLinkedTwice`).
-    let err = PreparedComponent::linked(&engine, &contract, &bytes, &links)
-        .err()
-        .expect("one import, two links");
-    assert!(
-        matches!(&err, LoadError::BadLink { message, .. } if message.contains("as one")),
-        "{err}"
+    let lowered = witgraph_wit::verify::verify_component(&contract, &bytes).unwrap();
+    let linked = witgraph_wit::compose::link_node(
+        &contract,
+        &bytes,
+        &lowered,
+        &links,
+        &mut std::collections::HashSet::new(),
     );
+    match linked {
+        Ok(_) => panic!("one import, two links"),
+        Err(err) => assert!(err.message.contains("as one"), "{}", err.message),
+    }
 }
 
 #[tokio::test]
@@ -867,7 +868,7 @@ async fn resource_methods_and_async_functions_match_their_source() {
 }
 
 #[tokio::test]
-async fn growing_memory_past_the_island_limit_faults() {
+async fn growing_memory_past_the_group_limit_faults() {
     let wit = format!("package demo:grow@0.1.0; world w {{ {NODE} }}");
     let mut resolve = Resolve::default();
     let package = resolve.push_str("test.wit", &wit).unwrap();
@@ -904,7 +905,7 @@ async fn growing_memory_past_the_island_limit_faults() {
         .expect("compiles");
     let wasm: HashMap<ComponentRef, &[u8]> = HashMap::from([(contract.id.clone(), &bytes[..])]);
     let config = RuntimeConfig {
-        max_island_memory: Some(4 << 20),
+        max_memory: Some(witgraph_runtime::ByteCount(4 << 20)),
         ..RuntimeConfig::default()
     };
     let mut rt = RuntimeGraph::load(compiled, &wasm, config, witgraph_runtime::Perf)
@@ -1114,7 +1115,7 @@ async fn fatal_from_a_start_function_during_a_rebuild_aborts_the_tick() {
     );
 
     fail.store(true, Ordering::SeqCst);
-    rt.cancel(&"n".into()).unwrap();
+    rt.shutdown();
     rt.rerun(&"n".into()).unwrap();
     let tick = tokio::time::timeout(Duration::from_secs(20), rt.tick())
         .await

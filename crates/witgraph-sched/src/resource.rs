@@ -1,9 +1,9 @@
-//! Per-resource weighted semaphore, at island granularity.
+//! Per-resource weighted semaphore, by the unit that holds claims: a node, or
+//! a stream group.
 //!
-//! Each named resource has an implicit capacity of 1.0. An island's claim
-//! on a resource is the sum of its nodes' claims; it is acquired when the
-//! island starts a generation and released when the generation finishes,
-//! faults or is cancelled.
+//! Each named resource has an implicit capacity of 1.0. A node's claim is held
+//! while it runs. A group's is the sum of its members' claims, held from when it
+//! starts until it has drained. Everything is released when the graph stops.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -21,28 +21,28 @@ pub(crate) struct ResourcePool {
 }
 
 impl ResourcePool {
-    /// Registers an island's summed claims. Returns the first resource the
-    /// island over-commits on its own (more than 1.0), which it could
+    /// Registers an unit's summed claims. Returns the first resource the
+    /// unit over-commits on its own (more than 1.0), which it could
     /// never acquire.
     pub(crate) fn register(
         &mut self,
-        island: usize,
+        unit: usize,
         claims: BTreeMap<ResourceId, f64>,
     ) -> Result<(), ResourceId> {
         if let Some((resource, _)) = claims.iter().find(|(_, f)| **f > 1.0 + EPSILON) {
             return Err(resource.clone());
         }
         if !claims.is_empty() {
-            self.claims.insert(island, claims);
+            self.claims.insert(unit, claims);
         }
         Ok(())
     }
 
-    pub(crate) fn can_acquire(&self, island: usize) -> bool {
-        if self.held_by.contains(&island) {
+    pub(crate) fn can_acquire(&self, unit: usize) -> bool {
+        if self.held_by.contains(&unit) {
             return true;
         }
-        let Some(claims) = self.claims.get(&island) else {
+        let Some(claims) = self.claims.get(&unit) else {
             return true;
         };
         claims.iter().all(|(resource, fraction)| {
@@ -50,23 +50,23 @@ impl ResourcePool {
         })
     }
 
-    pub(crate) fn acquire(&mut self, island: usize) {
-        if !self.held_by.insert(island) {
+    pub(crate) fn acquire(&mut self, unit: usize) {
+        if !self.held_by.insert(unit) {
             return;
         }
-        if let Some(claims) = self.claims.get(&island) {
+        if let Some(claims) = self.claims.get(&unit) {
             for (resource, fraction) in claims {
                 *self.allocated.entry(resource.clone()).or_insert(0.0) += fraction;
             }
         }
     }
 
-    /// Releases everything the island holds. Idempotent.
-    pub(crate) fn release(&mut self, island: usize) {
-        if !self.held_by.remove(&island) {
+    /// Releases everything the unit holds. Idempotent.
+    pub(crate) fn release(&mut self, unit: usize) {
+        if !self.held_by.remove(&unit) {
             return;
         }
-        let Some(claims) = self.claims.get(&island) else {
+        let Some(claims) = self.claims.get(&unit) else {
             return;
         };
         for (resource, fraction) in claims {
@@ -80,8 +80,8 @@ impl ResourcePool {
     }
 
     #[cfg(test)]
-    fn is_held(&self, island: usize) -> bool {
-        self.held_by.contains(&island)
+    fn is_held(&self, unit: usize) -> bool {
+        self.held_by.contains(&unit)
     }
 }
 
@@ -91,12 +91,12 @@ mod tests {
 
     fn pool_with(entries: &[(usize, &[(&str, f64)])]) -> ResourcePool {
         let mut pool = ResourcePool::default();
-        for (island, claims) in entries {
+        for (unit, claims) in entries {
             let claims = claims
                 .iter()
                 .map(|(r, f)| (ResourceId::from((*r).to_string()), *f))
                 .collect();
-            pool.register(*island, claims).unwrap();
+            pool.register(*unit, claims).unwrap();
         }
         pool
     }
@@ -160,7 +160,7 @@ mod tests {
     }
 
     #[test]
-    fn over_committed_island_is_rejected() {
+    fn over_committed_unit_is_rejected() {
         let mut pool = ResourcePool::default();
         let claims = [(ResourceId::from("disk".to_string()), 1.2)]
             .into_iter()

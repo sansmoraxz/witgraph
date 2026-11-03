@@ -11,16 +11,26 @@ use std::time::Instant;
 use witgraph_runtime::RunningGraph;
 
 use test_components::ECHO;
-use witgraph_runtime::witgraph_ir::{ComponentContract, Graph};
+use witgraph_runtime::witgraph_ir::{CompiledGraph, ComponentContract, Graph};
 use witgraph_runtime::{
-    NoCapabilities, Perf, PreparedComponent, RuntimeConfig, RuntimeGraph, TickResult, Val,
+    NoCapabilities, Perf, PreparedGraph, RuntimeConfig, RuntimeGraph, TickResult, Val,
 };
+
+fn graph(contract: &ComponentContract) -> Result<CompiledGraph, Box<dyn Error>> {
+    Graph::builder("precompiled")
+        .add_component(contract)
+        .add_node("echo", contract.id.clone())
+        .build()
+        .compile(std::slice::from_ref(contract))
+        .map_err(|e| format!("{e:?}").into())
+}
 
 #[cfg(feature = "compile")]
 fn save(contract: &ComponentContract, path: &str) -> Result<(), Box<dyn Error>> {
     let engine = RuntimeConfig::default().new_engine()?;
     let start = Instant::now();
-    let prepared = PreparedComponent::new(&engine, contract, ECHO.wasm)?;
+    let wasm = [(contract.id.clone(), ECHO.wasm)].into_iter().collect();
+    let prepared = PreparedGraph::new(&engine, &graph(contract)?, &wasm)?;
     println!("compiled in {:?}", start.elapsed());
     std::fs::write(path, prepared.serialize()?)?;
     Ok(())
@@ -36,18 +46,13 @@ async fn run(contract: &ComponentContract, path: &str) -> Result<(), Box<dyn Err
     let bytes = std::fs::read(path)?;
     let start = Instant::now();
     // SAFETY: this example wrote the file itself, with `save`.
-    let prepared = unsafe { PreparedComponent::deserialize(&engine, contract, &bytes) }?;
+    let compiled = graph(contract)?;
+    let prepared = unsafe { PreparedGraph::deserialize(&engine, &compiled, &bytes) }?;
     println!("loaded in {:?}", start.elapsed());
 
-    let compiled = Graph::builder("precompiled")
-        .add_component(contract)
-        .add_node("echo", contract.id.clone())
-        .build()
-        .compile(std::slice::from_ref(contract))
-        .map_err(|e| format!("{e:?}"))?;
     let mut rt = RuntimeGraph::load_prepared(
         compiled,
-        &[prepared],
+        &prepared,
         RuntimeConfig::default(),
         Perf,
         NoCapabilities,

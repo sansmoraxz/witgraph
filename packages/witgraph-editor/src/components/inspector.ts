@@ -259,29 +259,23 @@ export class WitgraphInspector extends HTMLElement {
     stats.appendChild(this.#el('div', 'text-xs text-wg-text-dim mb-1', 'Statistics'));
     stats.appendChild(this.#el('div', 'text-sm', `${this.#controller?.nodes.size ?? 0} nodes`));
     stats.appendChild(this.#el('div', 'text-sm', `${this.#controller?.edges.length ?? 0} edges`));
-    const islands = this.#controller?.islands ?? [];
+    const groups = this.#controller?.streamGroups ?? [];
     stats.appendChild(
-      this.#el(
-        'div',
-        'text-sm',
-        `${islands.length} execution island${islands.length !== 1 ? 's' : ''}`,
-      ),
+      this.#el('div', 'text-sm', `${groups.length} stream group${groups.length !== 1 ? 's' : ''}`),
     );
-    if (islands.length > 0) {
-      const islandList = this.#el('div', 'mt-1');
-      islands.forEach((members, i) => {
+    if (groups.length > 0) {
+      const groupList = this.#el('div', 'mt-1');
+      groups.forEach((members, i) => {
         const row = this.#el('div', 'font-mono text-xs text-wg-text-dim py-0.5');
-        const hasStream = members.length > 1;
-        const badge = hasStream ? '🔗' : '·';
-        row.textContent = `  ${badge} #${i}: ${members.join(', ')}`;
-        islandList.appendChild(row);
+        row.textContent = `  🔗 #${i}: ${members.join(', ')}`;
+        groupList.appendChild(row);
       });
-      stats.appendChild(islandList);
+      stats.appendChild(groupList);
       stats.appendChild(
         this.#el(
           'div',
           'text-xs text-wg-text-dim mt-1',
-          'Islands group nodes sharing stream/future edges. Value-only nodes run independently.',
+          'A stream can be read once, so nodes sharing one re-run together. Every other node runs on its own.',
         ),
       );
     }

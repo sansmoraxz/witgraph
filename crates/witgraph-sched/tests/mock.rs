@@ -8,93 +8,43 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use futures::FutureExt;
 use futures::executor::block_on;
 use witgraph_ir::{
-    ComponentContract, ComponentRef, Graph, NodeId, PortDef, PortDirection, PortKind, PortName,
-    PortRef, Type,
+    ComponentContract, ComponentRef, Graph, NodeId, PortDef, PortDirection, PortKind, PortRef, Type,
 };
 use witgraph_sched::{
-    Canonical, Executor, Generation, GenerationFuture, IslandEventKind, NodeCaller, NodeFault,
-    NodePhase, OptionPayload, Perf, RunShape, RuntimeError, RuntimeMode, Scheduler, TickResult,
-    Trace, TraceEvent, drive,
+    BoxFuture, CallFuture, Canonical, Executor, MemberPlan, NodeFault, NodePhase, OptionPayload,
+    Outcome, Perf, RunShape, RuntimeError, RuntimeMode, Scheduler, TickResult, Trace, TraceEvent,
+    boxed,
 };
 
 /// What a node computes: its inputs, by field, to its outputs, by name.
 type Behaviour = Arc<dyn Fn(&[Option<u32>]) -> Result<Vec<(String, u32)>, String> + Send + Sync>;
 
-/// Runs nodes as closures. An island has no state between generations, so
-/// its live island is `()`.
+/// Runs nodes as closures, which keep no state.
 struct Closures {
     behaviour: Arc<HashMap<NodeId, Behaviour>>,
     ports: HashSet<(PortRef, PortDirection)>,
     rebuilds: Arc<AtomicUsize>,
 }
 
-struct Members<'a> {
-    generation: &'a Generation<u32>,
-    behaviour: &'a HashMap<NodeId, Behaviour>,
-}
-
-impl NodeCaller<u32> for Members<'_> {
-    type Error = String;
-
-    async fn call(
-        &self,
-        member: usize,
-        args: Vec<Option<u32>>,
-    ) -> Result<Vec<(String, u32)>, String> {
-        let node = &self.generation.plan.members[member].node;
-        (self.behaviour[node])(&args)
-    }
-
-    fn close(&self, _: u32) -> Result<(), String> {
-        Ok(())
-    }
-
-    fn missing_input(&self, _: usize, field: &PortName) -> String {
-        format!("no value for `{field}`")
-    }
-}
-
-impl Closures {
-    fn generation(&self, mut generation: Generation<u32>) -> GenerationFuture<()> {
-        let behaviour = self.behaviour.clone();
-        async move {
-            let external = std::mem::take(&mut generation.external);
-            let members = Members {
-                generation: &generation,
-                behaviour: &behaviour,
-            };
-            let send = |kind| generation.send(kind);
-            drive(
-                &members,
-                &generation.plan,
-                external,
-                Closures::option_payload,
-                &send,
-            )
-            .await
-            .map_err(|message| (NodeFault::WasmTrap { message }, None))
-        }
-        .boxed()
-    }
-}
-
 impl Executor for Closures {
     type Value = u32;
     type Type = ();
-    type Island = ();
 
-    fn run(&self, (): (), generation: Generation<u32>) -> GenerationFuture<()> {
-        self.generation(generation)
+    fn call(&self, member: Arc<MemberPlan>, args: Vec<Option<u32>>) -> CallFuture<u32> {
+        let result = (self.behaviour[&member.node])(&args);
+        boxed(async move { result.map_err(|message| (NodeFault::WasmTrap { message }, None)) })
     }
 
-    fn rebuild_and_run(&self, generation: Generation<u32>) -> GenerationFuture<()> {
+    fn rebuild(&self) -> BoxFuture<Outcome> {
         self.rebuilds.fetch_add(1, Ordering::SeqCst);
-        generation.send(IslandEventKind::Rebuilt);
-        self.generation(generation)
+        boxed(async { Ok(()) })
     }
+
+    fn close(&self, _: u32) {}
+
+    fn abandon(&self, _: &[NodeId]) {}
 
     fn option_payload(_: &u32) -> OptionPayload<'_, u32> {
         OptionPayload::NotOption
@@ -171,11 +121,7 @@ fn load<M: RuntimeMode>(
         inputs: Some(vec!["in".into()]),
         has_result: true,
     };
-    let islands = compiled
-        .islands()
-        .iter()
-        .map(|members| ((), vec![shape.clone(); members.len()]))
-        .collect();
+    let shapes = shapes_of(&compiled, &shape);
     let rebuilds = Arc::new(AtomicUsize::new(0));
     let executor = Closures {
         behaviour: Arc::new(behaviour),
@@ -183,9 +129,18 @@ fn load<M: RuntimeMode>(
         rebuilds: rebuilds.clone(),
     };
     Loaded {
-        sched: Scheduler::new(compiled, mode, executor, islands, 100).expect("loads"),
+        sched: Scheduler::new(compiled, mode, executor, &shapes, 100).expect("loads"),
         rebuilds,
     }
+}
+
+fn shapes_of(compiled: &witgraph_ir::CompiledGraph, shape: &RunShape) -> HashMap<NodeId, RunShape> {
+    compiled
+        .graph()
+        .nodes
+        .iter()
+        .map(|node| (node.id.clone(), shape.clone()))
+        .collect()
 }
 
 fn builder() -> witgraph_ir::GraphBuilder {
@@ -284,7 +239,7 @@ fn a_snapshot_restores_onto_a_fresh_scheduler() {
     assert_eq!(
         rebuilds.load(Ordering::SeqCst),
         1,
-        "a restore drops every island"
+        "a restore builds a new instance"
     );
 
     let other = builder().add_node("m", inc()).build();
@@ -298,7 +253,7 @@ fn a_snapshot_restores_onto_a_fresh_scheduler() {
 }
 
 #[test]
-fn a_fault_stops_its_island_and_a_rerun_rebuilds_it() {
+fn a_fault_stops_the_graph_and_a_rerun_rebuilds_it() {
     let graph = builder()
         .add_node("a", inc())
         .add_node("b", inc())
@@ -321,7 +276,8 @@ fn a_fault_stops_its_island_and_a_rerun_rebuilds_it() {
         sched.node_state(&node.into()).unwrap().phase()
     };
     assert_eq!(phase(&sched, "a"), NodePhase::Faulted);
-    assert_eq!(out(&sched, "b"), Some(1), "`b` ran on no input");
+    assert_eq!(phase(&sched, "b"), NodePhase::Faulted, "one fault domain");
+    assert_eq!(out(&sched, "b"), None);
 
     fail.store(false, Ordering::SeqCst);
     sched.rerun(&"a".into()).unwrap();
@@ -329,6 +285,40 @@ fn a_fault_stops_its_island_and_a_rerun_rebuilds_it() {
     assert_eq!(rebuilds.load(Ordering::SeqCst), 1);
     assert_eq!(phase(&sched, "a"), NodePhase::Idle);
     assert_eq!(out(&sched, "b"), Some(2));
+}
+
+#[test]
+fn a_rebuild_runs_every_node_and_keeps_only_what_the_host_wrote() {
+    let graph = builder()
+        .add_node("a", inc())
+        .add_node("b", inc())
+        .add_node("c", inc())
+        .connect("ab", PortRef::new("a", "out"), PortRef::new("b", "in"))
+        .build();
+    let fail = Arc::new(AtomicBool::new(false));
+    let Loaded { mut sched, .. } = load(graph, Trace::new(), Some(("c", fail.clone())));
+    sched.inject(&"a".into(), &"in".into(), 5).unwrap();
+    settle(&mut sched);
+    assert_eq!(out(&sched, "b"), Some(7));
+
+    fail.store(true, Ordering::SeqCst);
+    sched.inject(&"c".into(), &"in".into(), 1).unwrap();
+    settle(&mut sched);
+    assert_eq!(out(&sched, "b"), None, "values are gone with the instance");
+
+    fail.store(false, Ordering::SeqCst);
+    sched.mode().take_trace();
+    sched.inject(&"c".into(), &"in".into(), 2).unwrap();
+    settle(&mut sched);
+    assert_eq!(out(&sched, "b"), Some(7), "`a`'s input was the host's");
+    assert_eq!(out(&sched, "c"), Some(3));
+    let runs = sched
+        .mode()
+        .take_trace()
+        .iter()
+        .filter(|e| matches!(e, TraceEvent::RunStarted { .. }))
+        .count();
+    assert_eq!(runs, 3, "every node runs again");
 }
 
 #[test]
@@ -365,18 +355,14 @@ fn a_run_shape_names_only_contract_inputs() {
         inputs: Some(vec!["extra".into(), "in".into()]),
         has_result: true,
     };
-    let islands = compiled
-        .islands()
-        .iter()
-        .map(|members| ((), vec![shape.clone(); members.len()]))
-        .collect();
+    let shapes = shapes_of(&compiled, &shape);
     let executor = Closures {
         behaviour: Arc::new(HashMap::new()),
         ports: HashSet::new(),
         rebuilds: Arc::new(AtomicUsize::new(0)),
     };
     assert!(matches!(
-        Scheduler::new(compiled, Perf, executor, islands, 100),
+        Scheduler::new(compiled, Perf, executor, &shapes, 100),
         Err(RuntimeError::InvalidConfig { .. })
     ));
 }

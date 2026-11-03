@@ -1,5 +1,5 @@
 //! A partition of `0..n` into disjoint sets (union-find), as compilation
-//! groups nodes into islands and loading groups island members into Stores.
+//! groups nodes joined by streams and futures.
 
 /// Disjoint sets over `0..n`, each named by its smallest member.
 #[derive(Debug, Clone)]

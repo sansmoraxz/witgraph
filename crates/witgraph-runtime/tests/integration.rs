@@ -19,9 +19,9 @@ use witgraph_ir::{
     PortRef, ResourceClaim,
 };
 use witgraph_runtime::{
-    CapabilityPlugin, Host, HostState, IslandSnapshot, LinkedProvider, LoadError, NodeFault,
-    NodePhase, PluginData, Plugins, PreparedComponent, RuntimeConfig, RuntimeError, RuntimeGraph,
-    RuntimeMode, Snapshot, TickResult, Trace, TraceEvent, Val,
+    CapabilityPlugin, Host, HostState, LoadError, NodeFault, NodePhase, PluginData, Plugins,
+    PreparedGraph, RuntimeConfig, RuntimeError, RuntimeGraph, RuntimeMode, Snapshot, TickResult,
+    Trace, TraceEvent, Val,
 };
 
 // ---- Fixtures ----
@@ -94,12 +94,11 @@ impl Host for Mqtt {
 
     fn link(
         &self,
-        _node: &NodeId,
-        contract: &ComponentContract,
+        capabilities: &[Capability],
         linker: &mut wasmtime::component::Linker<HostState>,
     ) -> wasmtime::Result<()> {
         const SOURCE: &str = "test:mqtt/source@0.1.0";
-        if !contract.capabilities.iter().any(|c| c.interface == SOURCE) {
+        if !capabilities.iter().any(|c| c.interface == SOURCE) {
             return Ok(());
         }
         let feed = self.feed.clone();
@@ -112,7 +111,7 @@ impl Host for Mqtt {
         Ok(())
     }
 
-    fn island_data(&self, _members: &[NodeId], state: HostState) -> wasmtime::Result<HostState> {
+    fn store_data(&self, state: HostState) -> wasmtime::Result<HostState> {
         Ok(state)
     }
 }
@@ -326,10 +325,10 @@ async fn inject_rejects_bad_targets_and_types() {
 }
 
 #[tokio::test]
-async fn inject_rejects_an_input_fed_inside_its_island() {
+async fn inject_rejects_an_input_fed_inside_its_group() {
     let kit = Kit::new(&[STREAM_PRODUCER, STREAM_CONSUMER]);
     let graph = kit
-        .builder("in-island")
+        .builder("in-group")
         .add_node("prod", kit.get(STREAM_PRODUCER))
         .add_node("cons", kit.get(STREAM_CONSUMER))
         .connect("s", port("prod", "items"), port("cons", "items"))
@@ -388,15 +387,15 @@ async fn zero_limits_are_invalid() {
             ..RuntimeConfig::default()
         },
         RuntimeConfig {
-            yield_interval: 0,
+            yield_interval: witgraph_runtime::Fuel(0),
             ..RuntimeConfig::default()
         },
         RuntimeConfig {
-            fuel_per_run: Some(0),
+            fuel_per_run: Some(witgraph_runtime::Fuel(0)),
             ..RuntimeConfig::default()
         },
         RuntimeConfig {
-            max_island_memory: Some(0),
+            max_memory: Some(witgraph_runtime::ByteCount(0)),
             ..RuntimeConfig::default()
         },
         RuntimeConfig {
@@ -404,7 +403,7 @@ async fn zero_limits_are_invalid() {
             ..RuntimeConfig::default()
         },
         RuntimeConfig {
-            memory_reservation: Some(u64::MAX),
+            memory_reservation: Some(witgraph_runtime::ByteCount(u64::MAX)),
             ..RuntimeConfig::default()
         },
     ] {
@@ -425,7 +424,7 @@ async fn zero_limits_are_invalid() {
 async fn a_zero_memory_reservation_is_valid() {
     let kit = Kit::new(&[ECHO]);
     let config = RuntimeConfig {
-        memory_reservation: Some(0),
+        memory_reservation: Some(witgraph_runtime::ByteCount(0)),
         ..RuntimeConfig::default()
     };
     let graph = kit.builder("zero").add_node("e", kit.get(ECHO)).build();
@@ -611,19 +610,6 @@ fn pipeline(kit: &Kit) -> Graph {
         .build()
 }
 
-/// Both island layouts: one Store per island (the default), and members
-/// joined by a pumpable stream in Stores of their own.
-fn both_layouts() -> [RuntimeConfig; 2] {
-    [RuntimeConfig::default(), split()]
-}
-
-fn split() -> RuntimeConfig {
-    RuntimeConfig {
-        split_islands: true,
-        ..RuntimeConfig::default()
-    }
-}
-
 /// Sets the producer's burst size and the consumer's take count; `None`
 /// leaves the optional input absent (endless producer / take everything).
 async fn feed_pipeline<M: RuntimeMode, H: Host>(
@@ -640,85 +626,56 @@ async fn feed_pipeline<M: RuntimeMode, H: Host>(
 }
 
 #[tokio::test]
-async fn stream_producer_consumer_share_an_island() {
+async fn stream_producer_consumer_share_an_group() {
     let kit = Kit::new(&[STREAM_PRODUCER, STREAM_CONSUMER]);
-    for config in both_layouts() {
-        let split = config.split_islands;
-        let mut rt = kit.load(pipeline(&kit), config, Trace::new()).await;
-        feed_pipeline(&mut rt, Some(5), None).await;
-        assert_eq!(rt.compiled().islands().len(), 1);
-        settle(&mut rt).await;
+    let mut rt = kit
+        .load(pipeline(&kit), RuntimeConfig::default(), Trace::new())
+        .await;
+    feed_pipeline(&mut rt, Some(5), None).await;
+    assert_eq!(rt.compiled().stream_groups().len(), 1);
+    settle(&mut rt).await;
 
-        assert_eq!(
-            read_u32(&mut rt, "cons", "total").await,
-            10,
-            "split: {split}"
-        );
-        assert_eq!(
-            read_u32(&mut rt, "cons", "count").await,
-            5,
-            "split: {split}"
-        );
-        assert_eq!(phase(&rt, "prod"), NodePhase::Idle, "split: {split}");
-        assert_eq!(phase(&rt, "cons"), NodePhase::Idle, "split: {split}");
-        let trace = rt.mode().trace();
-        assert!(trace.iter().any(|e| matches!(
-            e,
-            TraceEvent::GenerationFinished {
-                island: 0,
-                generation: 1
-            }
-        )));
-        assert!(faults(&trace).is_empty(), "{:?}", faults(&trace));
-    }
+    assert_eq!(read_u32(&mut rt, "cons", "total").await, 10);
+    assert_eq!(read_u32(&mut rt, "cons", "count").await, 5);
+    assert_eq!(phase(&rt, "prod"), NodePhase::Idle);
+    assert_eq!(phase(&rt, "cons"), NodePhase::Idle);
+    let trace = rt.mode().trace();
+    assert!(
+        trace
+            .iter()
+            .any(|e| matches!(e, TraceEvent::GroupDrained { .. }))
+    );
+    assert!(faults(&trace).is_empty(), "{:?}", faults(&trace));
 }
 
 #[tokio::test]
 async fn backpressure_slow_consumer_gets_every_item() {
     let kit = Kit::new(&[STREAM_PRODUCER, STREAM_CONSUMER]);
-    for config in both_layouts() {
-        let split = config.split_islands;
-        let mut rt = kit.load(pipeline(&kit), config, Trace::new()).await;
-        feed_pipeline(&mut rt, Some(2000), None).await;
-        inject(&mut rt, "cons", "delay", Val::U32(3)).await;
-        settle(&mut rt).await;
-        assert_eq!(
-            read_u32(&mut rt, "cons", "count").await,
-            2000,
-            "split: {split}"
-        );
-        let total = (0..2000).sum::<u32>();
-        assert_eq!(
-            read_u32(&mut rt, "cons", "total").await,
-            total,
-            "split: {split}"
-        );
-    }
+    let mut rt = kit
+        .load(pipeline(&kit), RuntimeConfig::default(), Trace::new())
+        .await;
+    feed_pipeline(&mut rt, Some(2000), None).await;
+    inject(&mut rt, "cons", "delay", Val::U32(3)).await;
+    settle(&mut rt).await;
+    assert_eq!(read_u32(&mut rt, "cons", "count").await, 2000);
+    let total = (0..2000).sum::<u32>();
+    assert_eq!(read_u32(&mut rt, "cons", "total").await, total);
 }
 
 #[tokio::test]
 async fn early_reader_drop_stops_an_infinite_producer() {
     let kit = Kit::new(&[STREAM_PRODUCER, STREAM_CONSUMER]);
-    for config in both_layouts() {
-        let split = config.split_islands;
-        // No burst-size: the producer streams forever unless its reader
-        // goes.
-        let mut rt = kit.load(pipeline(&kit), config, Trace::new()).await;
-        feed_pipeline(&mut rt, None, Some(3)).await;
-        settle(&mut rt).await;
-        assert_eq!(
-            read_u32(&mut rt, "cons", "count").await,
-            3,
-            "split: {split}"
-        );
-        assert_eq!(
-            read_u32(&mut rt, "cons", "total").await,
-            3,
-            "split: {split}"
-        );
-        // The generation finished, so the producer's writer task exited.
-        assert_eq!(phase(&rt, "prod"), NodePhase::Idle, "split: {split}");
-    }
+    // No burst-size: the producer streams forever unless its reader
+    // goes.
+    let mut rt = kit
+        .load(pipeline(&kit), RuntimeConfig::default(), Trace::new())
+        .await;
+    feed_pipeline(&mut rt, None, Some(3)).await;
+    settle(&mut rt).await;
+    assert_eq!(read_u32(&mut rt, "cons", "count").await, 3);
+    assert_eq!(read_u32(&mut rt, "cons", "total").await, 3);
+    // The run finished, so the producer's writer task exited.
+    assert_eq!(phase(&rt, "prod"), NodePhase::Idle);
 }
 
 /// prod → relay → cons, where the relay returns the stream it was given:
@@ -736,27 +693,18 @@ fn relayed(kit: &Kit) -> Graph {
 #[tokio::test]
 async fn a_stream_passed_through_a_node_reaches_its_reader() {
     let kit = Kit::new(&[STREAM_PRODUCER, STREAM_RELAY, STREAM_CONSUMER]);
-    for config in both_layouts() {
-        let split = config.split_islands;
-        let mut rt = kit.load(relayed(&kit), config, Trace::new()).await;
-        // More items than a pump holds at once, so the relay's Store keeps
-        // forwarding after the relay returned.
-        feed_pipeline(&mut rt, Some(100_000), None).await;
-        settle(&mut rt).await;
-        assert_eq!(
-            read_u32(&mut rt, "cons", "count").await,
-            100_000,
-            "split: {split}"
-        );
-        let total = (0..100_000u32).fold(0u32, u32::wrapping_add);
-        assert_eq!(
-            read_u32(&mut rt, "cons", "total").await,
-            total,
-            "split: {split}"
-        );
-        for node in ["prod", "relay", "cons"] {
-            assert_eq!(phase(&rt, node), NodePhase::Idle, "{node}, split: {split}");
-        }
+    let mut rt = kit
+        .load(relayed(&kit), RuntimeConfig::default(), Trace::new())
+        .await;
+    // More items than a pump holds at once, so the relay's Store keeps
+    // forwarding after the relay returned.
+    feed_pipeline(&mut rt, Some(100_000), None).await;
+    settle(&mut rt).await;
+    assert_eq!(read_u32(&mut rt, "cons", "count").await, 100_000);
+    let total = (0..100_000u32).fold(0u32, u32::wrapping_add);
+    assert_eq!(read_u32(&mut rt, "cons", "total").await, total);
+    for node in ["prod", "relay", "cons"] {
+        assert_eq!(phase(&rt, node), NodePhase::Idle, "{node}");
     }
 }
 
@@ -771,36 +719,30 @@ async fn a_passed_through_stream_is_forwarded_after_its_reader_returned() {
         .connect("a", port("prod", "items"), port("relay", "items"))
         .connect("b", port("relay", "items"), port("drain", "items"))
         .build();
-    for config in both_layouts() {
-        let split = config.split_islands;
-        let mut rt = kit.load(graph.clone(), config, Trace::new()).await;
-        inject(&mut rt, "prod", "burst-size", Val::U32(100_000)).await;
-        // Every call returns before the stream ends: the generation lasts
-        // until the producer has written it all and the drain read it.
-        settle(&mut rt).await;
-        for node in ["prod", "relay", "drain"] {
-            assert_eq!(phase(&rt, node), NodePhase::Idle, "{node}, split: {split}");
-        }
+    let mut rt = kit
+        .load(graph.clone(), RuntimeConfig::default(), Trace::new())
+        .await;
+    inject(&mut rt, "prod", "burst-size", Val::U32(100_000)).await;
+    // Every call returns before the stream ends: the run lasts
+    // until the producer has written it all and the drain read it.
+    settle(&mut rt).await;
+    for node in ["prod", "relay", "drain"] {
+        assert_eq!(phase(&rt, node), NodePhase::Idle, "{node}");
     }
 }
 
 #[tokio::test]
 async fn a_reader_dropping_a_passed_through_stream_stops_its_producer() {
     let kit = Kit::new(&[STREAM_PRODUCER, STREAM_RELAY, STREAM_CONSUMER]);
-    for config in both_layouts() {
-        let split = config.split_islands;
-        for _ in 0..10 {
-            let mut rt = kit.load(relayed(&kit), config.clone(), Trace::new()).await;
-            feed_pipeline(&mut rt, None, Some(3)).await;
-            settle(&mut rt).await;
-            assert_eq!(
-                read_u32(&mut rt, "cons", "count").await,
-                3,
-                "split: {split}"
-            );
-            // The generation finished, so the producer's writer task exited.
-            assert_eq!(phase(&rt, "prod"), NodePhase::Idle, "split: {split}");
-        }
+    for _ in 0..10 {
+        let mut rt = kit
+            .load(relayed(&kit), RuntimeConfig::default(), Trace::new())
+            .await;
+        feed_pipeline(&mut rt, None, Some(3)).await;
+        settle(&mut rt).await;
+        assert_eq!(read_u32(&mut rt, "cons", "count").await, 3);
+        // The run finished, so the producer's writer task exited.
+        assert_eq!(phase(&rt, "prod"), NodePhase::Idle);
     }
 }
 
@@ -865,12 +807,11 @@ impl Host for Clock {
 
     fn link(
         &self,
-        _node: &NodeId,
-        contract: &ComponentContract,
+        capabilities: &[Capability],
         linker: &mut wasmtime::component::Linker<HostState>,
     ) -> wasmtime::Result<()> {
         const CLOCK: &str = "wasi:clocks/monotonic-clock@0.3.2";
-        if !contract.capabilities.iter().any(|c| c.interface == CLOCK) {
+        if !capabilities.iter().any(|c| c.interface == CLOCK) {
             return Ok(());
         }
         linker
@@ -883,7 +824,7 @@ impl Host for Clock {
             })
     }
 
-    fn island_data(&self, _members: &[NodeId], state: HostState) -> wasmtime::Result<HostState> {
+    fn store_data(&self, state: HostState) -> wasmtime::Result<HostState> {
         Ok(state)
     }
 }
@@ -1058,13 +999,12 @@ impl Host for Accel {
 
     fn link(
         &self,
-        node: &NodeId,
-        contract: &ComponentContract,
+        capabilities: &[Capability],
         linker: &mut wasmtime::component::Linker<HostState>,
     ) -> wasmtime::Result<()> {
-        Clock.link(node, contract, linker)?;
+        Clock.link(capabilities, linker)?;
         const CNN: &str = "test:accel/cnn@0.1.0";
-        if !contract.capabilities.iter().any(|c| c.interface == CNN) {
+        if !capabilities.iter().any(|c| c.interface == CNN) {
             return Ok(());
         }
         let accelerated = self.accelerated;
@@ -1084,7 +1024,7 @@ impl Host for Accel {
         )
     }
 
-    fn island_data(&self, _members: &[NodeId], state: HostState) -> wasmtime::Result<HostState> {
+    fn store_data(&self, state: HostState) -> wasmtime::Result<HostState> {
         Ok(state)
     }
 }
@@ -1223,8 +1163,8 @@ fn a_wrong_viewer_hint_is_skipped_not_fatal() {
 const KEYVALUE: &str = "wasi:keyvalue/store@0.2.0-draft2";
 
 /// Serves `wasi:keyvalue/store`. A bucket's `get` answers
-/// `<plugin id>:<key>#<n>`, where `n` counts the calls made in the island so
-/// far, by any store: the count lives in the island's plugin state.
+/// `<plugin id>:<key>#<n>`, where `n` counts the calls made in the group so
+/// far, by any store: the count lives in the group's plugin state.
 struct KvStore(&'static str);
 
 #[derive(Default)]
@@ -1256,7 +1196,6 @@ impl CapabilityPlugin for KvStore {
 
     fn link(
         &self,
-        _node: &NodeId,
         capability: &Capability,
         linker: &mut wasmtime::component::Linker<PluginData>,
     ) -> wasmtime::Result<()> {
@@ -1316,7 +1255,7 @@ async fn labels_route_one_interface_to_two_plugins() {
     inject(&mut rt, "n", "key", Val::String("k".into())).await;
     settle(&mut rt).await;
     // Each label reached the plugin of its name; the call count is the
-    // island's, shared by both plugins.
+    // group's, shared by both plugins.
     assert_eq!(read_string(&mut rt, "n", "primary").await, "primary:k#1");
     assert_eq!(read_string(&mut rt, "n", "backup").await, "backup:k#2");
 }
@@ -1420,15 +1359,15 @@ async fn a_link_satisfies_an_import_with_a_providers_export() {
     assert_eq!(read_u32(&mut rt, "b", "total").await, 3);
 
     // Each node has a provider of its own, which lives as long as the
-    // node's island does.
+    // node's group does.
     assert_eq!(read_u32(&mut rt, "a", "calls").await, 1);
     assert_eq!(read_u32(&mut rt, "b", "calls").await, 1);
     inject(&mut rt, "a", "x", Val::U32(4)).await;
     settle(&mut rt).await;
     assert_eq!(read_u32(&mut rt, "a", "calls").await, 2);
     assert_eq!(read_u32(&mut rt, "b", "calls").await, 1);
-    // A rebuilt island gets a fresh provider with the node.
-    rt.cancel(&id("a")).unwrap();
+    // A rebuilt group gets a fresh provider with the node.
+    rt.shutdown();
     rt.rerun(&id("a")).unwrap();
     settle(&mut rt).await;
     assert_eq!(read_u32(&mut rt, "a", "calls").await, 1);
@@ -1509,17 +1448,29 @@ async fn each_node_runs_the_composition_built_for_its_links() {
         .expect("loads");
     inject(&mut rt, "a", "x", Val::U32(5)).await;
     settle(&mut rt).await;
-    assert_eq!(
-        read_u32(&mut rt, "a", "doubled").await,
-        10,
-        "`a` runs `math`"
-    );
     assert!(
         matches!(
             rt.node_state(&id("b")).unwrap().fault_cause(),
             Some(NodeFault::WasmTrap { .. })
         ),
         "`b` runs the trapping provider"
+    );
+
+    let graph = kit
+        .builder("one-provider")
+        .add_node("a", kit.get(CALC))
+        .link("la", "a", OPS, math(), OPS)
+        .build();
+    let compiled = graph.compile(&kit.contracts).expect("compiles");
+    let mut rt = RuntimeGraph::load(compiled, &kit.wasm, RuntimeConfig::default(), Perf)
+        .await
+        .expect("loads");
+    inject(&mut rt, "a", "x", Val::U32(5)).await;
+    settle(&mut rt).await;
+    assert_eq!(
+        read_u32(&mut rt, "a", "doubled").await,
+        10,
+        "`a` runs `math`"
     );
 }
 
@@ -1618,7 +1569,6 @@ async fn a_link_that_cannot_be_made_fails_the_load() {
 #[tokio::test]
 async fn a_linked_node_is_prepared_with_its_links() {
     let kit = calc_kit();
-    let contract = &kit.contracts[0];
     let engine = RuntimeConfig::default().new_engine().unwrap();
     let graph = || {
         kit.builder("prepared")
@@ -1628,10 +1578,16 @@ async fn a_linked_node_is_prepared_with_its_links() {
             .compile(&kit.contracts)
             .expect("compiles")
     };
-    let load = async |prepared: PreparedComponent| {
+    let bare = kit
+        .builder("prepared")
+        .add_node("n", kit.get(CALC))
+        .build()
+        .compile(&kit.contracts)
+        .expect("compiles");
+    let load = async |prepared: PreparedGraph| {
         RuntimeGraph::load_prepared(
             graph(),
-            &[prepared],
+            &prepared,
             RuntimeConfig::default(),
             Perf,
             witgraph_runtime::NoCapabilities,
@@ -1639,22 +1595,17 @@ async fn a_linked_node_is_prepared_with_its_links() {
         .await
     };
 
-    let bare = PreparedComponent::new(&engine, contract, CALC.wasm).unwrap();
-    let err = load(bare).await.err().expect("prepared without the link");
-    assert!(
-        matches!(&err, LoadError::ContractMismatch { message, .. }
-            if message.contains("not prepared with the links of node `n`")),
-        "{err}"
-    );
+    let mut wasm = kit.wasm.clone();
+    wasm.insert(math(), MATH.wasm);
+    // Another graph: what it composes has no provider in it.
+    let without = PreparedGraph::new(&engine, &bare, &wasm).unwrap();
+    let err = load(without)
+        .await
+        .err()
+        .expect("prepared without the link");
+    assert!(matches!(err, LoadError::GraphMismatch { .. }), "{err}");
 
-    let provider = math();
-    let links = [LinkedProvider {
-        import: OPS,
-        provider: &provider,
-        bytes: MATH.wasm,
-        export: OPS,
-    }];
-    let linked = PreparedComponent::linked(&engine, contract, CALC.wasm, &links).unwrap();
+    let linked = PreparedGraph::new(&engine, &graph(), &wasm).unwrap();
     let mut rt = load(linked).await.expect("prepared with the link");
     inject(&mut rt, "n", "x", Val::U32(2)).await;
     settle(&mut rt).await;
@@ -1696,8 +1647,8 @@ async fn wide_graph_full_flow() {
         .connect("m1", port("mqtt", "messages"), port("count", "items"))
         .build();
     let compiled = graph.compile(&kit.contracts).expect("compiles");
-    // cfg, echo_a, echo_b, {prod, cons}, plus, sink_a, sink_b, {mqtt, count}
-    assert_eq!(compiled.islands().len(), 8);
+    // {prod, cons}, {mqtt, count}
+    assert_eq!(compiled.stream_groups().len(), 2);
     let feed = Arc::new(Mutex::new(
         (0..4u32).map(|i| vec![i as u8]).collect::<VecDeque<_>>(),
     ));
@@ -1738,10 +1689,10 @@ async fn wide_graph_full_flow() {
     );
 }
 
-// ---- Scheduling across islands ----
+// ---- Scheduling across groups ----
 
 #[tokio::test]
-async fn a_value_latched_mid_generation_wakes_downstream_islands() {
+async fn a_value_latched_mid_run_wakes_downstream_groups() {
     let kit = Kit::new(&[STREAM_PRODUCER, STREAM_CONSUMER, RELAY]);
     let graph = kit
         .builder("endless")
@@ -1756,10 +1707,7 @@ async fn a_value_latched_mid_generation_wakes_downstream_islands() {
         .await;
     // Endless: no burst-size, no take.
     let tick = tokio::time::timeout(Duration::from_secs(2), rt.tick()).await;
-    assert!(
-        tick.is_err(),
-        "the endless generation keeps the tick running"
-    );
+    assert!(tick.is_err(), "the endless run keeps the tick running");
     assert_eq!(phase(&rt, "cons"), NodePhase::Running);
     assert_eq!(
         read_u32(&mut rt, "r", "out").await,
@@ -1770,7 +1718,7 @@ async fn a_value_latched_mid_generation_wakes_downstream_islands() {
 }
 
 #[tokio::test]
-async fn an_endless_island_owing_another_run_does_not_hold_back_downstream() {
+async fn an_endless_group_owing_another_run_does_not_hold_back_downstream() {
     let kit = Kit::new(&[STREAM_PRODUCER, STREAM_CONSUMER, RELAY]);
     let graph = kit
         .builder("endless")
@@ -1786,7 +1734,7 @@ async fn an_endless_island_owing_another_run_does_not_hold_back_downstream() {
     let _ = tokio::time::timeout(Duration::from_secs(2), rt.tick()).await;
     assert_eq!(read_u32(&mut rt, "r", "out").await, u32::MAX);
 
-    // The endless island now owes another run it can never start.
+    // The endless group now owes another run it can never start.
     inject(&mut rt, "cons", "delay", Val::U32(1)).await;
     inject(&mut rt, "r", "add", Val::U32(1)).await;
     let _ = tokio::time::timeout(Duration::from_secs(2), rt.tick()).await;
@@ -1810,7 +1758,11 @@ async fn a_value_round_trip_through_another_node_runs_in_one_generation() {
         .connect("t", port("r", "out"), port("cons", "take"))
         .build();
     let compiled = graph.clone().compile(&kit.contracts).expect("compiles");
-    assert_eq!(compiled.islands().len(), 1, "`r` joins the stream island");
+    assert_eq!(
+        compiled.stream_groups().len(),
+        1,
+        "`r` joins the stream group"
+    );
     let mut rt = kit
         .load(graph, RuntimeConfig::default(), Trace::new())
         .await;
@@ -1823,15 +1775,15 @@ async fn a_value_round_trip_through_another_node_runs_in_one_generation() {
     assert_eq!(
         runs_of(&rt.mode().trace(), "cons"),
         1,
-        "`cons` ran once, on `take` fresh from this generation"
+        "`cons` ran once, on `take` fresh from this run"
     );
 }
 
 #[tokio::test]
-async fn a_node_reading_an_island_that_will_rerun_waits_for_it() {
+async fn a_node_reading_an_group_that_will_rerun_waits_for_it() {
     let kit = Kit::new(&[BUSY_LOOP, RELAY, STREAM_PRODUCER, STREAM_CONSUMER, MAYBE]);
     let graph = kit
-        .builder("whole-island")
+        .builder("whole-group")
         .add_node("x", kit.get(BUSY_LOOP))
         .add_node("prod", kit.get(STREAM_PRODUCER))
         .add_node("r", kit.get(RELAY))
@@ -1851,7 +1803,7 @@ async fn a_node_reading_an_island_that_will_rerun_waits_for_it() {
     assert_eq!(
         runs_of(&rt.mode().trace(), "j"),
         1,
-        "`prod` reruns with its island once `x` delivers, so `j` waits for it"
+        "`prod` reruns with its group once `x` delivers, so `j` waits for it"
     );
 }
 
@@ -1922,7 +1874,7 @@ async fn bytes_can_be_keyed_by_an_unhashed_ref() {
 }
 
 #[tokio::test]
-async fn a_cycle_through_three_stream_islands_runs() {
+async fn a_cycle_through_three_stream_groups_runs() {
     let kit = Kit::new(&[STREAM_PRODUCER, STREAM_CONSUMER]);
     let mut builder = kit.builder("three");
     for i in 1..=3 {
@@ -1943,7 +1895,7 @@ async fn a_cycle_through_three_stream_islands_runs() {
     let mut rt = kit
         .load(graph, RuntimeConfig::default(), Trace::new())
         .await;
-    assert_eq!(rt.compiled().islands().len(), 1);
+    assert_eq!(rt.compiled().stream_groups().len(), 3);
     inject(&mut rt, "s1", "burst-size", Val::U32(2)).await;
     inject(&mut rt, "s2", "burst-size", Val::U32(3)).await;
     inject(&mut rt, "s3", "burst-size", Val::U32(4)).await;
@@ -2033,17 +1985,19 @@ async fn shutdown_forgets_feedback_buffered_by_an_unfinished_tick() {
         "1",
         "the loop's iteration was over, so the dropped tick latched it"
     );
-    assert_eq!(snapshot.islands.len(), 2, "`a` owes its next iteration");
+    assert!(
+        snapshot.owed.contains(&id("a")),
+        "`a` owes its next iteration"
+    );
 
     rt.shutdown();
     assert!(rt.snapshot().await.unwrap().feedback.is_empty());
     assert!(matches!(rt.tick().await, TickResult::Idle));
-    assert_eq!(read_u32(&mut rt, "b", "out").await, 1);
     assert_eq!(runs_of(&rt.mode().trace(), "a"), 1, "nothing restarted");
 }
 
 #[tokio::test]
-async fn feedback_loops_advance_beside_an_island_that_never_finishes() {
+async fn feedback_loops_advance_beside_an_group_that_never_finishes() {
     let kit = Kit::new(&[RELAY, STREAM_PRODUCER, STREAM_CONSUMER]);
     let mut rt = kit
         .load(
@@ -2138,10 +2092,10 @@ async fn step_limited_self_loop(kit: &Kit) -> RuntimeGraph<Trace> {
 }
 
 #[tokio::test]
-async fn cancel_forgets_buffered_feedback() {
+async fn shutdown_forgets_buffered_feedback() {
     let kit = Kit::new(&[RELAY]);
     let mut rt = step_limited_self_loop(&kit).await;
-    rt.cancel(&id("a")).unwrap();
+    rt.shutdown();
     assert!(rt.snapshot().await.unwrap().feedback.is_empty());
     for _ in 0..5 {
         let _ = rt.tick().await;
@@ -2150,7 +2104,7 @@ async fn cancel_forgets_buffered_feedback() {
 }
 
 #[tokio::test]
-async fn shutdown_forgets_buffered_feedback() {
+async fn shutdown_forgets_feedback_buffered_at_the_step_limit() {
     let kit = Kit::new(&[RELAY]);
     let mut rt = step_limited_self_loop(&kit).await;
     rt.shutdown();
@@ -2172,7 +2126,7 @@ async fn an_injected_value_outlives_feedback_buffered_before_it() {
 }
 
 #[tokio::test]
-async fn cancel_forgets_feedback_buffered_for_the_island() {
+async fn shutdown_forgets_feedback_buffered_for_the_group() {
     let kit = Kit::new(&[RELAY, STREAM_PRODUCER, STREAM_CONSUMER]);
     let mut rt = kit
         .load(
@@ -2184,8 +2138,8 @@ async fn cancel_forgets_feedback_buffered_for_the_island() {
     inject(&mut rt, "a", "in", Val::U32(0)).await;
     inject(&mut rt, "a", "add", Val::U32(1)).await;
     let _ = tokio::time::timeout(Duration::from_millis(500), rt.tick()).await;
-    rt.cancel(&id("a")).unwrap();
-    rt.cancel(&id("cons")).unwrap();
+    rt.shutdown();
+    rt.shutdown();
     assert!(matches!(rt.tick().await, TickResult::Idle));
     assert_eq!(phase(&rt, "a"), NodePhase::Cancelled);
     assert_eq!(runs_of(&rt.mode().trace(), "a"), 1);
@@ -2214,16 +2168,16 @@ async fn a_spinning_guest_yields_so_a_timeout_fires() {
         .expect("the timeout around the tick fired")
         .expect("the tick task did not panic");
     assert!(timed_out);
-    rt.cancel(&id("busy")).unwrap();
+    rt.shutdown();
 }
 
 #[tokio::test]
-async fn an_island_over_its_memory_limit_fails_to_instantiate() {
+async fn an_group_over_its_memory_limit_fails_to_instantiate() {
     let kit = Kit::new(&[ECHO]);
     let graph = kit.builder("small").add_node("e", kit.get(ECHO)).build();
     let compiled = graph.compile(&kit.contracts).expect("compiles");
     let config = RuntimeConfig {
-        max_island_memory: Some(4096),
+        max_memory: Some(witgraph_runtime::ByteCount(4096)),
         ..RuntimeConfig::default()
     };
     let err = RuntimeGraph::load(compiled, &kit.wasm, config, Perf)
@@ -2237,7 +2191,7 @@ async fn an_island_over_its_memory_limit_fails_to_instantiate() {
 }
 
 #[tokio::test]
-async fn a_trap_faults_only_its_island() {
+async fn a_trap_stops_the_whole_graph() {
     let kit = Kit::new(&[BUSY_LOOP, ECHO, STREAM_PRODUCER, STREAM_CONSUMER]);
     let graph = kit
         .builder("isolation")
@@ -2255,18 +2209,25 @@ async fn a_trap_faults_only_its_island() {
     inject(&mut rt, "prod", "burst-size", Val::U32(3)).await;
     settle(&mut rt).await;
 
-    let busy = rt.node_state(&id("busy")).unwrap();
-    assert_eq!(busy.phase(), NodePhase::Faulted);
-    assert!(matches!(
-        busy.fault_cause(),
-        Some(NodeFault::WasmTrap { .. })
-    ));
+    for node in ["busy", "e", "prod", "cons"] {
+        let state = rt.node_state(&id(node)).unwrap();
+        assert_eq!(state.phase(), NodePhase::Faulted, "{node}");
+        assert!(
+            matches!(state.fault_cause(), Some(NodeFault::WasmTrap { .. })),
+            "{node}"
+        );
+    }
+    assert_eq!(rt.read_output(&id("e"), &"out".into()).await.unwrap(), None);
+
+    // What the host wrote survives, and everything runs again.
+    inject(&mut rt, "busy", "action", Val::Enum("finish".into())).await;
+    settle(&mut rt).await;
     assert_eq!(read_f64(&mut rt, "e", "out").await, 1.5);
     assert_eq!(read_u32(&mut rt, "cons", "total").await, 3);
     assert_eq!(phase(&rt, "cons"), NodePhase::Idle);
 }
 
-/// A pipeline plus a lone busy-loop node: two islands sharing one config.
+/// A pipeline plus a lone busy-loop node: two groups sharing one config.
 fn pipeline_and_busy(kit: &Kit) -> Graph {
     let mut graph = pipeline(kit);
     graph.nodes.push(witgraph_ir::Node {
@@ -2280,11 +2241,11 @@ fn pipeline_and_busy(kit: &Kit) -> Graph {
 }
 
 #[tokio::test]
-async fn busy_loop_exhausts_its_run_budget_while_a_sibling_island_finishes() {
+async fn a_spinning_node_burns_the_budget_of_the_whole_graph() {
     let kit = Kit::new(&[BUSY_LOOP, STREAM_PRODUCER, STREAM_CONSUMER]);
     let config = RuntimeConfig {
-        yield_interval: 10_000,
-        fuel_per_run: Some(5_000_000),
+        yield_interval: witgraph_runtime::Fuel(10_000),
+        fuel_per_run: Some(witgraph_runtime::Fuel(5_000_000)),
         ..RuntimeConfig::default()
     };
     let mut rt = kit
@@ -2294,37 +2255,29 @@ async fn busy_loop_exhausts_its_run_budget_while_a_sibling_island_finishes() {
     inject(&mut rt, "busy", "action", Val::Enum("spin".into())).await;
     settle(&mut rt).await;
 
-    let busy = rt.node_state(&id("busy")).unwrap();
-    assert!(
-        matches!(busy.fault_cause(), Some(NodeFault::FuelExhausted)),
-        "{:?}",
-        busy.fault_cause()
-    );
-    assert_eq!(read_u32(&mut rt, "cons", "count").await, 100);
-    assert_eq!(
-        read_u32(&mut rt, "cons", "total").await,
-        (0..100).sum::<u32>()
-    );
-    assert_eq!(
-        phase(&rt, "cons"),
-        NodePhase::Idle,
-        "the pipeline fits its budget"
-    );
+    for node in ["busy", "prod", "cons"] {
+        let state = rt.node_state(&id(node)).unwrap();
+        assert!(
+            matches!(state.fault_cause(), Some(NodeFault::FuelExhausted)),
+            "{node}: {:?}",
+            state.fault_cause()
+        );
+    }
 }
 
 #[tokio::test]
-async fn an_endless_island_exhausts_a_finite_budget() {
+async fn an_endless_group_exhausts_a_finite_budget() {
     let kit = Kit::new(&[STREAM_PRODUCER, STREAM_CONSUMER]);
     let config = RuntimeConfig {
-        fuel_per_run: Some(5_000_000),
+        fuel_per_run: Some(witgraph_runtime::Fuel(5_000_000)),
         ..RuntimeConfig::default()
     };
-    // No burst-size, no take: the generation never ends on its own, and the
+    // No burst-size, no take: the run never ends on its own, and the
     // budget is only reset when a `run` starts.
     let mut rt = kit.load(pipeline(&kit), config, Trace::new()).await;
     let tick = tokio::time::timeout(Duration::from_secs(30), rt.tick())
         .await
-        .expect("fuel ends the endless generation");
+        .expect("fuel ends the endless run");
     assert!(matches!(tick, TickResult::Progress), "{tick:?}");
     for node in ["prod", "cons"] {
         let state = rt.node_state(&id(node)).unwrap();
@@ -2359,12 +2312,12 @@ async fn fatal_aborts_the_tick() {
     assert_eq!(phase(&rt, "busy"), NodePhase::Faulted);
     assert!(
         matches!(rt.tick().await, TickResult::Idle),
-        "a faulted island waits for input"
+        "a faulted group waits for input"
     );
 }
 
 #[tokio::test]
-async fn a_faulted_island_restarts_on_new_input() {
+async fn a_faulted_group_restarts_on_new_input() {
     let kit = Kit::new(&[BUSY_LOOP]);
     let graph = kit
         .builder("restart")
@@ -2399,8 +2352,8 @@ async fn an_input_change_during_a_faulting_generation_reruns_after_the_fault() {
         .add_node("busy", kit.get(BUSY_LOOP))
         .build();
     let config = RuntimeConfig {
-        yield_interval: 10_000,
-        fuel_per_run: Some(200_000_000),
+        yield_interval: witgraph_runtime::Fuel(10_000),
+        fuel_per_run: Some(witgraph_runtime::Fuel(200_000_000)),
         ..RuntimeConfig::default()
     };
     let mut rt = kit.load(graph, config, Trace::new()).await;
@@ -2408,7 +2361,7 @@ async fn an_input_change_during_a_faulting_generation_reruns_after_the_fault() {
     poll_tick_once(&mut rt).await;
     assert_eq!(phase(&rt, "busy"), NodePhase::Running);
 
-    // Owed while the spinning generation runs; the fault must not drop it.
+    // Owed while the spinning run runs; the fault must not drop it.
     inject(&mut rt, "busy", "action", Val::Enum("finish".into())).await;
     settle(&mut rt).await;
     assert_eq!(phase(&rt, "busy"), NodePhase::Idle);
@@ -2429,7 +2382,7 @@ async fn an_input_change_during_a_faulting_generation_reruns_after_the_fault() {
 }
 
 #[tokio::test]
-async fn cancelling_a_faulted_island_marks_it_cancelled() {
+async fn shutting_down_a_faulted_graph_keeps_its_fault() {
     let kit = Kit::new(&[BUSY_LOOP]);
     let graph = kit
         .builder("cancel-faulted")
@@ -2442,22 +2395,21 @@ async fn cancelling_a_faulted_island_marks_it_cancelled() {
     settle(&mut rt).await;
     assert_eq!(phase(&rt, "busy"), NodePhase::Faulted);
 
-    rt.cancel(&id("busy")).unwrap();
+    rt.shutdown();
     let state = rt.node_state(&id("busy")).unwrap();
-    assert_eq!(state.phase(), NodePhase::Cancelled);
-    assert!(state.fault_cause().is_none());
-    rt.cancel(&id("busy")).unwrap();
+    assert_eq!(state.phase(), NodePhase::Faulted);
+    assert!(state.fault_cause().is_some());
     let cancels = rt
         .mode()
         .trace()
         .iter()
         .filter(|e| matches!(e, TraceEvent::Cancelled { .. }))
         .count();
-    assert_eq!(cancels, 1, "cancelling a cancelled island reports nothing");
+    assert_eq!(cancels, 0);
 }
 
 #[tokio::test]
-async fn cancelling_again_forgets_work_owed_since() {
+async fn shutting_down_again_forgets_work_owed_since() {
     let kit = Kit::new(&[ECHO]);
     let graph = kit.builder("recancel").add_node("e", kit.get(ECHO)).build();
     let mut rt = kit
@@ -2465,35 +2417,32 @@ async fn cancelling_again_forgets_work_owed_since() {
         .await;
     inject(&mut rt, "e", "in", Val::Float64(1.0)).await;
     settle(&mut rt).await;
-    rt.cancel(&id("e")).unwrap();
+    rt.shutdown();
     inject(&mut rt, "e", "in", Val::Float64(2.0)).await;
-    rt.cancel(&id("e")).unwrap();
+    rt.shutdown();
     assert!(matches!(rt.tick().await, TickResult::Idle));
     assert_eq!(phase(&rt, "e"), NodePhase::Cancelled);
-    assert_eq!(read_f64(&mut rt, "e", "out").await, 1.0);
+    assert_eq!(rt.read_output(&id("e"), &"out".into()).await.unwrap(), None);
 }
 
 // ---- Cancellation and shutdown ----
 
 #[tokio::test]
-async fn cancel_drops_an_endless_island_and_new_input_restarts_it() {
+async fn shutdown_drops_an_endless_group_and_new_input_restarts_it() {
     let kit = Kit::new(&[STREAM_PRODUCER, STREAM_CONSUMER]);
     // Endless: no burst-size, no take.
     let mut rt = kit
         .load(pipeline(&kit), RuntimeConfig::default(), Trace::new())
         .await;
     let tick = tokio::time::timeout(Duration::from_millis(300), rt.tick()).await;
-    assert!(
-        tick.is_err(),
-        "the endless generation keeps the tick running"
-    );
+    assert!(tick.is_err(), "the endless run keeps the tick running");
     assert_eq!(phase(&rt, "cons"), NodePhase::Running);
 
-    rt.cancel(&id("cons")).unwrap();
+    rt.shutdown();
     assert_eq!(
         phase(&rt, "prod"),
         NodePhase::Cancelled,
-        "cancel hits the whole island"
+        "cancel hits the whole group"
     );
     assert_eq!(phase(&rt, "cons"), NodePhase::Cancelled);
     assert!(matches!(rt.tick().await, TickResult::Idle));
@@ -2544,7 +2493,7 @@ async fn shutdown_cancels_everything() {
 }
 
 #[tokio::test]
-async fn rerun_restarts_an_island_the_host_cannot_feed() {
+async fn rerun_restarts_an_group_the_host_cannot_feed() {
     let kit = Kit::new(&[MQTT_NODE, BYTES_CONSUMER]);
     let graph = kit
         .builder("mqtt")
@@ -2565,7 +2514,7 @@ async fn rerun_restarts_an_island_the_host_cannot_feed() {
     .expect("loads");
     settle(&mut rt).await;
     assert_eq!(read_u32(&mut rt, "cons", "total-bytes").await, 2);
-    rt.cancel(&id("mqtt")).unwrap();
+    rt.shutdown();
 
     feed.lock()
         .unwrap()
@@ -2602,16 +2551,16 @@ async fn clear_input_forgets_an_injected_value() {
     );
 }
 
-/// Records the members of every island Store it creates data for.
+/// Counts the Stores it creates data for.
 struct Counting {
-    built: Arc<Mutex<Vec<Vec<NodeId>>>>,
+    built: Arc<Mutex<Vec<()>>>,
 }
 
 struct Counted {
     state: HostState,
 }
 
-impl witgraph_runtime::IslandData for Counted {
+impl witgraph_runtime::StoreData for Counted {
     fn host_state(&mut self) -> &mut HostState {
         &mut self.state
     }
@@ -2622,21 +2571,20 @@ impl Host for Counting {
 
     fn link(
         &self,
-        _node: &NodeId,
-        _contract: &ComponentContract,
+        _capabilities: &[Capability],
         _linker: &mut wasmtime::component::Linker<Counted>,
     ) -> wasmtime::Result<()> {
         Ok(())
     }
 
-    fn island_data(&self, members: &[NodeId], state: HostState) -> wasmtime::Result<Counted> {
-        self.built.lock().unwrap().push(members.to_vec());
+    fn store_data(&self, state: HostState) -> wasmtime::Result<Counted> {
+        self.built.lock().unwrap().push(());
         Ok(Counted { state })
     }
 }
 
 #[tokio::test]
-async fn the_host_creates_the_data_of_every_island_store() {
+async fn the_host_creates_the_data_of_the_store() {
     let kit = Kit::new(&[ECHO]);
     let graph = kit
         .builder("host")
@@ -2656,21 +2604,17 @@ async fn the_host_creates_the_data_of_every_island_store() {
     )
     .await
     .expect("loads");
-    assert_eq!(built.lock().unwrap().len(), 2, "one Store per island");
+    assert_eq!(built.lock().unwrap().len(), 1, "one Store for the graph");
     settle(&mut rt).await;
-    rt.cancel(&id("a")).unwrap();
+    rt.shutdown();
     inject(&mut rt, "a", "in", Val::Float64(1.0)).await;
     settle(&mut rt).await;
     assert_eq!(read_f64(&mut rt, "a", "out").await, 1.0);
-    assert_eq!(
-        built.lock().unwrap().last(),
-        Some(&vec![id("a")]),
-        "a rebuild gets fresh data"
-    );
+    assert_eq!(built.lock().unwrap().len(), 2, "a rebuild gets fresh data");
 }
 
 #[tokio::test]
-async fn cancel_frees_what_the_island_held_back() {
+async fn shutdown_drops_a_spinning_run_and_a_new_input_starts_again() {
     let kit = Kit::new(&[BUSY_LOOP, MAYBE]);
     let graph = kit
         .builder("held")
@@ -2688,17 +2632,40 @@ async fn cancel_frees_what_the_island_held_back() {
     assert!(matches!(tick, TickResult::Interrupted), "{tick:?}");
     assert_eq!(phase(&rt, "m"), NodePhase::Pending, "held back by `busy`");
 
-    rt.cancel(&id("busy")).unwrap();
-    assert!(matches!(rt.tick().await, TickResult::Progress));
-    assert_eq!(
-        phase(&rt, "m"),
-        NodePhase::Idle,
-        "nothing holds it back now"
-    );
+    rt.shutdown();
+    assert!(matches!(rt.tick().await, TickResult::Idle));
+    assert_eq!(phase(&rt, "m"), NodePhase::Cancelled);
+    inject(&mut rt, "busy", "action", Val::Enum("finish".into())).await;
+    settle(&mut rt).await;
+    assert_eq!(phase(&rt, "m"), NodePhase::Idle);
 }
 
 #[tokio::test]
-async fn cancel_releases_resources_to_waiting_islands() {
+async fn a_pull_waits_for_a_spinning_guest_and_can_be_given_up_on() {
+    let kit = Kit::new(&[BUSY_LOOP]);
+    let graph = kit
+        .builder("spin")
+        .add_node("busy", kit.get(BUSY_LOOP))
+        .build();
+    let mut rt = kit
+        .load(graph, RuntimeConfig::default(), Trace::new())
+        .await;
+    inject(&mut rt, "busy", "action", Val::Enum("spin".into())).await;
+    let tick = rt
+        .tick_until(tokio::time::sleep(Duration::from_millis(100)))
+        .await;
+    assert!(matches!(tick, TickResult::Interrupted), "{tick:?}");
+    let reader = rt.reader();
+    let read = witgraph_runtime::until(
+        tokio::time::sleep(Duration::from_millis(200)),
+        witgraph_runtime::OutputReader::read_output(&reader, &id("busy"), &"done".into()),
+    )
+    .await;
+    assert!(matches!(read, Err(RuntimeError::PullStopped)), "{read:?}");
+}
+
+#[tokio::test]
+async fn shutdown_releases_resources() {
     let kit = Kit::new(&[BUSY_LOOP, ECHO]);
     let graph = kit
         .builder("gpu")
@@ -2717,17 +2684,16 @@ async fn cancel_releases_resources_to_waiting_islands() {
     let _ = rt
         .tick_until(tokio::time::sleep(Duration::from_millis(200)))
         .await;
-    let e_ran = read(&mut rt, "e", "out").await.is_some();
-    if phase(&rt, "busy") == NodePhase::Running {
-        assert!(!e_ran, "`e` waits for the gpu");
-        rt.cancel(&id("busy")).unwrap();
-        let _ = rt.tick().await;
-    }
+    assert_eq!(phase(&rt, "busy"), NodePhase::Running);
+    assert_eq!(phase(&rt, "e"), NodePhase::Pending, "`e` waits for the gpu");
+    rt.shutdown();
+    inject(&mut rt, "busy", "action", Val::Enum("finish".into())).await;
+    settle(&mut rt).await;
     assert_eq!(read_f64(&mut rt, "e", "out").await, 4.0);
 }
 
 #[tokio::test]
-async fn a_faulted_island_releases_its_resources() {
+async fn a_fault_stops_the_graph_and_frees_its_resources() {
     let kit = Kit::new(&[BUSY_LOOP, ECHO]);
     let graph = kit
         .builder("disk")
@@ -2745,31 +2711,27 @@ async fn a_faulted_island_releases_its_resources() {
     inject(&mut rt, "e", "in", Val::Float64(2.0)).await;
     settle(&mut rt).await;
     assert_eq!(phase(&rt, "busy"), NodePhase::Faulted);
-    assert_eq!(
-        read_f64(&mut rt, "e", "out").await,
-        2.0,
-        "the trap freed the disk"
-    );
-    let trace = rt.mode().trace();
-    assert!(
-        trace
-            .iter()
-            .any(|e| matches!(e, TraceEvent::GenerationStopped { .. })),
-        "a faulted generation is reported stopped"
-    );
+    assert_eq!(phase(&rt, "e"), NodePhase::Faulted, "one fault domain");
     let busy = rt.node_state(&id("busy")).unwrap();
     assert_eq!(busy.culprit(), Some(&id("busy")));
     let faults = rt.take_faults();
     assert!(
         matches!(
             faults.as_slice(),
-            [report] if report.members == [id("busy")]
-                && report.culprit == Some(id("busy"))
+            [report] if report.culprit == Some(id("busy"))
                 && matches!(report.fault, NodeFault::WasmTrap { .. })
         ),
         "{faults:?}"
     );
     assert!(rt.take_faults().is_empty(), "taken");
+
+    inject(&mut rt, "busy", "action", Val::Enum("finish".into())).await;
+    settle(&mut rt).await;
+    assert_eq!(
+        read_f64(&mut rt, "e", "out").await,
+        2.0,
+        "the disk is free, and `e`'s input was the host's"
+    );
 }
 
 /// `prod` streaming records to `cons`: a stream the host cannot move, so
@@ -2783,49 +2745,17 @@ fn reading_pipeline(kit: &Kit) -> Graph {
 }
 
 #[tokio::test]
-async fn a_fault_in_a_member_s_own_store_is_pinned_on_it() {
+async fn fuel_running_out_beside_a_stream_names_no_node() {
     let kit = Kit::new(&[STREAM_PRODUCER, STREAM_CONSUMER]);
     let config = RuntimeConfig {
-        fuel_per_run: Some(5_000_000),
-        ..split()
-    };
-    let mut rt = kit.load(pipeline(&kit), config, Perf).await;
-    let _ = tokio::time::timeout(Duration::from_secs(30), rt.tick())
-        .await
-        .expect("fuel ends the endless generation");
-    // Split, a stream of `u32` is pumped between Stores, so each member has
-    // its own: the one whose Store ran out of fuel is known.
-    let faults = rt.take_faults();
-    let [report] = faults.as_slice() else {
-        panic!("one island faulted: {faults:?}");
-    };
-    assert!(
-        matches!(report.fault, NodeFault::FuelExhausted),
-        "{report:?}"
-    );
-    let culprit = report.culprit.clone().expect("the member is known");
-    assert!(culprit == id("prod") || culprit == id("cons"), "{culprit}");
-    // The island still faults as one.
-    for node in ["prod", "cons"] {
-        let state = rt.node_state(&id(node)).unwrap();
-        assert_eq!(state.phase(), NodePhase::Faulted, "{node}");
-        assert_eq!(state.culprit(), Some(&culprit), "{node}");
-    }
-}
-
-#[tokio::test]
-async fn by_default_an_island_is_one_store() {
-    let kit = Kit::new(&[STREAM_PRODUCER, STREAM_CONSUMER]);
-    let config = RuntimeConfig {
-        fuel_per_run: Some(5_000_000),
+        fuel_per_run: Some(witgraph_runtime::Fuel(5_000_000)),
         ..RuntimeConfig::default()
     };
     let mut rt = kit.load(pipeline(&kit), config, Perf).await;
     let _ = tokio::time::timeout(Duration::from_secs(30), rt.tick())
         .await
-        .expect("fuel ends the endless generation");
-    // One Store, as if the stream could not be pumped: no member is singled
-    // out.
+        .expect("fuel ends the endless run");
+    // The producer returned and writes from a task: either could have burned it.
     let faults = rt.take_faults();
     assert!(
         matches!(faults.as_slice(), [report] if report.culprit.is_none()
@@ -2838,13 +2768,13 @@ async fn by_default_an_island_is_one_store() {
 async fn a_trap_in_a_shared_store_has_no_culprit() {
     let kit = Kit::new(&[READING_PRODUCER, READING_CONSUMER]);
     let config = RuntimeConfig {
-        fuel_per_run: Some(5_000_000),
+        fuel_per_run: Some(witgraph_runtime::Fuel(5_000_000)),
         ..RuntimeConfig::default()
     };
     let mut rt = kit.load(reading_pipeline(&kit), config, Perf).await;
     let _ = tokio::time::timeout(Duration::from_secs(30), rt.tick())
         .await
-        .expect("fuel ends the endless generation");
+        .expect("fuel ends the endless run");
     // The producer returned and writes from a task; the consumer is still
     // in `run`. In one Store, either may have burned the fuel.
     for node in ["prod", "cons"] {
@@ -2859,7 +2789,7 @@ async fn a_trap_in_a_shared_store_has_no_culprit() {
 }
 
 #[tokio::test]
-async fn split_members_share_a_store_only_for_streams_the_host_cannot_move() {
+async fn every_stream_group_shares_one_store() {
     let kit = Kit::new(&[
         STREAM_PRODUCER,
         STREAM_CONSUMER,
@@ -2876,30 +2806,20 @@ async fn split_members_share_a_store_only_for_streams_the_host_cannot_move() {
         .connect("r", port("readings", "items"), port("total", "items"))
         .build();
     let compiled = graph.compile(&kit.contracts).expect("compiles");
-    assert_eq!(compiled.islands().len(), 2, "two stream islands");
+    assert_eq!(compiled.stream_groups().len(), 2, "two stream groups");
     let built = Arc::new(Mutex::new(Vec::new()));
     let mut rt = RuntimeGraph::load_with_host(
         compiled,
         &kit.wasm,
-        split(),
-        Trace::new().with_stream_items(),
+        RuntimeConfig::default(),
+        Trace::new(),
         Counting {
             built: built.clone(),
         },
     )
     .await
     .expect("loads");
-    // `u32` items are pumped between two Stores; records stay in one.
-    let mut stores = built.lock().unwrap().clone();
-    stores.sort();
-    assert_eq!(
-        stores,
-        [
-            vec![id("numbers")],
-            vec![id("readings"), id("total")],
-            vec![id("sum")],
-        ]
-    );
+    assert_eq!(built.lock().unwrap().len(), 1);
 
     inject(&mut rt, "numbers", "burst-size", Val::U32(5)).await;
     inject(&mut rt, "readings", "burst-size", Val::U32(5)).await;
@@ -2908,15 +2828,6 @@ async fn split_members_share_a_store_only_for_streams_the_host_cannot_move() {
         assert_eq!(read_u32(&mut rt, consumer, "count").await, 5, "{consumer}");
         assert_eq!(read_u32(&mut rt, consumer, "total").await, 10, "{consumer}");
     }
-    // The host saw the pumped items pass, and only those.
-    let mut passed = 0;
-    for event in rt.mode().trace() {
-        if let TraceEvent::StreamItems { node, port, count } = event {
-            assert_eq!((node, port), (id("numbers"), "items".into()));
-            passed += count;
-        }
-    }
-    assert_eq!(passed, 5);
 }
 
 #[tokio::test]
@@ -2960,41 +2871,67 @@ async fn values_inject_as_wave_text_against_the_port_type() {
     ));
 }
 
-/// Records generation starts and ends outside the graph, so they outlive
-/// it.
-struct Generations(Arc<Mutex<Vec<(usize, u64, bool)>>>);
+/// Store data that says when it goes.
+struct Flagged {
+    state: HostState,
+    dropped: Arc<std::sync::atomic::AtomicBool>,
+}
 
-impl RuntimeMode for Generations {
-    fn on_generation_started(&self, island: usize, generation: u64) {
-        self.0.lock().unwrap().push((island, generation, true));
+impl Drop for Flagged {
+    fn drop(&mut self) {
+        self.dropped
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl witgraph_runtime::StoreData for Flagged {
+    fn host_state(&mut self) -> &mut HostState {
+        &mut self.state
+    }
+}
+
+struct Flagging(Arc<std::sync::atomic::AtomicBool>);
+
+impl Host for Flagging {
+    type Data = Flagged;
+
+    fn link(
+        &self,
+        _: &[Capability],
+        _: &mut wasmtime::component::Linker<Flagged>,
+    ) -> wasmtime::Result<()> {
+        Ok(())
     }
 
-    fn on_generation_finished(&self, island: usize, generation: u64) {
-        self.0.lock().unwrap().push((island, generation, false));
-    }
-
-    fn on_generation_stopped(&self, island: usize, generation: u64) {
-        self.0.lock().unwrap().push((island, generation, false));
+    fn store_data(&self, state: HostState) -> wasmtime::Result<Flagged> {
+        Ok(Flagged {
+            state,
+            dropped: self.0.clone(),
+        })
     }
 }
 
 #[tokio::test]
-async fn dropping_a_graph_stops_its_generations() {
+async fn dropping_a_graph_drops_its_store() {
     let kit = Kit::new(&[STREAM_PRODUCER, STREAM_CONSUMER]);
-    let log = Arc::new(Mutex::new(Vec::new()));
-    let mut rt = kit
-        .load(
-            pipeline(&kit),
-            RuntimeConfig::default(),
-            Generations(log.clone()),
-        )
-        .await;
+    let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let compiled = pipeline(&kit).compile(&kit.contracts).expect("compiles");
+    let mut rt = RuntimeGraph::load_with_host(
+        compiled,
+        &kit.wasm,
+        RuntimeConfig::default(),
+        Perf,
+        Flagging(dropped.clone()),
+    )
+    .await
+    .expect("loads");
     let tick = rt
         .tick_until(tokio::time::sleep(Duration::from_millis(100)))
         .await;
     assert!(matches!(tick, TickResult::Interrupted), "{tick:?}");
+    assert!(!dropped.load(std::sync::atomic::Ordering::SeqCst));
     drop(rt);
-    assert_eq!(*log.lock().unwrap(), [(0, 1, true), (0, 1, false)]);
+    assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
 }
 
 #[tokio::test]
@@ -3021,20 +2958,35 @@ async fn read_output_reports_bad_targets() {
 }
 
 #[tokio::test]
-async fn a_tiny_hostcall_budget_faults_a_run_that_returns_a_record() {
-    let kit = Kit::new(&[ECHO]);
-    let graph = kit.builder("e").add_node("e", kit.get(ECHO)).build();
+async fn a_tiny_hostcall_budget_spares_a_typed_read_and_faults_a_dynamic_one() {
+    let kit = Kit::new(&[BLOB_SOURCE]);
+    let graph = kit.builder("b").add_node("b", kit.get(BLOB_SOURCE)).build();
+    // Room for the bytes, at about one a byte, not for a `Val` per byte.
     let config = RuntimeConfig {
-        hostcall_fuel: 16,
+        hostcall_fuel: 1 << 20,
         ..RuntimeConfig::default()
     };
     let mut rt = kit.load(graph, config, Perf).await;
-    let _ = rt.tick().await;
-    let fault = rt.node_state(&id("e")).unwrap().fault_cause().cloned();
-    assert!(
-        matches!(fault, Some(NodeFault::HostcallFuelExhausted)),
-        "{fault:?}"
+    inject(&mut rt, "b", "size", Val::U32(100_000)).await;
+    settle(&mut rt).await;
+    let blob = rt
+        .output::<Vec<u8>>(&id("b"), &"blob".into())
+        .await
+        .unwrap();
+    assert_eq!(rt.get(&blob).await.unwrap().unwrap().len(), 100_000);
+
+    assert_eq!(
+        rt.read_output(&id("b"), &"blob".into()).await.unwrap(),
+        None,
+        "the engine stopped the Store"
     );
+    let faults = rt.take_faults();
+    assert!(
+        matches!(faults.as_slice(), [report]
+            if matches!(report.fault, NodeFault::HostcallFuelExhausted)),
+        "{faults:?}"
+    );
+    assert_eq!(phase(&rt, "b"), NodePhase::Faulted);
 }
 
 #[tokio::test]
@@ -3107,7 +3059,7 @@ async fn tick_until_interrupts_an_endless_tick() {
         .await;
     assert!(matches!(tick, TickResult::Interrupted), "{tick:?}");
     assert_eq!(phase(&rt, "cons"), NodePhase::Running, "it carries on");
-    rt.cancel(&id("cons")).unwrap();
+    rt.shutdown();
 }
 
 #[tokio::test]
@@ -3143,7 +3095,7 @@ async fn re_injecting_the_current_value_keeps_a_loop_going() {
 }
 
 #[tokio::test]
-async fn a_restored_replay_keeps_the_host_write_over_stale_feedback() {
+async fn a_restored_run_starts_after_the_host_write_it_was_stale_for() {
     let kit = Kit::new(&[STREAM_PRODUCER, STREAM_CONSUMER, RELAY]);
     let graph = || {
         kit.builder("stale")
@@ -3159,39 +3111,30 @@ async fn a_restored_replay_keeps_the_host_write_over_stale_feedback() {
     inject(&mut rt, "cons", "delay", Val::U32(4)).await;
     inject(&mut rt, "r", "in", Val::U32(1)).await;
     poll_tick_once(&mut rt).await;
-    // Newer than what the in-flight generation will feed back.
+    // Newer than what the in-flight run will feed back.
     inject(&mut rt, "r", "in", Val::U32(100)).await;
     let snapshot = rt.snapshot().await.unwrap();
-    assert_eq!(
-        snapshot
-            .islands
-            .iter()
-            .find(|i| i.running.is_some())
-            .unwrap()
-            .stale_feedback,
-        [witgraph_ir::ConnectionId::from("t")].into_iter().collect()
-    );
 
     for graph_rt in [&mut rt] {
         settle(graph_rt).await;
         assert_eq!(read_u32(graph_rt, "r", "out").await, 100, "original");
     }
+    // Restored, `cons` runs again from the start, after that write, so what it
+    // feeds back is the newest.
+    let total = (0..500).sum::<u32>();
     let mut fresh = kit.load(graph(), small_slices(), Trace::new()).await;
     fresh.restore(&snapshot).await.unwrap();
-    settle(&mut fresh).await;
     assert_eq!(
-        read_u32(&mut fresh, "r", "out").await,
-        100,
-        "restored replay"
+        fresh.snapshot().await.unwrap().inputs[&id("r")][&"in".into()],
+        "100"
     );
+    settle(&mut fresh).await;
+    assert_eq!(read_u32(&mut fresh, "r", "out").await, total);
 
-    // A host write after the restore wins over the replay's feedback too.
+    // A host write while `cons` runs wins, as it did the first time.
     let mut again = kit.load(graph(), small_slices(), Trace::new()).await;
-    let mut clean = snapshot.clone();
-    for island in &mut clean.islands {
-        island.stale_feedback.clear();
-    }
-    again.restore(&clean).await.unwrap();
+    again.restore(&snapshot).await.unwrap();
+    poll_tick_once(&mut again).await;
     inject(&mut again, "r", "in", Val::U32(200)).await;
     settle(&mut again).await;
     assert_eq!(read_u32(&mut again, "r", "out").await, 200);
@@ -3277,19 +3220,20 @@ async fn load_claimants(kit: &Kit, a: f64, b: f64) -> RuntimeGraph<Trace> {
     rt
 }
 
-/// Whether the generations of islands `x` and `y` ever overlapped.
-fn overlapped(trace: &[TraceEvent], x: usize, y: usize) -> bool {
+/// Whether the `run`s of nodes `x` and `y` ever overlapped.
+fn overlapped(trace: &[TraceEvent], x: &str, y: &str) -> bool {
+    let (x, y) = (id(x), id(y));
     let mut running = std::collections::HashSet::new();
     for event in trace {
         match event {
-            TraceEvent::GenerationStarted { island, .. } => {
-                running.insert(*island);
+            TraceEvent::RunStarted { node } => {
+                running.insert(node.clone());
                 if running.contains(&x) && running.contains(&y) {
                     return true;
                 }
             }
-            TraceEvent::GenerationFinished { island, .. } => {
-                running.remove(island);
+            TraceEvent::RunReturned { node } => {
+                running.remove(node);
             }
             _ => {}
         }
@@ -3305,11 +3249,7 @@ async fn resource_claims_exclude_each_other() {
     assert_eq!(read_f64(&mut rt, "a", "out").await, 1.0);
     assert_eq!(read_f64(&mut rt, "b", "out").await, 2.0);
     assert_eq!(read_f64(&mut rt, "free", "out").await, 3.0);
-    let (ia, ib) = (
-        rt.compiled().island_of(&id("a")).unwrap(),
-        rt.compiled().island_of(&id("b")).unwrap(),
-    );
-    assert!(!overlapped(&rt.mode().trace(), ia, ib), "0.6 + 0.6 > 1.0");
+    assert!(!overlapped(&rt.mode().trace(), "a", "b"), "0.6 + 0.6 > 1.0");
 }
 
 #[tokio::test]
@@ -3317,15 +3257,11 @@ async fn compatible_claims_run_together() {
     let kit = Kit::new(&[ECHO]);
     let mut rt = load_claimants(&kit, 0.5, 0.5).await;
     settle(&mut rt).await;
-    let (ia, ib) = (
-        rt.compiled().island_of(&id("a")).unwrap(),
-        rt.compiled().island_of(&id("b")).unwrap(),
-    );
-    assert!(overlapped(&rt.mode().trace(), ia, ib), "0.5 + 0.5 fits");
+    assert!(overlapped(&rt.mode().trace(), "a", "b"), "0.5 + 0.5 fits");
 }
 
 #[tokio::test]
-async fn an_island_over_committing_a_resource_is_rejected() {
+async fn a_group_over_committing_a_resource_is_rejected() {
     let kit = Kit::new(&[STREAM_PRODUCER, STREAM_CONSUMER]);
     let mut graph = pipeline(&kit);
     for node in &mut graph.nodes {
@@ -3334,17 +3270,17 @@ async fn an_island_over_committing_a_resource_is_rejected() {
     }
     let failure = graph
         .compile(&kit.contracts)
-        .expect_err("the island sums to 1.2");
+        .expect_err("the group sums to 1.2");
     assert!(
         failure
             .diagnostics
             .iter()
-            .any(|d| matches!(d, witgraph_ir::Diagnostic::IslandOverclaims { .. })),
+            .any(|d| matches!(d, witgraph_ir::Diagnostic::GroupOverclaims { .. })),
         "{failure:?}"
     );
 }
 
-/// Hands out island data until `panic_after` Stores were made, then
+/// Hands out group data until `panic_after` Stores were made, then
 /// panics.
 struct PanickingData {
     made: std::sync::atomic::AtomicUsize,
@@ -3356,22 +3292,21 @@ impl Host for PanickingData {
 
     fn link(
         &self,
-        _: &NodeId,
-        _: &ComponentContract,
+        _: &[Capability],
         _: &mut wasmtime::component::Linker<HostState>,
     ) -> wasmtime::Result<()> {
         Ok(())
     }
 
-    fn island_data(&self, _: &[NodeId], state: HostState) -> wasmtime::Result<HostState> {
+    fn store_data(&self, state: HostState) -> wasmtime::Result<HostState> {
         let made = self.made.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        assert!(made < self.panic_after, "island data panics");
+        assert!(made < self.panic_after, "store data panics");
         Ok(state)
     }
 }
 
 #[tokio::test]
-async fn a_panic_making_island_data_on_a_rebuild_is_a_restart_fault() {
+async fn a_panic_making_group_data_on_a_rebuild_is_a_restart_fault() {
     let kit = Kit::new(&[ECHO]);
     let graph = kit.builder("e").add_node("e", kit.get(ECHO)).build();
     let compiled = graph.compile(&kit.contracts).unwrap();
@@ -3384,7 +3319,7 @@ async fn a_panic_making_island_data_on_a_rebuild_is_a_restart_fault() {
             .await
             .expect("loads");
     settle(&mut rt).await;
-    rt.cancel(&id("e")).unwrap();
+    rt.shutdown();
     rt.rerun(&id("e")).unwrap();
     settle(&mut rt).await;
     assert!(
@@ -3400,62 +3335,55 @@ async fn a_panic_making_island_data_on_a_rebuild_is_a_restart_fault() {
 // ---- Loading ----
 
 #[tokio::test]
-async fn a_node_finds_the_component_prepared_against_its_contract() {
-    use witgraph_runtime::graph::PreparedComponent;
+async fn a_revision_differing_only_in_its_docs_is_the_same_graph() {
     let kit = Kit::new(&[ECHO]);
-    // Two revisions of one contract that differ only in a doc comment: one
-    // id, content hash included.
     let documented = ComponentContract {
         docs: Some("Another revision.".into()),
         ..kit.contracts[0].clone()
     };
     let engine = RuntimeConfig::default().new_engine().unwrap();
-    let prepared = [&kit.contracts[0], &documented]
-        .map(|contract| PreparedComponent::new(&engine, contract, ECHO.wasm).unwrap());
-    for (contracts, order) in [
-        (std::slice::from_ref(&documented), [0, 1]),
-        (std::slice::from_ref(&documented), [1, 0]),
-        (&kit.contracts[..], [1, 0]),
-    ] {
-        let compiled = Graph::builder("e")
-            .add_component(&contracts[0])
-            .add_node("e", contracts[0].id.clone())
+    let graph = |contract: &ComponentContract| {
+        Graph::builder("e")
+            .add_component(contract)
+            .add_node("e", contract.id.clone())
             .build()
-            .compile(contracts)
-            .unwrap();
-        let prepared = order.map(|i| prepared[i].clone());
-        RuntimeGraph::load_prepared(
-            compiled,
-            &prepared,
-            RuntimeConfig::default(),
-            Perf,
-            witgraph_runtime::NoCapabilities,
-        )
-        .await
-        .unwrap_or_else(|e| panic!("{order:?}: {e}"));
-    }
-}
-
-#[tokio::test]
-async fn prepared_components_load_on_their_engine() {
-    use witgraph_runtime::graph::PreparedComponent;
-    let kit = Kit::new(&[ECHO]);
-    let graph = || kit.builder("e").add_node("e", kit.get(ECHO)).build();
-    let engine = RuntimeConfig::default().new_engine().unwrap();
-    let contract = &kit.contracts[0];
-    let prepared = PreparedComponent::new(&engine, contract, ECHO.wasm).unwrap();
-    assert_eq!(prepared.contract(), contract);
-
-    let compiled = graph().compile(&kit.contracts).unwrap();
-    let mut rt = RuntimeGraph::load_prepared(
-        compiled,
-        std::slice::from_ref(&prepared),
+            .compile(std::slice::from_ref(contract))
+            .unwrap()
+    };
+    let prepared = PreparedGraph::new(&engine, &graph(&kit.contracts[0]), &kit.wasm).unwrap();
+    RuntimeGraph::load_prepared(
+        graph(&documented),
+        &prepared,
         RuntimeConfig::default(),
         Perf,
         witgraph_runtime::NoCapabilities,
     )
     .await
-    .expect("the engine comes from the prepared component");
+    .unwrap_or_else(|e| panic!("{e}"));
+}
+
+#[tokio::test]
+async fn a_prepared_graph_loads_on_its_engine() {
+    let kit = Kit::new(&[ECHO]);
+    let graph = || {
+        kit.builder("e")
+            .add_node("e", kit.get(ECHO))
+            .build()
+            .compile(&kit.contracts)
+            .unwrap()
+    };
+    let engine = RuntimeConfig::default().new_engine().unwrap();
+    let prepared = PreparedGraph::new(&engine, &graph(), &kit.wasm).unwrap();
+
+    let mut rt = RuntimeGraph::load_prepared(
+        graph(),
+        &prepared,
+        RuntimeConfig::default(),
+        Perf,
+        witgraph_runtime::NoCapabilities,
+    )
+    .await
+    .expect("the engine comes from the prepared graph");
     assert!(wasmtime::Engine::same(rt.engine(), &engine));
     assert!(wasmtime::Engine::same(
         rt.config().engine.as_ref().unwrap(),
@@ -3470,8 +3398,8 @@ async fn prepared_components_load_on_their_engine() {
         ..RuntimeConfig::default()
     };
     let err = RuntimeGraph::load_prepared(
-        graph().compile(&kit.contracts).unwrap(),
-        std::slice::from_ref(&prepared),
+        graph(),
+        &prepared,
         other,
         Perf,
         witgraph_runtime::NoCapabilities,
@@ -3483,23 +3411,10 @@ async fn prepared_components_load_on_their_engine() {
         matches!(err, LoadError::Runtime(RuntimeError::InvalidConfig { .. })),
         "{err}"
     );
-
-    let err = RuntimeGraph::load_prepared(
-        graph().compile(&kit.contracts).unwrap(),
-        &[],
-        RuntimeConfig::default(),
-        Perf,
-        witgraph_runtime::NoCapabilities,
-    )
-    .await
-    .err()
-    .expect("nothing prepared for `e`");
-    assert!(matches!(err, LoadError::MissingWasm { .. }), "{err}");
 }
 
 #[tokio::test]
-async fn a_component_prepared_against_another_contract_is_rejected() {
-    use witgraph_runtime::graph::PreparedComponent;
+async fn a_graph_prepared_against_another_contract_is_rejected() {
     let kit = Kit::new(&[ECHO]);
     let engine = RuntimeConfig::default().new_engine().unwrap();
     let real = kit.contracts[0].clone();
@@ -3507,23 +3422,26 @@ async fn a_component_prepared_against_another_contract_is_rejected() {
     // to it.
     let mut other = real.clone();
     other.outputs.retain(|p| p.name.as_str() != "out");
-    let prepared = PreparedComponent::new(&engine, &real, ECHO.wasm).unwrap();
-    let graph = Graph::builder("e")
-        .add_component(&other)
-        .add_node("e", other.id.clone())
-        .build();
-    let compiled = graph.compile(std::slice::from_ref(&other)).unwrap();
+    let compile = |contract: &ComponentContract| {
+        Graph::builder("e")
+            .add_component(contract)
+            .add_node("e", contract.id.clone())
+            .build()
+            .compile(std::slice::from_ref(contract))
+            .unwrap()
+    };
+    let prepared = PreparedGraph::new(&engine, &compile(&real), &kit.wasm).unwrap();
     let err = RuntimeGraph::load_prepared(
-        compiled,
-        std::slice::from_ref(&prepared),
+        compile(&other),
+        &prepared,
         RuntimeConfig::default(),
         Perf,
         witgraph_runtime::NoCapabilities,
     )
     .await
     .err()
-    .expect("prepared against another contract");
-    assert!(matches!(err, LoadError::ContractMismatch { .. }), "{err}");
+    .expect("another contract");
+    assert!(matches!(err, LoadError::GraphMismatch { .. }), "{err}");
 }
 
 #[tokio::test]
@@ -3631,7 +3549,7 @@ async fn restore_continues_a_feedback_loop_from_the_snapshot() {
 }
 
 #[tokio::test]
-async fn restore_onto_an_untouched_graph_runs_only_queued_islands() {
+async fn restore_onto_an_untouched_graph_runs_only_what_was_owed() {
     let kit = Kit::new(&[ECHO]);
     let graph = || {
         kit.builder("pair")
@@ -3647,15 +3565,8 @@ async fn restore_onto_an_untouched_graph_runs_only_queued_islands() {
     inject(&mut rt, "b", "in", Val::Float64(2.0)).await;
     let snapshot = rt.snapshot().await.unwrap();
     assert!(snapshot.quiescent);
-    assert_eq!(
-        snapshot.islands,
-        vec![IslandSnapshot {
-            members: vec![id("b")],
-            running: None,
-            queued: true,
-            stale_feedback: Default::default(),
-        }]
-    );
+    assert!(snapshot.in_flight.is_empty());
+    assert_eq!(snapshot.owed, [id("b")].into_iter().collect());
     assert_eq!(snapshot.phases[&id("a")], NodePhase::Idle);
 
     let mut fresh = kit
@@ -3670,21 +3581,21 @@ async fn restore_onto_an_untouched_graph_runs_only_queued_islands() {
     assert_eq!(read_f64(&mut fresh, "b", "out").await, 2.0);
 }
 
-/// Polls one tick exactly once, leaving a long generation in flight.
+/// Polls one tick exactly once, leaving a long run in flight.
 async fn poll_tick_once<M: RuntimeMode, H: Host>(rt: &mut RuntimeGraph<M, H>) {
     let polled = tokio::time::timeout(Duration::ZERO, rt.tick()).await;
-    assert!(polled.is_err(), "the generation outlives one poll");
+    assert!(polled.is_err(), "the run outlives one poll");
 }
 
 fn small_slices() -> RuntimeConfig {
     RuntimeConfig {
-        yield_interval: 10_000,
+        yield_interval: witgraph_runtime::Fuel(10_000),
         ..RuntimeConfig::default()
     }
 }
 
 #[tokio::test]
-async fn a_mid_flight_snapshot_replays_the_streaming_generation() {
+async fn a_mid_flight_snapshot_re_runs_what_was_in_flight() {
     let kit = Kit::new(&[STREAM_PRODUCER, STREAM_CONSUMER]);
     let mut rt = kit.load(pipeline(&kit), small_slices(), Trace::new()).await;
     // Endless producer; the consumer stops after 5000 items.
@@ -3696,11 +3607,12 @@ async fn a_mid_flight_snapshot_replays_the_streaming_generation() {
     let snapshot = rt.snapshot().await.unwrap();
     assert!(!snapshot.quiescent);
     assert_eq!(snapshot.phases[&id("cons")], NodePhase::Running);
-    let [island] = snapshot.islands.as_slice() else {
-        panic!("one island in flight: {:?}", snapshot.islands)
-    };
-    let started = island.running.as_ref().expect("in flight");
-    assert_eq!(started[&id("cons")][&"take".into()], "5000");
+    assert_eq!(
+        snapshot.in_flight,
+        [id("cons")].into_iter().collect(),
+        "`prod` returned, and its group re-runs as one"
+    );
+    assert_eq!(snapshot.inputs[&id("cons")][&"take".into()], "5000");
 
     let err = rt.restore(&snapshot).await.unwrap_err();
     assert!(matches!(err, RuntimeError::NotQuiescent), "{err}");
@@ -3742,7 +3654,7 @@ async fn restore_after_shutdown_replays_the_interrupted_generation() {
     assert_eq!(
         phase(&rt, "cons"),
         NodePhase::Idle,
-        "the stopped island was rebuilt"
+        "the stopped group was rebuilt"
     );
 }
 
@@ -3756,10 +3668,10 @@ async fn restore_works_right_after_cancel() {
     let snapshot = rt.snapshot().await.unwrap();
     assert!(!snapshot.quiescent);
 
-    rt.cancel(&id("cons")).unwrap();
+    rt.shutdown();
     rt.restore(&snapshot)
         .await
-        .expect("a cancelled island has nothing in flight");
+        .expect("a cancelled group has nothing in flight");
     settle(&mut rt).await;
     assert_eq!(read_u32(&mut rt, "cons", "count").await, 3000);
     assert_eq!(phase(&rt, "cons"), NodePhase::Idle);
@@ -3848,61 +3760,24 @@ async fn restore_rejects_a_rewired_graph() {
 }
 
 #[tokio::test]
-async fn restore_matches_islands_by_their_members_in_any_order() {
-    let kit = Kit::new(&[STREAM_PRODUCER, STREAM_CONSUMER]);
-    let mut rt = kit.load(pipeline(&kit), small_slices(), Trace::new()).await;
-    inject(&mut rt, "cons", "take", Val::U32(300)).await;
-    inject(&mut rt, "cons", "delay", Val::U32(4)).await;
-    poll_tick_once(&mut rt).await;
-    let mut snapshot = rt.snapshot().await.unwrap();
-    assert_eq!(
-        snapshot.islands[0].members,
-        vec![id("cons"), id("prod")],
-        "sorted"
-    );
-    snapshot.islands[0].members.reverse();
-
-    let mut fresh = kit.load(pipeline(&kit), small_slices(), Trace::new()).await;
-    fresh
-        .restore(&snapshot)
-        .await
-        .expect("members match as a set");
-    settle(&mut fresh).await;
-    assert_eq!(read_u32(&mut fresh, "cons", "count").await, 300);
-}
-
-#[tokio::test]
-async fn restore_rejects_a_replay_missing_a_required_input() {
+async fn a_restored_node_without_its_required_input_waits_for_it() {
     let kit = Kit::new(&[RELAY]);
     let mut rt = kit
         .load(counter_loop(&kit), RuntimeConfig::default(), Trace::new())
         .await;
     let mut snapshot = rt.snapshot().await.unwrap();
-    snapshot.islands = vec![IslandSnapshot {
-        members: vec![id("a")],
-        running: Some([(id("a"), Default::default())].into_iter().collect()),
-        queued: false,
-        stale_feedback: Default::default(),
-    }];
-    let err = rt.restore(&snapshot).await.unwrap_err();
+    snapshot.in_flight = [id("a")].into_iter().collect();
+    rt.restore(&snapshot).await.unwrap();
     assert!(
-        matches!(err, RuntimeError::SnapshotValue { ref port, .. } if port.as_str() == "in"),
-        "`a.in` is required: {err}"
+        matches!(rt.tick().await, TickResult::Idle),
+        "`a.in` is required"
     );
 
-    snapshot.islands[0].running = Some(
-        [(
-            id("a"),
-            [
-                ("in".into(), "1".to_string()),
-                ("out".into(), "1".to_string()),
-            ]
-            .into_iter()
-            .collect(),
-        )]
-        .into_iter()
-        .collect(),
-    );
+    snapshot
+        .inputs
+        .entry(id("a"))
+        .or_default()
+        .insert("out".into(), "1".to_string());
     let err = rt.restore(&snapshot).await.unwrap_err();
     assert!(
         matches!(err, RuntimeError::SnapshotValue { ref port, .. } if port.as_str() == "out"),
@@ -3924,41 +3799,13 @@ async fn restore_rejects_inconsistent_snapshots_and_changes_nothing() {
         let _ = rt.tick().await;
     }
     let good = rt.snapshot().await.unwrap();
-    let running = |node: &str| -> Option<witgraph_runtime::PortValues> {
-        Some(
-            [(
-                id(node),
-                [("in".into(), "1".to_string())].into_iter().collect(),
-            )]
-            .into_iter()
-            .collect(),
-        )
-    };
-    let island = |members: &[&str], running, stale: &[&str]| IslandSnapshot {
-        members: members.iter().map(|m| id(m)).collect(),
-        running,
-        queued: false,
-        stale_feedback: stale.iter().map(|c| (*c).into()).collect(),
-    };
     let mut cases: Vec<(&str, Snapshot)> = Vec::new();
-    let mut twice = good.clone();
-    twice.islands = vec![island(&["a"], None, &[]), island(&["a"], None, &[])];
-    cases.push(("an island listed twice", twice));
-    let mut unknown = good.clone();
-    unknown.islands = vec![island(&["a", "b"], None, &[])];
-    cases.push(("no such island", unknown));
-    let mut outside = good.clone();
-    outside.islands = vec![island(&["a"], running("b"), &[])];
-    cases.push(("a member of another island", outside));
     let mut not_feedback = good.clone();
     not_feedback.feedback.insert("ab".into(), "1".into());
     cases.push(("a non-feedback connection", not_feedback));
-    let mut stale_elsewhere = good.clone();
-    stale_elsewhere.islands = vec![island(&["a"], running("a"), &["ba"])];
-    cases.push(("stale feedback from another island", stale_elsewhere));
-    let mut stale_idle = good.clone();
-    stale_idle.islands = vec![island(&["b"], None, &["ba"])];
-    cases.push(("stale feedback without a replay", stale_idle));
+    let mut unknown = good.clone();
+    unknown.owed.insert(id("ghost"));
+    cases.push(("a node not in the graph owes a run", unknown));
     let mut phases = good.clone();
     phases.phases.insert(id("ghost"), NodePhase::Idle);
     cases.push(("a phase for a node not in the graph", phases));
@@ -4006,12 +3853,8 @@ fn snapshot_round_trips_through_serde() {
         inputs: values("in", "1.5"),
         outputs: Default::default(),
         feedback: [("ba".into(), "3".to_string())].into_iter().collect(),
-        islands: vec![IslandSnapshot {
-            members: vec![id("n")],
-            running: Some(values("in", "1.0")),
-            queued: true,
-            stale_feedback: Default::default(),
-        }],
+        in_flight: [id("n")].into_iter().collect(),
+        owed: [id("n")].into_iter().collect(),
     };
     let json = serde_json::to_string(&snapshot).unwrap();
     let back: Snapshot = serde_json::from_str(&json).unwrap();
@@ -4020,10 +3863,10 @@ fn snapshot_round_trips_through_serde() {
 
 #[test]
 fn a_misspelled_snapshot_key_is_rejected() {
-    let json = r#"{"nodes":{},"connections":[],"quiescent":true,"phases":{},"inputs":{},"outputs":{},"feedback":{},"islands":[{"members":["n"],"runing":null,"queued":false}]}"#;
+    let json = r#"{"nodes":{},"connections":[],"quiescent":true,"phases":{},"inputs":{},"outputs":{},"feedback":{},"in_flight":[],"owed":[],"quiesent":false}"#;
     assert!(
         serde_json::from_str::<Snapshot>(json).is_err(),
-        "a typo must not silently drop a replay"
+        "a typo must not silently drop anything"
     );
 }
 
@@ -4039,4 +3882,41 @@ fn guest_copy_of_the_runtime_wit_is_current() {
         canonical, copy,
         "re-copy wit/witgraph-runtime.wit into the guest's deps"
     );
+}
+
+/// The fault that kept this on wasmtime's main: a guest task's table entry leaked
+/// per call of a callee that returned at once, so a composition stopped after a
+/// million or so. Run on a bump of wasmtime.
+#[tokio::test]
+#[ignore = "two million runs: run by hand on a bump of wasmtime"]
+async fn two_million_runs_fault_nothing_and_stay_flat() {
+    fn resident_kib() -> u64 {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix("VmRSS:"))
+            .and_then(|rest| rest.trim().trim_end_matches(" kB").parse().ok())
+            .unwrap()
+    }
+    let kit = Kit::new(&[BLOB_SOURCE, BLOB_SINK]);
+    let graph = kit
+        .builder("soak")
+        .add_node("source", kit.get(BLOB_SOURCE))
+        .add_node("sink", kit.get(BLOB_SINK))
+        .connect("blob", port("source", "blob"), port("sink", "blob"))
+        .build();
+    let mut rt = kit.load(graph, RuntimeConfig::default(), Perf).await;
+    inject(&mut rt, "source", "size", Val::U32(1024)).await;
+    let mut settled = None;
+    for seed in 0..1_000_000u32 {
+        inject(&mut rt, "source", "seed", Val::U32(seed % 256)).await;
+        while !matches!(rt.tick().await, TickResult::Idle) {}
+        if seed == 100_000 {
+            settled = Some(resident_kib());
+        }
+    }
+    assert!(rt.take_faults().is_empty());
+    assert_eq!(read_u32(&mut rt, "sink", "len").await, 1024);
+    let (settled, end) = (settled.unwrap(), resident_kib());
+    assert!(end < settled + 64 * 1024, "{settled} KiB grew to {end} KiB");
 }

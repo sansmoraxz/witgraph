@@ -4,31 +4,30 @@ use witgraph_ir::NodeId;
 
 use crate::error::NodeFault;
 
-/// The outcome of one `tick`(crate::Scheduler::tick).
+/// The outcome of one `tick`.
 #[derive(Debug, Clone)]
 #[must_use = "a tick can end in an abort or a step limit"]
 pub enum TickResult {
-    /// Work happened: a generation started or finished (or faulted), or a
-    /// feedback edge latched a new value. Tick again to continue. Faults
+    /// Work happened: a node ran, the graph faulted, or a feedback edge
+    /// latched a new value. Tick again to continue. Faults
     /// other than `fatal` do not end a tick: see
-    /// `take_faults`(crate::Scheduler::take_faults).
+    /// `take_faults`.
     Progress,
-    /// Nothing ran, and nothing can make progress: every island is idle,
-    /// stopped, or owes a run it cannot start (a required input has no
-    /// value yet).
+    /// Nothing ran, and nothing can make progress: the graph is stopped, or
+    /// every node is idle or owes a run it cannot start (a required input has
+    /// no value yet).
     Idle,
     /// The `stop` future of
-    /// `tick_until`(crate::Scheduler::tick_until) fired
-    /// first. The tick ended as a dropped one does: generations in flight
-    /// carry on with the next tick, and every feedback loop whose iteration
+    /// `tick_until` fired
+    /// first. The tick ended as a dropped one does: what is in flight carries
+    /// on with the next tick, and every feedback loop whose iteration
     /// is over was latched.
     Interrupted,
-    /// The tick started `max_steps_per_tick` generations before reaching
-    /// quiescence. Generations still in flight keep their state and resume
-    /// on the next tick.
+    /// The tick started `max_steps_per_tick` runs before reaching quiescence.
+    /// What is in flight resumes on the next tick.
     StepLimitReached,
-    /// A node called `fatal`. The tick stopped at once; its island is
-    /// faulted, and other in-flight generations resume on the next tick.
+    /// A node called `fatal`. The tick stopped at once, and the graph is
+    /// faulted.
     Aborted {
         /// The node that called `fatal`.
         node: NodeId,
@@ -37,16 +36,12 @@ pub enum TickResult {
     },
 }
 
-/// An island fault, as `take_faults`(crate::Scheduler::take_faults)
-/// reports it.
+/// A fault, as `take_faults` reports it: it stopped the whole graph.
 #[derive(Debug, Clone)]
 pub struct FaultReport {
-    /// The island's members, in island order: every one of them faulted.
-    pub members: Vec<NodeId>,
-    /// The member that caused the fault, when it is known: the one that
-    /// called `fatal` or failed to rebuild, the island's only member, or
-    /// one the executor pins the fault on (see
-    /// [`NodeState::culprit`](crate::NodeState::culprit)).
+    /// The node that caused the fault, when it is known: the one that called
+    /// `fatal`, or the only one with a `run` in flight when it happened, with no
+    /// stream group at work (see [`NodeState::culprit`](crate::NodeState::culprit)).
     pub culprit: Option<NodeId>,
     /// The fault.
     pub fault: NodeFault,

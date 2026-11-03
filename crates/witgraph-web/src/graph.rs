@@ -453,7 +453,7 @@ impl WebGraph {
     ///   gives the node fresh guest state (a new instance), throwing or
     ///   rejecting if it cannot (with an error marked `witgraphFatal` when
     ///   a start function called `fatal`); `close(value)` drops a stream
-    ///   or future nothing reads; `abandon(nodes)` says the generation of
+    ///   or future nothing reads; `abandon(nodes)` says the instance of
     ///   those nodes ended before their `rebuild` or `run` calls did (a
     ///   cancel, shutdown or restore, or a sibling's failed `run`), so
     ///   whatever those calls still do belongs to nothing.
@@ -543,40 +543,41 @@ impl WebGraph {
             input_types: HashMap::new(),
             output_types: HashMap::new(),
             outputs: HashMap::new(),
+            nodes: Vec::new(),
         };
-        let mut islands = Vec::new();
-        for members in compiled.islands() {
-            let mut shapes = Vec::with_capacity(members.len());
-            for node in members {
-                let contract = compiled
-                    .contract_for(node)
-                    .ok_or_else(|| error(format!("unknown node `{node}`")))?;
-                for port in &contract.inputs {
-                    if let (PortKind::Value, Some(ty)) = (port.kind, &port.ty) {
-                        let port = PortRef::new(node.clone(), port.name.clone());
-                        shared.input_types.insert(port, ty.clone());
-                    }
+        let mut shapes = HashMap::new();
+        for node in compiled.topological_order() {
+            shared.nodes.push(node.clone());
+            let contract = compiled
+                .contract_for(node)
+                .ok_or_else(|| error(format!("unknown node `{node}`")))?;
+            for port in &contract.inputs {
+                if let (PortKind::Value, Some(ty)) = (port.kind, &port.ty) {
+                    let port = PortRef::new(node.clone(), port.name.clone());
+                    shared.input_types.insert(port, ty.clone());
                 }
-                let mut outputs = Vec::new();
-                for port in &contract.outputs {
-                    if let (PortKind::Value, Some(ty)) = (port.kind, &port.ty) {
-                        let port = PortRef::new(node.clone(), port.name.clone());
-                        shared.output_types.insert(port, ty.clone());
-                    }
-                    outputs.push(OutputPort {
-                        name: port.name.to_string(),
-                        kind: port.kind,
-                        ty: port.ty.clone(),
-                    });
+            }
+            let mut outputs = Vec::new();
+            for port in &contract.outputs {
+                if let (PortKind::Value, Some(ty)) = (port.kind, &port.ty) {
+                    let port = PortRef::new(node.clone(), port.name.clone());
+                    shared.output_types.insert(port, ty.clone());
                 }
-                shared.outputs.insert(node.clone(), outputs);
-                shapes.push(RunShape {
+                outputs.push(OutputPort {
+                    name: port.name.to_string(),
+                    kind: port.kind,
+                    ty: port.ty.clone(),
+                });
+            }
+            shared.outputs.insert(node.clone(), outputs);
+            shapes.insert(
+                node.clone(),
+                RunShape {
                     inputs: (!contract.inputs.is_empty())
                         .then(|| contract.inputs.iter().map(|p| p.name.to_string()).collect()),
                     has_result: !contract.outputs.is_empty(),
-                });
-            }
-            islands.push(((), shapes));
+                },
+            );
         }
         let shared = Rc::new(shared);
         let executor = Js {
@@ -588,7 +589,7 @@ impl WebGraph {
             compiled,
             mode,
             executor,
-            islands,
+            &shapes,
             witgraph_sched::DEFAULT_MAX_STEPS_PER_TICK,
         )
         .map_err(error)?;
@@ -824,17 +825,12 @@ impl WebGraph {
         })
     }
 
-    /// Makes the node's island owe a run on its latched inputs.
+    /// Makes the node owe a run on its latched inputs.
     pub fn rerun(&self, node: &str) -> Result<(), JsError> {
         self.idle()?.rerun(&node.into()).map_err(error)
     }
 
-    /// Cancels the node's island.
-    pub fn cancel(&self, node: &str) -> Result<(), JsError> {
-        self.idle()?.0.cancel(&node.into()).map_err(error)
-    }
-
-    /// Stops every island.
+    /// Stops the graph.
     pub fn shutdown(&self) -> Result<(), JsError> {
         self.idle()?.shutdown();
         Ok(())
@@ -922,7 +918,7 @@ impl WebGraph {
     }
 
     /// Takes the faults reported since the last call: an array of
-    /// `{ members, culprit?, fault }`.
+    /// `{ culprit?, fault }`. A fault stops the whole graph.
     #[wasm_bindgen(js_name = takeFaults)]
     pub fn take_faults(&self) -> Result<Array, JsError> {
         let faults = self.idle()?.take_faults();
@@ -930,8 +926,6 @@ impl WebGraph {
             .iter()
             .map(|report| {
                 let object = Object::new();
-                let members: Array = report.members.iter().map(|m| text(m.as_str())).collect();
-                set(&object, "members", &members);
                 if let Some(culprit) = &report.culprit {
                     set(&object, "culprit", &text(culprit.as_str()));
                 }
@@ -992,18 +986,30 @@ impl WebGraph {
         self.warnings.iter().map(|w| JsValue::from_str(w)).collect()
     }
 
-    /// The islands of the compiled graph: arrays of node ids, in island
-    /// order.
-    pub fn islands(&self) -> Result<Array, JsError> {
+    /// The compiled graph's stream groups: arrays of node ids, which always
+    /// re-run together, in topological order.
+    #[wasm_bindgen(js_name = streamGroups)]
+    pub fn stream_groups(&self) -> Result<Array, JsError> {
         let sched = self.idle()?;
         Ok(sched
             .compiled()
-            .islands()
+            .stream_groups()
             .iter()
             .map(|members| {
                 let members: Array = members.iter().map(|m| text(m.as_str())).collect();
                 JsValue::from(members)
             })
+            .collect())
+    }
+
+    /// The compiled graph's nodes, in topological order.
+    pub fn nodes(&self) -> Result<Array, JsError> {
+        let sched = self.idle()?;
+        Ok(sched
+            .compiled()
+            .topological_order()
+            .iter()
+            .map(|node| text(node.as_str()))
             .collect())
     }
 }
@@ -1092,18 +1098,7 @@ fn trace_event(event: &TraceEvent) -> JsValue {
     let object = Object::new();
     let named = |name: &str| set(&object, "event", &text(name));
     let node = |node: &NodeId| set(&object, "node", &text(node.as_str()));
-    let generation = |island: usize, generation: u64| {
-        set(&object, "island", &JsValue::from(island as u32));
-        set(&object, "generation", &JsValue::from(generation as f64));
-    };
     match event {
-        TraceEvent::GenerationStarted {
-            island,
-            generation: number,
-        } => {
-            named("generation-started");
-            generation(*island, *number);
-        }
         TraceEvent::RunStarted { node: id } => {
             named("run-started");
             node(id);
@@ -1112,19 +1107,10 @@ fn trace_event(event: &TraceEvent) -> JsValue {
             named("run-returned");
             node(id);
         }
-        TraceEvent::GenerationFinished {
-            island,
-            generation: number,
-        } => {
-            named("generation-finished");
-            generation(*island, *number);
-        }
-        TraceEvent::GenerationStopped {
-            island,
-            generation: number,
-        } => {
-            named("generation-stopped");
-            generation(*island, *number);
+        TraceEvent::GroupDrained { nodes } => {
+            named("group-drained");
+            let nodes: Array = nodes.iter().map(|node| text(node.as_str())).collect();
+            set(&object, "nodes", &nodes);
         }
         TraceEvent::PhaseTransition { node: id, from, to } => {
             named("phase-transition");

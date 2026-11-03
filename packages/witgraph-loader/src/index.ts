@@ -129,7 +129,7 @@ export interface SessionOptions {
   /**
    * What a node imports: called for each import every time the node is
    * instantiated (when the session loads, and on every rebuild after a
-   * fault, cancel or restore), with the capability of the node's contract
+   * fault, shutdown or restore), with the capability of the node's contract
    * the import is, as a wasmtime host is asked for it. It returns the
    * import's implementation as jco expects it (functions by
    * `lowerCamelCase` name), or `undefined` when there is none. The
@@ -319,7 +319,7 @@ export class Session {
   #components: Map<string, NodeComponent>;
   #instances = new Map<string, Record<string, any>>();
   /**
-   * Per node, how many of its generations were abandoned: a rebuild or run
+   * Per node, how many of its instances were abandoned: a rebuild or run
    * started under an older count belongs to none.
    */
   #epoch = new Map<string, number>();
@@ -372,7 +372,7 @@ export class Session {
       // `components`, or, for a node whose links apply, that entry composed
       // with its providers (`bytes`). Nodes running the same bytes share a
       // transpile.
-      const nodes: string[] = (web.islands() as string[][]).flat();
+      const nodes: string[] = web.nodes() as string[];
       const entries = new Map<string, Promise<Transpiled>>();
       const transpiled = nodes.map((node) => {
         const { index, sha256, bytes } = web.component(node) as {
@@ -503,7 +503,7 @@ export class Session {
   }
 
   /**
-   * Counts a generation of each node abandoned, and closes the streams its
+   * Counts an instance of each node abandoned, and closes the streams its
    * runs returned: their writers' next writes fail, so a guest's background
    * writer stops instead of running on for nobody.
    */
@@ -547,7 +547,7 @@ export class Session {
     }
     const getCoreModule = (path: string) => transpiled.modules.get(path)!;
     const instance = await transpiled.instantiate(getCoreModule, provided);
-    // An instance whose generation was abandoned meanwhile is nobody's: a
+    // An instance abandoned meanwhile is nobody's: a
     // newer rebuild may already have run on its own.
     if (!this.#disposed && (this.#epoch.get(node) ?? 0) === epoch)
       this.#instances.set(node, instance);
@@ -555,7 +555,7 @@ export class Session {
 
   /** One call of a node's `run`, with the hooks around it. */
   async #run(node: string, inputs: PortValues): Promise<PortValues> {
-    // A run whose generation is abandoned (cancelled, say, while
+    // A run abandoned (shut down, say, while
     // `beforeRun` held it) stops at the next step: its node may already be
     // rebuilt, and nothing reads what it returns.
     const epoch = this.#epoch.get(node) ?? 0;
@@ -581,7 +581,7 @@ export class Session {
       return outputs;
     }
     // Every stream output is tapped, so it can be closed when its
-    // generation is abandoned or the session disposed.
+    // instance is abandoned or the session disposed.
     for (const port of this.contracts.get(node)?.outputs ?? []) {
       const key = camelCase(port.name);
       if (port.kind === 'future') {

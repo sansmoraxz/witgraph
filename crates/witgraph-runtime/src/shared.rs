@@ -34,7 +34,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use wasmtime::component::{LinkerInstance, ResourceDynamic, ResourceType};
 use witgraph_ir::interface::compat_track;
 
-use crate::engine::IslandData;
+use crate::engine::StoreData;
 
 /// An object a handle port carries: cloning it clones a reference, and two
 /// are equal only when they are the same object.
@@ -113,7 +113,7 @@ pub(crate) fn tag(interface: &str, resource: &str) -> u32 {
 /// for `interface`, as a resource handle ports may carry. A guest dropping
 /// an `own` handle of it drops its reference; the object lives on while
 /// anything else holds it.
-pub fn link_resource<D: IslandData>(
+pub fn link_resource<D: StoreData>(
     instance: &mut LinkerInstance<'_, D>,
     interface: &str,
     resource: &str,

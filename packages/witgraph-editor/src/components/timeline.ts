@@ -13,7 +13,6 @@ function eventColor(event: string): string {
     case 'error':
       return 'var(--wg-error)';
     case 'cancelled':
-    case 'generation-stopped':
       return 'var(--wg-accent)';
     case 'restarted':
     case 'warning':
@@ -145,13 +144,8 @@ export class WitgraphTimeline extends HTMLElement {
     name.textContent = entry.event;
     el.appendChild(name);
 
-    // A node's event names the node; an island's names its nodes.
-    const nodes =
-      entry.node !== undefined
-        ? [entry.node]
-        : entry.island !== undefined
-          ? (this.#controller?.islands[entry.island] ?? [])
-          : [];
+    // A node's event names the node; a stream group's names its nodes.
+    const nodes = entry.node !== undefined ? [entry.node] : (entry.nodes ?? []);
     nodes.forEach((node, i) => {
       el.appendChild(document.createTextNode(i === 0 ? ' ' : ', '));
       const nodeSpan = document.createElement('span');
@@ -162,7 +156,6 @@ export class WitgraphTimeline extends HTMLElement {
     });
 
     const details: string[] = [];
-    if (entry.generation !== undefined) details.push(`(generation ${entry.generation})`);
     if (entry.message) details.push(entry.message);
     if (entry.from && entry.to) details.push(`${entry.from} → ${entry.to}`);
     if (entry.fault) details.push(entry.fault.message);

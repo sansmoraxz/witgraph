@@ -174,19 +174,22 @@ fn demo_graph_compiles_and_aggregates_capabilities() {
 }
 
 #[test]
-fn demo_graph_partitions_into_stream_islands() {
+fn demo_graph_partitions_into_stream_groups() {
     let contracts = fixtures();
     let compiled = demo_graph(&contracts).compile(&contracts).unwrap();
-    let mut islands: Vec<BTreeSet<&str>> = compiled
-        .islands()
+    let mut groups: Vec<BTreeSet<&str>> = compiled
+        .stream_groups()
         .iter()
-        .map(|island| island.iter().map(|n| n.as_str()).collect())
+        .map(|group| group.iter().map(|n| n.as_str()).collect())
         .collect();
-    islands.sort();
+    groups.sort();
+    assert!(
+        compiled.group_of(&"accumulator".into()).is_none(),
+        "value connections join nothing"
+    );
     assert_eq!(
-        islands,
+        groups,
         vec![
-            BTreeSet::from(["accumulator"]),
             BTreeSet::from(["alarm", "display", "filter", "sensor"]),
             BTreeSet::from(["archive", "collector"]),
         ]

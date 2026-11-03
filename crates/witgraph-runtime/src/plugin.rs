@@ -31,14 +31,14 @@ use std::any::{Any, TypeId};
 use std::collections::HashMap;
 
 use wasmtime::component::Linker;
-use witgraph_ir::{Capability, ComponentContract, HandleType, NodeId};
+use witgraph_ir::{Capability, HandleType, NodeId};
 
-use crate::engine::{CapabilityGap, Host, HostState, IslandData};
+use crate::engine::{CapabilityGap, Host, HostState, StoreData};
 use witgraph_ir::interface::semver_serves;
 use witgraph_sched::RuntimeError;
 
 /// One provider of capabilities, for [`Plugins`].
-pub trait CapabilityPlugin<D: IslandData = PluginData>: Send + Sync + 'static {
+pub trait CapabilityPlugin<D: StoreData = PluginData>: Send + Sync + 'static {
     /// The plugin's id, unique among a [`Plugins`]' plugins. A labelled
     /// import whose label equals it is routed to this plugin.
     fn id(&self) -> &str;
@@ -51,17 +51,11 @@ pub trait CapabilityPlugin<D: IslandData = PluginData>: Send + Sync + 'static {
     /// Asked once, when the plugin is added to a [`Plugins`].
     fn provides(&self) -> Vec<String>;
 
-    /// Adds `capability` to `node`'s linker under the name the node
-    /// imports it by, [`Capability::link_name`]: an interface id, inline
-    /// import name or label as an instance, a bare function or world
-    /// resource at the linker's root. Called once per node and capability
-    /// routed to this plugin.
-    fn link(
-        &self,
-        node: &NodeId,
-        capability: &Capability,
-        linker: &mut Linker<D>,
-    ) -> wasmtime::Result<()>;
+    /// Adds `capability` to the graph's linker under the name it is imported
+    /// by, [`Capability::link_name`]: an interface id, inline import name or
+    /// label as an instance, a bare function or world resource at the linker's
+    /// root. Called once per capability routed to this plugin.
+    fn link(&self, capability: &Capability, linker: &mut Linker<D>) -> wasmtime::Result<()>;
 
     /// Whether `resource`, declared in `interface` (one of the interfaces
     /// it [provides](Self::provides)), is one handle ports may carry: one
@@ -76,10 +70,7 @@ pub trait CapabilityPlugin<D: IslandData = PluginData>: Send + Sync + 'static {
 }
 
 /// Per-Store state of any type, one value per type: where plugins sharing
-/// a Store keep what belongs to them. An island has one Store, or several
-/// when members joined only by streams the host can pump each get their
-/// own (see [`engine`](crate::engine#islands)); state kept here is not
-/// shared between an island's Stores.
+/// the graph's Store keep what belongs to them.
 #[derive(Default)]
 pub struct Extensions(HashMap<TypeId, Box<dyn Any + Send>>);
 
@@ -109,9 +100,9 @@ impl std::fmt::Debug for Extensions {
     }
 }
 
-/// The default island Store data of [`Plugins`]: witgraph's [`HostState`]
+/// The default Store data of [`Plugins`]: witgraph's [`HostState`]
 /// plus [`Extensions`] for the plugins' own state in that Store. It is
-/// created empty for every island Store, at load and on every rebuild.
+/// created empty for every Store, at load and on every rebuild.
 #[derive(Debug)]
 pub struct PluginData {
     state: HostState,
@@ -125,27 +116,27 @@ impl PluginData {
     }
 }
 
-impl IslandData for PluginData {
+impl StoreData for PluginData {
     fn host_state(&mut self) -> &mut HostState {
         &mut self.state
     }
 }
 
-/// How [`Plugins`] makes the data of an island Store.
-type DataFactory<D> = Box<dyn Fn(&[NodeId], HostState) -> wasmtime::Result<D> + Send + Sync>;
+/// How [`Plugins`] makes the data of a Store.
+type DataFactory<D> = Box<dyn Fn(HostState) -> wasmtime::Result<D> + Send + Sync>;
 
 /// A [`Host`] made of [`CapabilityPlugin`]s. See the [module docs](self)
 /// for how a capability is routed to one of them.
-pub struct Plugins<D: IslandData = PluginData> {
+pub struct Plugins<D: StoreData = PluginData> {
     /// Each plugin, with what it provides.
     plugins: Vec<(Box<dyn CapabilityPlugin<D>>, Vec<String>)>,
     data: DataFactory<D>,
 }
 
 impl Plugins<PluginData> {
-    /// No plugins yet, with [`PluginData`] as the island Store data.
+    /// No plugins yet, with [`PluginData`] as the Store data.
     pub fn new() -> Self {
-        Self::with_data(|_, state| {
+        Self::with_data(|state| {
             Ok(PluginData {
                 state,
                 extensions: Extensions::default(),
@@ -160,12 +151,12 @@ impl Default for Plugins<PluginData> {
     }
 }
 
-impl<D: IslandData> Plugins<D> {
-    /// No plugins yet, with island Store data made by `data` (as
-    /// [`Host::island_data`] makes it), for plugins that need a data type
+impl<D: StoreData> Plugins<D> {
+    /// No plugins yet, with Store data made by `data` (as
+    /// [`Host::store_data`] makes it), for plugins that need a data type
     /// of their own.
     pub fn with_data(
-        data: impl Fn(&[NodeId], HostState) -> wasmtime::Result<D> + Send + Sync + 'static,
+        data: impl Fn(HostState) -> wasmtime::Result<D> + Send + Sync + 'static,
     ) -> Self {
         Self {
             plugins: Vec::new(),
@@ -226,23 +217,18 @@ impl<D: IslandData> Plugins<D> {
     }
 }
 
-impl<D: IslandData> Host for Plugins<D> {
+impl<D: StoreData> Host for Plugins<D> {
     type Data = D;
 
-    fn link(
-        &self,
-        node: &NodeId,
-        contract: &ComponentContract,
-        linker: &mut Linker<D>,
-    ) -> wasmtime::Result<()> {
-        for capability in &contract.capabilities {
+    fn link(&self, capabilities: &[Capability], linker: &mut Linker<D>) -> wasmtime::Result<()> {
+        for capability in capabilities {
             let plugin = self.route(capability).map_err(|gap| {
                 wasmtime::format_err!(
                     "no plugin for capability `{}`: {gap:?}",
                     capability.interface
                 )
             })?;
-            plugin.link(node, capability, linker).map_err(|e| {
+            plugin.link(capability, linker).map_err(|e| {
                 e.context(format!(
                     "plugin `{}` linking `{}`",
                     plugin.id(),
@@ -253,8 +239,8 @@ impl<D: IslandData> Host for Plugins<D> {
         Ok(())
     }
 
-    fn island_data(&self, members: &[NodeId], state: HostState) -> wasmtime::Result<D> {
-        (self.data)(members, state)
+    fn store_data(&self, state: HostState) -> wasmtime::Result<D> {
+        (self.data)(state)
     }
 
     fn check(&self, _: &NodeId, capability: &Capability) -> Result<(), CapabilityGap> {
@@ -283,12 +269,7 @@ mod tests {
             self.1.iter().map(ToString::to_string).collect()
         }
 
-        fn link(
-            &self,
-            _: &NodeId,
-            _: &Capability,
-            _: &mut Linker<PluginData>,
-        ) -> wasmtime::Result<()> {
+        fn link(&self, _: &Capability, _: &mut Linker<PluginData>) -> wasmtime::Result<()> {
             Ok(())
         }
     }

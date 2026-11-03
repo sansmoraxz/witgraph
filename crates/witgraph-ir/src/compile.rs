@@ -258,7 +258,7 @@ impl RequiredCapability {
 /// [`CompiledGraph::into_graph`].
 ///
 /// Besides the graph, it keeps what compilation resolved: every node's
-/// contract and island ([`nodes`](Self::nodes)) and every connection's
+/// contract and stream group ([`nodes`](Self::nodes)) and every connection's
 /// ports ([`connections`](Self::connections)), so consumers need not look
 /// them up again.
 #[derive(Debug, Clone)]
@@ -269,15 +269,15 @@ pub struct CompiledGraph {
     node_index: HashMap<NodeId, usize>,
     /// Per node (by position): its contract's index in `contracts`.
     node_contract: Vec<usize>,
-    /// Per node (by position): its island.
-    node_island: Vec<usize>,
+    /// Per node (by position): its stream group, if it is in one.
+    node_group: Vec<Option<usize>>,
     /// Per connection (by position): where its ends resolved.
     connection_ends: Vec<Ends>,
     /// Per node (by position): the positions of its links in
     /// `graph.links`, in declaration order.
     node_links: Vec<Vec<usize>>,
     order: Vec<NodeId>,
-    islands: Vec<Vec<NodeId>>,
+    stream_groups: Vec<Vec<NodeId>>,
     warnings: Diagnostics,
 }
 
@@ -300,8 +300,9 @@ pub struct CompiledNode<'a> {
     pub node: &'a Node,
     /// The contract it instantiates.
     pub contract: &'a ComponentContract,
-    /// Its island's index into [`CompiledGraph::islands`].
-    pub island: usize,
+    /// Its stream group's index into [`CompiledGraph::stream_groups`], if it
+    /// is in one.
+    pub group: Option<usize>,
 }
 
 /// A connection of a [`CompiledGraph`], with its resolved ports.
@@ -356,28 +357,22 @@ impl CompiledGraph {
         topo::depth_map(&self.graph, &self.order, &resolved)
     }
 
-    /// The graph's stream islands: the connected components of the graph
-    /// over Stream and Future connections. Nodes in one island exchange
-    /// component-model stream/future handles directly, so a runtime must
-    /// host them together; a node with no Stream or Future connection is an
-    /// island of its own.
+    /// The graph's stream groups: the connected components of the graph over
+    /// Stream and Future connections, of more than one node. A stream or
+    /// future can be read once, so its producer and reader must re-run
+    /// together, whichever of them has a reason to. A node with no such
+    /// connection is in no group.
     ///
-    /// The islands form a DAG over non-feedback connections: islands that a
-    /// non-feedback path leaves and re-enters (through Value connections)
-    /// are merged into one, with a [`Diagnostic::MergedIsland`] warning.
-    ///
-    /// Deterministic: islands are in a topological order of the island DAG
-    /// (an island comes after every island that reaches it), ties broken by
-    /// their first member's topological position, and members are in
-    /// topological order.
-    pub fn islands(&self) -> &[Vec<NodeId>] {
-        &self.islands
+    /// Deterministic: groups are in the topological order of their first
+    /// members, and members are in topological order.
+    pub fn stream_groups(&self) -> &[Vec<NodeId>] {
+        &self.stream_groups
     }
 
-    /// The index into [`islands`](Self::islands) of the island holding the
-    /// given node, if the graph has it.
-    pub fn island_of(&self, node: &NodeId) -> Option<usize> {
-        self.node(node).map(|n| n.island)
+    /// The index into [`stream_groups`](Self::stream_groups) of the group
+    /// holding the given node, if it is in one.
+    pub fn group_of(&self, node: &NodeId) -> Option<usize> {
+        self.node(node).and_then(|n| n.group)
     }
 
     /// The contract the given node instantiates, if the graph has it.
@@ -385,7 +380,7 @@ impl CompiledGraph {
         self.node(node).map(|n| n.contract)
     }
 
-    /// The given node, with its contract and island, if the graph has it.
+    /// The given node, with its contract and stream group, if the graph has it.
     pub fn node(&self, id: &NodeId) -> Option<CompiledNode<'_>> {
         self.node_at(*self.node_index.get(id)?)
     }
@@ -395,11 +390,11 @@ impl CompiledGraph {
             index,
             node: self.graph.nodes.get(index)?,
             contract: self.contracts.get(*self.node_contract.get(index)?)?,
-            island: *self.node_island.get(index)?,
+            group: *self.node_group.get(index)?,
         })
     }
 
-    /// Every node, in declaration order, with its contract and island.
+    /// Every node, in declaration order, with its contract and stream group.
     pub fn nodes(&self) -> impl Iterator<Item = CompiledNode<'_>> + '_ {
         // Every index is in range: compilation resolved every node.
         (0..self.graph.nodes.len()).filter_map(|i| self.node_at(i))
@@ -1021,55 +1016,12 @@ fn check_cycles(
 }
 
 /// Every resolved feedback edge should earn its unit delay: it sits on a
-/// cycle of nodes, or on a cycle of islands (with every feedback edge on it
-/// a plain connection, the islands on it would merge). Unresolved edges
-/// never enter cycle analysis, so they cannot fairly be called useless.
-fn check_useless_feedback(
-    graph: &Graph,
-    resolved: &[bool],
-    islands: &Islands,
-    diagnostics: &mut Diagnostics,
-) {
+/// cycle of nodes. Unresolved edges never enter cycle analysis, so they cannot
+/// fairly be called useless.
+fn check_useless_feedback(graph: &Graph, resolved: &[bool], diagnostics: &mut Diagnostics) {
     let useful = topo::useful_feedback_edges(graph, resolved);
-    // Islands on a common cycle over every resolved connection, feedback
-    // included.
-    let island_edges = graph
-        .connections
-        .iter()
-        .zip(resolved)
-        .filter(|(_, ok)| **ok)
-        .filter_map(|(conn, _)| {
-            Some((
-                *islands.island_of.get(&conn.from.node)?,
-                *islands.island_of.get(&conn.to.node)?,
-            ))
-        });
-    let mut group_of: HashMap<usize, usize> = HashMap::new();
-    for (group, members) in topo::cyclic_groups(islands.islands.len(), island_edges)
-        .into_iter()
-        .enumerate()
-    {
-        for island in members {
-            group_of.insert(island, group);
-        }
-    }
     for (index, conn) in graph.connections.iter().enumerate() {
-        if !conn.feedback || !resolved[index] || useful.contains(&index) {
-            continue;
-        }
-        let separates = match (
-            islands.island_of.get(&conn.from.node),
-            islands.island_of.get(&conn.to.node),
-        ) {
-            (Some(from), Some(to)) => {
-                from != to
-                    && group_of
-                        .get(from)
-                        .is_some_and(|g| group_of.get(to) == Some(g))
-            }
-            _ => false,
-        };
-        if !separates {
+        if conn.feedback && resolved[index] && !useful.contains(&index) {
             diagnostics.push(Diagnostic::UselessFeedback {
                 conn: conn.id.clone(),
             });
@@ -1149,150 +1101,143 @@ fn check_async_fan_out(
     }
 }
 
-/// Claims within an island are held together for the whole generation
-/// (see [`ResourceClaim`](crate::ResourceClaim)), so an island whose
-/// members' claims on one resource sum to more than all of it could never
-/// start.
-fn check_island_claims(graph: &Graph, islands: &Islands, diagnostics: &mut Diagnostics) {
+/// What a group of nodes claims, resource by resource.
+fn claims_of<'g>(
+    nodes: &HashMap<&NodeId, &'g Node>,
+    members: impl Iterator<Item = &'g NodeId>,
+) -> BTreeMap<&'g ResourceId, f64> {
+    let mut claims: BTreeMap<&ResourceId, f64> = BTreeMap::new();
+    for node in members.filter_map(|m| nodes.get(m)) {
+        for (resource, claim) in &node.resources {
+            *claims.entry(resource).or_insert(0.0) += claim.fraction.get();
+        }
+    }
+    claims
+}
+
+/// A stream group holds its members' claims together from when the first
+/// starts until it has drained (see [`ResourceClaim`](crate::ResourceClaim)),
+/// as its producer's writer outlives `run`. So a group whose claims on one
+/// resource sum to more than all of it could never start, and groups on a
+/// cycle, each waiting for a node of the next, must all fit at once: one holding
+/// what the next needs would wait for it forever.
+fn check_group_claims(graph: &Graph, groups: &StreamGroups, diagnostics: &mut Diagnostics) {
     // Tolerates float rounding in sums of fractions such as 0.1 + 0.2.
     const EPSILON: f64 = 1e-9;
     let mut nodes: HashMap<&NodeId, &Node> = HashMap::new();
     for node in &graph.nodes {
         nodes.entry(&node.id).or_insert(node);
     }
-    for members in &islands.islands {
-        let mut claims: BTreeMap<&ResourceId, f64> = BTreeMap::new();
-        for node in members.iter().filter_map(|m| nodes.get(m)) {
-            for (resource, claim) in &node.resources {
-                *claims.entry(resource).or_insert(0.0) += claim.fraction.get();
-            }
-        }
+    for members in &groups.groups {
+        let claims = claims_of(
+            &nodes,
+            members.iter().filter_map(|m| nodes.get(m).map(|n| &n.id)),
+        );
         for (resource, _) in claims.into_iter().filter(|(_, sum)| *sum > 1.0 + EPSILON) {
-            diagnostics.push(Diagnostic::IslandOverclaims {
+            diagnostics.push(Diagnostic::GroupOverclaims {
                 nodes: members.clone(),
+                resource: resource.clone(),
+            });
+        }
+    }
+    // A vertex per group, then one per node in none, joined by what must return
+    // before what.
+    let vertex: HashMap<&NodeId, usize> = groups
+        .groups
+        .iter()
+        .enumerate()
+        .flat_map(|(at, members)| members.iter().map(move |m| (m, at)))
+        .chain(
+            graph
+                .nodes
+                .iter()
+                .map(|n| &n.id)
+                .filter(|n| !groups.in_group.contains_key(n))
+                .enumerate()
+                .map(|(at, n)| (n, groups.groups.len() + at)),
+        )
+        .collect();
+    let edges = graph
+        .connections
+        .iter()
+        .filter(|conn| !conn.feedback)
+        .filter_map(|conn| Some((*vertex.get(&conn.from.node)?, *vertex.get(&conn.to.node)?)))
+        .filter(|(from, to)| from != to);
+    for cycle in topo::cyclic_groups(vertex.len(), edges) {
+        let on_it: Vec<&Vec<NodeId>> = cycle
+            .iter()
+            .filter_map(|at| groups.groups.get(*at))
+            .collect();
+        if on_it.len() < 2 {
+            continue;
+        }
+        let members = || on_it.iter().flat_map(|members| members.iter());
+        let claims = claims_of(
+            &nodes,
+            members().filter_map(|m| nodes.get(m).map(|n| &n.id)),
+        );
+        for (resource, _) in claims.into_iter().filter(|(_, sum)| *sum > 1.0 + EPSILON) {
+            diagnostics.push(Diagnostic::ClaimsCanDeadlock {
+                nodes: members().cloned().collect(),
                 resource: resource.clone(),
             });
         }
     }
 }
 
-/// The graph's islands (see [`CompiledGraph::islands`]), read off in
-/// topological order, plus the islands that had to absorb a cycle.
-///
-/// Two passes of union-find over the nodes in topological order:
-/// 1. resolved Stream/Future connections join their endpoints;
-/// 2. the islands from pass 1 that form a cycle over non-feedback
-///    connections (a Value path that leaves an island and re-enters it) are
-///    joined too, so the islands themselves form a DAG. Otherwise neither
-///    island on such a cycle could finish before the other started.
-fn stream_islands(
+/// The graph's stream groups (see [`CompiledGraph::stream_groups`]): union-find
+/// over stream and future connections, the nodes in topological order.
+fn stream_groups(
     graph: &Graph,
     contracts: &HashMap<&NodeId, &ComponentContract>,
     resolved: &[bool],
     order: &[NodeId],
-) -> Islands {
+) -> StreamGroups {
     let index: HashMap<&NodeId, usize> = order.iter().enumerate().map(|(i, n)| (n, i)).collect();
-    // A set's root is its smallest member: the earliest topological
-    // position, so a root is always its island's first member.
+    // A set's root is its smallest member: the earliest topological position.
     let mut parent = crate::partition::Partition::new(order.len());
-    let edges: Vec<(usize, usize, bool)> = graph
+    for conn in graph
         .connections
         .iter()
         .zip(resolved)
         .filter(|(conn, ok)| **ok && !conn.feedback)
         .map(|(conn, _)| conn)
-        .filter_map(|conn| {
-            let is_async = source_kind(contracts, &conn.from).is_some_and(PortKind::is_async);
-            Some((
-                *index.get(&conn.from.node)?,
-                *index.get(&conn.to.node)?,
-                is_async,
-            ))
-        })
-        .collect();
-    for &(a, b, is_async) in &edges {
-        if is_async {
-            parent.union(a, b);
+    {
+        let is_async = source_kind(contracts, &conn.from).is_some_and(PortKind::is_async);
+        if let (true, Some(from), Some(to)) = (
+            is_async,
+            index.get(&conn.from.node),
+            index.get(&conn.to.node),
+        ) {
+            parent.union(*from, *to);
         }
     }
-
     let roots: Vec<usize> = (0..order.len()).map(|i| parent.find(i)).collect();
-    let cycles = topo::cyclic_groups(
-        order.len(),
-        edges
-            .iter()
-            .filter(|(a, b, _)| roots[*a] != roots[*b])
-            .map(|&(a, b, _)| (roots[a], roots[b])),
-    );
-    let mut merged_roots = Vec::new();
-    for group in &cycles {
-        if let [first, rest @ ..] = group.as_slice() {
-            for &other in rest {
-                parent.union(*first, other);
-            }
-            merged_roots.push(*first);
-        }
+    let mut sizes: BTreeMap<usize, usize> = BTreeMap::new();
+    for root in &roots {
+        *sizes.entry(*root).or_insert(0) += 1;
     }
-
-    // Islands keyed by root (their first member's position), then numbered
-    // in a topological order of the island DAG, earliest root first among
-    // the ready ones.
-    let roots: Vec<usize> = (0..order.len()).map(|i| parent.find(i)).collect();
-    let mut successors: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
-    let mut indegree: BTreeMap<usize, usize> = roots.iter().map(|&r| (r, 0)).collect();
-    for &(a, b, _) in &edges {
-        let (ra, rb) = (roots[a], roots[b]);
-        if ra != rb && successors.entry(ra).or_default().insert(rb) {
-            *indegree.entry(rb).or_insert(0) += 1;
-        }
-    }
-    let mut ready: BTreeSet<usize> = indegree
-        .iter()
-        .filter(|(_, d)| **d == 0)
-        .map(|(r, _)| *r)
-        .collect();
+    let mut groups = Vec::new();
     let mut number: HashMap<usize, usize> = HashMap::new();
-    while let Some(root) = ready.pop_first() {
-        number.insert(root, number.len());
-        for next in successors.get(&root).into_iter().flatten() {
-            if let Some(d) = indegree.get_mut(next) {
-                *d -= 1;
-                if *d == 0 {
-                    ready.insert(*next);
-                }
-            }
-        }
-    }
-
-    let mut islands: Vec<Vec<NodeId>> = vec![Vec::new(); number.len()];
-    let mut island_of: HashMap<NodeId, usize> = HashMap::new();
+    let mut in_group = HashMap::new();
     for (i, node) in order.iter().enumerate() {
-        if let Some(&island) = number.get(&roots[i]) {
-            islands[island].push(node.clone());
-            island_of.insert(node.clone(), island);
+        if sizes[&roots[i]] < 2 {
+            continue;
         }
+        let at = *number.entry(roots[i]).or_insert_with(|| {
+            groups.push(Vec::new());
+            groups.len() - 1
+        });
+        groups[at].push(node.clone());
+        in_group.insert(node.clone(), at);
     }
-    let merged = merged_roots
-        .into_iter()
-        .filter_map(|root| number.get(&parent.find(root)).copied())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .map(|island| islands[island].clone())
-        .collect();
-    Islands {
-        islands,
-        island_of,
-        merged,
-    }
+    StreamGroups { groups, in_group }
 }
 
-/// The result of [`stream_islands`].
-struct Islands {
-    /// In a topological order of the island DAG.
-    islands: Vec<Vec<NodeId>>,
-    island_of: HashMap<NodeId, usize>,
-    /// Members of every island that absorbed a cycle, in island order.
-    merged: Vec<Vec<NodeId>>,
+/// The result of [`stream_groups`].
+struct StreamGroups {
+    groups: Vec<Vec<NodeId>>,
+    in_group: HashMap<NodeId, usize>,
 }
 
 impl Graph {
@@ -1352,34 +1297,26 @@ impl Graph {
         // an error) is analyzed as its first declaration.
         let order = check_cycles(&self, &resolved, &mut diagnostics);
 
-        let islands = order
+        let groups = order
             .as_ref()
-            .map(|order| stream_islands(&self, &node_contracts, &resolved, order));
-        // Without islands (an illegal cycle), or with a connection left out
-        // of the topology (unresolved: a typo, say), whether a feedback edge
-        // sits on a cycle or keeps islands apart is unknown: say nothing.
-        if let Some(islands) = &islands
-            && resolved.iter().all(|ok| *ok)
-        {
-            check_useless_feedback(&self, &resolved, islands, &mut diagnostics);
+            .map(|order| stream_groups(&self, &node_contracts, &resolved, order));
+        // With a connection left out of the topology (unresolved: a typo,
+        // say), whether a feedback edge sits on a cycle is unknown: say nothing.
+        if order.is_some() && resolved.iter().all(|ok| *ok) {
+            check_useless_feedback(&self, &resolved, &mut diagnostics);
         }
-        if let Some(islands) = &islands {
-            check_island_claims(&self, islands, &mut diagnostics);
-        }
-        for island in islands.iter().flat_map(|i| &i.merged) {
-            diagnostics.push(Diagnostic::MergedIsland {
-                nodes: island.clone(),
-            });
+        if let Some(groups) = &groups {
+            check_group_claims(&self, groups, &mut diagnostics);
         }
 
-        // `order` (and with it `islands`) is None only when IllegalCycle
+        // `order` (and with it `groups`) is None only when IllegalCycle
         // errors were pushed, so the arms are exhaustive without any panic
         // path. Without errors, every node id is unique and resolved, and
         // every connection resolved.
         let connection_ports: Option<Vec<(usize, usize)>> =
             endpoints.ports.iter().copied().collect();
-        match (order, islands, connection_ports) {
-            (Some(order), Some(islands), Some(ports)) if !diagnostics.has_errors() => {
+        match (order, groups, connection_ports) {
+            (Some(order), Some(groups), Some(ports)) if !diagnostics.has_errors() => {
                 // Compact the table to its resolved contracts (cloned once
                 // each) and point each node at its contract.
                 let mut compact: HashMap<&ComponentRef, usize> = HashMap::new();
@@ -1392,16 +1329,15 @@ impl Graph {
                 }
                 let mut node_index = HashMap::with_capacity(self.nodes.len());
                 let mut node_contract = Vec::with_capacity(self.nodes.len());
-                let mut node_island = Vec::with_capacity(self.nodes.len());
+                let mut node_group = Vec::with_capacity(self.nodes.len());
                 for (index, node) in self.nodes.iter().enumerate() {
                     let contract = node_contracts
                         .get(&node.id)
                         .and_then(|contract| compact.get(&contract.id));
-                    let island = islands.island_of.get(&node.id);
-                    if let (Some(&contract), Some(&island)) = (contract, island) {
+                    if let Some(&contract) = contract {
                         node_index.insert(node.id.clone(), index);
                         node_contract.push(contract);
-                        node_island.push(island);
+                        node_group.push(groups.in_group.get(&node.id).copied());
                     }
                 }
                 let connection_ends = self
@@ -1427,12 +1363,12 @@ impl Graph {
                     contracts: resolved_contracts,
                     node_index,
                     node_contract,
-                    node_island,
+                    node_group,
                     connection_ends,
                     node_links,
                     graph: self,
                     order,
-                    islands: islands.islands,
+                    stream_groups: groups.groups,
                     warnings: diagnostics,
                 })
             }
@@ -2188,11 +2124,11 @@ mod tests {
         let compiled = graph
             .compile()
             .expect("a value feedback edge breaks the loop into generations");
-        assert_eq!(compiled.islands().len(), 1, "p and r share a stream island");
+        assert_eq!(compiled.stream_groups().len(), 1, "p and r share a group");
     }
 
     #[test]
-    fn islands_partition_over_async_edges() {
+    fn groups_partition_over_async_edges() {
         let value_to_stream = contract(
             "v2s",
             vec![port("in", PortKind::Value)],
@@ -2236,19 +2172,19 @@ mod tests {
             .connect("c4", PortRef::new("f", "done"), PortRef::new("g", "done"))
             .build();
         let compiled = graph.compile().expect("valid graph");
-        let mut islands: Vec<Vec<&str>> = compiled
-            .islands()
+        let mut groups: Vec<Vec<&str>> = compiled
+            .stream_groups()
             .iter()
-            .map(|island| island.iter().map(|n| n.as_str()).collect())
+            .map(|group| group.iter().map(|n| n.as_str()).collect())
             .collect();
-        islands.sort();
+        groups.sort();
         assert_eq!(
-            islands,
-            vec![vec!["a", "b"], vec!["dst"], vec!["f", "g"], vec!["src"]],
-            "value edges never join islands; stream and future edges do"
+            groups,
+            vec![vec!["a", "b"], vec!["f", "g"]],
+            "value edges never join groups; stream and future edges do"
         );
-        for island in compiled.islands() {
-            let positions: Vec<usize> = island
+        for group in compiled.stream_groups() {
+            let positions: Vec<usize> = group
                 .iter()
                 .map(|n| {
                     compiled
@@ -2263,10 +2199,10 @@ mod tests {
                 "members in topo order"
             );
         }
-        let a = compiled.island_of(&NodeId::from("a")).unwrap();
-        assert_eq!(compiled.island_of(&NodeId::from("b")), Some(a));
-        assert_ne!(compiled.island_of(&NodeId::from("src")), Some(a));
-        assert_eq!(compiled.island_of(&NodeId::from("ghost")), None);
+        let a = compiled.group_of(&NodeId::from("a")).unwrap();
+        assert_eq!(compiled.group_of(&NodeId::from("b")), Some(a));
+        assert_eq!(compiled.group_of(&NodeId::from("src")), None);
+        assert_eq!(compiled.group_of(&NodeId::from("ghost")), None);
     }
 
     /// `outputs { st: stream, status: value }`.
@@ -2295,16 +2231,10 @@ mod tests {
         )
     }
 
-    fn island_names(compiled: &CompiledGraph) -> Vec<Vec<&str>> {
-        compiled
-            .islands()
-            .iter()
-            .map(|island| island.iter().map(|n| n.as_str()).collect())
-            .collect()
-    }
-
+    /// A value path out of a group and back no longer joins anything: each
+    /// node runs when what it reads has settled.
     #[test]
-    fn a_value_path_out_of_an_island_and_back_merges_the_islands() {
+    fn a_value_path_out_of_a_group_and_back_joins_nothing() {
         let graph = builder("t")
             .add_component(stream_and_status())
             .add_component(stream_with_threshold())
@@ -2320,96 +2250,51 @@ mod tests {
                 PortRef::new("t", "threshold"),
             )
             .build();
-        let compiled = graph.compile().expect("merging keeps the graph legal");
-        assert_eq!(island_names(&compiled), vec![vec!["s", "r", "t"]]);
-        let warnings: Vec<_> = compiled.warnings().iter().cloned().collect();
-        assert_eq!(
-            warnings,
-            vec![Diagnostic::MergedIsland {
-                nodes: vec!["s".into(), "r".into(), "t".into()],
-            }]
-        );
-    }
-
-    #[test]
-    fn a_cycle_through_three_islands_merges_all_of_them() {
-        let mut builder = builder("t")
-            .add_component(stream_and_status())
-            .add_component(stream_with_threshold())
-            .add_component(source());
-        for i in 1..=3 {
-            builder = builder
-                .add_node(format!("s{i}").as_str(), cref("src"))
-                .add_node(format!("t{i}").as_str(), cref("dst"))
-                .connect(
-                    format!("st{i}").as_str(),
-                    PortRef::new(format!("s{i}"), "st"),
-                    PortRef::new(format!("t{i}"), "st"),
-                );
-        }
-        let graph = builder
-            .add_node("lone", cref("source"))
-            .connect(
-                "v12",
-                PortRef::new("s1", "status"),
-                PortRef::new("t2", "threshold"),
-            )
-            .connect(
-                "v23",
-                PortRef::new("s2", "status"),
-                PortRef::new("t3", "threshold"),
-            )
-            .connect(
-                "v31",
-                PortRef::new("s3", "status"),
-                PortRef::new("t1", "threshold"),
-            )
-            .build();
         let compiled = graph.compile().expect("valid graph");
-        let islands = island_names(&compiled);
-        assert_eq!(islands.len(), 2, "{islands:?}");
-        let merged = islands
-            .iter()
-            .find(|i| i.len() == 6)
-            .expect("one merged island");
-        let mut sorted = merged.clone();
-        sorted.sort_unstable();
-        assert_eq!(sorted, ["s1", "s2", "s3", "t1", "t2", "t3"]);
-        assert!(islands.contains(&vec!["lone"]));
-        assert_eq!(compiled.warnings().len(), 1);
+        assert_eq!(compiled.stream_groups().len(), 1);
+        assert_eq!(compiled.group_of(&NodeId::from("r")), None);
+        assert!(compiled.warnings().is_empty(), "{:?}", compiled.warnings());
     }
 
+    /// `{a, b}` and `{c, d}`, joined by `a -> c`, `a -> d` and `d -> b`: `b`
+    /// waits for `d`, whose group may not fit while the other holds its claim.
     #[test]
-    fn a_feedback_edge_keeps_islands_apart() {
+    fn groups_waiting_on_each_other_must_fit_their_claims_together() {
+        let claim = || ResourceClaim::new(0.6).unwrap();
         let graph = builder("t")
-            .add_component(stream_and_status())
             .add_component(contract(
-                "dst",
-                vec![
-                    port("st", PortKind::Stream),
-                    port("threshold", PortKind::Value).optional(),
-                ],
-                vec![],
+                "head",
+                vec![port("in", PortKind::Value).optional()],
+                vec![port("st", PortKind::Stream), port("out", PortKind::Value)],
                 &[],
             ))
-            .add_component(pass_through())
-            .add_node("s", cref("src"))
-            .add_node("t", cref("dst"))
-            .add_node("r", cref("pass"))
-            .connect("st", PortRef::new("s", "st"), PortRef::new("t", "st"))
-            .connect("out", PortRef::new("s", "status"), PortRef::new("r", "in"))
-            .connect_feedback(
-                "back",
-                PortRef::new("r", "out"),
-                PortRef::new("t", "threshold"),
-            )
+            .add_component(contract(
+                "tail",
+                vec![port("st", PortKind::Stream), port("in", PortKind::Value)],
+                vec![port("out", PortKind::Value)],
+                &[],
+            ))
+            .add_node("a", cref("head"))
+            .add_node("b", cref("tail"))
+            .add_node("c", cref("head"))
+            .add_node("d", cref("tail"))
+            .connect("ab", PortRef::new("a", "st"), PortRef::new("b", "st"))
+            .connect("cd", PortRef::new("c", "st"), PortRef::new("d", "st"))
+            .connect("ac", PortRef::new("a", "out"), PortRef::new("c", "in"))
+            .connect("ad", PortRef::new("a", "out"), PortRef::new("d", "in"))
+            .connect("db", PortRef::new("d", "out"), PortRef::new("b", "in"))
+            .set_resource("a", "gpu", claim())
+            .unwrap()
+            .set_resource("c", "gpu", claim())
+            .unwrap()
             .build();
-        let compiled = graph.compile().expect("valid graph");
-        assert_eq!(island_names(&compiled), vec![vec!["s", "t"], vec!["r"]]);
-        assert!(
-            compiled.warnings().is_empty(),
-            "no merge, and the feedback edge is not useless: it keeps the islands apart: {:?}",
-            compiled.warnings()
+        let diagnostics = diags(graph.compile());
+        assert_eq!(
+            diagnostics,
+            vec![Diagnostic::ClaimsCanDeadlock {
+                nodes: vec!["a".into(), "b".into(), "c".into(), "d".into()],
+                resource: "gpu".into(),
+            }]
         );
     }
 
@@ -2467,30 +2352,6 @@ mod tests {
     }
 
     #[test]
-    fn islands_are_in_topological_order() {
-        let graph = builder("t")
-            .add_component(stream_and_status())
-            .add_component(stream_with_threshold())
-            .add_component(source())
-            .add_node("p", cref("src"))
-            .add_node("c", cref("dst"))
-            .add_node("u", cref("source"))
-            .connect("st", PortRef::new("p", "st"), PortRef::new("c", "st"))
-            .connect(
-                "v",
-                PortRef::new("u", "out"),
-                PortRef::new("c", "threshold"),
-            )
-            .build();
-        let compiled = graph.compile().expect("valid graph");
-        assert_eq!(
-            island_names(&compiled),
-            vec![vec!["u"], vec!["p", "c"]],
-            "`u` feeds the stream island, so it comes first"
-        );
-    }
-
-    #[test]
     fn a_source_returning_another_revision_is_not_trusted() {
         let mut pinned = cref("source");
         pinned.content_hash = Some("dead".into());
@@ -2540,7 +2401,7 @@ mod tests {
             .connect("c0", PortRef::new("head", "out"), PortRef::new("n0", "in"))
             .build();
         let compiled = graph.compile().expect("valid graph");
-        assert_eq!(compiled.islands().len(), n + 1);
+        assert!(compiled.stream_groups().is_empty());
     }
 
     #[test]
@@ -2985,46 +2846,6 @@ mod tests {
     }
 
     #[test]
-    fn feedback_edges_that_keep_islands_apart_together_are_useful() {
-        let graph = builder("t")
-            .add_component(stream_and_status())
-            .add_component(contract(
-                "dst",
-                vec![
-                    port("st", PortKind::Stream),
-                    port("threshold", PortKind::Value).optional(),
-                ],
-                vec![],
-                &[],
-            ))
-            .add_component(contract(
-                "opt-pass",
-                vec![port("in", PortKind::Value).optional()],
-                vec![port("out", PortKind::Value)],
-                &[],
-            ))
-            .add_node("a", cref("src"))
-            .add_node("a2", cref("dst"))
-            .add_node("b", cref("opt-pass"))
-            .add_node("c", cref("opt-pass"))
-            .connect("st", PortRef::new("a", "st"), PortRef::new("a2", "st"))
-            .connect("ab", PortRef::new("a", "status"), PortRef::new("b", "in"))
-            .connect_feedback("f1", PortRef::new("b", "out"), PortRef::new("c", "in"))
-            .connect_feedback(
-                "f2",
-                PortRef::new("c", "out"),
-                PortRef::new("a2", "threshold"),
-            )
-            .build();
-        let compiled = graph.compile().expect("valid graph");
-        assert!(
-            compiled.warnings().is_empty(),
-            "unmarking both would merge the islands: {:?}",
-            compiled.warnings()
-        );
-    }
-
-    #[test]
     fn an_unhashed_entry_needs_a_single_revision() {
         let mut hashed = source();
         hashed.id.content_hash = Some("h1".into());
@@ -3165,7 +2986,7 @@ mod tests {
     }
 
     #[test]
-    fn an_island_claiming_more_than_a_resource_is_rejected() {
+    fn a_group_claiming_more_than_a_resource_is_rejected() {
         let producer = contract("producer", vec![], vec![port("out", PortKind::Stream)], &[]);
         let consumer = contract("consumer", vec![port("in", PortKind::Stream)], vec![], &[]);
         let claim = || ResourceClaim::new(0.6).unwrap();
@@ -3183,16 +3004,16 @@ mod tests {
         let diagnostics = diags(graph.compile());
         assert_eq!(
             diagnostics,
-            vec![Diagnostic::IslandOverclaims {
+            vec![Diagnostic::GroupOverclaims {
                 nodes: vec!["p".into(), "c".into()],
                 resource: "gpu".into(),
             }]
         );
         assert_eq!(
             diagnostics[0].location(),
-            crate::Location::Island(vec!["p".into(), "c".into()])
+            crate::Location::Group(vec!["p".into(), "c".into()])
         );
-        // Apart, each island fits.
+        // Apart, each node fits.
         let graph = builder("t")
             .add_component(source())
             .add_component(sink())
@@ -3206,7 +3027,7 @@ mod tests {
             .build();
         graph
             .compile()
-            .expect("value-connected nodes are separate islands");
+            .expect("value-connected nodes hold their claims apart");
     }
 
     #[test]
@@ -3273,7 +3094,7 @@ mod tests {
             ]
         );
         let p = compiled.node(&NodeId::from("p")).expect("known node");
-        assert_eq!(p.island, compiled.island_of(&NodeId::from("p")).unwrap());
+        assert_eq!(p.group, compiled.group_of(&NodeId::from("p")));
         assert!(compiled.node(&NodeId::from("ghost")).is_none());
         let depth = compiled.depth_map();
         assert_eq!(

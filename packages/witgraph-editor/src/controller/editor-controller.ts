@@ -117,7 +117,7 @@ export class EditorController extends EventTarget {
   /** Per node and output, what it carried: see {@link observe}. */
   #observed = new Map<string, Map<string, Observation>>();
   #stopRequested = false;
-  #islands: string[][] = [];
+  #streamGroups: string[][] = [];
   /** The load warnings already in the trace. */
   #warned = new Set<string>();
   /** Whether a run or step is ticking the graph. */
@@ -216,11 +216,12 @@ export class EditorController extends EventTarget {
   }
 
   /**
-   * The graph's execution islands, as it was compiled: read once per load,
-   * since the scheduler cannot be asked while a tick holds it.
+   * The graph's stream groups, as it was compiled: nodes that always re-run
+   * together. Read once per load, since the scheduler cannot be asked while a
+   * tick holds it.
    */
-  get islands(): readonly string[][] {
-    return this.#islands;
+  get streamGroups(): readonly string[][] {
+    return this.#streamGroups;
   }
   get canUndo(): boolean {
     return this.#undoStack.length > 0;
@@ -858,7 +859,7 @@ export class EditorController extends EventTarget {
   dispose(): void {
     this.#session?.dispose();
     this.#session = null;
-    this.#islands = [];
+    this.#streamGroups = [];
     this.#warned.clear();
     this.#nodes.clear();
     this.#edges = [];
@@ -1049,14 +1050,14 @@ export class EditorController extends EventTarget {
     while (this.#breakpointResolve && !this.#stopRequested) await nextFrame();
   }
 
-  /** Stops every island: what is still running ends, streams included. */
+  /** Stops the graph: what is still running ends, streams included. */
   #shutdown(): void {
     try {
       this.#session?.graph.shutdown();
     } catch {}
   }
 
-  /** Islands a stop cancelled run again on their latched inputs. */
+  /** Nodes a stop cancelled run again on their latched inputs. */
   #rerunCancelled(): void {
     for (const [id, visual] of this.#nodes) {
       if (visual.phase !== 'cancelled') continue;
@@ -1706,7 +1707,7 @@ export class EditorController extends EventTarget {
       this.#traceEvents.push({ event: 'warning', message, timestamp: performance.now() });
       this.#dispatch('trace-event');
     }
-    this.#islands = session.graph.islands() as string[][];
+    this.#streamGroups = session.graph.streamGroups() as string[][];
     this.#dirty = false;
     this.#buildVisuals();
     await this.#restoreInjections(graph);
@@ -1812,12 +1813,10 @@ export class EditorController extends EventTarget {
 
     const faults = this.#session.graph.takeFaults() as FaultReport[];
     for (const fault of faults) {
-      for (const member of fault.members) {
-        const node = this.#nodes.get(member);
-        if (node) {
-          node.fault = fault.fault;
-          if (fault.culprit) node.culprit = fault.culprit;
-        }
+      // A fault stops the whole graph.
+      for (const node of this.#nodes.values()) {
+        node.fault = fault.fault;
+        if (fault.culprit) node.culprit = fault.culprit;
       }
       this.#dispatch('fault');
     }

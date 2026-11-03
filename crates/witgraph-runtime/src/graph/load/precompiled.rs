@@ -1,9 +1,11 @@
-//! Saving a [`PreparedComponent`] and loading it back without compiling.
+//! Saving a [`PreparedGraph`] and loading it back without compiling.
 //!
-//! A saved component is [`MAGIC`], the length of a JSON [`Saved`] as a
+//! A saved graph is [`MAGIC`], the length of a JSON [`Saved`] as a
 //! little-endian `u32`, that JSON, and wasmtime's serialized component,
 //! which carries its own check of the wasmtime version and engine settings.
 
+#[cfg(feature = "compile")]
+use std::collections::HashMap;
 #[cfg(feature = "compile")]
 use std::fs::{self, File};
 #[cfg(feature = "compile")]
@@ -18,33 +20,28 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use wasmtime::Engine;
 use wasmtime::component::Component;
-use witgraph_ir::{Capability, ComponentContract};
 #[cfg(feature = "compile")]
-use witgraph_wit::compose::LinkedProvider;
-use witgraph_wit::hash::content_hash;
+use witgraph_ir::ComponentRef;
+use witgraph_ir::{Capability, CompiledGraph, NodeId};
 
-use super::{LinkKey, Parts, PreparedComponent, validate_engine};
+use super::{Parts, PreparedGraph, fingerprint, validate_engine};
 use crate::error::LoadError;
 
-/// What a saved component starts with; the last byte is the format's version.
-const MAGIC: &[u8; 8] = b"witgrap\x01";
+/// What a saved graph starts with; the last byte is the format's version.
+const MAGIC: &[u8; 8] = b"witgrap\x02";
 
-/// What a saved component holds besides its code: its [`Parts`], with the
-/// contract reduced to its hash, as contracts are never serialized.
+/// What a saved graph holds besides its code: its [`Parts`].
 #[derive(Serialize, Deserialize)]
 struct Saved {
-    contract_hash: String,
-    export: String,
-    links: Vec<LinkKey>,
-    capabilities: Vec<Capability>,
+    graph: String,
+    capabilities: Vec<(NodeId, Vec<Capability>)>,
     components: usize,
     source: Option<String>,
 }
 
-impl PreparedComponent {
-    /// The component as bytes for [`deserialize`](Self::deserialize) to load
-    /// in another process, without its contract, which that process has
-    /// again from its WIT.
+impl PreparedGraph {
+    /// The graph as bytes for [`deserialize`](Self::deserialize) to load in
+    /// another process.
     ///
     /// # Compatibility
     ///
@@ -52,18 +49,15 @@ impl PreparedComponent {
     /// only with the exact same wasmtime version (`50.0.0` does not load
     /// `50.0.1`'s), architecture and operating system, compiler settings,
     /// and engine settings, on a CPU with the features they were compiled to
-    /// use. So keep the component's `.wasm` as the source, and treat these
+    /// use. So keep the components' `.wasm` as the source, and treat these
     /// bytes as a build output: updating wasmtime makes them stale.
     pub fn serialize(&self) -> Result<Vec<u8>, LoadError> {
-        let bad = |what: &str, e: &dyn std::fmt::Display| LoadError::BadComponent {
-            component: Box::new(self.parts.contract.id.clone()),
+        let bad = |what: &str, e: &dyn std::fmt::Display| LoadError::GraphMismatch {
             message: format!("failed to save {what}: {e}"),
         };
         let parts = &self.parts;
         let saved = serde_json::to_vec(&Saved {
-            contract_hash: content_hash(&parts.contract),
-            export: parts.export.clone(),
-            links: parts.links.clone(),
+            graph: parts.graph.clone(),
             capabilities: parts.capabilities.clone(),
             components: parts.components,
             source: parts.source.clone(),
@@ -82,15 +76,14 @@ impl PreparedComponent {
         Ok(bytes)
     }
 
-    /// Loads a component saved by [`serialize`](Self::serialize), for
-    /// `engine` and `contract`, without compiling it or looking at its WIT.
+    /// Loads a graph saved by [`serialize`](Self::serialize), for `engine` and
+    /// `compiled`, without compiling it or looking at any WIT.
     ///
-    /// Bytes that are not a saved component, or whose code does not fit this
-    /// wasmtime or `engine`'s settings (see [`serialize`](Self::serialize)),
-    /// are a [`LoadError::BadComponent`]: engines made from different
-    /// [`RuntimeConfig`](super::RuntimeConfig)s can differ. Bytes saved for another contract are a
-    /// [`LoadError::ContractMismatch`]; an engine that cannot run a graph is
-    /// an `InvalidConfig` ([`LoadError::Runtime`]).
+    /// Bytes that are not a saved graph, whose code does not fit this wasmtime
+    /// or `engine`'s settings (see [`serialize`](Self::serialize)), or saved for
+    /// another graph are a [`LoadError::GraphMismatch`]: engines made from
+    /// different [`RuntimeConfig`](super::RuntimeConfig)s can differ. An engine
+    /// that cannot run a graph is an `InvalidConfig` ([`LoadError::Runtime`]).
     ///
     /// # Safety
     ///
@@ -100,34 +93,26 @@ impl PreparedComponent {
     /// [`serialize`](Self::serialize), by way of storage only you can write to.
     pub unsafe fn deserialize(
         engine: &Engine,
-        contract: &ComponentContract,
+        compiled: &CompiledGraph,
         bytes: &[u8],
     ) -> Result<Self, LoadError> {
         validate_engine(engine)?;
-        let bad = |message: String| LoadError::BadComponent {
-            component: Box::new(contract.id.clone()),
-            message,
-        };
-        let not_saved = || bad("these bytes are not a saved component of this version".into());
+        let bad = |message: String| LoadError::GraphMismatch { message };
+        let not_saved = || bad("these bytes are not a saved graph of this version".into());
         let rest = bytes.strip_prefix(MAGIC).ok_or_else(not_saved)?;
         let (length, rest) = rest.split_first_chunk::<4>().ok_or_else(not_saved)?;
         let length = u32::from_le_bytes(*length) as usize;
         let (saved, code) = rest.split_at_checked(length).ok_or_else(not_saved)?;
         let saved: Saved = serde_json::from_slice(saved).map_err(|_| not_saved())?;
-        if saved.contract_hash != content_hash(contract) {
-            return Err(LoadError::ContractMismatch {
-                component: Box::new(contract.id.clone()),
-                message: "it was saved for another contract".into(),
-            });
+        if saved.graph != fingerprint(compiled) {
+            return Err(bad("it was saved for another graph".into()));
         }
         // SAFETY: passed on to the caller.
         let component = unsafe { Component::deserialize(engine, code) }
             .map_err(|e| bad(format!("failed to load its code: {e:#}")))?;
         Ok(Self {
             parts: Parts {
-                contract: contract.clone(),
-                export: saved.export,
-                links: saved.links,
+                graph: saved.graph,
                 capabilities: saved.capabilities,
                 components: saved.components,
                 source: saved.source,
@@ -138,22 +123,21 @@ impl PreparedComponent {
 }
 
 #[cfg(feature = "compile")]
-impl PreparedComponent {
-    /// Loads the component saved at `path` if it is still good, and
-    /// otherwise compiles `bytes` with `links` and saves the result there.
+impl PreparedGraph {
+    /// Loads the graph saved at `path` if it is still good, and otherwise
+    /// prepares it from `wasm` and saves the result there.
     ///
-    /// A file is still good if [`deserialize`](Self::deserialize) accepts it
-    /// and it was prepared from these very bytes and links, which a changed
-    /// component with the same contract is not. A file that is missing,
-    /// unreadable, damaged or stale (see [`serialize`](Self::serialize)'s
-    /// compatibility) is replaced, in one step, so a process reading it never
-    /// sees half a file.
+    /// A file is still good if [`deserialize`](Self::deserialize) accepts it and
+    /// it was prepared from these very bytes, which a changed component with the
+    /// same contract is not. A file that is missing, unreadable, damaged or stale
+    /// (see [`serialize`](Self::serialize)'s compatibility) is replaced, in one
+    /// step, so a process reading it never sees half a file.
     ///
-    /// Compiling reports what [`linked`](Self::linked) reports. An engine
-    /// that cannot run a graph is an `InvalidConfig` ([`LoadError::Runtime`]).
-    /// A result that cannot be saved is a [`LoadError::BadComponent`], rather
-    /// than a graph that silently compiles on every start. Like `linked` it
-    /// runs synchronously, and it can take as long.
+    /// Preparing reports what [`new`](Self::new) reports. An engine that cannot
+    /// run a graph is an `InvalidConfig` ([`LoadError::Runtime`]). A result that
+    /// cannot be saved is a [`LoadError::GraphMismatch`], rather than a graph that
+    /// silently compiles on every start. Like `new` it runs synchronously, and it
+    /// can take as long.
     ///
     /// # Safety
     ///
@@ -161,16 +145,15 @@ impl PreparedComponent {
     /// as native code, so only you may be able to write to it.
     pub unsafe fn load_or_compile(
         engine: &Engine,
-        contract: &ComponentContract,
-        bytes: &[u8],
-        links: &[LinkedProvider<'_>],
+        compiled: &CompiledGraph,
+        wasm: &HashMap<ComponentRef, &[u8]>,
         path: impl AsRef<Path>,
     ) -> Result<Self, LoadError> {
         let path = path.as_ref();
-        let source = source_hash(bytes, links);
+        let source = source_hash(wasm);
         if let Ok(saved) = fs::read(path) {
             // SAFETY: passed on to the caller.
-            match unsafe { Self::deserialize(engine, contract, &saved) } {
+            match unsafe { Self::deserialize(engine, compiled, &saved) } {
                 Ok(prepared) if prepared.parts.source.as_ref() == Some(&source) => {
                     return Ok(prepared);
                 }
@@ -179,43 +162,31 @@ impl PreparedComponent {
                 Ok(_) | Err(_) => {}
             }
         }
-        let prepared = Self::linked(engine, contract, bytes, links)?;
-        save(path, &prepared.serialize()?).map_err(|e| LoadError::BadComponent {
-            component: Box::new(contract.id.clone()),
+        let prepared = Self::new(engine, compiled, wasm)?;
+        save(path, &prepared.serialize()?).map_err(|e| LoadError::GraphMismatch {
             message: format!("failed to save it to `{}`: {e}", path.display()),
         })?;
         Ok(prepared)
     }
-
-    /// The component, knowing what it was prepared from.
-    pub(super) fn with_source(self, bytes: &[u8], links: &[LinkedProvider<'_>]) -> Self {
-        Self {
-            parts: Parts {
-                source: Some(source_hash(bytes, links)),
-                ..self.parts
-            },
-            ..self
-        }
-    }
 }
 
-/// A hash of what a component is prepared from: its bytes, and each link
-/// with its provider's bytes, in any order.
+/// A hash of what a graph is prepared from: every component's key and bytes, in
+/// any order.
 #[cfg(feature = "compile")]
-fn source_hash(bytes: &[u8], links: &[LinkedProvider<'_>]) -> String {
+pub(super) fn source_hash(wasm: &HashMap<ComponentRef, &[u8]>) -> String {
     let mut hash = Sha256::new();
     let mut field = |field: &[u8]| {
         hash.update((field.len() as u64).to_le_bytes());
         hash.update(field);
     };
-    field(bytes);
-    let mut links: Vec<_> = links.iter().collect();
-    links.sort_by_key(|link| (link.import, link.provider, link.export));
-    for link in links {
-        field(link.import.as_bytes());
-        field(link.provider.to_string().as_bytes());
-        field(link.export.as_bytes());
-        field(link.bytes);
+    let mut keys: Vec<(String, &[u8])> = wasm
+        .iter()
+        .map(|(key, bytes)| (key.to_string(), *bytes))
+        .collect();
+    keys.sort();
+    for (key, bytes) in keys {
+        field(key.as_bytes());
+        field(bytes);
     }
     hex::encode(hash.finalize())
 }

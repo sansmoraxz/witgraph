@@ -1,34 +1,26 @@
 //! A data plane that holds values in the host: the latched value of every
-//! port, shared with the generations that write them.
+//! port, beside an [`Executor`] that runs the nodes.
 
-use std::any::Any;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use futures::FutureExt;
 use futures::channel::mpsc::UnboundedSender;
+use futures::stream::{FuturesUnordered, StreamExt};
 use witgraph_ir::{
-    CompiledGraph, FeedbackIdx, Idx, IndexVec, InputIdx, NodeId, OutputIdx, PortDirection,
-    PortKind, PortName, PortTable,
+    CompiledGraph, FeedbackIdx, Idx, IndexVec, InputIdx, NodeId, NodeIdx, OutputIdx, PortDirection,
+    PortKind, PortName, PortSet, PortTable,
+};
+use witgraph_traits::plan::{InputField, MemberPlan, OutputField, RunShape};
+use witgraph_traits::{
+    BoxFuture, Command, ControlEvent, ControlKind, DataPlane, Executor, Latched, NodeFault,
+    OptionPayload, OptionPayloadFn, Outcome, PortValue, PortVersion, Returned, RuntimeError,
+    Serving, boxed,
 };
 
-use crate::control::{ControlEvent, ControlKind, PortVersions};
-use crate::error::{NodeFault, RuntimeError};
-use crate::executor::{
-    DataPlane, EventSink, Executor, Generation, GenerationFuture, IslandEvent, IslandEventKind,
-    Latched, LiveIsland, OptionPayload, OptionPayloadFn, Outcome, PortValue, Returned,
-    StartGeneration,
-};
-use crate::plan::{IslandPlan, MemberPlan};
-use witgraph_traits::PortVersion;
+use crate::control::PortVersions;
 
 /// The latched value of each port or connection of one kind that has one.
 pub(crate) type Latches<I, V> = IndexVec<I, Option<Arc<V>>>;
-
-/// The external Value inputs of a generation: per member in plan order,
-/// per field of its `inputs` record (`None` for a field with no value, or
-/// one a member of the island writes). Shared with the latched values they
-/// were read from.
-pub(crate) type StartInputs<V> = Vec<Vec<Option<Arc<V>>>>;
 
 /// An outgoing connection of an output port.
 #[derive(Debug, Clone, Copy)]
@@ -45,9 +37,9 @@ struct Edge {
 enum Route {
     /// Buffered until the end-of-iteration latch.
     Feedback(FeedbackIdx),
-    /// To a member of the producer's own island: part of the generation.
+    /// Inside a stream group: its reader runs with the group.
     Internal,
-    /// To another island, at once.
+    /// Anything else, at once.
     External,
 }
 
@@ -65,10 +57,8 @@ pub(crate) struct HostLatches<V: Clone> {
     /// Feedback writes waiting for the end-of-iteration latch: the value as
     /// the source produced it, by connection.
     pub(crate) feedback: Latches<FeedbackIdx, V>,
-    /// Per island, the external inputs of its generation in flight.
-    pub(crate) started: Vec<Option<StartInputs<V>>>,
-    /// Per island, the inputs a restored generation is to replay.
-    pub(crate) replays: Vec<Option<StartInputs<V>>>,
+    /// The inputs the host wrote: all that survives an instance.
+    host_written: PortSet<InputIdx>,
     out_edges: IndexVec<OutputIdx, Box<[Edge]>>,
     ports: Arc<PortTable>,
     option_payload: OptionPayloadFn<V>,
@@ -80,7 +70,7 @@ impl<V: PortValue> HostLatches<V> {
         ports: &Arc<PortTable>,
         option_payload: OptionPayloadFn<V>,
     ) -> Self {
-        let island_of: Vec<usize> = compiled.nodes().map(|n| n.island).collect();
+        let group_of: Vec<Option<usize>> = compiled.nodes().map(|n| n.group).collect();
         let mut out_edges: Vec<Vec<Edge>> = vec![Vec::new(); ports.outputs().len()];
         for resolved in compiled.connections() {
             let conn = resolved.connection;
@@ -90,8 +80,9 @@ impl<V: PortValue> HostLatches<V> {
             ) else {
                 continue;
             };
-            let same_island = island_of[resolved.from_node] == island_of[resolved.to_node];
-            let route = match (ports.feedback_index(&conn.id), same_island) {
+            let same_group = group_of[resolved.from_node].is_some()
+                && group_of[resolved.from_node] == group_of[resolved.to_node];
+            let route = match (ports.feedback_index(&conn.id), same_group) {
                 (Some(feedback), _) => Route::Feedback(feedback),
                 (None, true) => Route::Internal,
                 (None, false) => Route::External,
@@ -102,13 +93,11 @@ impl<V: PortValue> HostLatches<V> {
                 unwrap_option: resolved.unwraps_option,
             });
         }
-        let islands = compiled.islands().len();
         Self {
             inputs: IndexVec::from_fn(ports.inputs().len(), |_| None),
             outputs: IndexVec::from_fn(ports.outputs().len(), |_| None),
             feedback: IndexVec::from_fn(ports.feedback().len(), |_| None),
-            started: (0..islands).map(|_| None).collect(),
-            replays: (0..islands).map(|_| None).collect(),
+            host_written: PortSet::new(ports.inputs().len()),
             out_edges: out_edges.into_iter().map(Vec::into_boxed_slice).collect(),
             ports: ports.clone(),
             option_payload,
@@ -129,9 +118,7 @@ impl<V: PortValue> HostLatches<V> {
         }
     }
 
-    /// Writes a value to an input from outside its island. Returns whether
-    /// the value changed.
-    pub(crate) fn set_input(&mut self, port: InputIdx, val: Arc<V>) -> bool {
+    fn set_input(&mut self, port: InputIdx, val: Arc<V>) -> bool {
         if self.inputs[port].as_ref().is_some_and(|old| **old == *val) {
             return false;
         }
@@ -139,14 +126,21 @@ impl<V: PortValue> HostLatches<V> {
         true
     }
 
-    /// Forgets an input's value. Returns whether it had one.
-    pub(crate) fn clear_input(&mut self, port: InputIdx) -> bool {
+    /// Writes a value to an input for the host. Returns whether it changed.
+    pub(crate) fn host_set(&mut self, port: InputIdx, val: Arc<V>) -> bool {
+        self.host_written.insert(port);
+        self.set_input(port, val)
+    }
+
+    /// Forgets an input's value for the host. Returns whether it had one.
+    pub(crate) fn host_clear(&mut self, port: InputIdx) -> bool {
+        self.host_written.remove(port);
         self.inputs[port].take().is_some()
     }
 
-    /// Writes a delivered value into an input from outside its island:
-    /// unwrapped first when the connection unwraps an option, where `none`
-    /// clears the input.
+    /// Writes a delivered value into an input from outside its group: unwrapped
+    /// first when the connection unwraps an option, where `none` clears the
+    /// input.
     fn write_input(&mut self, port: InputIdx, val: &Arc<V>, unwrap_option: bool) -> InputWrite {
         match self.delivered(val, unwrap_option) {
             Some(val) => {
@@ -157,7 +151,7 @@ impl<V: PortValue> HostLatches<V> {
                 }
             }
             None => {
-                if self.clear_input(port) {
+                if self.inputs[port].take().is_some() {
                     InputWrite::Cleared
                 } else {
                     InputWrite::Unchanged
@@ -166,15 +160,25 @@ impl<V: PortValue> HostLatches<V> {
         }
     }
 
-    /// Latches a returned `run`'s values and routes them. Each value is
-    /// shared, not copied, between the outputs, the inputs it reaches and
-    /// buffered feedback. Guest values are already canonical.
-    fn deliver(&mut self, member: &MemberPlan, values: Vec<(PortName, V)>) -> Returned {
+    /// Latches a returned `run`'s values and routes them. Each value is shared,
+    /// not copied, between the outputs, the inputs it reaches and buffered
+    /// feedback. Returned too: what nothing reads, to close.
+    fn deliver(&mut self, member: &MemberPlan, values: Vec<(String, V)>) -> (Returned, Vec<V>) {
         let mut returned = Returned::default();
+        let mut unread = Vec::new();
         for (port, val) in values {
-            let Some(output) = member.outputs.get(&port).map(|output| output.index) else {
+            let port = PortName::from(port);
+            let Some(OutputField {
+                index: output,
+                kind,
+            }) = member.outputs.get(&port).copied()
+            else {
                 continue;
             };
+            if kind.is_async() && self.out_edges[output].is_empty() {
+                unread.push(val);
+                continue;
+            }
             let val = Arc::new(val);
             for at in 0..self.out_edges[output].len() {
                 let Edge {
@@ -187,15 +191,13 @@ impl<V: PortValue> HostLatches<V> {
                         self.feedback[conn] = Some(val.clone());
                         returned.feedback_buffered.push(conn);
                     }
-                    // Consumed inside this generation; recorded, not a
-                    // change.
                     Route::Internal => match self.delivered(&val, unwrap_option) {
                         Some(delivered) => {
                             self.inputs[to] = Some(delivered);
                             returned.inputs_recorded.push(to);
                         }
                         None => {
-                            if self.clear_input(to) {
+                            if self.inputs[to].take().is_some() {
                                 returned.inputs_cleared.push(to);
                             }
                         }
@@ -207,24 +209,74 @@ impl<V: PortValue> HostLatches<V> {
                     },
                 }
             }
-            self.outputs[output] = Some(val);
-            returned.outputs_changed.push(output);
+            if kind.is_latched() {
+                self.outputs[output] = Some(val);
+                returned.outputs_changed.push(output);
+            }
         }
-        returned
+        (returned, unread)
     }
 
-    /// The latched external Value inputs of each member, per field.
-    fn external_inputs(&self, plan: &IslandPlan) -> StartInputs<V> {
-        plan.members
+    /// What `member` starts with: its inputs' latched values. A stream or
+    /// future moves to its reader.
+    fn args(&mut self, member: &MemberPlan) -> Vec<Option<V>> {
+        member
+            .inputs
             .iter()
-            .map(|member| {
-                let mut fields = vec![None; member.field_count()];
-                for (field, input) in member.external_values() {
-                    fields[field] = self.inputs[input.index].clone();
-                }
-                fields
+            .flatten()
+            .map(|field| {
+                let value = if field.kind.is_async() {
+                    self.inputs[field.index].take()
+                } else {
+                    self.inputs[field.index].clone()
+                };
+                value.map(|value| (*value).clone())
             })
             .collect()
+    }
+
+    fn latch_feedback(&mut self, connection: FeedbackIdx) -> Latched {
+        let Some(val) = self.feedback[connection].take() else {
+            return Latched::Unchanged;
+        };
+        let entry = &self.ports.feedback()[connection];
+        let (to, unwrap_option) = (entry.to, entry.unwraps_option);
+        match self.write_input(to, &val, unwrap_option) {
+            InputWrite::Unchanged => Latched::Unchanged,
+            InputWrite::Changed => Latched::Changed,
+            InputWrite::Cleared => Latched::Cleared,
+        }
+    }
+
+    /// Puts a snapshot's values in place. What `host` says of an input is
+    /// whether it survives a new instance as the host's.
+    pub(crate) fn restore(
+        &mut self,
+        inputs: Latches<InputIdx, V>,
+        outputs: Latches<OutputIdx, V>,
+        feedback: Latches<FeedbackIdx, V>,
+        host: impl Fn(InputIdx) -> bool,
+    ) {
+        self.host_written.clear();
+        for (input, value) in inputs.iter_enumerated() {
+            if value.is_some() && host(input) {
+                self.host_written.insert(input);
+            }
+        }
+        self.inputs = inputs;
+        self.outputs = outputs;
+        self.feedback = feedback;
+    }
+
+    /// The instance is gone: all that survives is what the host wrote.
+    fn reset(&mut self) {
+        for (input, value) in self.inputs.iter_enumerated_mut() {
+            if !self.host_written.contains(input) {
+                *value = None;
+            }
+        }
+        self.outputs = IndexVec::from_fn(self.outputs.len(), |_| None);
+        self.feedback = IndexVec::from_fn(self.feedback.len(), |_| None);
     }
 }
 
@@ -234,55 +286,80 @@ fn lock<V: Clone>(latches: &Mutex<HostLatches<V>>) -> MutexGuard<'_, HostLatches
     latches.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Latches what generations return, then tells the scheduler what changed.
-pub(crate) struct LatchSink<V: Clone> {
-    latches: Arc<Mutex<HostLatches<V>>>,
-    plans: Vec<Arc<IslandPlan>>,
-    events: UnboundedSender<ControlEvent>,
-}
-
-impl<V: PortValue> EventSink<V> for LatchSink<V> {
-    fn send(&self, event: IslandEvent<V>) {
-        let IslandEvent {
-            island,
-            generation,
-            kind,
-        } = event;
-        let kind = match kind {
-            IslandEventKind::RunStarted { member } => ControlKind::RunStarted { member },
-            IslandEventKind::Rebuilt => ControlKind::Rebuilt,
-            IslandEventKind::StreamItems {
-                member,
-                port,
-                count,
-            } => ControlKind::StreamItems {
-                member,
-                port,
-                count,
-            },
-            IslandEventKind::RunReturned { member, values } => {
-                let plan = self.plans.get(island).and_then(|p| p.members.get(member));
-                let returned = plan
-                    .map(|plan| lock(&self.latches).deliver(plan, values))
-                    .unwrap_or_default();
-                ControlKind::RunReturned { member, returned }
-            }
-        };
-        // The receiver lives as long as the scheduler; a send can only fail
-        // while it is being dropped.
-        let _ = self.events.unbounded_send(ControlEvent {
-            island,
-            generation,
-            kind,
-        });
-    }
+/// How to call each node, from the shapes of their `run`s.
+pub(crate) fn plan_members(
+    compiled: &CompiledGraph,
+    ports: &PortTable,
+    shapes: &HashMap<NodeId, RunShape>,
+) -> Result<IndexVec<NodeIdx, Arc<MemberPlan>>, RuntimeError> {
+    (0..ports.node_count())
+        .map(|at| {
+            let index = NodeIdx::from_position(at);
+            let node = ports.node_id(index);
+            let unknown = || RuntimeError::UnknownNode { node: node.clone() };
+            let contract = compiled.contract_for(node).ok_or_else(unknown)?;
+            let shape = shapes.get(node).ok_or_else(unknown)?;
+            // A shape names the contract's inputs: fields are as it lists them.
+            let inputs = shape
+                .inputs
+                .as_ref()
+                .map(|fields| {
+                    fields
+                        .iter()
+                        .map(|name| {
+                            let port = contract
+                                .inputs
+                                .iter()
+                                .find(|p| p.name.as_str() == name)
+                                .ok_or_else(|| RuntimeError::InvalidConfig {
+                                    message: format!(
+                                        "`{node}`'s `run` takes `{name}`, which its contract has no input for"
+                                    ),
+                                })?;
+                            let index = ports.input(node, &port.name).ok_or_else(unknown)?;
+                            Ok(InputField {
+                                name: port.name.clone(),
+                                port: witgraph_ir::PortRef::new(node.clone(), port.name.clone()),
+                                index,
+                                kind: port.kind,
+                                optional: port.optional,
+                            })
+                        })
+                        .collect::<Result<Vec<_>, RuntimeError>>()
+                })
+                .transpose()?;
+            let outputs = contract
+                .outputs
+                .iter()
+                .filter_map(|port| {
+                    let index = ports.output(node, &port.name)?;
+                    Some((
+                        port.name.clone(),
+                        OutputField {
+                            index,
+                            kind: port.kind,
+                        },
+                    ))
+                })
+                .collect();
+            Ok(Arc::new(MemberPlan {
+                node: node.clone(),
+                index,
+                inputs,
+                has_result: shape.has_result,
+                outputs,
+            }))
+        })
+        .collect()
 }
 
 /// An [`Executor`] over host-held latches.
 pub(crate) struct HostPlane<X: Executor> {
     pub(crate) latches: Arc<Mutex<HostLatches<X::Value>>>,
-    pub(crate) sink: Arc<LatchSink<X::Value>>,
-    pub(crate) executor: X,
+    pub(crate) executor: Arc<X>,
+    members: Arc<IndexVec<NodeIdx, Arc<MemberPlan>>>,
+    /// Whether the next instance is the first, whose guest state is fresh.
+    fresh: Mutex<bool>,
 }
 
 impl<X: Executor> HostPlane<X> {
@@ -290,110 +367,151 @@ impl<X: Executor> HostPlane<X> {
         executor: X,
         compiled: &CompiledGraph,
         ports: &Arc<PortTable>,
-        plans: &[Arc<IslandPlan>],
-        events: UnboundedSender<ControlEvent>,
+        members: IndexVec<NodeIdx, Arc<MemberPlan>>,
     ) -> Self {
         let latches = HostLatches::new(compiled, ports, X::option_payload);
-        let latches = Arc::new(Mutex::new(latches));
-        let sink = Arc::new(LatchSink {
-            latches: latches.clone(),
-            plans: plans.to_vec(),
-            events,
-        });
         Self {
-            latches,
-            sink,
-            executor,
+            latches: Arc::new(Mutex::new(latches)),
+            executor: Arc::new(executor),
+            members: Arc::new(members),
+            fresh: Mutex::new(true),
         }
     }
 
     pub(crate) fn lock(&self) -> MutexGuard<'_, HostLatches<X::Value>> {
         lock(&self.latches)
     }
+}
 
-    /// The generation `start` asks for, recording what it starts with.
-    fn generation(&self, start: StartGeneration) -> Generation<X::Value> {
-        let StartGeneration {
-            plan,
-            number,
-            stream_items,
-            replay,
-        } = start;
-        let mut latches = self.lock();
-        let replayed = replay.then(|| latches.replays[plan.index].take());
-        let inputs = match replayed.flatten() {
-            Some(inputs) => inputs,
-            None => latches.external_inputs(&plan),
-        };
-        let external = inputs
-            .iter()
-            .map(|fields| fields.iter().map(|v| v.as_deref().cloned()).collect())
-            .collect();
-        latches.started[plan.index] = Some(inputs);
-        drop(latches);
-        Generation {
-            plan,
-            external,
-            number,
-            stream_items,
-            events: self.sink.clone(),
+/// Tells the executor, if an instance ends with calls in flight, that those are
+/// abandoned.
+struct Abandon<'a, X: Executor> {
+    executor: &'a X,
+    members: &'a IndexVec<NodeIdx, Arc<MemberPlan>>,
+    in_flight: bool,
+}
+
+impl<X: Executor> Drop for Abandon<'_, X> {
+    fn drop(&mut self) {
+        if self.in_flight {
+            let nodes: Vec<NodeId> = self.members.iter().map(|m| m.node.clone()).collect();
+            self.executor.abandon(&nodes);
         }
     }
 }
 
-/// The generation future with its live island made opaque again.
-fn opaque<L: LiveIsland>(future: GenerationFuture<L>) -> GenerationFuture<Box<dyn LiveIsland>> {
-    let future = future
-        .map(|outcome: Outcome<L>| outcome.map(|island| Box::new(island) as Box<dyn LiveIsland>));
-    #[cfg(not(target_family = "wasm"))]
-    return future.boxed();
-    #[cfg(target_family = "wasm")]
-    return future.boxed_local();
+/// Which node's `run` ended, with what.
+type CallDone<V> = (
+    NodeIdx,
+    Result<Vec<(String, V)>, (NodeFault, Option<NodeId>)>,
+);
+
+/// Serves one instance.
+async fn serve_host<X: Executor>(
+    executor: Arc<X>,
+    latches: Arc<Mutex<HostLatches<X::Value>>>,
+    members: Arc<IndexVec<NodeIdx, Arc<MemberPlan>>>,
+    fresh: bool,
+    serving: Serving,
+) -> Outcome {
+    let Serving {
+        incarnation,
+        mut commands,
+        events,
+        ..
+    } = serving;
+    let mut abandon = Abandon {
+        executor: &*executor,
+        members: &members,
+        in_flight: false,
+    };
+    let send = |events: &UnboundedSender<ControlEvent>, kind| {
+        // The receiver lives as long as the scheduler; a send can only fail
+        // while it is being dropped.
+        let _ = events.unbounded_send(ControlEvent { incarnation, kind });
+    };
+    if !fresh {
+        abandon.in_flight = true;
+        let rebuilt = executor.rebuild().await;
+        // Every rebuild has settled: nothing is left in flight.
+        abandon.in_flight = false;
+        rebuilt?;
+        send(&events, ControlKind::Built);
+    }
+    let mut calls = FuturesUnordered::new();
+    let mut closed = false;
+    loop {
+        futures::select_biased! {
+            done = calls.select_next_some() => {
+                let (node, result): CallDone<X::Value> = done;
+                abandon.in_flight = !calls.is_empty();
+                let values = result?;
+                let (returned, unread) = lock(&latches).deliver(&members[node], values);
+                for value in unread {
+                    executor.close(value);
+                }
+                send(&events, ControlKind::RunReturned { node, returned });
+            }
+            command = commands.next() => match command {
+                Some(Command::Run(node)) => {
+                    let member = members[node].clone();
+                    let args = lock(&latches).args(&member);
+                    // Checked before anything started: a required input only
+                    // lacks a value if its stream's producer did not deliver.
+                    if let Some(field) = member
+                        .inputs
+                        .iter()
+                        .flatten()
+                        .zip(&args)
+                        .find(|(field, arg)| !field.optional && arg.is_none())
+                        .map(|(field, _)| field)
+                    {
+                        let message = format!(
+                            "no value for required input `{}.{}`",
+                            member.node, field.name
+                        );
+                        return Err((NodeFault::WasmTrap { message }, Some(member.node.clone())));
+                    }
+                    let call = executor.call(member, args);
+                    calls.push(async move { (node, call.await) });
+                    abandon.in_flight = true;
+                }
+                Some(Command::LatchFeedback(connection)) => {
+                    let latched = lock(&latches).latch_feedback(connection);
+                    send(&events, ControlKind::Latched { connection, latched });
+                }
+                Some(Command::DropFeedback(connection)) => {
+                    lock(&latches).feedback[connection] = None;
+                }
+                Some(Command::AwaitQuiet(at)) => send(&events, ControlKind::Quiet(at)),
+                None => closed = true,
+            },
+            complete => break,
+        }
+        if closed && calls.is_empty() {
+            break;
+        }
+    }
+    Ok(())
 }
 
 impl<X: Executor> DataPlane for HostPlane<X> {
-    fn run(
-        &self,
-        island: Box<dyn LiveIsland>,
-        start: StartGeneration,
-    ) -> GenerationFuture<Box<dyn LiveIsland>> {
-        let island: Box<dyn Any> = island;
-        match island.downcast::<X::Island>() {
-            Ok(island) => opaque(self.executor.run(*island, self.generation(start))),
-            // The scheduler only ever hands back what this plane gave it.
-            Err(_) => {
-                let fault = NodeFault::Restart {
-                    message: "a live island of another executor".into(),
-                };
-                opaque::<X::Island>(Box::pin(async move { Err((fault, None)) }))
-            }
-        }
-    }
-
-    fn rebuild_and_run(&self, start: StartGeneration) -> GenerationFuture<Box<dyn LiveIsland>> {
-        opaque(self.executor.rebuild_and_run(self.generation(start)))
-    }
-
-    fn generation_ended(&self, island: usize) {
-        self.lock().started[island] = None;
-    }
-
-    fn latch_feedback(&self, connection: FeedbackIdx) -> Latched {
-        let mut latches = self.lock();
-        let Some(val) = latches.feedback[connection].take() else {
-            return Latched::Unchanged;
+    fn serve(&self, serving: Serving) -> BoxFuture<Outcome> {
+        let fresh = {
+            let mut fresh = self.fresh.lock().unwrap_or_else(PoisonError::into_inner);
+            std::mem::take(&mut *fresh)
         };
-        let entry = &latches.ports.feedback()[connection];
-        let (to, unwrap_option) = (entry.to, entry.unwraps_option);
-        match latches.write_input(to, &val, unwrap_option) {
-            InputWrite::Unchanged => Latched::Unchanged,
-            InputWrite::Changed => Latched::Changed,
-            InputWrite::Cleared => Latched::Cleared,
-        }
+        boxed(serve_host(
+            self.executor.clone(),
+            self.latches.clone(),
+            self.members.clone(),
+            fresh,
+            serving,
+        ))
     }
 
-    fn drop_feedback(&self, connection: FeedbackIdx) {
-        self.lock().feedback[connection] = None;
+    fn stopped(&self) {
+        self.lock().reset();
     }
 }
 
@@ -447,9 +565,7 @@ impl<V: PortValue> LatchReader<V> {
             .map(|val| (**val).clone()))
     }
 
-    /// Which value of a Value or handle output port is latched: it moves on
-    /// each time the node's `run` writes the port, so a host can tell it has
-    /// seen the latest without reading it.
+    /// Which value of a Value or handle output port is latched.
     pub fn output_version(
         &self,
         node: &NodeId,

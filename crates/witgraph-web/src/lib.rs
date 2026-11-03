@@ -6,13 +6,11 @@
 //! scheduling rules are the scheduler's, so a graph ticks, latches,
 //! feeds back, faults and snapshots in a browser under the same rules as
 //! on wasmtime. What differs is the engine's own business: there is no fuel
-//! or memory limit, and a generation ends when every `run` has settled.
-//! wasmtime also waits for work a guest keeps doing after its `run`
-//! returns (a stream writer, say); a JavaScript host cannot see that work,
-//! so a node's next `run` may start while its previous stream is still
-//! being written. And each node is an instance of its own, so a failed call
-//! is always pinned on its node, where wasmtime names no culprit for a
-//! fault in a Store several members share.
+//! or memory limit. wasmtime also waits for work a guest keeps doing after its
+//! `run` returns (a stream writer, say); a JavaScript host cannot see that work,
+//! so a node's next `run` may start while its previous stream is still being
+//! written. And each node is an instance of its own, so a failed call is always
+//! pinned on its node, where wasmtime names no culprit beside a stream.
 //!
 //! Built for `wasm32-unknown-unknown` (or, opting in, for
 //! `wasm64-unknown-unknown`: a 64-bit memory, for values past what 4 GiB
