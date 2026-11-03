@@ -46,8 +46,7 @@ serde_json = "1.0"
 sha2 = "0.11"
 # wasmtime and the wasm-tools crates move together: this wasmtime is built on
 # wasm-tools 0.263. Bump every wasm-tools crate below together with wasmtime.
-# wac-graph is the exception: it works on component bytes and carries its own
-# wasm-tools, so it can lag.
+# Bugs in wit-parser and wac are fixed on `witgraph-patches` in our forks.
 #
 # wasmtime is pinned to a commit of main: the fix for a table leak in
 # guest-to-guest async calls is not in 50.0.1. Move back to crates.io once
@@ -57,8 +56,19 @@ wit-parser = "0.263"
 wit-component = "0.263"
 wasmparser = { version = "0.263", default-features = false }
 wasm-encoder = "0.263"
-wac-graph = "0.12"
+wac-graph = { git = "https://github.com/sansmoraxz/wac", rev = "05bcb89620a17b2c8d14d0c6bb0a516dd8daed5b" }
 wasm-wave = { version = "0.263", default-features = false, features = ["std"] }
 
 [profile.dev.package."*"]
 opt-level = 1
+
+[patch.crates-io]
+wasm-encoder = { git = "https://github.com/sansmoraxz/wasm-tools", rev = "51eb0b097375efcb8a44137dd3342a773c25c85f" }
+wasm-metadata = { git = "https://github.com/sansmoraxz/wasm-tools", rev = "51eb0b097375efcb8a44137dd3342a773c25c85f" }
+wasm-wave = { git = "https://github.com/sansmoraxz/wasm-tools", rev = "51eb0b097375efcb8a44137dd3342a773c25c85f" }
+wasmparser = { git = "https://github.com/sansmoraxz/wasm-tools", rev = "51eb0b097375efcb8a44137dd3342a773c25c85f" }
+wasmprinter = { git = "https://github.com/sansmoraxz/wasm-tools", rev = "51eb0b097375efcb8a44137dd3342a773c25c85f" }
+wast = { git = "https://github.com/sansmoraxz/wasm-tools", rev = "51eb0b097375efcb8a44137dd3342a773c25c85f" }
+wat = { git = "https://github.com/sansmoraxz/wasm-tools", rev = "51eb0b097375efcb8a44137dd3342a773c25c85f" }
+wit-component = { git = "https://github.com/sansmoraxz/wasm-tools", rev = "51eb0b097375efcb8a44137dd3342a773c25c85f" }
+wit-parser = { git = "https://github.com/sansmoraxz/wasm-tools", rev = "51eb0b097375efcb8a44137dd3342a773c25c85f" }

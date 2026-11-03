@@ -147,19 +147,12 @@ pub fn contract_from_str(
 /// naming an output the component does not have, say) is skipped, and
 /// noted in [`warnings`](lower::Lowered::warnings). Its `witgraph-docs`
 /// section is the contract's [`docs`](witgraph_ir::ComponentContract::docs).
-///
-/// See [`load::load_component`] on untrusted bytes; a panic lowering what
-/// it decoded is contained the same way.
 pub fn lower_component(
     bytes: &[u8],
     id: &witgraph_ir::ComponentRef,
 ) -> Result<lower::Lowered, Error> {
     let source = load::load_component(bytes)?;
-    let mut lowered = std::panic::catch_unwind(|| lower::lower(&source)).map_err(|_| {
-        Error::Load(load::LoadError::Resolve {
-            message: "the component's WIT could not be lowered".into(),
-        })
-    })??;
+    let mut lowered = lower::lower(&source)?;
     match lowered.len() {
         1 => {
             let mut lowered = lowered.remove(0);

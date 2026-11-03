@@ -6,7 +6,7 @@
 //! ([`witgraph_wit::compose::link_node`]), once per node component and set
 //! of links.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use wasm_bindgen::JsError;
 use witgraph_ir::{Capability, CompiledGraph, ComponentRef, Link, NodeId};
@@ -80,7 +80,6 @@ pub fn compose_links(
     // `None` is a set none of whose links applies.
     let mut done: HashMap<(&ComponentRef, Vec<LinkKey>), Option<usize>> = HashMap::new();
     let mut lowered: HashMap<&ComponentRef, Lowered> = HashMap::new();
-    let mut decodable = HashSet::new();
     for node in &compiled.graph().nodes {
         let mut links: Vec<&Link> = compiled
             .graph()
@@ -138,7 +137,7 @@ pub fn compose_links(
                 })
             })
             .collect::<Result<Vec<_>, JsError>>()?;
-        let result = link_node(contract, bytes, view, &providers, &mut decodable)
+        let result = link_node(contract, bytes, view, &providers)
             .map_err(|e| error(format!("component `{}`: {e}", contract.id)))?;
         let index = match result.bytes {
             std::borrow::Cow::Borrowed(_) => None,

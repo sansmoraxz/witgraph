@@ -17,8 +17,6 @@ use witgraph_ir::{
     PortName, PortTable,
 };
 
-use crate::verify::check_decodable;
-
 use super::abi::{Abi, Prim, Shape};
 use super::module::{
     AddingFuncs, Body, EqFn, FuncIdx, HEAP_TOP, Helper, Import, Local, ModuleBuilder, Offset,
@@ -68,12 +66,7 @@ fn read_member(member: &HubMember<'_>) -> Result<Decoded, HubError> {
         node: member.node.clone(),
         message,
     };
-    // The bytes are as untrusted as any: rule out what the decoder panics on,
-    // and contain what that does not.
-    check_decodable(member.bytes).map_err(failed)?;
-    let decoded = std::panic::catch_unwind(|| decode(member.bytes))
-        .map_err(|_| failed("its WIT could not be decoded".into()))?
-        .map_err(|e| failed(format!("{e:#}")))?;
+    let decoded = decode(member.bytes).map_err(|e| failed(format!("{e:#}")))?;
     let DecodedWasm::Component(resolve, world) = decoded else {
         return Err(failed("the bytes are a WIT package".into()));
     };

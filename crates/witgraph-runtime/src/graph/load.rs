@@ -8,7 +8,6 @@ mod precompiled;
 use std::borrow::Cow;
 use std::collections::HashMap;
 #[cfg(feature = "compile")]
-use std::collections::HashSet;
 use std::collections::hash_map::Entry;
 use std::sync::Arc;
 #[cfg(feature = "compile")]
@@ -168,7 +167,6 @@ impl PreparedGraph {
         let mut checked: Vec<CheckedNode<'_>> = Vec::new();
         let mut index_of: HashMap<(&ComponentRef, Vec<LinkKey>), usize> = HashMap::new();
         let mut verified: HashMap<&ComponentRef, (&[u8], Lowered)> = HashMap::new();
-        let mut decodable = HashSet::new();
         let mut of_node = Vec::with_capacity(compiled.graph().nodes.len());
         for node in &compiled.graph().nodes {
             let contract = contract_of(compiled, &node.id)?;
@@ -205,12 +203,10 @@ impl PreparedGraph {
                 })
                 .collect::<Result<Vec<_>, LoadError>>()?;
             let linked =
-                link_node(contract, bytes, lowered, &links, &mut decodable).map_err(|e| {
-                    LoadError::BadLink {
-                        component: Box::new(contract.id.clone()),
-                        import: e.import,
-                        message: e.message,
-                    }
+                link_node(contract, bytes, lowered, &links).map_err(|e| LoadError::BadLink {
+                    component: Box::new(contract.id.clone()),
+                    import: e.import,
+                    message: e.message,
                 })?;
             checked.push(CheckedNode {
                 export: linked.export,

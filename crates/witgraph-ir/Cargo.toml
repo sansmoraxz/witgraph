@@ -25,7 +25,7 @@ wasm-wave = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
-wac-types = "0.12"
+wac-types = { git = "https://github.com/sansmoraxz/wac", rev = "05bcb89620a17b2c8d14d0c6bb0a516dd8daed5b" }
 
 [features]
 default = ["serde"]

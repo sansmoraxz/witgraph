@@ -14,7 +14,6 @@
 //! still has to provide.
 
 use std::borrow::Cow;
-use std::collections::HashSet;
 
 use wac_graph::types::Package;
 use wac_graph::{CompositionGraph, EncodeOptions, NodeId};
@@ -22,7 +21,6 @@ use witgraph_ir::{Capability, ComponentContract, ComponentRef};
 
 use crate::lower::Lowered;
 use crate::lower_component;
-use crate::verify::check_decodable;
 
 /// Whether two components are the same bytes: the same slice, or equal.
 fn same_bytes(a: &[u8], b: &[u8]) -> bool {
@@ -227,21 +225,11 @@ fn as_declared(
 /// has nothing to satisfy and is left out; one the bytes import at a newer
 /// semver-compatible version (wit-component merges such imports) satisfies
 /// that import. With no link left, `bytes` come back as they are.
-///
-/// `decodable` holds the providers (by the address and length of their
-/// bytes) already checked for [`check_decodable`] in this load, so a
-/// provider shared by several nodes is checked once.
-///
-/// Where panics unwind, one in the composer's decoder is contained and
-/// reported as a failed link. On `wasm32-unknown-unknown` panics abort, so
-/// there the decodable check is all that stands between a hostile provider
-/// and the decoder.
 pub fn link_node<'a>(
     contract: &ComponentContract,
     bytes: &'a [u8],
     lowered: &Lowered,
     links: &[LinkedProvider<'_>],
-    decodable: &mut HashSet<(usize, usize)>,
 ) -> Result<LinkedNode<'a>, LinkError> {
     let bad_link = |import: &str, message: String| LinkError {
         import: import.to_string(),
@@ -265,15 +253,6 @@ pub fn link_node<'a>(
                 ),
             ));
         }
-        // The provider's bytes are as untrusted as the node's, and the
-        // composer decodes them: rule out what its decoder panics on.
-        let key = (link.bytes.as_ptr() as usize, link.bytes.len());
-        if decodable.insert(key) {
-            check_decodable(link.bytes).map_err(|e| {
-                decodable.remove(&key);
-                bad_link(link.import, format!("provider `{}`: {e}", link.provider))
-            })?;
-        }
         used.push((link, argument));
     }
     if used.is_empty() {
@@ -285,25 +264,16 @@ pub fn link_node<'a>(
         });
     }
     let export = lowered.export.clone();
-    // What the check above does not rule out is still contained here
-    // (where panics unwind).
-    let composed = std::panic::catch_unwind(|| compose(bytes, &export, &used))
-        .map_err(|_| {
-            let import = used.first().map_or("", |(link, _)| link.import);
-            bad_link(import, "the composition could not decode a provider".into())
-        })?
-        .map_err(|(import, message)| bad_link(&import, message))?;
+    let composed =
+        compose(bytes, &export, &used).map_err(|(import, message)| bad_link(&import, message))?;
     // The composed component's own view of its world: its ports are the
-    // node's, its imports what is left for the host. Lowering validates
-    // the bytes first. The node's own bytes lowered, so what fails now,
-    // a decoder panic included, came with the providers (what they
-    // import).
+    // node's, its imports what is left for the host. The node's own bytes
+    // lowered, so what fails now came with the providers (what they import).
     let with_providers = |message: String| {
         let import = used.first().map_or("", |(link, _)| link.import);
         bad_link(import, format!("with its providers composed in: {message}"))
     };
-    let composed_view = std::panic::catch_unwind(|| lower_component(&composed.bytes, &contract.id))
-        .map_err(|_| with_providers("the composed component's WIT could not be decoded".into()))?
+    let composed_view = lower_component(&composed.bytes, &contract.id)
         .map_err(|e| with_providers(e.to_string()))?;
     Ok(LinkedNode {
         bytes: Cow::Owned(composed.bytes),

@@ -184,20 +184,9 @@ pub fn load_str(name: &str, wit: &str) -> Result<WitSource, LoadError> {
 /// What it loads is the component's view of its world, which can be
 /// narrower than the WIT source: a component imports only the functions
 /// and resources its code uses.
-///
-/// The bytes are validated first ([`check_decodable`]): wit-parser's
-/// decoder expects a valid component and panics on some bytes that are not
-/// one. A panic the check does not foresee is still an error where panics
-/// unwind; where they abort (on `wasm32`, say) only the check stands
-/// between untrusted bytes and an abort.
-///
-/// [`check_decodable`]: crate::verify::check_decodable
 pub fn load_component(bytes: &[u8]) -> Result<WitSource, LoadError> {
     let failed = |message: String| LoadError::Resolve { message };
-    crate::verify::check_decodable(bytes).map_err(failed)?;
-    let decoded = std::panic::catch_unwind(|| wit_parser::decoding::decode(bytes))
-        .map_err(|_| failed("the component's WIT could not be decoded".into()))?
-        .map_err(|e| failed(format!("{e:#}")))?;
+    let decoded = wit_parser::decoding::decode(bytes).map_err(|e| failed(format!("{e:#}")))?;
     let package = decoded.package();
     let wit_parser::decoding::DecodedWasm::Component(resolve, _) = decoded else {
         return Err(failed(

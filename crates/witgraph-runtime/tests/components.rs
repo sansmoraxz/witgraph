@@ -825,13 +825,7 @@ async fn two_links_on_imports_the_bytes_merged_are_refused() {
     });
     // Even links that agree: a graph never has them (`ImportLinkedTwice`).
     let lowered = witgraph_wit::verify::verify_component(&contract, &bytes).unwrap();
-    let linked = witgraph_wit::compose::link_node(
-        &contract,
-        &bytes,
-        &lowered,
-        &links,
-        &mut std::collections::HashSet::new(),
-    );
+    let linked = witgraph_wit::compose::link_node(&contract, &bytes, &lowered, &links);
     match linked {
         Ok(_) => panic!("one import, two links"),
         Err(err) => assert!(err.message.contains("as one"), "{}", err.message),

@@ -1,5 +1,4 @@
-//! Checking component bytes: that untrusted bytes can be decoded at all,
-//! and that a component implements a contract.
+//! Checking that a component implements a contract.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -19,108 +18,6 @@ pub enum VerifyError {
     /// The bytes implement another contract: the first difference.
     #[error("{0}")]
     Mismatch(String),
-}
-
-/// Validates untrusted bytes as a component, and rejects what wit-parser's
-/// decoder cannot represent: a type imported or exported (at any depth)
-/// that is not a value or resource type, a function named like an
-/// interface (`a:b/c`) rather than a plain or method name, a nested
-/// component, a core module, or an imported instance exported again.
-/// wit-parser panics on some of those, and `catch_unwind` cannot contain a
-/// panic where panics abort (on `wasm32`, or in a host built with
-/// `panic = "abort"`).
-pub fn check_decodable(bytes: &[u8]) -> Result<(), String> {
-    use wasmparser::component_types::{ComponentAnyTypeId, ComponentEntityType};
-    use wasmparser::names::{ComponentName, ComponentNameKind};
-    use wasmparser::{Parser, Payload, ValidPayload, Validator, WasmFeatures};
-
-    fn check(
-        name: &str,
-        ty: &ComponentEntityType,
-        types: wasmparser::types::TypesRef<'_>,
-    ) -> Result<(), String> {
-        match ty {
-            // A function is a plain, constructor, method or static name.
-            ComponentEntityType::Func(_) => match ComponentName::new(name, 0)
-                .map(|n| matches!(n.kind(), ComponentNameKind::Plain(_)))
-            {
-                Ok(true) => Ok(()),
-                _ => Err(format!("function `{name}` has an interface's name")),
-            },
-            ComponentEntityType::Value(_) => Ok(()),
-            ComponentEntityType::Type { referenced, .. } => match referenced {
-                ComponentAnyTypeId::Defined(_) | ComponentAnyTypeId::Resource(_) => Ok(()),
-                _ => Err("it imports or exports a component, instance or function type".into()),
-            },
-            ComponentEntityType::Instance(id) => types[*id]
-                .exports
-                .iter()
-                .try_for_each(|(name, item)| check(name, &item.ty, types)),
-            ComponentEntityType::Component(_) => {
-                Err("it imports or exports a nested component".into())
-            }
-            ComponentEntityType::Module(_) => Err("it imports or exports a core module".into()),
-        }
-    }
-
-    // One pass: validate every payload (function bodies are left to
-    // `Component::new`, which validates them while compiling) and note the
-    // root's own imports and exports, outside any nested module or
-    // component.
-    let mut validator = Validator::new_with_features(WasmFeatures::all());
-    let mut depth = 0usize;
-    let mut root_types = None;
-    let mut imports = Vec::new();
-    let mut exports = Vec::new();
-    let invalid = |e: wasmparser::BinaryReaderError| format!("not a valid component: {e}");
-    for payload in Parser::new(0).parse_all(bytes) {
-        let payload = payload.map_err(invalid)?;
-        match &payload {
-            Payload::ModuleSection { .. } | Payload::ComponentSection { .. } => depth += 1,
-            Payload::ComponentImportSection(reader) if depth == 0 => {
-                for import in reader.clone() {
-                    imports.push(import.map_err(invalid)?.name.name);
-                }
-            }
-            Payload::ComponentExportSection(reader) if depth == 0 => {
-                for export in reader.clone() {
-                    exports.push(export.map_err(invalid)?.name.name);
-                }
-            }
-            _ => {}
-        }
-        if let ValidPayload::End(types) = validator.payload(&payload).map_err(invalid)? {
-            if depth == 0 {
-                root_types = Some(types);
-            } else {
-                depth -= 1;
-            }
-        }
-    }
-    let types = root_types.ok_or("not a valid component: it has no end")?;
-    let types = types.as_ref();
-    let mut imported = std::collections::HashSet::new();
-    for name in imports {
-        if let Some(item) = types.component_item_for_import(name) {
-            check(name, &item.ty, types).map_err(|e| format!("import `{name}`: {e}"))?;
-            if let ComponentEntityType::Instance(id) = item.ty {
-                imported.insert(id);
-            }
-        }
-    }
-    for name in exports {
-        if let Some(item) = types.component_item_for_export(name) {
-            check(name, &item.ty, types).map_err(|e| format!("export `{name}`: {e}"))?;
-            // The decoder maps an instance's types once: an instance both
-            // imported and exported would be mapped twice.
-            if let ComponentEntityType::Instance(id) = item.ty
-                && imported.contains(&id)
-            {
-                return Err(format!("export `{name}`: it exports an imported instance"));
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Decodes the WIT embedded in a component, lowers it, and checks that the
@@ -236,7 +133,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn shapes_the_decoder_panics_on_are_refused() {
+    fn shapes_wit_cannot_represent_are_refused() {
         let id: witgraph_ir::ComponentRef = "a:b/c@0.1.0".parse().unwrap();
         for (shape, wat) in [
             (
@@ -244,6 +141,13 @@ mod tests {
                 r#"(component
                     (import "a:b/c" (instance $i (type $t u32) (export "t" (type (eq $t)))))
                     (export "a:b/c" (instance $i)))"#,
+            ),
+            (
+                "imports sharing an instance type, with no node",
+                r#"(component
+                    (type $i (instance (type $t u32) (export "t" (type (eq $t)))))
+                    (import "a" (implements "a:b/c") (instance (type $i)))
+                    (import "b" (implements "a:b/c") (instance (type $i))))"#,
             ),
             (
                 "a function with an interface's name",
@@ -255,7 +159,6 @@ mod tests {
             ),
         ] {
             let bytes = wat::parse_str(wat).unwrap();
-            assert!(check_decodable(&bytes).is_err(), "{shape}");
             assert!(lower_component(&bytes, &id).is_err(), "{shape}");
         }
     }
