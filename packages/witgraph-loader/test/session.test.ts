@@ -1285,6 +1285,58 @@ test('a guest suspended in an async host import, with its caller parked, finishe
   assert.equal(instanceHooks('nothing to replace'), 'nothing to replace');
 });
 
+test('every patch finds what it patches in a composite', async () => {
+  // They match jco's output as text, and a behaviour can't show them all: a jco
+  // that moves the text fails here, so the patch is redone or dropped.
+  const names = ['tensor-stream-source', 'tensor-stream-sink'];
+  const components = await Promise.all(
+    names.map(async (name) => ({ id: ids[name], bytes: (await guestSource(name)).bytes })),
+  );
+  const graph = {
+    metadata: { name: 'patches' },
+    components: names.map((name) => componentRef(ids[name])),
+    nodes: names.map((name) => ({ id: name, component: componentRef(ids[name]) })),
+    connections: [
+      {
+        id: 'a',
+        from: { node: names[0], port: 'tensors' },
+        to: { node: names[1], port: 'tensors' },
+      },
+    ],
+  };
+  const web = WebGraph.load(
+    JSON.stringify(graph),
+    components,
+    {
+      run: () => ({}),
+      rebuild: () => {},
+      instance: () => undefined,
+      readHandle: () => undefined,
+    },
+    [],
+  );
+  const { bytes } = web.composite() as { bytes: Uint8Array };
+  web.free();
+  const { files } = await transpile(bytes, TRANSPILE_OPTIONS);
+  const source = new TextDecoder().decode(
+    (files as [string, Uint8Array][]).find(([name]) => name.endsWith('.js'))![1],
+  );
+  assert.notEqual(ownedFromWriter(source), source);
+  assert.notEqual(fastListLift(source), source);
+  const hooked = instanceHooks(source);
+  for (const [what, at] of [
+    ['host objects', 'captureTable'],
+    ['jco disposing one', '?.disposed.add(rsc)'],
+    ['a trap', '?.trapped(err)'],
+    ['the scheduler', "TickResult.DONE && !imports['$witgraph']?.stopped"],
+    ['the watchdog', "if (imports['$witgraph']?.stopped || STORE_TRAP.error"],
+    ['host imports', "if (imports['$witgraph']?.stopped) { throw"],
+  ]) {
+    assert.ok(hooked.includes(at), `no hook for ${what}`);
+  }
+  assert.ok(/imports\['\$witgraph'\]\?\.tables\.push\(captureTable\d+\)/.test(hooked));
+});
+
 test('the list loop jco generates is there to be replaced', async () => {
   // jco lifts a list a guest returns an element at a time; the loader
   // copies a list of numbers at once instead. A jco that generates its
