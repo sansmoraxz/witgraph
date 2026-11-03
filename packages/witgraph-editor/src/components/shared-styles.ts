@@ -77,6 +77,7 @@ const DEFAULT_CSS = `
   .underline { text-decoration: underline; }
   .whitespace-pre-wrap { white-space: pre-wrap; }
   .break-all { word-break: break-all; }
+  .wrap-anywhere { overflow-wrap: anywhere; }
   .leading-snug { line-height: 1.4; }
   .truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
