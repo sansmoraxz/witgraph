@@ -63,6 +63,30 @@ pub type GenerationFuture<L> = futures::future::LocalBoxFuture<'static, Outcome<
 pub trait PortValue: Clone + PartialEq + MaybeSend + MaybeSync + 'static {}
 impl<T: Clone + PartialEq + MaybeSend + MaybeSync + 'static> PortValue for T {}
 
+/// A value in the one form a guest produces, so that equal values compare
+/// equal: value equality decides whether an input changed. The scheduler's
+/// write path takes nothing else.
+///
+/// Made by an executor's [`check_input`](Executor::check_input) and
+/// [`parse_wave`](Executor::parse_wave), the only places that know a value's
+/// canonical form.
+#[derive(Debug, Clone, PartialEq)]
+#[repr(transparent)]
+pub struct Canonical<V>(V);
+
+impl<V> Canonical<V> {
+    /// Vouches that `value` is in its canonical form. For an executor's
+    /// `check_input` and `parse_wave`; nothing checks it.
+    pub fn assume(value: V) -> Self {
+        Self(value)
+    }
+
+    /// The value.
+    pub fn into_inner(self) -> V {
+        self.0
+    }
+}
+
 /// What a value is to a connection that unwraps an option
 /// ([`Executor::option_payload`]).
 #[derive(Debug, Clone, PartialEq)]
@@ -280,12 +304,16 @@ pub trait Executor: 'static {
     /// Checks that `value` has type `ty` (a Value input's payload type) and
     /// returns it in the one form a guest produces, so equal values compare
     /// equal.
-    fn check_input(&self, ty: &Self::Type, value: Self::Value) -> Result<Self::Value, String>;
+    fn check_input(
+        &self,
+        ty: &Self::Type,
+        value: Self::Value,
+    ) -> Result<Canonical<Self::Value>, String>;
 
     /// Parses WAVE text as a value of type `ty` (a Value port's), in the
     /// same form as [`check_input`](Self::check_input) returns. Record
     /// fields, cases and flags the type does not have are errors.
-    fn parse_wave(&self, ty: &Self::Type, text: &str) -> Result<Self::Value, String>;
+    fn parse_wave(&self, ty: &Self::Type, text: &str) -> Result<Canonical<Self::Value>, String>;
 
     /// A value of a Value port as WAVE text, or why it cannot be written
     /// (one too large for the host to convert, say).

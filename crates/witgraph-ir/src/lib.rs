@@ -12,6 +12,7 @@ pub mod component;
 pub mod diagnostics;
 pub mod graph;
 pub mod id;
+pub mod index;
 pub mod interface;
 pub mod partition;
 pub mod port;
@@ -31,6 +32,10 @@ pub use graph::{
 pub use id::{
     ComponentRef, ConnectionId, LinkId, NodeId, PackageRef, ParseComponentRefError, PortName,
     PortRef, ResourceId,
+};
+pub use index::{
+    FeedbackEntry, FeedbackIdx, Idx, IndexVec, InputIdx, NodeIdx, OutputIdx, PortEntry, PortSet,
+    PortTable,
 };
 pub use port::{HandleType, NodeShape, PortDef, PortDirection, PortKind};
 pub use wasm_wave;

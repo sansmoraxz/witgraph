@@ -102,8 +102,8 @@ use witgraph_ir::{
 };
 use witgraph_sched::plan::{IslandPlan, MemberPlan};
 use witgraph_sched::{
-    Executor, Generation, GenerationFuture, IslandEventKind, NodeCaller, NodeFault, OptionPayload,
-    Outcome, drive, missing_input_message,
+    Canonical, Executor, Generation, GenerationFuture, IslandEventKind, NodeCaller, NodeFault,
+    OptionPayload, Outcome, drive, missing_input_message,
 };
 
 use crate::pump::{Ended, Intake, StreamRx, Tap, export_stream, import_stream};
@@ -1514,14 +1514,14 @@ impl<H: Host> Executor for Wasmtime<H> {
         }
     }
 
-    fn check_input(&self, ty: &Type, value: Value) -> Result<Value, String> {
+    fn check_input(&self, ty: &Type, value: Value) -> Result<Canonical<Value>, String> {
         let val = value.into_val();
         check_type(ty, &val)?;
-        Ok(Value::from_val(canonical(ty, val)))
+        Ok(Canonical::assume(Value::from_val(canonical(ty, val))))
     }
 
-    fn parse_wave(&self, ty: &Type, text: &str) -> Result<Value, String> {
-        parse_wave(ty, text).map(Value::from_val)
+    fn parse_wave(&self, ty: &Type, text: &str) -> Result<Canonical<Value>, String> {
+        parse_wave(ty, text).map(|val| Canonical::assume(Value::from_val(val)))
     }
 
     /// A Value port never holds a kind WAVE cannot render (a handle, say).

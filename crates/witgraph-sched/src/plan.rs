@@ -2,7 +2,10 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use witgraph_ir::{CompiledGraph, Connection, ConnectionId, NodeId, PortKind, PortName, PortRef};
+use witgraph_ir::{
+    CompiledGraph, Connection, ConnectionId, FeedbackIdx, Idx, InputIdx, NodeId, NodeIdx,
+    OutputIdx, PortKind, PortName, PortRef, PortTable,
+};
 
 use crate::error::RuntimeError;
 
@@ -25,6 +28,8 @@ pub struct InputField {
     pub name: PortName,
     /// The member's port this field is.
     pub port: PortRef,
+    /// The same port, numbered.
+    pub index: InputIdx,
     /// The port's kind.
     pub kind: PortKind,
     /// Declared `option<T>`: the host wraps the value (or passes `none`).
@@ -48,6 +53,8 @@ pub struct Consumer {
 /// One field of a member's `outputs` record.
 #[derive(Debug, Clone)]
 pub struct OutputField {
+    /// The port, numbered.
+    pub index: OutputIdx,
     /// The port's kind.
     pub kind: PortKind,
     /// Its in-island consumers. At most one for a stream or future.
@@ -108,14 +115,14 @@ impl IslandPlan {
     }
 
     /// Every member's required external Value inputs.
-    pub(crate) fn required_inputs(&self) -> Vec<PortRef> {
+    pub(crate) fn required_inputs(&self) -> Vec<InputIdx> {
         self.members
             .iter()
             .flat_map(|member| {
                 member
                     .external_values()
                     .filter(|(_, field)| !field.optional)
-                    .map(|(_, field)| field.port.clone())
+                    .map(|(_, field)| field.index)
             })
             .collect()
     }
@@ -179,6 +186,7 @@ impl<'a> Wiring<'a> {
 pub(crate) fn plan_island(
     compiled: &CompiledGraph,
     wiring: &Wiring<'_>,
+    table: &PortTable,
     index: usize,
     members: &[NodeId],
     shapes: &[RunShape],
@@ -233,6 +241,7 @@ pub(crate) fn plan_island(
                     Some(InputField {
                         name: port.name.clone(),
                         port: PortRef::new(node.clone(), port.name.clone()),
+                        index: table.input(node, &port.name)?,
                         kind: port.kind,
                         optional: port.optional,
                         source: if producer.is_some() {
@@ -248,7 +257,7 @@ pub(crate) fn plan_island(
         let outputs = contract
             .outputs
             .iter()
-            .map(|port| {
+            .filter_map(|port| {
                 let consumers = wiring
                     .readers
                     .get(&PortRef::new(node.clone(), port.name.clone()))
@@ -269,13 +278,14 @@ pub(crate) fn plan_island(
                         })
                     })
                     .collect();
-                (
+                Some((
                     port.name.clone(),
                     OutputField {
+                        index: table.output(node, &port.name)?,
                         kind: port.kind,
                         consumers,
                     },
-                )
+                ))
             })
             .collect();
 
@@ -302,36 +312,39 @@ pub(crate) fn plan_island(
 /// An island's place in the graph-wide node index.
 pub(crate) struct IslandWiring {
     /// Where its members start in the graph-wide node index.
-    pub(crate) offset: usize,
-    /// Per member, the nodes (graph-wide index) writing one of its inputs
-    /// over a non-feedback connection.
-    pub(crate) preds: Vec<Vec<usize>>,
-    /// The nodes (graph-wide index) writing one of its inputs over a
-    /// feedback connection.
-    pub(crate) feedback_sources: Vec<usize>,
+    pub(crate) offset: NodeIdx,
+    /// Per member, the nodes writing one of its inputs over a non-feedback
+    /// connection.
+    pub(crate) preds: Vec<Vec<NodeIdx>>,
+    /// The nodes writing one of its inputs over a feedback connection.
+    pub(crate) feedback_sources: Vec<NodeIdx>,
     /// The feedback connections out of its members.
-    pub(crate) feedback_out: Vec<ConnectionId>,
+    pub(crate) feedback_out: Vec<FeedbackIdx>,
 }
 
 /// Every island's [`IslandWiring`], in island order.
-pub(crate) fn node_wiring(compiled: &CompiledGraph, wiring: &Wiring<'_>) -> Vec<IslandWiring> {
+pub(crate) fn node_wiring(
+    compiled: &CompiledGraph,
+    wiring: &Wiring<'_>,
+    table: &PortTable,
+) -> Vec<IslandWiring> {
     // An island's wiring while it is collected: writers as sets, each
     // once, listed when complete.
     struct Collecting {
-        offset: usize,
-        preds: Vec<BTreeSet<usize>>,
-        feedback_sources: BTreeSet<usize>,
-        feedback_out: Vec<ConnectionId>,
+        offset: NodeIdx,
+        preds: Vec<BTreeSet<NodeIdx>>,
+        feedback_sources: BTreeSet<NodeIdx>,
+        feedback_out: Vec<FeedbackIdx>,
     }
-    let mut position: HashMap<&NodeId, (usize, usize, usize)> = HashMap::new();
+    let mut position: HashMap<&NodeId, (usize, usize, NodeIdx)> = HashMap::new();
     let mut wired = Vec::with_capacity(compiled.islands().len());
     let mut next = 0;
     for (island, members) in compiled.islands().iter().enumerate() {
         for (member, node) in members.iter().enumerate() {
-            position.insert(node, (island, member, next + member));
+            position.insert(node, (island, member, NodeIdx::at(next + member)));
         }
         wired.push(Collecting {
-            offset: next,
+            offset: NodeIdx::at(next),
             preds: vec![BTreeSet::new(); members.len()],
             feedback_sources: BTreeSet::new(),
             feedback_out: Vec::new(),
@@ -349,7 +362,9 @@ pub(crate) fn node_wiring(compiled: &CompiledGraph, wiring: &Wiring<'_>) -> Vec<
         if let (Some(&(source, _, from)), Some(&(island, _, _))) =
             (position.get(&conn.from.node), position.get(&conn.to.node))
         {
-            wired[source].feedback_out.push(conn.id.clone());
+            if let Some(index) = table.feedback_index(&conn.id) {
+                wired[source].feedback_out.push(index);
+            }
             wired[island].feedback_sources.insert(from);
         }
     }

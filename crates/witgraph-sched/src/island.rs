@@ -24,12 +24,11 @@
 //! [`Owed`]: input changes owe a generation whatever phase the island is
 //! in, and the scheduler starts the island once it can.
 
-use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use futures::FutureExt;
-use witgraph_ir::{ConnectionId, NodeId};
+use witgraph_ir::{FeedbackIdx, NodeId, PortSet};
 
 use crate::error::NodeFault;
 use crate::executor::{GenerationFuture, Outcome};
@@ -321,7 +320,7 @@ pub(crate) struct Replay<V> {
     /// Feedback connections whose target the host wrote after the original
     /// generation started, or after the restore: what it feeds back there
     /// is stale.
-    pub(crate) stale: BTreeSet<ConnectionId>,
+    pub(crate) stale: PortSet<FeedbackIdx>,
 }
 
 /// One generation to start.
@@ -407,7 +406,7 @@ mod tests {
     fn replay() -> Replay<u32> {
         Replay {
             inputs: vec![Vec::new()],
-            stale: BTreeSet::new(),
+            stale: PortSet::new(0),
         }
     }
 

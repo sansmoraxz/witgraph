@@ -15,9 +15,9 @@ use witgraph_ir::{
     PortRef, Type,
 };
 use witgraph_sched::{
-    Executor, Generation, GenerationFuture, IslandEventKind, NodeCaller, NodeFault, NodePhase,
-    OptionPayload, Perf, RunShape, RuntimeError, RuntimeMode, Scheduler, TickResult, Trace,
-    TraceEvent, drive,
+    Canonical, Executor, Generation, GenerationFuture, IslandEventKind, NodeCaller, NodeFault,
+    NodePhase, OptionPayload, Perf, RunShape, RuntimeError, RuntimeMode, Scheduler, TickResult,
+    Trace, TraceEvent, drive,
 };
 
 /// What a node computes: its inputs, by field, to its outputs, by name.
@@ -106,12 +106,14 @@ impl Executor for Closures {
             .then_some(&())
     }
 
-    fn check_input(&self, (): &(), value: u32) -> Result<u32, String> {
-        Ok(value)
+    fn check_input(&self, (): &(), value: u32) -> Result<Canonical<u32>, String> {
+        Ok(Canonical::assume(value))
     }
 
-    fn parse_wave(&self, (): &(), text: &str) -> Result<u32, String> {
-        text.parse().map_err(|e| format!("{e}"))
+    fn parse_wave(&self, (): &(), text: &str) -> Result<Canonical<u32>, String> {
+        text.parse()
+            .map(Canonical::assume)
+            .map_err(|e| format!("{e}"))
     }
 
     fn to_wave(&self, value: &u32) -> Result<String, String> {

@@ -84,18 +84,18 @@
 //! tick, a cancel or a shutdown still has its outputs latched and
 //! delivered.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::task::Waker;
 
 use futures::channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use witgraph_ir::{
-    CompiledGraph, ComponentRef, Connection, ConnectionId, Link, NodeId, PortDirection, PortName,
-    PortRef, ResourceId,
+    CompiledGraph, ComponentRef, Connection, ConnectionId, FeedbackIdx, Idx, IndexVec, InputIdx,
+    Link, NodeId, NodeIdx, OutputIdx, PortDirection, PortName, PortSet, PortTable, ResourceId,
 };
 
 use crate::error::RuntimeError;
-use crate::executor::{Executor, IslandEvent};
+use crate::executor::{Canonical, Executor, IslandEvent};
 use crate::island::{Island, IslandState, Owed, StopCause};
 use crate::mode::RuntimeMode;
 use crate::node::NodeState;
@@ -104,11 +104,13 @@ use crate::resource::ResourcePool;
 use crate::run::{IslandWaker, WakeSet};
 use crate::schedule::FaultReport;
 
+/// The latched value of each port or connection of one kind that has one.
+pub(crate) type Latches<I, V> = IndexVec<I, Option<Arc<V>>>;
+
 /// An outgoing connection of a Value output port.
 #[derive(Debug, Clone)]
 pub(crate) struct Edge {
-    pub(crate) id: ConnectionId,
-    pub(crate) to: PortRef,
+    pub(crate) to: InputIdx,
     pub(crate) route: Route,
     /// An `option<T>` output feeding an optional input of payload `T`
     /// ([`witgraph_ir::PortDef::unwraps_into`]).
@@ -119,7 +121,7 @@ pub(crate) struct Edge {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Route {
     /// Buffered until the end-of-iteration latch.
-    Feedback,
+    Feedback(FeedbackIdx),
     /// To a member of the producer's own island: part of the generation.
     Internal,
     /// To another island, at once.
@@ -131,25 +133,25 @@ pub(crate) struct Slot<X: Executor> {
     pub(crate) plan: Arc<IslandPlan>,
     /// Where the island's members start in the graph-wide node index (the
     /// members are `offset..offset + members.len()`).
-    pub(crate) offset: usize,
-    /// Per member, in plan order: the nodes (graph-wide index) that write
-    /// one of its inputs over a non-feedback connection.
-    pub(crate) preds: Vec<Vec<usize>>,
-    /// The nodes (graph-wide index) that write one of the island's inputs
-    /// over a feedback connection.
-    pub(crate) feedback_sources: Vec<usize>,
+    pub(crate) offset: NodeIdx,
+    /// Per member, in plan order: the nodes that write one of its inputs
+    /// over a non-feedback connection.
+    pub(crate) preds: Vec<Vec<NodeIdx>>,
+    /// The nodes that write one of the island's inputs over a feedback
+    /// connection.
+    pub(crate) feedback_sources: Vec<NodeIdx>,
     /// The feedback connections out of the island's members.
-    pub(crate) feedback_out: Vec<ConnectionId>,
+    pub(crate) feedback_out: Vec<FeedbackIdx>,
     /// Every member's required external Value inputs: a run on the latched
     /// inputs needs a value for each.
-    pub(crate) required: Vec<PortRef>,
+    pub(crate) required: Vec<InputIdx>,
     /// Per member, in plan order: whether its `run` is still to return in
     /// the generation in flight. All `false` when nothing is in flight.
     pub(crate) awaiting: Vec<bool>,
     /// Feedback connections the generation in flight must not deliver:
     /// the host wrote their target since it started (or, for a replay,
     /// since the original generation started).
-    pub(crate) stale_feedback: BTreeSet<ConnectionId>,
+    pub(crate) stale_feedback: PortSet<FeedbackIdx>,
     /// Wakes the tick for this island's generation alone.
     pub(crate) waker: Waker,
     pub(crate) state: IslandState<X::Island, X::Value>,
@@ -172,16 +174,19 @@ pub struct Scheduler<M: RuntimeMode, X: Executor> {
     pub(crate) running: usize,
     /// Each island's index, by its sorted members: how a snapshot names it.
     pub(crate) island_index: HashMap<Vec<NodeId>, usize>,
-    /// Latched value of every Value input port that has one.
-    pub(crate) inputs: HashMap<PortRef, Arc<X::Value>>,
-    /// Latched Value outputs.
-    pub(crate) outputs: HashMap<PortRef, Arc<X::Value>>,
-    pub(crate) out_edges: HashMap<PortRef, Arc<[Edge]>>,
-    /// Every feedback connection, by id, with its source port.
-    pub(crate) feedback_edges: HashMap<ConnectionId, (PortRef, Edge)>,
+    /// Every port and feedback connection, numbered.
+    pub(crate) ports: PortTable,
+    /// Each node's island.
+    pub(crate) island_of_node: IndexVec<NodeIdx, usize>,
+    /// The latched value of each input port. Only Value and handle ports
+    /// ever hold one.
+    pub(crate) inputs: Latches<InputIdx, X::Value>,
+    /// The latched value of each output port, likewise.
+    pub(crate) outputs: Latches<OutputIdx, X::Value>,
+    pub(crate) out_edges: IndexVec<OutputIdx, Arc<[Edge]>>,
     /// The feedback connections into each input port, with the island of
     /// their source.
-    pub(crate) feedback_into: HashMap<PortRef, Vec<(ConnectionId, usize)>>,
+    pub(crate) feedback_into: IndexVec<InputIdx, Box<[(FeedbackIdx, usize)]>>,
     /// The graph's connections, sorted by id: how snapshots name the
     /// wiring.
     pub(crate) connections: Vec<Connection>,
@@ -190,14 +195,12 @@ pub struct Scheduler<M: RuntimeMode, X: Executor> {
     /// The graph's links, sorted by id: how snapshots name what is
     /// composed into the nodes.
     pub(crate) links: Vec<Link>,
-    /// Input ports written by a non-feedback connection, with that
-    /// connection: the one writer [`inject`](Self::inject) may not compete
-    /// with.
-    pub(crate) connected: HashMap<PortRef, ConnectionId>,
+    /// The non-feedback connection writing each input port, if one does:
+    /// the one writer [`inject`](Self::inject) may not compete with.
+    pub(crate) connected: IndexVec<InputIdx, Option<ConnectionId>>,
     /// Feedback writes waiting for the end-of-iteration latch: the value
-    /// as the source produced it, by connection. Where it goes is the
-    /// connection's [`Edge`] in [`feedback_edges`](Self::feedback_edges).
-    pub(crate) feedback: BTreeMap<ConnectionId, Arc<X::Value>>,
+    /// as the source produced it, by connection.
+    pub(crate) feedback: Latches<FeedbackIdx, X::Value>,
     /// The latest fault of each island not yet taken by
     /// [`take_faults`](Self::take_faults).
     pub(crate) faults: BTreeMap<usize, FaultReport>,
@@ -228,7 +231,7 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
         port: &PortName,
         val: X::Value,
     ) -> Result<(), RuntimeError> {
-        let (port_ref, ty) = self.host_input(node, port)?;
+        let (input, ty) = self.host_input(node, port)?;
         let val =
             self.executor
                 .check_input(ty, val)
@@ -237,15 +240,15 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
                     port: port.clone(),
                     message,
                 })?;
-        self.inject_checked(port_ref, val);
+        self.inject_checked(input, val);
         Ok(())
     }
 
     /// Writes a value already in the port's checked, canonical form.
-    fn inject_checked(&mut self, port_ref: PortRef, val: X::Value) {
+    fn inject_checked(&mut self, input: InputIdx, val: Canonical<X::Value>) {
         self.drain_events();
-        if self.set_input(port_ref.clone(), Arc::new(val)) {
-            self.note_host_write(&port_ref);
+        if self.set_input(input, Arc::new(val.into_inner())) {
+            self.note_host_write(input);
         }
     }
 
@@ -259,7 +262,7 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
         port: &PortName,
         text: &str,
     ) -> Result<(), RuntimeError> {
-        let (port_ref, ty) = self.host_input(node, port)?;
+        let (input, ty) = self.host_input(node, port)?;
         let val =
             self.executor
                 .parse_wave(ty, text)
@@ -268,8 +271,7 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
                     port: port.clone(),
                     message,
                 })?;
-        // `parse_wave` returns the checked, canonical form `inject` makes.
-        self.inject_checked(port_ref, val);
+        self.inject_checked(input, val);
         Ok(())
     }
 
@@ -281,9 +283,9 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
     /// the clear wins over feedback for this input computed before it.
     pub fn clear_input(&mut self, node: &NodeId, port: &PortName) -> Result<(), RuntimeError> {
         self.drain_events();
-        let (port_ref, _) = self.host_input(node, port)?;
-        if self.clear_input_value(port_ref.clone()) {
-            self.note_host_write(&port_ref);
+        let (input, _) = self.host_input(node, port)?;
+        if self.clear_input_value(input) {
+            self.note_host_write(input);
         }
         Ok(())
     }
@@ -309,8 +311,8 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
         node: &NodeId,
         port: &PortName,
     ) -> Result<Option<X::Value>, RuntimeError> {
-        let port_ref = self.latched_port(node, port, PortDirection::Output)?;
-        Ok(self.outputs.get(&port_ref).map(|val| (**val).clone()))
+        let output = self.latched_output(node, port)?;
+        Ok(self.outputs[output].as_ref().map(|val| (**val).clone()))
     }
 
     /// The type of a Value port: for an input, its payload type (for an
@@ -323,7 +325,7 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
         port: &PortName,
         direction: PortDirection,
     ) -> Result<&X::Type, RuntimeError> {
-        self.value_port(node, port, direction).map(|(_, ty)| ty)
+        self.value_port(node, port, direction)
     }
 
     /// The payload type of a Value input the host may write, as
@@ -339,30 +341,18 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
         self.host_input(node, port).map(|(_, ty)| ty)
     }
 
-    /// Checks that `node` exists and `port` is a Value or handle port of it
-    /// in `direction`: one whose values the host latches.
-    fn latched_port(
-        &self,
-        node: &NodeId,
-        port: &PortName,
-        direction: PortDirection,
-    ) -> Result<PortRef, RuntimeError> {
+    /// Checks that `node` exists and `port` is a Value or handle output of
+    /// it: one whose values the host latches.
+    fn latched_output(&self, node: &NodeId, port: &PortName) -> Result<OutputIdx, RuntimeError> {
         self.island(node)?;
-        let latched = self.compiled.contract_for(node).is_some_and(|contract| {
-            let ports = match direction {
-                PortDirection::Input => &contract.inputs,
-                PortDirection::Output => &contract.outputs,
-            };
-            ports.iter().any(|p| &p.name == port && p.kind.is_latched())
-        });
-        if !latched {
-            return Err(RuntimeError::NotAValuePort {
+        self.ports
+            .output(node, port)
+            .filter(|output| self.ports.outputs()[*output].kind.is_latched())
+            .ok_or_else(|| RuntimeError::NotAValuePort {
                 node: node.clone(),
                 port: port.clone(),
-                direction,
-            });
-        }
-        Ok(PortRef::new(node.clone(), port.clone()))
+                direction: PortDirection::Output,
+            })
     }
 
     /// Checks that `node` exists and `port` is a Value port of it in
@@ -372,17 +362,25 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
         node: &NodeId,
         port: &PortName,
         direction: PortDirection,
-    ) -> Result<(PortRef, &X::Type), RuntimeError> {
+    ) -> Result<&X::Type, RuntimeError> {
         self.island(node)?;
-        let port_ref = PortRef::new(node.clone(), port.clone());
-        match self.executor.port_type(&port_ref, direction) {
-            Some(ty) => Ok((port_ref, ty)),
-            None => Err(RuntimeError::NotAValuePort {
+        let entry = match direction {
+            PortDirection::Input => self
+                .ports
+                .input(node, port)
+                .map(|input| &self.ports.inputs()[input]),
+            PortDirection::Output => self
+                .ports
+                .output(node, port)
+                .map(|output| &self.ports.outputs()[output]),
+        };
+        entry
+            .and_then(|entry| self.executor.port_type(&entry.port, direction))
+            .ok_or_else(|| RuntimeError::NotAValuePort {
                 node: node.clone(),
                 port: port.clone(),
                 direction,
-            }),
-        }
+            })
     }
 
     /// A node's current lifecycle state: a view of its island's state at
@@ -440,7 +438,7 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
         for index in 0..self.slots.len() {
             self.stop_island(index, StopCause::Shutdown);
         }
-        self.feedback.clear();
+        self.feedback = IndexVec::from_fn(self.feedback.len(), |_| None);
     }
 
     /// The compiled graph being run.
@@ -491,16 +489,22 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
         &self,
         node: &NodeId,
         port: &PortName,
-    ) -> Result<(PortRef, &X::Type), RuntimeError> {
-        let (port_ref, ty) = self.value_port(node, port, PortDirection::Input)?;
-        if let Some(connection) = self.connected.get(&port_ref) {
+    ) -> Result<(InputIdx, &X::Type), RuntimeError> {
+        let ty = self.value_port(node, port, PortDirection::Input)?;
+        let not_a_port = || RuntimeError::NotAValuePort {
+            node: node.clone(),
+            port: port.clone(),
+            direction: PortDirection::Input,
+        };
+        let input = self.ports.input(node, port).ok_or_else(not_a_port)?;
+        if let Some(connection) = &self.connected[input] {
             return Err(RuntimeError::ConnectedInput {
                 node: node.clone(),
                 port: port.clone(),
                 connection: connection.clone(),
             });
         }
-        Ok((port_ref, ty))
+        Ok((input, ty))
     }
 }
 
@@ -534,36 +538,44 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
         let resources = register_resources(&compiled)?;
         let graph = compiled.graph();
         let wiring = Wiring::new(&compiled);
-        let mut out_edges: HashMap<PortRef, Vec<Edge>> = HashMap::new();
-        let mut feedback_edges = HashMap::new();
-        let mut feedback_into: HashMap<PortRef, Vec<(ConnectionId, usize)>> = HashMap::new();
+        let ports = PortTable::new(&compiled);
+        let island_of_node: IndexVec<NodeIdx, usize> = compiled
+            .islands()
+            .iter()
+            .enumerate()
+            .flat_map(|(island, members)| members.iter().map(move |_| island))
+            .collect();
+        let mut out_edges: Vec<Vec<Edge>> = vec![Vec::new(); ports.outputs().len()];
+        let mut feedback_into: Vec<Vec<(FeedbackIdx, usize)>> =
+            vec![Vec::new(); ports.inputs().len()];
         let island_of: Vec<usize> = compiled.nodes().map(|n| n.island).collect();
         for resolved in compiled.connections() {
             let conn = resolved.connection;
             let (from, to) = (island_of[resolved.from_node], island_of[resolved.to_node]);
-            let route = match (conn.feedback, from == to) {
-                (true, _) => Route::Feedback,
-                (false, true) => Route::Internal,
-                (false, false) => Route::External,
+            let (Some(output), Some(input)) = (
+                ports.output(&conn.from.node, &conn.from.port),
+                ports.input(&conn.to.node, &conn.to.port),
+            ) else {
+                continue;
             };
-            let edge = Edge {
-                id: conn.id.clone(),
-                to: conn.to.clone(),
+            let route = match (ports.feedback_index(&conn.id), from == to) {
+                (Some(feedback), _) => {
+                    feedback_into[input.position()].push((feedback, from));
+                    Route::Feedback(feedback)
+                }
+                (None, true) => Route::Internal,
+                (None, false) => Route::External,
+            };
+            out_edges[output.position()].push(Edge {
+                to: input,
                 route,
                 unwrap_option: resolved.unwraps_option,
-            };
-            if conn.feedback {
-                feedback_edges.insert(conn.id.clone(), (conn.from.clone(), edge.clone()));
-                feedback_into
-                    .entry(conn.to.clone())
-                    .or_default()
-                    .push((conn.id.clone(), from));
-            }
-            out_edges.entry(conn.from.clone()).or_default().push(edge);
+            });
         }
-        let out_edges = out_edges
+        let out_edges = out_edges.into_iter().map(Arc::from).collect();
+        let feedback_into = feedback_into
             .into_iter()
-            .map(|(port, edges)| (port, edges.into()))
+            .map(Vec::into_boxed_slice)
             .collect();
         let mut connections = graph.connections.clone();
         connections.sort_by(|a, b| a.id.cmp(&b.id));
@@ -574,20 +586,21 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
             .iter()
             .filter_map(|n| Some((n.id.clone(), compiled.contract_for(&n.id)?.id.clone())))
             .collect();
-        let connected = wiring
-            .writer
-            .iter()
-            .map(|(port, conn)| ((*port).clone(), conn.id.clone()))
-            .collect();
+        let mut connected = IndexVec::from_fn(ports.inputs().len(), |_| None);
+        for (port, conn) in &wiring.writer {
+            if let Some(input) = ports.input(&port.node, &port.port) {
+                connected[input] = Some(conn.id.clone());
+            }
+        }
 
-        let wired = plan::node_wiring(&compiled, &wiring);
+        let wired = plan::node_wiring(&compiled, &wiring, &ports);
         let wakes = Arc::new(WakeSet::new(islands.len()));
         let mut slots = Vec::with_capacity(islands.len());
         let members = compiled.islands().iter();
         for (index, ((members, (live, shapes)), wired)) in
             members.zip(islands).zip(wired).enumerate()
         {
-            let plan = plan::plan_island(&compiled, &wiring, index, members, &shapes)?;
+            let plan = plan::plan_island(&compiled, &wiring, &ports, index, members, &shapes)?;
             // A new island owes its first generation.
             let mut owed = Owed::default();
             owed.push_latched();
@@ -599,7 +612,7 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
                 preds: wired.preds,
                 feedback_sources: wired.feedback_sources,
                 feedback_out: wired.feedback_out,
-                stale_feedback: BTreeSet::new(),
+                stale_feedback: PortSet::new(ports.feedback().len()),
                 waker: futures::task::waker(Arc::new(IslandWaker {
                     island: index,
                     set: wakes.clone(),
@@ -624,16 +637,17 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
             slots,
             running: 0,
             island_index,
-            inputs: HashMap::new(),
-            outputs: HashMap::new(),
+            inputs: IndexVec::from_fn(ports.inputs().len(), |_| None),
+            outputs: IndexVec::from_fn(ports.outputs().len(), |_| None),
+            feedback: IndexVec::from_fn(ports.feedback().len(), |_| None),
+            ports,
+            island_of_node,
             out_edges,
-            feedback_edges,
             feedback_into,
             connections,
             components,
             links,
             connected,
-            feedback: BTreeMap::new(),
             faults: BTreeMap::new(),
             wakes,
             dirty: true,

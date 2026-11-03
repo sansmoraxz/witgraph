@@ -4,8 +4,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use witgraph_ir::{
-    ComponentRef, Connection, ConnectionId, Link, NodeId, PortDirection, PortKind, PortName,
-    PortRef,
+    ComponentRef, Connection, ConnectionId, FeedbackIdx, Idx, IndexVec, Link, NodeId,
+    PortDirection, PortEntry, PortKind, PortName, PortRef, PortSet,
 };
 
 use crate::error::RuntimeError;
@@ -13,7 +13,7 @@ use crate::executor::Executor;
 use crate::island::{Replay, StartInputs, StopCause};
 use crate::mode::RuntimeMode;
 use crate::node::NodePhase;
-use crate::scheduler::Scheduler;
+use crate::scheduler::{Latches, Scheduler};
 
 /// WAVE text per port, keyed by node id then port name.
 pub type PortValues = BTreeMap<NodeId, BTreeMap<PortName, String>>;
@@ -129,45 +129,27 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
     ///
     /// Fails, naming it, on a value the executor cannot write as WAVE text.
     pub fn snapshot(&self) -> Result<Snapshot, SnapshotError> {
-        let wave = |val: &X::Value, at: &dyn Fn() -> String| {
-            self.executor
-                .to_wave(val)
-                .map_err(|message| SnapshotError { at: at(), message })
-        };
+        let wave = |val: &X::Value, at: &dyn Fn() -> String| self.wave(val, at);
         // A handle is the host's, not text: it is left out, and the island
         // that produced it owes a run, which makes a new one.
         let producers: BTreeSet<usize> = self
             .outputs
-            .keys()
-            .filter(|port| self.is_handle(port, PortDirection::Output))
-            .filter_map(|port| self.compiled.island_of(&port.node))
-            .collect();
-        // Latched values as WAVE text, by node and port.
-        let port_values = |map: &HashMap<PortRef, Arc<X::Value>>,
-                           direction: PortDirection|
-         -> Result<PortValues, SnapshotError> {
-            let mut out = PortValues::new();
-            for (port, val) in map
-                .iter()
-                .filter(|(port, _)| !self.is_handle(port, direction))
-            {
-                let text = wave(val, &|| format!("`{}.{}`", port.node, port.port))?;
-                out.entry(port.node.clone())
-                    .or_default()
-                    .insert(port.port.clone(), text);
-            }
-            Ok(out)
-        };
-        let feedback = self
-            .feedback
-            .iter()
-            .filter(|(conn, _)| {
-                self.feedback_edges
-                    .get(*conn)
-                    .is_none_or(|(from, _)| !self.is_handle(from, PortDirection::Output))
+            .iter_enumerated()
+            .filter(|(output, val)| {
+                val.is_some() && self.ports.outputs()[*output].kind == PortKind::Handle
             })
-            .map(|(conn, val)| Ok((conn.clone(), wave(val, &|| format!("feedback `{conn}`"))?)))
-            .collect::<Result<_, SnapshotError>>()?;
+            .map(|(output, _)| self.island_of_node[self.ports.outputs()[output].node])
+            .collect();
+        let mut feedback = BTreeMap::new();
+        for (conn, val) in self.feedback.iter_enumerated() {
+            let entry = &self.ports.feedback()[conn];
+            if let Some(val) = val
+                && self.ports.outputs()[entry.from].kind != PortKind::Handle
+            {
+                let id = &entry.id;
+                feedback.insert(id.clone(), wave(val, &|| format!("feedback `{id}`"))?);
+            }
+        }
         let mut islands = Vec::new();
         for (index, slot) in self.slots.iter().enumerate() {
             // In flight, or a restored replay not started yet: its inputs,
@@ -209,7 +191,14 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
                 Ok::<_, SnapshotError>(by_member)
             });
             let running = running.transpose()?;
-            let stale_feedback = started.map(|(_, stale)| stale.clone()).unwrap_or_default();
+            let stale_feedback = started
+                .map(|(_, stale)| {
+                    stale
+                        .iter()
+                        .map(|conn| self.ports.feedback()[conn].id.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
             let queued = slot.owed.has_latched() || with_handle || producers.contains(&index);
             if running.is_some() || queued {
                 islands.push(IslandSnapshot {
@@ -236,8 +225,8 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
                         .map(move |m| (m.node.clone(), phase))
                 })
                 .collect(),
-            inputs: port_values(&self.inputs, PortDirection::Input)?,
-            outputs: port_values(&self.outputs, PortDirection::Output)?,
+            inputs: self.latched_values(self.ports.inputs(), &self.inputs)?,
+            outputs: self.latched_values(self.ports.outputs(), &self.outputs)?,
             feedback,
             islands,
         })
@@ -302,42 +291,28 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
         if snapshot.links != self.links {
             return Err(mismatch("the graph's links differ".into()));
         }
-        let executor = &self.executor;
-        let parse = |port: &PortRef, direction: PortDirection, text: &str| {
-            let invalid = |message: String| RuntimeError::SnapshotValue {
-                node: port.node.clone(),
-                port: port.port.clone(),
-                message,
-            };
-            let ty = executor
-                .port_type(port, direction)
-                .ok_or_else(|| invalid(format!("not a Value {direction} port")))?;
-            executor.parse_wave(ty, text).map(Arc::new).map_err(invalid)
-        };
-        let parse_values = |values: &PortValues,
-                            direction: PortDirection|
-         -> Result<HashMap<PortRef, Arc<X::Value>>, RuntimeError> {
-            let mut out = HashMap::new();
-            for (node, ports) in values {
-                for (port, text) in ports {
-                    let port = PortRef::new(node.clone(), port.clone());
-                    let val = parse(&port, direction, text)?;
-                    out.insert(port, val);
-                }
-            }
-            Ok(out)
-        };
-        let inputs = parse_values(&snapshot.inputs, PortDirection::Input)?;
-        let outputs = parse_values(&snapshot.outputs, PortDirection::Output)?;
-        let mut feedback = BTreeMap::new();
+        let inputs = self.parse_values(
+            &snapshot.inputs,
+            PortDirection::Input,
+            self.ports.inputs().len(),
+            |node, port| self.ports.input(node, port),
+        )?;
+        let outputs = self.parse_values(
+            &snapshot.outputs,
+            PortDirection::Output,
+            self.ports.outputs().len(),
+            |node, port| self.ports.output(node, port),
+        )?;
+        let mut feedback = IndexVec::from_fn(self.feedback.len(), |_| None);
         for (conn, text) in &snapshot.feedback {
-            let (from, _) = self.feedback_edges.get(conn).ok_or_else(|| {
+            let index = self.ports.feedback_index(conn).ok_or_else(|| {
                 mismatch(format!(
                     "`{conn}` is not a feedback connection of this graph"
                 ))
             })?;
-            let val = parse(from, PortDirection::Output, text)?;
-            feedback.insert(conn.clone(), val);
+            let from = self.ports.feedback()[index].from;
+            let port = &self.ports.outputs()[from].port;
+            feedback[index] = Some(self.parse_port(port, PortDirection::Output, text)?);
         }
         let mut work: HashMap<usize, OwedWork<X::Value>> = HashMap::new();
         for island in &snapshot.islands {
@@ -348,15 +323,19 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
                     mismatch(format!("no island with members {:?}", island.members))
                 })?;
             let outgoing = &self.slots[index].feedback_out;
-            if let Some(conn) = island
-                .stale_feedback
-                .iter()
-                .find(|conn| !outgoing.contains(conn))
-            {
-                return Err(mismatch(format!(
-                    "`{conn}` is not a feedback connection out of island {:?}",
-                    island.members
-                )));
+            let mut stale: PortSet<FeedbackIdx> = PortSet::new(self.feedback.len());
+            for conn in &island.stale_feedback {
+                let Some(index) = self
+                    .ports
+                    .feedback_index(conn)
+                    .filter(|index| outgoing.contains(index))
+                else {
+                    return Err(mismatch(format!(
+                        "`{conn}` is not a feedback connection out of island {:?}",
+                        island.members
+                    )));
+                };
+                stale.insert(index);
             }
             let replay = match &island.running {
                 None if !island.stale_feedback.is_empty() => {
@@ -368,7 +347,7 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
                 None => None,
                 Some(by_member) => Some(Replay {
                     inputs: self.parse_replay(index, by_member)?,
-                    stale: island.stale_feedback.clone(),
+                    stale,
                 }),
             };
             if work.insert(index, (replay, island.queued)).is_some() {
@@ -395,7 +374,7 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
             let slot = &mut self.slots[index];
             let (replay, queued) = work.remove(&index).unwrap_or((None, false));
             slot.owed.clear();
-            slot.stale_feedback = BTreeSet::new();
+            slot.stale_feedback.clear();
             if let Some(replay) = replay {
                 slot.owed.set_replay(replay);
             }
@@ -407,19 +386,77 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
         Ok(())
     }
 
-    /// Whether `port` is a handle port of that direction.
-    fn is_handle(&self, port: &PortRef, direction: PortDirection) -> bool {
-        self.compiled
-            .contract_for(&port.node)
-            .is_some_and(|contract| {
-                let ports = match direction {
-                    PortDirection::Input => &contract.inputs,
-                    PortDirection::Output => &contract.outputs,
-                };
-                ports
-                    .iter()
-                    .any(|p| p.name == port.port && p.kind == PortKind::Handle)
-            })
+    /// `val` as WAVE text; `at` says which value it is, if it cannot be.
+    fn wave(&self, val: &X::Value, at: &dyn Fn() -> String) -> Result<String, SnapshotError> {
+        self.executor
+            .to_wave(val)
+            .map_err(|message| SnapshotError { at: at(), message })
+    }
+
+    /// The latched values of one direction's ports as WAVE text, by node and
+    /// port. A handle is left out: it is the host's, not text.
+    fn latched_values<I: Idx>(
+        &self,
+        entries: &IndexVec<I, PortEntry>,
+        latches: &Latches<I, X::Value>,
+    ) -> Result<PortValues, SnapshotError> {
+        let mut out = PortValues::new();
+        for (index, val) in latches.iter_enumerated() {
+            let entry = &entries[index];
+            if let Some(val) = val
+                && entry.kind != PortKind::Handle
+            {
+                let port = &entry.port;
+                let text = self.wave(val, &|| format!("`{}.{}`", port.node, port.port))?;
+                out.entry(port.node.clone())
+                    .or_default()
+                    .insert(port.port.clone(), text);
+            }
+        }
+        Ok(out)
+    }
+
+    /// `text` parsed as a value of `port`.
+    fn parse_port(
+        &self,
+        port: &PortRef,
+        direction: PortDirection,
+        text: &str,
+    ) -> Result<Arc<X::Value>, RuntimeError> {
+        let invalid = |message: String| RuntimeError::SnapshotValue {
+            node: port.node.clone(),
+            port: port.port.clone(),
+            message,
+        };
+        let ty = self
+            .executor
+            .port_type(port, direction)
+            .ok_or_else(|| invalid(format!("not a Value {direction} port")))?;
+        self.executor
+            .parse_wave(ty, text)
+            .map(|val| Arc::new(val.into_inner()))
+            .map_err(invalid)
+    }
+
+    /// One direction's values of a snapshot, parsed, by port.
+    fn parse_values<I: Idx>(
+        &self,
+        values: &PortValues,
+        direction: PortDirection,
+        len: usize,
+        index_of: impl Fn(&NodeId, &PortName) -> Option<I>,
+    ) -> Result<Latches<I, X::Value>, RuntimeError> {
+        let mut out = IndexVec::from_fn(len, |_| None);
+        for (node, ports) in values {
+            for (port, text) in ports {
+                let reference = PortRef::new(node.clone(), port.clone());
+                let val = self.parse_port(&reference, direction, text)?;
+                if let Some(index) = index_of(node, port) {
+                    out[index] = Some(val);
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Parses a replay's recorded inputs for island `index`: only external
@@ -464,7 +501,7 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
                     .executor
                     .parse_wave(ty, text)
                     .map_err(|e| invalid(&e))?;
-                external[position][field] = Some(Arc::new(val));
+                external[position][field] = Some(Arc::new(val.into_inner()));
             }
         }
         for (member, values) in plan.members.iter().zip(&external) {

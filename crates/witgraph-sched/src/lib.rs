@@ -40,8 +40,8 @@ mod tests;
 
 pub use error::{NodeFault, RuntimeError};
 pub use executor::{
-    Executor, Generation, GenerationFuture, IslandEvent, IslandEventKind, MaybeSend, MaybeSync,
-    NodeCaller, OptionPayload, OptionPayloadFn, Outcome, PortValue, Reporter, drive,
+    Canonical, Executor, Generation, GenerationFuture, IslandEvent, IslandEventKind, MaybeSend,
+    MaybeSync, NodeCaller, OptionPayload, OptionPayloadFn, Outcome, PortValue, Reporter, drive,
     missing_input_message,
 };
 pub use mode::{Perf, RuntimeMode, Trace, TraceEvent};

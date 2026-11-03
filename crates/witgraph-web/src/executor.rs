@@ -13,8 +13,8 @@ use witgraph_ir::wasm_wave::value::Type;
 use witgraph_ir::{NodeId, PortDirection, PortKind, PortName, PortRef};
 use witgraph_sched::plan::IslandPlan;
 use witgraph_sched::{
-    Executor, Generation, GenerationFuture, IslandEventKind, NodeCaller, NodeFault, OptionPayload,
-    drive, missing_input_message,
+    Canonical, Executor, Generation, GenerationFuture, IslandEventKind, NodeCaller, NodeFault,
+    OptionPayload, drive, missing_input_message,
 };
 
 use crate::value::{
@@ -385,17 +385,18 @@ impl Executor for Js {
         }
     }
 
-    fn check_input(&self, ty: &Type, value: WebValue) -> Result<WebValue, String> {
+    fn check_input(&self, ty: &Type, value: WebValue) -> Result<Canonical<WebValue>, String> {
         let WebValue::Data(data) = value else {
             return Err("a stream, future or handle is not a Value".into());
         };
         check_type(data.value()?, ty)?;
-        Ok(WebValue::Data(data))
+        Ok(Canonical::assume(WebValue::Data(data)))
     }
 
-    fn parse_wave(&self, ty: &Type, text: &str) -> Result<WebValue, String> {
-        parse_wave(ty, text)
-            .map(|value| WebValue::Data(Rc::new(Data::from_value(value, ty.clone()))))
+    fn parse_wave(&self, ty: &Type, text: &str) -> Result<Canonical<WebValue>, String> {
+        parse_wave(ty, text).map(|value| {
+            Canonical::assume(WebValue::Data(Rc::new(Data::from_value(value, ty.clone()))))
+        })
     }
 
     fn to_wave(&self, value: &WebValue) -> Result<String, String> {

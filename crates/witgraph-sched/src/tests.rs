@@ -14,7 +14,7 @@ use witgraph_ir::{
 };
 
 use crate::executor::{
-    Executor, Generation, GenerationFuture, IslandEvent, IslandEventKind, NodeCaller,
+    Canonical, Executor, Generation, GenerationFuture, IslandEvent, IslandEventKind, NodeCaller,
     OptionPayload, drive,
 };
 use crate::plan::RunShape;
@@ -117,12 +117,14 @@ impl Executor for Adders {
             .then_some(&())
     }
 
-    fn check_input(&self, (): &(), value: u32) -> Result<u32, String> {
-        Ok(value)
+    fn check_input(&self, (): &(), value: u32) -> Result<Canonical<u32>, String> {
+        Ok(Canonical::assume(value))
     }
 
-    fn parse_wave(&self, (): &(), text: &str) -> Result<u32, String> {
-        text.parse().map_err(|e| format!("{e}"))
+    fn parse_wave(&self, (): &(), text: &str) -> Result<Canonical<u32>, String> {
+        text.parse()
+            .map(Canonical::assume)
+            .map_err(|e| format!("{e}"))
     }
 
     fn to_wave(&self, value: &u32) -> Result<String, String> {

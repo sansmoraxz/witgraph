@@ -1,7 +1,7 @@
 //! Driving a loaded graph: ticks, the start rule, generations, events,
 //! delivery, faults and stops.
 
-use std::collections::{BTreeSet, HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::future::{Future, poll_fn};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -10,12 +10,13 @@ use std::task::{Context, Poll};
 use futures::future::Either;
 use futures::stream::StreamExt;
 use futures::task::{ArcWake, AtomicWaker};
-use witgraph_ir::{ConnectionId, NodeId, PortName, PortRef};
+use witgraph_ir::{FeedbackIdx, Idx, InputIdx, NodeId, NodeIdx, PortName, PortSet};
 
 use crate::error::NodeFault;
 use crate::executor::{Executor, Generation, IslandEvent, IslandEventKind, OptionPayload, Outcome};
 use crate::island::{self, IslandState, StartInputs, StopCause, Work};
 use crate::mode::RuntimeMode;
+use crate::plan::MemberPlan;
 use crate::schedule::{FaultReport, TickResult};
 use crate::scheduler::{Route, Scheduler, Slot};
 
@@ -215,7 +216,7 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
     /// [`tick_until`](Self::tick_until)).
     pub(crate) fn tick_interrupted(&mut self) {
         self.drain_events();
-        if self.feedback.is_empty() {
+        if self.feedback.iter().all(Option::is_none) {
             return;
         }
         let (blocked, unsettled) = self.unsettled();
@@ -227,19 +228,25 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
                 && slot
                     .feedback_sources
                     .iter()
-                    .all(|&source| !unsettled[source])
+                    .all(|&source| !unsettled.contains(source))
         };
-        let latch: HashSet<ConnectionId> = self
-            .feedback
-            .keys()
-            .filter(|conn| {
-                self.feedback_edges.get(*conn).is_some_and(|(_, edge)| {
-                    self.compiled.island_of(&edge.to.node).is_some_and(settled)
-                })
-            })
-            .cloned()
-            .collect();
+        let mut latch = PortSet::new(self.feedback.len());
+        for (conn, val) in self.feedback.iter_enumerated() {
+            if val.is_some() && settled(self.island_of_feedback_target(conn)) {
+                latch.insert(conn);
+            }
+        }
         self.latch_feedback(|conn| latch.contains(conn));
+    }
+
+    /// The island a feedback connection writes into.
+    pub(crate) fn island_of_feedback_target(&self, conn: FeedbackIdx) -> usize {
+        self.island_of_input(self.ports.feedback()[conn].to)
+    }
+
+    /// The island of the node an input port belongs to.
+    fn island_of_input(&self, input: InputIdx) -> usize {
+        self.island_of_node[self.ports.inputs()[input].node]
     }
 
     /// Applies an island transition, keeps the count of running islands,
@@ -281,41 +288,35 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
     /// Records a host write that changed an input: feedback buffered for
     /// it is dropped, and feedback into it from a generation in flight (or
     /// a replay owed) is stale, never overwriting it.
-    pub(crate) fn note_host_write(&mut self, port: &PortRef) {
-        let Some(into) = self.feedback_into.get(port) else {
-            return;
-        };
-        for (conn, source) in into {
-            // Buffered feedback is keyed by its connection, so what targets
-            // `port` is found without scanning the rest.
-            self.feedback.remove(conn);
-            let slot = &mut self.slots[*source];
+    pub(crate) fn note_host_write(&mut self, port: InputIdx) {
+        for &(conn, source) in &self.feedback_into[port] {
+            self.feedback[conn] = None;
+            let slot = &mut self.slots[source];
             if slot.state.is_running() {
-                slot.stale_feedback.insert(conn.clone());
+                slot.stale_feedback.insert(conn);
             }
             if let Some(replay) = slot.owed.replay_mut() {
-                replay.stale.insert(conn.clone());
+                replay.stale.insert(conn);
             }
         }
     }
 
     /// Forgets a Value input's latched value. Returns whether it had one
     /// (and so made the island owe a generation).
-    pub(crate) fn clear_input_value(&mut self, port: PortRef) -> bool {
-        if self.inputs.remove(&port).is_none() {
+    pub(crate) fn clear_input_value(&mut self, port: InputIdx) -> bool {
+        if self.inputs[port].take().is_none() {
             return false;
         }
         self.dirty = true;
-        if let Some(index) = self.compiled.island_of(&port.node) {
-            self.slots[index].owed.push_latched();
-        }
+        let index = self.island_of_input(port);
+        self.slots[index].owed.push_latched();
         true
     }
 
     /// Writes a delivered Value into an input from outside its island:
     /// unwrapped first when the connection unwraps an option, where `none`
     /// clears the input. Returns whether the input changed.
-    fn write_input(&mut self, port: PortRef, val: &Arc<X::Value>, unwrap_option: bool) -> bool {
+    fn write_input(&mut self, port: InputIdx, val: &Arc<X::Value>, unwrap_option: bool) -> bool {
         match delivered::<X>(val, unwrap_option) {
             Some(val) => self.set_input(port, val),
             None => self.clear_input_value(port),
@@ -324,15 +325,14 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
 
     /// Writes a Value input from outside its island. Returns whether the
     /// value changed (and so made the island owe a generation).
-    pub(crate) fn set_input(&mut self, port: PortRef, val: Arc<X::Value>) -> bool {
-        if self.inputs.get(&port).is_some_and(|old| **old == *val) {
+    pub(crate) fn set_input(&mut self, port: InputIdx, val: Arc<X::Value>) -> bool {
+        if self.inputs[port].as_ref().is_some_and(|old| **old == *val) {
             return false;
         }
         self.dirty = true;
-        if let Some(index) = self.compiled.island_of(&port.node) {
-            self.slots[index].owed.push_latched();
-        }
-        self.inputs.insert(port, val);
+        let index = self.island_of_input(port);
+        self.slots[index].owed.push_latched();
+        self.inputs[port] = Some(val);
         true
     }
 
@@ -345,7 +345,7 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
         if slot.owed.next_is_replay() {
             return true;
         }
-        slot.owed.has_latched() && slot.required.iter().all(|p| self.inputs.contains_key(p))
+        slot.owed.has_latched() && slot.required.iter().all(|&p| self.inputs[p].is_some())
     }
 
     /// Per island, whether something upstream of it can still change its
@@ -362,26 +362,29 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
     /// never finish (an endless stream), and what it delivers next is
     /// handled by change detection. The islands form a DAG, so an island
     /// never waits on itself. Linear in the size of the graph.
-    pub(crate) fn unsettled(&self) -> (Vec<bool>, Vec<bool>) {
-        let mut unsettled = vec![false; self.slots.iter().map(|s| s.awaiting.len()).sum()];
+    pub(crate) fn unsettled(&self) -> (Vec<bool>, PortSet<NodeIdx>) {
+        let mut unsettled = PortSet::new(self.ports.node_count());
         let mut blocked = vec![false; self.slots.len()];
         // Islands are in topological order, and so are each island's
         // members: every writer is decided before what it writes.
         for (island, slot) in self.slots.iter().enumerate() {
-            let own = slot.offset..slot.offset + slot.awaiting.len();
+            let own = slot.offset.position()..slot.offset.position() + slot.awaiting.len();
             blocked[island] = slot
                 .preds
                 .iter()
                 .flatten()
-                .any(|&pred| !own.contains(&pred) && unsettled[pred]);
+                .any(|&pred| !own.contains(&pred.position()) && unsettled.contains(pred));
             if slot.state.is_running() {
                 for member in 0..slot.awaiting.len() {
-                    let upstream = slot.preds[member].iter().any(|&pred| unsettled[pred]);
-                    unsettled[slot.offset + member] = slot.awaiting[member] || upstream;
+                    let upstream = slot.preds[member].iter().any(|&p| unsettled.contains(p));
+                    if slot.awaiting[member] || upstream {
+                        unsettled.insert(NodeIdx::at(slot.offset.position() + member));
+                    }
                 }
-            } else {
-                let whole = blocked[island] || self.next_ready(island);
-                unsettled[own].fill(whole);
+            } else if blocked[island] || self.next_ready(island) {
+                for node in own {
+                    unsettled.insert(NodeIdx::at(node));
+                }
             }
         }
         (blocked, unsettled)
@@ -442,7 +445,10 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
         };
         let (started_with, stale) = match work {
             Work::Replay(replay) => (replay.inputs, replay.stale),
-            Work::Latched => (self.external_inputs(index), BTreeSet::new()),
+            Work::Latched => (
+                self.external_inputs(index),
+                PortSet::new(self.feedback.len()),
+            ),
         };
         let external: Vec<Vec<Option<X::Value>>> = started_with
             .iter()
@@ -498,7 +504,7 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
             .map(|member| {
                 let mut fields = vec![None; member.field_count()];
                 for (field, input) in member.external_values() {
-                    fields[field] = self.inputs.get(&input.port).cloned();
+                    fields[field] = self.inputs[input.index].clone();
                 }
                 fields
             })
@@ -591,7 +597,7 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
                 self.dirty = true;
                 if let Some(member) = plan.members.get(member) {
                     self.mode.on_run_returned(&member.node);
-                    self.deliver(event.island, &member.node, values);
+                    self.deliver(event.island, member, values);
                 }
             }
         }
@@ -601,37 +607,33 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
     /// Latches a returned `run`'s Value outputs and routes them. Each value
     /// is shared, not copied, between the outputs, the inputs it reaches
     /// and buffered feedback. Guest values are already canonical.
-    fn deliver(&mut self, island: usize, node: &NodeId, values: Vec<(PortName, X::Value)>) {
+    fn deliver(&mut self, island: usize, member: &MemberPlan, values: Vec<(PortName, X::Value)>) {
         for (port, val) in values {
-            let output = PortRef::new(node.clone(), port);
+            let Some(output) = member.outputs.get(&port).map(|output| output.index) else {
+                continue;
+            };
             let val = Arc::new(val);
-            if let Some(edges) = self.out_edges.get(&output).cloned() {
-                for edge in edges.iter() {
-                    match edge.route {
-                        // Computed from inputs older than a host write to
-                        // its target: the host's value stands.
-                        Route::Feedback => {
-                            if !self.slots[island].stale_feedback.contains(&edge.id) {
-                                self.feedback.insert(edge.id.clone(), val.clone());
-                            }
+            let edges = self.out_edges[output].clone();
+            for edge in edges.iter() {
+                match edge.route {
+                    // Computed from inputs older than a host write to its
+                    // target: the host's value stands.
+                    Route::Feedback(conn) => {
+                        if !self.slots[island].stale_feedback.contains(conn) {
+                            self.feedback[conn] = Some(val.clone());
                         }
-                        // Consumed inside this generation; recorded, not a
-                        // change.
-                        Route::Internal => match delivered::<X>(&val, edge.unwrap_option) {
-                            Some(val) => {
-                                self.inputs.insert(edge.to.clone(), val);
-                            }
-                            None => {
-                                self.inputs.remove(&edge.to);
-                            }
-                        },
-                        Route::External => {
-                            self.write_input(edge.to.clone(), &val, edge.unwrap_option);
-                        }
+                    }
+                    // Consumed inside this generation; recorded, not a
+                    // change.
+                    Route::Internal => {
+                        self.inputs[edge.to] = delivered::<X>(&val, edge.unwrap_option);
+                    }
+                    Route::External => {
+                        self.write_input(edge.to, &val, edge.unwrap_option);
                     }
                 }
             }
-            self.outputs.insert(output, val);
+            self.outputs[output] = Some(val);
         }
     }
 
@@ -707,12 +709,11 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
     pub(crate) fn stop_island(&mut self, index: usize, cause: StopCause) {
         self.dirty = true;
         self.slots[index].owed.clear();
-        let (compiled, edges) = (&self.compiled, &self.feedback_edges);
-        self.feedback.retain(|conn, _| {
-            edges
-                .get(conn)
-                .is_some_and(|(_, edge)| compiled.island_of(&edge.to.node) != Some(index))
-        });
+        for conn in (0..self.feedback.len()).map(FeedbackIdx::at) {
+            if self.island_of_feedback_target(conn) == index {
+                self.feedback[conn] = None;
+            }
+        }
         let keep = match self.slots[index].state.stop_cause() {
             Some(StopCause::Cancelled | StopCause::Shutdown) => true,
             Some(StopCause::Faulted(..)) => matches!(cause, StopCause::Shutdown),
@@ -736,13 +737,15 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
 
     /// Writes the buffered feedback values `latch` picks to their targets,
     /// keeping the others buffered. Returns whether any input changed.
-    pub(crate) fn latch_feedback(&mut self, mut latch: impl FnMut(&ConnectionId) -> bool) -> bool {
+    pub(crate) fn latch_feedback(&mut self, mut latch: impl FnMut(FeedbackIdx) -> bool) -> bool {
         let mut changed = false;
-        for (conn, val) in std::mem::take(&mut self.feedback) {
-            if !latch(&conn) {
-                self.feedback.insert(conn, val);
-            } else if let Some((_, edge)) = self.feedback_edges.get(&conn) {
-                let (to, unwrap_option) = (edge.to.clone(), edge.unwrap_option);
+        for conn in (0..self.feedback.len()).map(FeedbackIdx::at) {
+            if self.feedback[conn].is_none() || !latch(conn) {
+                continue;
+            }
+            if let Some(val) = self.feedback[conn].take() {
+                let entry = &self.ports.feedback()[conn];
+                let (to, unwrap_option) = (entry.to, entry.unwraps_option);
                 changed |= self.write_input(to, &val, unwrap_option);
             }
         }
