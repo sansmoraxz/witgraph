@@ -1,0 +1,9 @@
+packages:
+  - packages/*
+
+minimumReleaseAgeExclude:
+  - minimatch@11.0.4
+  - '@bytecodealliance/jco@1.41.0'
+
+overrides:
+  minimatch: ^11.0.4
