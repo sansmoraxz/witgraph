@@ -132,6 +132,10 @@ For the TypeScript packages, run `pnpm install` once, then `pnpm check` to lint
 and check formatting with [Biome](https://biomejs.dev), or `pnpm format` to fix
 formatting.
 
+wasm-tools, wac and jco come from the `witgraph-patches` branches of our forks,
+which fix the upstream bugs witgraph hits. `pnpm install` builds jco's transpiler
+from its fork, once per commit: that takes a few minutes and needs Rust.
+
 `test-components` builds the guests listed in `GUESTS` in
 `test-fixtures/test-components/build.rs`; a new directory under `guests/` is
 not picked up until it is added there. Where a guest imports a standard WASI

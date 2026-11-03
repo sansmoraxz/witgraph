@@ -1,9 +1,11 @@
 packages:
   - packages/*
 
+allowBuilds:
+  '@bytecodealliance/jco-transpile@https://codeload.github.com/sansmoraxz/jco/tar.gz/a26a24d61de3cb34d2aba3830f0bee71a02e3335#path:packages/jco-transpile': true
+
 minimumReleaseAgeExclude:
   - minimatch@11.0.4
-  - '@bytecodealliance/jco@1.41.0'
 
 overrides:
   minimatch: ^11.0.4

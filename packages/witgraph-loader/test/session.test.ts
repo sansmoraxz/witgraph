@@ -7,19 +7,16 @@ import { execFileSync } from 'node:child_process';
 import { readdir, readFile, stat } from 'node:fs/promises';
 import { afterEach, test } from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { parse } from '@bytecodealliance/jco';
-import { transpile } from '@bytecodealliance/jco/component';
+import { parse, print } from '@bytecodealliance/jco-transpile/wasm-tools';
 import { monotonicClock } from '@bytecodealliance/preview3-shim/clocks';
 
 import {
   type Capability,
   type ComponentSource,
   camelCase,
+  describeComponent,
   type FutureItem,
-  fastListLift,
-  instanceHooks,
   jsName,
-  ownedFromWriter,
   Session,
   type SessionOptions,
   type StreamItem,
@@ -1281,77 +1278,6 @@ test('a guest suspended in an async host import, with its caller parked, finishe
   await session.settle();
   assert.deepEqual(session.graph.takeFaults(), []);
   assert.equal(await session.graph.readOutput('k', 'len'), 12n);
-  assert.equal(ownedFromWriter('nothing to replace'), 'nothing to replace');
-  assert.equal(instanceHooks('nothing to replace'), 'nothing to replace');
-});
-
-test('every patch finds what it patches in a composite', async () => {
-  // They match jco's output as text, and a behaviour can't show them all: a jco
-  // that moves the text fails here, so the patch is redone or dropped.
-  const names = ['tensor-stream-source', 'tensor-stream-sink'];
-  const components = await Promise.all(
-    names.map(async (name) => ({ id: ids[name], bytes: (await guestSource(name)).bytes })),
-  );
-  const graph = {
-    metadata: { name: 'patches' },
-    components: names.map((name) => componentRef(ids[name])),
-    nodes: names.map((name) => ({ id: name, component: componentRef(ids[name]) })),
-    connections: [
-      {
-        id: 'a',
-        from: { node: names[0], port: 'tensors' },
-        to: { node: names[1], port: 'tensors' },
-      },
-    ],
-  };
-  const web = WebGraph.load(
-    JSON.stringify(graph),
-    components,
-    {
-      run: () => ({}),
-      rebuild: () => {},
-      instance: () => undefined,
-      readHandle: () => undefined,
-    },
-    [],
-  );
-  const { bytes } = web.composite() as { bytes: Uint8Array };
-  web.free();
-  const { files } = await transpile(bytes, TRANSPILE_OPTIONS);
-  const source = new TextDecoder().decode(
-    (files as [string, Uint8Array][]).find(([name]) => name.endsWith('.js'))![1],
-  );
-  assert.notEqual(ownedFromWriter(source), source);
-  assert.notEqual(fastListLift(source), source);
-  const hooked = instanceHooks(source);
-  for (const [what, at] of [
-    ['host objects', 'captureTable'],
-    ['jco disposing one', '?.disposed.add(rsc)'],
-    ['a trap', '?.trapped(err)'],
-    ['the scheduler', "TickResult.DONE && !imports['$witgraph']?.stopped"],
-    ['the watchdog', "if (imports['$witgraph']?.stopped || STORE_TRAP.error"],
-    ['host imports', "if (imports['$witgraph']?.stopped) { throw"],
-  ]) {
-    assert.ok(hooked.includes(at), `no hook for ${what}`);
-  }
-  assert.ok(/imports\['\$witgraph'\]\?\.tables\.push\(captureTable\d+\)/.test(hooked));
-});
-
-test('the list loop jco generates is there to be replaced', async () => {
-  // jco lifts a list a guest returns an element at a time; the loader
-  // copies a list of numbers at once instead. A jco that generates its
-  // loop otherwise leaves it alone, and this fails, so the copy is redone.
-  const { bytes } = await guestSource('blob-relay');
-  const { files } = await transpile(bytes, {
-    name: 'node',
-    instantiation: { tag: 'async' },
-    noTypescript: true,
-  });
-  const source = new TextDecoder().decode(
-    (files as [string, Uint8Array][]).find(([name]) => name.endsWith('.js'))![1],
-  );
-  assert.notEqual(fastListLift(source), source);
-  assert.equal(fastListLift('nothing to replace'), 'nothing to replace');
 });
 
 /** Whether the scheduler's module has a 64-bit memory (`pnpm build:wasm64`). */
@@ -1731,8 +1657,8 @@ test('a future its reader drops unread does not leave its writer waiting', async
   );
   await within(session.settle());
   assert.equal(await session.graph.readOutput('d', 'done'), true);
-  // `last` is how the previous run's write ended: 0 until one has. As for an
-  // unread future, its value was read and discarded, so it reads as taken.
+  // `last` is how the previous run's write ended: 0 until one has. Its reader
+  // dropped the future, so it reads as dropped, as on wasmtime.
   await within(
     (async () => {
       let last = 0;
@@ -1742,7 +1668,7 @@ test('a future its reader drops unread does not leave its writer waiting', async
         last = (await session.graph.readOutput('w', 'last')) as number;
         await tick();
       }
-      assert.equal(last, 1);
+      assert.equal(last, 2);
     })(),
   );
 });
@@ -1930,4 +1856,29 @@ test('a future nothing reads frees its tensor', async () => {
   const session = await load([['src', 'tensor-future-source']], [], tensorsFor(tensors));
   await within(session.settle(), 20000);
   await allDisposed(tensors);
+});
+
+test('a node importing a component is refused, and the next graph loads', async () => {
+  const text = await print(inline.values.bytes);
+  const end = text.lastIndexOf(')');
+  inline['imports-component'] = {
+    ...inline.values,
+    bytes: await parse(`${text.slice(0, end)} (import "c" (component)))`),
+  };
+  await assert.rejects(load([['v', 'imports-component']]), /failed to translate component/);
+  const session = await load([['v', 'values']]);
+  await session.settle();
+  assert.deepEqual(session.graph.takeFaults(), []);
+});
+
+test('imports sharing an instance type are decoded, not a crash', async () => {
+  // Two labels of one interface, as wit-parser used to panic on: no `node`, so no contract.
+  const bytes = await parse(`(component
+    (type $i (instance (type $t u32) (export "t" (type (eq $t)))))
+    (import "primary" (implements "a:b/store@0.1.0") (instance (type $i)))
+    (import "backup" (implements "a:b/store@0.1.0") (instance (type $i))))`);
+  assert.throws(
+    () => describeComponent('a:b/c@0.1.0', bytes),
+    /exactly one node world in the component, found 0/,
+  );
 });

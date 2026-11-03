@@ -9,7 +9,7 @@
 // each call, `onStreamItem` sees every chunk of a stream between nodes, and `mocks`
 // replaces a node with a function. A value reaches the host only when it asks.
 
-import { transpile } from '@bytecodealliance/jco/component';
+import { $init, generate } from '@bytecodealliance/jco-transpile/component';
 
 import initModule, {
   describeComponent as describeRaw,
@@ -229,6 +229,8 @@ interface Transpiled {
   instantiate: (
     getCoreModule: (path: string) => Promise<WebAssembly.Module>,
     imports: Record<string, object>,
+    instantiateCore: undefined,
+    options: { onTrap: (error: unknown) => void },
   ) => Promise<Record<string, any>>;
   modules: Map<string, Promise<WebAssembly.Module>>;
   /** Its imports, as jco names them. */
@@ -249,41 +251,12 @@ type InputNumber = number & { readonly brand: 'input' };
 /** An output port, as the hub numbers it. */
 type OutputNumber = number & { readonly brand: 'output' };
 
-/** How {@link instanceHooks}' code in jco's output reaches the loader, per instance. */
-const INSTANCE_HOOKS = '$witgraph';
-interface InstanceHooks {
-  /** Each table of host objects a guest or the hub holds, by rep. */
-  tables: Map<number, unknown>[];
-  /** Set once the instance is abandoned: its next call of a host import fails. */
-  stopped: boolean;
-  /** What jco disposed, when a guest dropped it: {@link dispose} leaves it alone. */
-  disposed: WeakSet<object>;
-  /** A guest trapped, in whichever task: not every trap reaches a call of `run`. */
-  trapped: (error: unknown) => void;
-}
-
 /** A live hub's exports, as jco names them. */
-interface HubInstance {
+interface HubInstance extends Disposable {
   control: {
     run: (node: NodeNumber) => Promise<unknown>;
   } & Record<string, (...args: any[]) => any>;
   ports: Record<string, (...args: any[]) => any>;
-}
-
-/** The objects {@link dispose} has been given: each is disposed once. */
-const disposed = new WeakSet<object>();
-
-/** Disposes a handle port's object, if it can be. */
-function dispose(object: unknown): void {
-  const free = (object as { [Symbol.dispose]?: () => void } | undefined)?.[Symbol.dispose];
-  if (typeof free !== 'function') return;
-  if (disposed.has(object as object)) return;
-  disposed.add(object as object);
-  try {
-    free.call(object);
-  } catch (error) {
-    console.error('disposing a handle threw:', error);
-  }
 }
 
 /** The `witgraph-web` module's initialisation, the `wasm` it was given, and whether it is done. */
@@ -363,8 +336,6 @@ export class Session {
   /** The nodes, by the number the hub knows them by. */
   #nodes: string[];
   #instance: HubInstance | undefined;
-  /** What the live instance's generated code told us of itself. */
-  #hooks: InstanceHooks | undefined;
   /** What the hub lent the host last. */
   #lent: unknown;
   /**
@@ -372,8 +343,6 @@ export class Session {
    * count belongs to none.
    */
   #epoch = 0;
-  /** The stream outputs of the live instance still open. */
-  #streams = new Set<Tap>();
   #disposed = false;
   /** Set once the scheduler's module trapped: see {@link broken}. */
   #trapped: { broken?: Error } = {};
@@ -537,39 +506,17 @@ export class Session {
     throw new Error(`the graph did not settle in ${limit} ticks`);
   }
 
-  /**
-   * Counts the instance abandoned, and closes its streams: their writers' next
-   * writes fail, so a guest's background writer stops instead of running on for
-   * nobody.
-   */
+  /** Counts the instance abandoned, and ends it. */
   #abandon(): void {
     this.#epoch++;
     this.#release();
   }
 
-  /**
-   * Lets go of the live instance. JavaScript cannot drop one, so what it does and
-   * holds is ended by hand: its streams, its next call of a host import, and
-   * every host object a guest or the hub still has.
-   */
+  /** Ends the live instance. */
   #release(): void {
-    this.#closeStreams();
-    const hooks = this.#hooks;
+    const instance = this.#instance;
     this.#instance = undefined;
-    this.#hooks = undefined;
-    if (!hooks) return;
-    hooks.stopped = true;
-    for (const table of hooks.tables) {
-      for (const object of table.values()) dispose(object);
-      table.clear();
-    }
-  }
-
-  /** Closes the streams of the live instance that are still open. */
-  #closeStreams(): void {
-    const taps = this.#streams;
-    this.#streams = new Set();
-    for (const tap of taps) tap.close();
+    if (instance) end(instance);
   }
 
   /** Reads the Value inputs of `node`, by `lowerCamelCase` port, as they stand now. */
@@ -623,23 +570,10 @@ export class Session {
         case 'mock':
           provided[name] = {
             run: async (inputs: PortValues) => {
-              const outputs = this.graph.mockOutputs(
+              return this.graph.mockOutputs(
                 what.node,
                 (await options.mocks![what.node](inputs)) ?? ({} as PortValues),
               ) as PortValues;
-              // A stream the host writes ends with the instance as any other.
-              for (const port of this.contracts.get(what.node)?.outputs ?? []) {
-                const key = camelCase(port.name);
-                if (port.kind !== 'stream' || !outputs[key]) continue;
-                const tap: Tap = tapped(
-                  outputs[key] as AsyncIterable<unknown>,
-                  () => {},
-                  () => this.#streams.delete(tap),
-                );
-                this.#streams.add(tap);
-                outputs[key] = tap;
-              }
-              return outputs;
             },
           };
           break;
@@ -658,26 +592,22 @@ export class Session {
       }
     }
     const { instantiate, modules } = this.#transpiled;
-    const hooks: InstanceHooks = {
-      tables: [],
-      stopped: false,
-      disposed,
+    let ended = false;
+    const instance = (await instantiate((path: string) => modules.get(path)!, provided, undefined, {
       // A call of `run` the trap ends rejects first, which names its node.
-      trapped: (error) => {
+      onTrap: (error: unknown) => {
         setTimeout(() => {
-          if (!hooks.stopped) this.graph.reportTrap(error);
+          if (!ended && this.#instance === instance) this.graph.reportTrap(error);
         }, 0);
       },
-    };
-    provided[INSTANCE_HOOKS] = hooks;
-    const instance = await instantiate((path: string) => modules.get(path)!, provided);
+    })) as HubInstance;
     // An instance abandoned meanwhile is nobody's: a newer rebuild may already
     // have run on its own.
     if (!this.#disposed && this.#epoch === epoch) {
-      this.#instance = instance as HubInstance;
-      this.#hooks = hooks;
+      this.#instance = instance;
     } else {
-      hooks.stopped = true;
+      ended = true;
+      end(instance);
     }
   }
 
@@ -693,7 +623,14 @@ export class Session {
     await options.beforeRun?.(node);
     if (abandoned()) throw new Error(`the run of \`${node}\` was abandoned`);
     const instance = this.#instance!;
-    const returned = await instance.control.run(number);
+    let returned: unknown;
+    try {
+      returned = await instance.control.run(number);
+    } catch (error) {
+      // Ending the instance ends its calls.
+      if (abandoned()) throw new Error(`the run of \`${node}\` was abandoned`);
+      throw error;
+    }
     if (abandoned()) return returned;
     this.#tap(node, instance);
     await options.afterRun?.(node);
@@ -702,11 +639,11 @@ export class Session {
 
   /**
    * Takes every stream and future the run of `node` delivered, and gives its
-   * reader what watches it, so a stream can be closed when its instance is
-   * abandoned or the session disposed.
+   * reader what reports it to the hooks. With no hooks they stay in the hub.
    */
   #tap(node: string, instance: HubInstance): void {
     const options = this.#options;
+    if (!options.onStreamItem && !options.onFutureValue) return;
     const contract = this.contracts.get(node);
     const edges = this.graph.streamEdges(node) as {
       port: string;
@@ -719,11 +656,7 @@ export class Session {
       if (value === undefined) continue;
       const give = instance.ports[`giveStream${input}`];
       if (kind === 'future') {
-        const future = value as PromiseLike<unknown> & Disposable;
-        // jco disposes a future its reader drops unread, but its writer's
-        // write still waits, on a timer that keeps the process alive. Reading
-        // the future ends the write, and hands over any handle it carries.
-        future[Symbol.dispose] = () => closeUnread(future);
+        const future = value as PromiseLike<unknown>;
         if (options.onFutureValue) {
           // jco's future settles once, and its reader is given the same
           // value: watching it takes nothing from the reader.
@@ -744,9 +677,8 @@ export class Session {
       }
       const type = contract?.outputs.find((output) => output.name === port)?.type_display ?? '';
       const numeric = NUMERIC_TYPES.has(type);
-      const tap: Tap = tapped(
-        value as AsyncIterable<unknown>,
-        (item) => {
+      give(
+        tapped(value as AsyncIterable<unknown>, (item) => {
           if (!options.onStreamItem || this.#disposed) return;
           const items =
             numeric && ArrayBuffer.isView(item) ? (item as unknown as ArrayLike<unknown>) : [item];
@@ -755,11 +687,8 @@ export class Session {
           } catch (error) {
             console.error(`onStreamItem threw on \`${node}.${port}\`:`, error);
           }
-        },
-        () => this.#streams.delete(tap),
+        }),
       );
-      this.#streams.add(tap);
-      give(tap);
     }
   }
 }
@@ -770,18 +699,12 @@ function mockableNodes(graph: string): string[] {
   return (parsed.nodes ?? []).map((node) => node.id);
 }
 
-/**
- * Drops a stream or future output nothing reads, or a future its reader
- * dropped. A stream is closed, so its writer's next write fails, as on
- * wasmtime. jco's future has no way to be dropped, so it is read and its value
- * discarded: its writer's write succeeds, where on wasmtime it fails.
- */
-function closeUnread(value: any): void {
-  if (typeof value?.[Symbol.asyncIterator] === 'function') {
-    void Promise.resolve(value[Symbol.asyncIterator]().return?.()).catch(() => {});
-  } else if (typeof value?.then === 'function') {
-    // A handle it carried is nobody else's now.
-    value.then(dispose, () => {});
+/** Ends `instance`. What disposing the host objects it held throws is only logged. */
+function end(instance: HubInstance): void {
+  try {
+    instance[Symbol.dispose]();
+  } catch (error) {
+    console.error('disposing a handle threw:', error);
   }
 }
 
@@ -865,62 +788,21 @@ export const NUMERIC_TYPES: ReadonlySet<string> = new Set([
   'f64',
 ]);
 
-/** A stream output as its reader sees it: see {@link tapped}. */
-interface Tap extends AsyncIterable<unknown> {
-  /** Ends the stream for its reader and stops its writer. */
-  close(): void;
-}
-
-/**
- * `stream`, reporting each chunk as its reader takes it. Closing it, or
- * the stream ending, calls `ended` once; a closed stream reads as ended.
- */
+/** `stream`, reporting each chunk as its reader takes it. */
 function tapped(
   stream: AsyncIterable<unknown>,
   seen: (chunk: unknown) => void,
-  ended: () => void,
-): Tap {
-  let inner: AsyncIterator<unknown> | undefined;
-  let closed = false;
-  const done = { done: true, value: undefined } as const;
-  const end = () => {
-    if (closed) return;
-    closed = true;
-    ended();
-  };
-  // Stopping the reader stops the writer: its next write fails.
-  const stop = async () => {
-    end();
-    const stopped = inner ?? stream[Symbol.asyncIterator]();
-    inner = undefined;
-    await Promise.resolve(stopped.return?.()).catch(() => {});
-    return done;
-  };
+): AsyncIterable<unknown> {
   return {
-    close: () => void stop(),
     [Symbol.asyncIterator]() {
-      if (!closed) inner ??= stream[Symbol.asyncIterator]();
+      const inner = stream[Symbol.asyncIterator]();
       return {
         async next() {
-          if (closed || !inner) return done;
-          let step: IteratorResult<unknown>;
-          try {
-            step = await inner.next();
-          } catch (error) {
-            // A read cut short by closing the stream is its end.
-            if (closed) return done;
-            throw error;
-          }
-          if (closed) {
-            // Read as it closed, so no reader takes it: a handle is ours to drop.
-            if (!step.done) dispose(step.value);
-            return done;
-          }
-          if (step.done) end();
-          else seen(step.value);
+          const step = await inner.next();
+          if (!step.done) seen(step.value);
           return step;
         },
-        return: stop,
+        return: async () => inner.return?.() ?? { done: true, value: undefined },
       };
     },
   };
@@ -963,7 +845,8 @@ export const TRANSPILE_OPTIONS = {
 } as const;
 
 async function transpileComposite(bytes: Uint8Array): Promise<Transpiled> {
-  const { files, imports } = await transpile(bytes, TRANSPILE_OPTIONS);
+  await $init;
+  const { files, imports } = generate(bytes, TRANSPILE_OPTIONS);
   const modules = new Map<string, Promise<WebAssembly.Module>>();
   let source: string | undefined;
   // jco makes each file's bytes itself, over an `ArrayBuffer`.
@@ -972,92 +855,9 @@ async function transpileComposite(bytes: Uint8Array): Promise<Transpiled> {
     else if (name.endsWith('.js')) source = new TextDecoder().decode(contents);
   }
   if (source === undefined) throw new Error('the composite transpiled to no JavaScript');
-  source = instanceHooks(ownedFromWriter(fastListLift(source)));
   const url = `data:text/javascript;base64,${base64(new TextEncoder().encode(source))}`;
   const { instantiate } = await import(/* @vite-ignore */ url);
   return { instantiate, modules, imports };
-}
-
-/**
- * How jco lifts a resource a guest wrote to a stream or future: from the table of
- * the host's imports, where it is not, rather than the writer's, where it is. So
- * the host reading such a stream traps, with "unknown handle index".
- */
-const OWNED_LIFT =
-  /(_liftFlatOwn\(\{\s*componentIdx: \d+,\s*tableIdx: (\d+),\s*classNameFn: \(\) => \w+,\s*createResourceFn:\s*\(handle\) => \{\s*const rep = )(handleTable\d+)(\[\(handle << 1\) \+ 1\] % T_OWN;[\s\S]*?rscTableRemove\()(handleTable\d+)(, handle\);)/g;
-
-/** `source`, jco's output, with {@link OWNED_LIFT} reading the writer's table. */
-export function ownedFromWriter(source: string): string {
-  return source.replace(
-    OWNED_LIFT,
-    (_, before, table, first, between, second, after) =>
-      `${before}(HANDLE_TABLES[${table}] ?? ${first})${between}(HANDLE_TABLES[${table}] ?? ${second})${after}`,
-  );
-}
-
-/**
- * `source`, jco's output, telling the loader what it needs to let go of an
- * instance, which JavaScript cannot drop: its tables of host objects, and a way to
- * stop it: its calls of host imports fail, so a guest's endless task ends, and its
- * scheduler stops polling for tasks that will never run, which keeps a process
- * alive, and its deadlock watchdog stops watching them.
- */
-export function instanceHooks(source: string): string {
-  return source
-    .replace(
-      /const (captureTable\d+)= new Map\(\);/g,
-      `const $1= new Map(); imports['${INSTANCE_HOOKS}']?.tables.push($1);`,
-    )
-    .replaceAll(
-      'if (rsc[symbolDispose]) rsc[symbolDispose]();',
-      `imports['${INSTANCE_HOOKS}']?.disposed.add(rsc); if (rsc[symbolDispose]) rsc[symbolDispose]();`,
-    )
-    .replace(
-      'err = _normalizeCoreTrap(err);',
-      `err = _normalizeCoreTrap(err); imports['${INSTANCE_HOOKS}']?.trapped(err);`,
-    )
-    .replace(
-      'while (result !== ComponentAsyncState.TickResult.DONE) {',
-      `while (result !== ComponentAsyncState.TickResult.DONE && !imports['${INSTANCE_HOOKS}']?.stopped) {`,
-    )
-    .replace(
-      'if (STORE_TRAP.error !== null || STORE_ASYNC_STATE.pendingHostOperations > 0) { return; }',
-      `if (imports['${INSTANCE_HOOKS}']?.stopped || STORE_TRAP.error !== null || STORE_ASYNC_STATE.pendingHostOperations > 0) { return; }`,
-    )
-    .replace(
-      "_debugLog('[_lowerImport()] calling lowered import', { importFn, params });",
-      `if (imports['${INSTANCE_HOOKS}']?.stopped) { throw new Error('the instance was abandoned'); }`,
-    );
-}
-
-/**
- * The loop with which jco lifts every element of a list a guest returns,
- * one call (and one `DataView`) per element: a `list<u8>` of a few
- * megabytes takes seconds. A list of numbers is its elements' bytes as
- * they are in linear memory, so it is lifted here in one copy instead, with
- * the same effect on jco's lifting context; anything else (a list too long
- * for the storage left, which jco reports) goes through jco's loop.
- */
-const LIST_LOOP = `        ctx.storagePtr = dataPtr;
-        const val = [];
-        for (var i = 0; i < len; i++) {`;
-const LIST_COPY = `        if (
-          typedArray !== undefined &&
-          elemSize32 === typedArray.BYTES_PER_ELEMENT &&
-          (ctx.storageLen === undefined || ctx.storageLen >= len * elemSize32)
-        ) {
-          const end = dataPtr + len * elemSize32;
-          const copied = new typedArray(ctx.memory.buffer.slice(dataPtr, end));
-          ctx.storagePtr = originalPtr !== null ? originalPtr : end;
-          if (originalLen !== null) ctx.storageLen = originalLen;
-          else if (ctx.storageLen !== undefined) ctx.storageLen -= len * elemSize32;
-          return [copied, ctx];
-        }
-`;
-
-/** `source`, jco's output, with {@link LIST_COPY} ahead of its list loop, if it has one. */
-export function fastListLift(source: string): string {
-  return source.includes(LIST_LOOP) ? source.replace(LIST_LOOP, LIST_COPY + LIST_LOOP) : source;
 }
 
 function base64(bytes: Uint8Array): string {

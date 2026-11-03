@@ -4,8 +4,9 @@
 `packages/witgraph-loader` wraps it. It works in a browser and in Node. The graph
 is composed into one component with the same generated hub as on wasmtime, which
 is transpiled with jco and instantiated once. Values move inside it, and reach
-JavaScript only when you ask. Ticks, feedback, faults and snapshots behave as they
-do on wasmtime, and snapshots have the same format.
+JavaScript only when you ask; streams and futures do too, unless you set
+`onStreamItem` or `onFutureValue`. Ticks, feedback, faults and snapshots behave as
+they do on wasmtime, and snapshots have the same format.
 
 ```ts
 const session = await Session.load({
@@ -114,11 +115,10 @@ the TypeScript and let `init` fetch the module from beside the script.
   load the graph again in a new session. A trap breaks every session, as
   they share the module.
 
-Call `session.dispose()` when you're done with a session. JavaScript can't drop an
-instance, so it ends one by hand: it closes the streams the nodes still have open,
-makes the instance's next call of a host import fail, so a node writing in the
-background stops instead of running on, and disposes every object the instance
-still holds. An instance the scheduler lets go of (on a fault, shutdown or restore)
+Call `session.dispose()` when you're done with a session. It ends the instance: its
+calls reject, its streams and futures close, so a node writing in the background
+stops, its next call of a host import fails, and every object it still holds is
+disposed once. An instance the scheduler lets go of (on a fault, shutdown or restore)
 goes the same way.
 
 ## Differences from wasmtime
@@ -131,20 +131,14 @@ goes the same way.
 - What a failed call is pinned on is the node whose call failed.
 - Nodes are async, so the browser needs JSPI.
 
-## What the loader changes in jco's output
+## Transpiling
 
-jco's output needs three patches, applied by text when a composite is transpiled.
-Each is tested to still apply, so a jco update that moves one fails a test rather
-than a graph:
-
-- `ownedFromWriter`: it lifts a resource a guest wrote to a stream from the wrong
-  table, once the host reads it.
-- `instanceHooks`: lets the loader dispose what an instance holds, stop its host
-  calls and scheduler, and hear of a trap in a task a guest spawned.
-- `fastListLift`: copies a list of numbers at once, not element by element.
-
-A composite must also be transpiled with `multiMemory`, or jco copies each list in
+A composite must be transpiled with `multiMemory`, or jco copies each list in
 JavaScript, about 300 times slower, with no error.
+
+The loader uses `@bytecodealliance/jco-transpile` from the `witgraph-patches` branch
+of a fork of jco, which fixes what witgraph hits. `pnpm install` builds it, once per
+commit: that takes a few minutes and needs Rust.
 
 ## Building
 
