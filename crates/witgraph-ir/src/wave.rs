@@ -152,7 +152,7 @@ pub fn check_parsed<T: WasmType>(ty: &T, parsed: &UntypedValue<'_>) -> Result<()
 fn check_node<T: WasmType>(ty: &T, node: &Node, src: &str) -> Result<(), String> {
     let at = |e: wasm_wave::parser::ParserError| format!("{e}");
     match (ty.kind(), node.ty()) {
-        (WasmTypeKind::Record, NodeType::Record) => {
+        (WasmTypeKind::Record, NodeType::TupleSet) => {
             let fields: Vec<_> = ty.record_fields().collect();
             for (label, value) in node.as_record(src).map_err(at)? {
                 let (_, field) = fields

@@ -206,7 +206,7 @@ where
             Poll::Pending if finish => return Poll::Ready(Ok(StreamResult::Cancelled)),
             Poll::Pending => return Poll::Pending,
         }
-        let wanted = source.remaining(&mut store).min(chunk_items::<T>());
+        let wanted = source.remaining(&mut store)?.min(chunk_items::<T>());
         let mut items = Vec::with_capacity(wanted);
         source.read(&mut store, &mut items)?;
         if items.is_empty() {
@@ -300,7 +300,7 @@ where
         mut destination: Destination<'a, T, VecBuffer<T>>,
         finish: bool,
     ) -> Poll<wasmtime::Result<StreamResult>> {
-        let zero = destination.remaining(&mut store) == Some(0);
+        let zero = destination.remaining(&mut store)? == Some(0);
         let mut slot = self
             .slot
             .lock()
@@ -325,7 +325,7 @@ where
             return Poll::Ready(Ok(StreamResult::Completed));
         }
         // A reader with room takes the chunks already waiting too.
-        let room = destination.remaining(&mut store).unwrap_or(usize::MAX);
+        let room = destination.remaining(&mut store)?.unwrap_or(usize::MAX);
         while this.pending.len() < room {
             match this.pipe.rx.try_recv() {
                 Ok(chunk) => this.hold(chunk),
