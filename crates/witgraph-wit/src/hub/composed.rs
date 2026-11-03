@@ -18,6 +18,10 @@ pub struct HubMember<'a> {
     pub bytes: &'a [u8],
     /// The name its `node` interface is exported under.
     pub export: &'a str,
+    /// Leaves the node out: the composite imports its `node` interface as
+    /// [`member_import`](super::member_import), for the host to implement, and
+    /// nothing else of it. Its bytes only say what its ports are.
+    pub mocked: bool,
 }
 
 /// A graph as one component.
@@ -73,7 +77,11 @@ pub fn compose_graph(
 
     let mut packages: HashMap<&[u8], wac_graph::PackageId> = HashMap::new();
     let mut components = 1;
+    let mut labels: HashMap<String, WacNode> = HashMap::new();
     for (position, member) in generated.order.iter().enumerate() {
+        if member.mocked {
+            continue;
+        }
         let package = match packages.get(member.bytes) {
             Some(package) => *package,
             None => {
@@ -102,6 +110,38 @@ pub fn compose_graph(
             let import = graph
                 .import(host_import(position), kind.promote())
                 .map_err(|e| compose(format!("`{}`: {e:#}", member.node)))?;
+            graph
+                .set_instantiation_argument(instance, &name, import)
+                .map_err(|e| compose(format!("`{}`: {e:#}", member.node)))?;
+        }
+        // A labelled import has a type of its own: wit-parser, which jco reads a
+        // component with, panics on two imports sharing one. wac merges interfaces
+        // of one id into one type, so the copy has none, and the label is plain.
+        let labelled: Vec<(String, wac_graph::types::InterfaceId)> = graph.types()[world]
+            .imports
+            .iter()
+            .filter(|(name, _)| !name.contains(':') && !name.contains('/'))
+            .filter_map(|(name, kind)| match kind {
+                wac_graph::types::ItemKind::Instance(id) if graph.types()[*id].id.is_some() => {
+                    Some((name.clone(), *id))
+                }
+                _ => None,
+            })
+            .collect();
+        for (name, interface) in labelled {
+            let import = match labels.get(&name) {
+                Some(import) => *import,
+                None => {
+                    let mut copy = graph.types()[interface].clone();
+                    copy.id = None;
+                    let copy = graph.types_mut().add_interface(copy);
+                    let import = graph
+                        .import(&name, wac_graph::types::ItemKind::Instance(copy))
+                        .map_err(|e| compose(format!("`{}`: {e:#}", member.node)))?;
+                    labels.insert(name.clone(), import);
+                    import
+                }
+            };
             graph
                 .set_instantiation_argument(instance, &name, import)
                 .map_err(|e| compose(format!("`{}`: {e:#}", member.node)))?;

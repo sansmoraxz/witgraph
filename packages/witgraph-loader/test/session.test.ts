@@ -15,12 +15,16 @@ import {
   type Capability,
   type ComponentSource,
   camelCase,
+  countLoweredReturns,
   type FutureItem,
   fastListLift,
+  instanceHooks,
   jsName,
+  ownedFromWriter,
   Session,
   type SessionOptions,
   type StreamItem,
+  TRANSPILE_OPTIONS,
   WebGraph,
   watchTraps,
 } from '../src/index.ts';
@@ -363,7 +367,7 @@ test('a stream passes between two nodes of a group, and a tap sees its items', a
 });
 
 /** `wasi:clocks/monotonic-clock`, as the WASI shim provides it. */
-const clock = (_node: string, capability: Capability) =>
+const clock = (capability: Capability) =>
   capability.interface === 'wasi:clocks/monotonic-clock@0.3.2' ? monotonicClock : undefined;
 
 /** A frame as jco hands one over. */
@@ -526,7 +530,7 @@ test('a feedback loop advances one iteration per tick, and a snapshot carries it
 
 test('a mock replaces a node, and the hooks see every run', async () => {
   const calls: string[] = [];
-  const session = await load(
+  const session: Session = await load(
     [
       ['a', 'echo'],
       ['b', 'echo'],
@@ -534,8 +538,12 @@ test('a mock replaces a node, and the hooks see every run', async () => {
     [['c', 'a.out', 'b.in']],
     {
       mocks: { a: (inputs) => ({ out: (inputs.in as number) * 100 }) },
-      beforeRun: (node, inputs) => void calls.push(`before ${node} ${JSON.stringify(inputs)}`),
-      afterRun: (node, outputs) => void calls.push(`after ${node} ${JSON.stringify(outputs)}`),
+      beforeRun: async (node) => {
+        calls.push(`before ${node} ${JSON.stringify(await session.readInputs(node))}`);
+      },
+      afterRun: async (node) => {
+        calls.push(`after ${node} ${await session.graph.readOutput(node, 'out')}`);
+      },
     },
   );
   await session.graph.inject('a', 'in', 2);
@@ -543,9 +551,9 @@ test('a mock replaces a node, and the hooks see every run', async () => {
   assert.equal(await session.graph.readOutput('b', 'out'), 200);
   assert.deepEqual(calls, [
     'before a {"in":2}',
-    'after a {"out":200}',
+    'after a 200',
     'before b {"in":200}',
-    'after b {"out":200}',
+    'after b 200',
   ]);
 });
 
@@ -599,7 +607,7 @@ test('a trap stops the whole graph, and fatal aborts the tick', async () => {
 
 test('capabilities and labelled imports come from the registry, named as on wasmtime', async () => {
   const feed = [Uint8Array.of(3), Uint8Array.of(4, 5), Uint8Array.of(6, 7, 8)];
-  const asked: [string, Capability][] = [];
+  const asked: Capability[] = [];
   const session = await load(
     [
       ['mqtt', 'mqtt-node'],
@@ -609,15 +617,15 @@ test('capabilities and labelled imports come from the registry, named as on wasm
     ],
     [['s', 'mqtt.messages', 'cons.items']],
     {
-      capabilities: (node, capability) => {
-        asked.push([node, capability]);
+      capabilities: (capability) => {
+        asked.push(capability);
         if (capability.interface === 'test:mqtt/source@0.1.0') {
           return { nextMessage: () => feed.shift() };
         }
         if (capability.implements === 'wasi:keyvalue/store@0.2.0-draft2') {
           class Bucket {
             get(key: string) {
-              return new TextEncoder().encode(`${capability.interface}:${key}@${node}`);
+              return new TextEncoder().encode(`${capability.interface}:${key}`);
             }
           }
           return { Bucket, open: () => new Bucket() };
@@ -630,17 +638,17 @@ test('capabilities and labelled imports come from the registry, named as on wasm
   await session.settle();
   assert.equal(await session.graph.readOutput('cons', 'count'), 3);
   assert.equal(await session.graph.readOutput('cons', 'total-bytes'), 6);
-  assert.equal(await session.graph.readOutput('kv', 'primary'), 'primary:k@kv');
-  assert.equal(await session.graph.readOutput('kv', 'backup'), 'backup:k@kv');
+  assert.equal(await session.graph.readOutput('kv', 'primary'), 'primary:k');
+  assert.equal(await session.graph.readOutput('kv', 'backup'), 'backup:k');
   // The contract's capabilities, version and labelled interface included;
   // the built-in host is never asked for.
-  const seen = asked.map(([node, { interface: name, implements: of }]) => [node, name, of]);
+  const seen = asked.map(({ interface: name, implements: of }) => [name, of]);
   assert.deepEqual(seen.sort(), [
-    ['kv', 'backup', 'wasi:keyvalue/store@0.2.0-draft2'],
-    ['kv', 'primary', 'wasi:keyvalue/store@0.2.0-draft2'],
-    ['mqtt', 'test:mqtt/source@0.1.0', undefined],
+    ['backup', 'wasi:keyvalue/store@0.2.0-draft2'],
+    ['primary', 'wasi:keyvalue/store@0.2.0-draft2'],
+    ['test:mqtt/source@0.1.0', undefined],
   ]);
-  assert.ok(asked.every(([, capability]) => capability.items !== undefined));
+  assert.ok(asked.every((capability) => capability.items !== undefined));
 });
 
 test('a graph that does not compile reports why', async () => {
@@ -828,10 +836,6 @@ test('each node runs the component its contract was resolved from', async () => 
     ],
   ]) {
     const session = await loaded({ graph, components, wasm });
-    assert.deepEqual(
-      session.graph.component('n').index,
-      components.findIndex((c) => c.bytes === echo.bytes),
-    );
     await session.graph.inject('n', 'in', 4);
     await session.settle();
     assert.deepEqual(session.graph.takeFaults(), []);
@@ -869,8 +873,6 @@ test('nested options cross in the representation jco picks at each depth', async
     assert.deepEqual([await wave('a'), await wave('b')], [a, b], 'through jco and back');
     assert.deepEqual(await session.graph.readOutput('n', 'a'), jsA);
     assert.deepEqual(await session.graph.readOutput('n', 'b'), jsB);
-    assert.deepEqual(runs.at(-1).a, jsA, 'as jco lifted it');
-    assert.deepEqual(runs.at(-1).b, jsB, 'as jco lifted it');
   }
   // And in: `b`'s payload is `option<option<u32>>`, tagged.
   await session.graph.inject('n', 'b', { tag: 'some', val: undefined });
@@ -1030,7 +1032,7 @@ test('a disposed session stops its tick, and disposing twice is harmless', async
 test('a fatal start function during a rebuild aborts the tick, naming its node', async () => {
   let fail = false;
   const session = await load([['n', 'start-fatal']], [], {
-    capabilities: (_, capability) =>
+    capabilities: (capability) =>
       capability.interface === 'demo:startfatal/ctl@0.1.0' ? { shouldFail: () => fail } : undefined,
   });
   assert.deepEqual(await session.tick(), { result: 'progress' });
@@ -1044,7 +1046,7 @@ test('a fatal start function during a rebuild aborts the tick, naming its node',
   assert.equal(session.graph.nodeState('n').culprit, 'n');
 });
 
-test('a failed rebuild names the node whose rebuild failed', async () => {
+test('a failed rebuild says what it lacked', async () => {
   let provide = true;
   const session = await load(
     [
@@ -1053,7 +1055,7 @@ test('a failed rebuild names the node whose rebuild failed', async () => {
     ],
     [['s', 'mqtt.messages', 'cons.items']],
     {
-      capabilities: (_, capability) =>
+      capabilities: (capability) =>
         provide && capability.interface === 'test:mqtt/source@0.1.0'
           ? { nextMessage: () => undefined }
           : undefined,
@@ -1065,12 +1067,8 @@ test('a failed rebuild names the node whose rebuild failed', async () => {
   session.graph.rerun('cons');
   assert.deepEqual(await session.tick(), { result: 'progress' });
   const [fault] = session.graph.takeFaults();
-  assert.equal(fault.culprit, 'mqtt');
   assert.equal(fault.fault.kind, 'restart');
-  assert.match(
-    fault.fault.message,
-    /`mqtt`: node `mqtt` imports `test:mqtt\/source@0.1.0`, which nothing provides/,
-  );
+  assert.match(fault.fault.message, /imports `test:mqtt\/source@0.1.0`, which nothing provides/);
 });
 
 test('an instance dropped while it rebuilds is abandoned', async () => {
@@ -1082,17 +1080,30 @@ test('an instance dropped while it rebuilds is abandoned', async () => {
     connections: [],
   };
   const rebuilding = gate();
-  const abandoned: string[][] = [];
-  const web = WebGraph.load(JSON.stringify(graph), [{ id: ids.echo, bytes }], {
-    run: () => ({ out: 1 }),
-    rebuild: () => {
-      rebuilding.open();
-      return new Promise(() => {});
+  let abandoned = 0;
+  const web = WebGraph.load(
+    JSON.stringify(graph),
+    [{ id: ids.echo, bytes }],
+    {
+      run: () => ({
+        outputsChanged: [],
+        inputsChanged: [],
+        inputsRecorded: [],
+        inputsCleared: [],
+        feedbackBuffered: [],
+      }),
+      rebuild: () => {
+        rebuilding.open();
+        return new Promise(() => {});
+      },
+      instance: () => ({ ports: { setInput0: () => true }, control: {} }),
+      readHandle: () => undefined,
+      abandon: () => void abandoned++,
     },
-    abandon: (nodes: string[]) => void abandoned.push(nodes),
-  });
+    [],
+  );
   try {
-    web.inject('a', 'in', 1);
+    await web.inject('a', 'in', 1);
     await web.tick();
     web.shutdown();
     web.rerun('a');
@@ -1101,14 +1112,14 @@ test('an instance dropped while it rebuilds is abandoned', async () => {
     await rebuilding.promise;
     stop();
     assert.equal((await ticked).result, 'interrupted');
-    assert.deepEqual(abandoned, []);
+    assert.equal(abandoned, 1, 'the first shutdown');
     web.shutdown();
-    assert.deepEqual(abandoned, [['a']]);
+    assert.equal(abandoned, 2);
   } finally {
     web.free();
   }
   assert.throws(
-    () => WebGraph.load(JSON.stringify(graph), [{ id: ids.echo, bytes }], { run: () => ({}) }),
+    () => WebGraph.load(JSON.stringify(graph), [{ id: ids.echo, bytes }], { run: () => ({}) }, []),
     /`callbacks.rebuild` is required/,
   );
 });
@@ -1141,10 +1152,8 @@ test('mocks are own properties, called as methods, with an empty result as no ou
   assert.equal(await session.graph.readOutput('toString', 'out'), 2, 'not mocked: it ran');
   assert.equal(await session.graph.readOutput('scaled', 'out'), 20);
 
-  const after: [string, string[]][] = [];
   const empty = await load([['none', 'echo']], [], {
     mocks: { none: () => undefined },
-    afterRun: (node, outputs) => void after.push([node, Object.keys(outputs)]),
   });
   await empty.graph.inject('none', 'in', 2);
   await empty.settle();
@@ -1153,7 +1162,6 @@ test('mocks are own properties, called as methods, with an empty result as no ou
     ['none'],
     'the empty mock is short of `out`',
   );
-  assert.deepEqual(after, [['none', []]]);
 });
 
 test('hooks are called as methods, and a throwing stream observer does not reach the reader', async () => {
@@ -1201,7 +1209,7 @@ test('hooks are called as methods, and a throwing stream observer does not reach
   }
 });
 
-test('a future output nothing reads is consumed, so its writer finishes', async () => {
+test('a future output nothing reads is dropped, so its writer finishes', async () => {
   const session = await load([['w', 'future-writer']]);
   await session.settle();
   // A run here ends when `run` returns, before the writer's task
@@ -1211,12 +1219,11 @@ test('a future output nothing reads is consumed, so its writer finishes', async 
     await session.graph.inject('w', 'again', again);
     await session.settle();
   }
-  // Unlike wasmtime, which drops the read end (2), the loader takes the
-  // value.
-  assert.equal(await session.graph.readOutput('w', 'last'), 1);
+  // As on wasmtime, the hub drops the read end.
+  assert.equal(await session.graph.readOutput('w', 'last'), 2);
 });
 
-test('a Value is passed on as its producer returned it, and compared without converting', async () => {
+test('a Value is read when asked, and compared in the hub', async () => {
   const runs: string[] = [];
   const session = await load(
     [
@@ -1238,8 +1245,6 @@ test('a Value is passed on as its producer returned it, and compared without con
   assert.ok(blob instanceof Uint8Array);
   assert.equal(blob.length, 1000);
   assert.equal(blob[3], 10);
-  // The very value, shared, not a copy made for each read.
-  assert.equal(await session.graph.readOutput('source', 'blob'), blob);
   assert.equal(await session.graph.readOutput('sink', 'len'), 1000);
   // WAVE text is made when asked for.
   assert.equal(await session.graph.readOutputWave('sink', 'len'), '1000');
@@ -1256,6 +1261,34 @@ test('a Value is passed on as its producer returned it, and compared without con
   await session.settle();
   assert.deepEqual(runs, ['source', 'a', 'sink']);
   assert.equal(((await session.graph.readOutput('a', 'blob')) as Uint8Array)[0], 8);
+});
+
+test('a composite is transpiled with multiMemory, which its speed depends on', () => {
+  assert.equal(TRANSPILE_OPTIONS.multiMemory, true);
+});
+
+test('the return jco counts no work for is there to be counted', async () => {
+  // A graph with a host import a guest calls async: `tensor-sink`'s `read`.
+  const sink = await guestSource('tensor-sink');
+  const source = await guestSource('tensor-source');
+  const session = await load(
+    [
+      ['s', 'tensor-source'],
+      ['k', 'tensor-sink'],
+    ],
+    [['t', 's.tensor', 'k.tensor']],
+    tensorsFor(cpuTensors()),
+  );
+  void sink;
+  void source;
+  await session.graph.inject('s', 'width', 2);
+  await session.graph.inject('s', 'height', 2);
+  await session.settle();
+  assert.deepEqual(session.graph.takeFaults(), []);
+  assert.equal(await session.graph.readOutput('k', 'len'), 12n);
+  assert.equal(countLoweredReturns('nothing to replace'), 'nothing to replace');
+  assert.equal(ownedFromWriter('nothing to replace'), 'nothing to replace');
+  assert.equal(instanceHooks('nothing to replace'), 'nothing to replace');
 });
 
 test('the list loop jco generates is there to be replaced', async () => {
@@ -1426,13 +1459,8 @@ test('a hook sees what a future resolves to, and its reader still gets it', asyn
   );
   await session.settle();
   assert.equal(await session.graph.readOutput('r', 'value'), 7);
-  // The unread one too, once it settles.
-  for (let i = 0; i < 50 && seen.length < 2; i++) await new Promise((r) => setTimeout(r, 10));
-  const values = seen.map(({ node, port, value }) => [node, port, value]).sort();
-  assert.deepEqual(values, [
-    ['alone', 'done', 7],
-    ['w', 'done', 7],
-  ]);
+  const values = seen.map(({ node, port, value }) => [node, port, value]);
+  assert.deepEqual(values, [['w', 'done', 7]], 'not the unread one, which the hub dropped');
 });
 
 test('nothing needs a secure context', async () => {
@@ -1500,17 +1528,6 @@ test('each node gets an instance of the provider of its own', async () => {
     1,
     'not the 2 a shared instance would count',
   );
-});
-
-test('a node component is composed once per set of links', async () => {
-  const session = await loadLinked(['a', 'b']);
-  const [a, b] = ['a', 'b'].map(
-    (node) =>
-      session.graph.component(node) as { index: number; sha256: string; bytes?: Uint8Array },
-  );
-  assert.ok(a.bytes && b.bytes, 'both come back composed');
-  assert.equal(a.sha256, b.sha256);
-  assert.equal(a.index, 0, 'index still names the node entry, not the provider');
 });
 
 test('a link whose provider was not given fails the load by name', async () => {
@@ -1589,7 +1606,7 @@ test('tensors pass between nodes as the objects their makers returned, disposed 
       ['e', 'copy.tensor', 'copy-sink.tensor'],
     ],
     {
-      capabilities: (_, capability) =>
+      capabilities: (capability) =>
         capability.interface === 'test:data/tensor@0.1.0' ? tensors.imports : undefined,
     },
   );
@@ -1645,7 +1662,7 @@ test('a node keeps its own reference to a tensor across runs', async () => {
     ],
     [['a', 'src.tensor', 'keep.tensor']],
     {
-      capabilities: (_, capability) =>
+      capabilities: (capability) =>
         capability.interface === 'test:data/tensor@0.1.0' ? tensors.imports : undefined,
     },
   );
@@ -1685,7 +1702,7 @@ test('a future its reader drops unread does not leave its writer waiting', async
 });
 
 const tensorsFor = (tensors: ReturnType<typeof cpuTensors>) => ({
-  capabilities: (_: string, capability: Capability) =>
+  capabilities: (capability: Capability) =>
     capability.interface === 'test:data/tensor@0.1.0' ? tensors.imports : undefined,
 });
 
@@ -1717,15 +1734,19 @@ const streamChain = (
     { ...tensorsFor(tensors), ...options },
   );
 
-const futureChain = (tensors: ReturnType<typeof cpuTensors>) =>
-  load(
-    [
-      ['src', 'tensor-future-source'],
-      ['sink', 'tensor-future-sink'],
-    ],
-    [['a', 'src.tensor', 'sink.tensor']],
-    tensorsFor(tensors),
+test('a future of a resource between nodes is refused by name', async () => {
+  await assert.rejects(
+    load(
+      [
+        ['src', 'tensor-future-source'],
+        ['sink', 'tensor-future-sink'],
+      ],
+      [['a', 'src.tensor', 'sink.tensor']],
+      tensorsFor(cpuTensors()),
+    ),
+    /`src.tensor`: a future of a resource cannot pass between nodes/,
   );
+});
 
 test('a stream of tensors flows, and each is disposed once', async () => {
   const tensors = cpuTensors();
@@ -1826,45 +1847,9 @@ test('a stream nothing reads frees its tensors', async () => {
   await allDisposed(tensors);
 });
 
-test('a future moves its tensor to its reader', async () => {
-  const tensors = cpuTensors();
-  const session = await futureChain(tensors);
-  await session.graph.inject('src', 'seed', 42);
-  await within(session.settle(), 20000);
-  assert.equal(await session.graph.readOutput('sink', 'first'), 42);
-  await allDisposed(tensors);
-});
-
-test('a future its reader drops frees its tensor', async () => {
-  const tensors = cpuTensors();
-  const session = await futureChain(tensors);
-  await session.graph.inject('sink', 'ignore', true);
-  await within(session.settle(), 20000);
-  assert.equal(await session.graph.readOutput('sink', 'first'), 1000);
-  await allDisposed(tensors);
-});
-
 test('a future nothing reads frees its tensor', async () => {
   const tensors = cpuTensors();
   const session = await load([['src', 'tensor-future-source']], [], tensorsFor(tensors));
   await within(session.settle(), 20000);
-  await allDisposed(tensors);
-});
-
-test('a future read to watch it still reaches its reader, and frees its tensor', async () => {
-  const tensors = cpuTensors();
-  const watched: unknown[] = [];
-  const session = await load(
-    [
-      ['src', 'tensor-future-source'],
-      ['sink', 'tensor-future-sink'],
-    ],
-    [['a', 'src.tensor', 'sink.tensor']],
-    { ...tensorsFor(tensors), onFutureValue: ({ value }) => void watched.push(value) },
-  );
-  await session.graph.inject('src', 'seed', 9);
-  await within(session.settle(), 20000);
-  assert.equal(await session.graph.readOutput('sink', 'first'), 9);
-  assert.ok(watched[0] instanceof tensors.imports.Tensor);
   await allDisposed(tensors);
 });

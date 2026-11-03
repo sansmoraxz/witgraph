@@ -525,34 +525,16 @@ let tensorImport = tensors(tensorBackend);
 /** `test:camera/camera`, its frames among those tensors. */
 let cameraImport = camera(tensorBackend, tensorImport.Tensor);
 
-/** Per-node capability instances (fresh state per instantiation). */
-const capInstances = new Map<string, Record<string, object>>();
-
-function capabilities(node: string, capability: Capability): object | undefined {
+function capabilities(capability: Capability): object | undefined {
   const iface = capability.implements ?? capability.interface;
   if (iface.startsWith('wasi:clocks/monotonic-clock')) return monotonicClock;
   if (iface.startsWith('wasi:webgpu/webgpu')) return webgpu;
   if (iface.startsWith('test:accel/cnn')) return cnn;
   if (iface.startsWith('test:data/tensor')) return tensorImport;
   if (iface.startsWith('test:camera/camera')) return cameraImport;
-  if (iface.startsWith('test:math/ops')) {
-    let instances = capInstances.get(node);
-    if (!instances) {
-      instances = {};
-      capInstances.set(node, instances);
-    }
-    if (!instances[iface]) instances[iface] = mathOps();
-    return instances[iface];
-  }
-  if (iface.startsWith('test:mqtt/source')) {
-    let instances = capInstances.get(node);
-    if (!instances) {
-      instances = {};
-      capInstances.set(node, instances);
-    }
-    if (!instances[iface]) instances[iface] = mqttSource();
-    return instances[iface];
-  }
+  // Asked once per instantiation: fresh state each time.
+  if (iface.startsWith('test:math/ops')) return mathOps();
+  if (iface.startsWith('test:mqtt/source')) return mqttSource();
   return undefined;
 }
 

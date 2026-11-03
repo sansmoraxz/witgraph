@@ -1,0 +1,454 @@
+//! The data plane on a JavaScript host: a composed graph's hub, as jco
+//! transpiled it, reached through callbacks of the loader.
+//!
+//! As on wasmtime, the hub holds every value, and the host writes and reads one
+//! port at a time when it asks. What differs is what a JavaScript host can see:
+//! it cannot tell when guests have no work left, so a stream group counts as
+//! drained as soon as its `run`s have returned. And `port` calls are plain calls:
+//! jco serves a sync export while a `run` is parked.
+
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::rc::Rc;
+
+use futures::FutureExt;
+use futures::channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use futures::channel::oneshot;
+use futures::future::{Either, LocalBoxFuture, Shared as SharedFuture};
+use futures::stream::{FuturesUnordered, StreamExt};
+use js_sys::{Array, Function, Promise, Reflect};
+use wasm_bindgen::{JsCast, JsValue};
+use wasm_bindgen_futures::JsFuture;
+use witgraph_ir::wasm_wave::value::Type;
+use witgraph_ir::{
+    FeedbackIdx, Idx, IndexVec, InputIdx, NodeId, NodeIdx, OutputIdx, PortKind, PortTable,
+};
+use witgraph_sched::{
+    BoxFuture, Command, ControlEvent, ControlKind, DataPlane, Latched, NodeFault, Outcome,
+    Returned, RuntimeError, Serving, boxed,
+};
+use witgraph_wit::hub;
+
+use crate::value::{Data, camel, describe};
+
+/// What the loader provides.
+pub(crate) struct Callbacks {
+    /// `run(node) -> Promise<returned>`: the hub's `run` of a node, by its
+    /// number, with the hooks around it.
+    pub(crate) run: Function,
+    /// `rebuild() -> Promise<void>`: a new instance of the composite, throwing or
+    /// rejecting if it cannot be made (with an error marked `witgraphFatal` when a
+    /// start function called `fatal`).
+    pub(crate) rebuild: Function,
+    /// `instance() -> { control, ports }`: the live instance's exports.
+    pub(crate) instance: Function,
+    /// `readHandle(output) -> object | undefined`: what the hub lends the host of
+    /// a handle output.
+    pub(crate) read_handle: Function,
+    /// `abandon()`: the instance stopped, whatever was in flight in it: what it
+    /// holds and what it still does belong to nothing now.
+    pub(crate) abandon: Option<Function>,
+}
+
+/// The message of a thrown JavaScript value.
+pub(crate) fn thrown(error: &JsValue) -> String {
+    if error.is_instance_of::<js_sys::Error>()
+        && let Some(message) = Reflect::get(error, &JsValue::from_str("message"))
+            .ok()
+            .and_then(|message| message.as_string())
+    {
+        #[cfg(feature = "addr2line")]
+        let message = with_wasm_frames(error, message);
+        return message;
+    }
+    describe(error)
+}
+
+/// `message`, then the WebAssembly frames of a trap's stack, one per line:
+/// each function with its offset in the core module, which
+/// `wasm-tools addr2line` takes. The JavaScript frames are left out: the
+/// loader imports jco's output from a `data:` URL, and each of them names
+/// all of it.
+#[cfg(feature = "addr2line")]
+fn with_wasm_frames(error: &JsValue, mut message: String) -> String {
+    if !error.is_instance_of::<js_sys::WebAssembly::RuntimeError>() {
+        return message;
+    }
+    let stack = Reflect::get(error, &JsValue::from_str("stack"))
+        .ok()
+        .and_then(|stack| stack.as_string())
+        .unwrap_or_default();
+    for frame in stack.lines().filter(|l| l.contains("wasm-function[")) {
+        message.push('\n');
+        message.push_str(frame.trim());
+    }
+    message
+}
+
+/// What a thrown JavaScript value is as a fault of `node`, the one whose call
+/// threw: [`NodeFault::Fatal`] when it is marked `witgraphFatal`, naming the node
+/// that called `fatal`.
+fn fault_of(error: &JsValue, node: Option<NodeId>, otherwise: bool) -> (NodeFault, Option<NodeId>) {
+    let message = thrown(error);
+    let fatal =
+        Reflect::get(error, &JsValue::from_str("witgraphFatal")).is_ok_and(|mark| mark.is_truthy());
+    if fatal {
+        let caller = Reflect::get(error, &JsValue::from_str("witgraphNode"))
+            .ok()
+            .and_then(|node| node.as_string())
+            .map(NodeId::from);
+        return (NodeFault::Fatal { message }, caller.or(node));
+    }
+    let fault = if otherwise {
+        NodeFault::Restart { message }
+    } else {
+        NodeFault::WasmTrap { message }
+    };
+    (fault, node)
+}
+
+/// Awaits `value` if it is a promise.
+async fn settle(value: JsValue) -> Result<JsValue, JsValue> {
+    match value.dyn_into::<Promise>() {
+        Ok(promise) => JsFuture::from(promise).await,
+        Err(value) => Ok(value),
+    }
+}
+
+/// A list of port numbers of a `returned`.
+fn numbers<I: Idx>(returned: &JsValue, field: &str, len: usize) -> Result<Vec<I>, String> {
+    let list =
+        Reflect::get(returned, &JsValue::from_str(field)).map_err(|_| format!("no `{field}`"))?;
+    let list = Array::from(&list);
+    list.iter()
+        .map(|at| {
+            let at = at
+                .as_f64()
+                .ok_or_else(|| format!("`{field}` holds a non-number"))?
+                as usize;
+            if at >= len {
+                return Err(format!("the hub named port {at} of {len}"));
+            }
+            Ok(I::at(at))
+        })
+        .collect()
+}
+
+/// What the hub's `run` returned, as the scheduler needs it. The one place the
+/// numbers are trusted.
+fn decode_returned(returned: &JsValue, ports: &PortTable) -> Result<Returned, String> {
+    let inputs = ports.inputs().len();
+    Ok(Returned {
+        outputs_changed: numbers(returned, "outputsChanged", ports.outputs().len())?,
+        inputs_changed: numbers(returned, "inputsChanged", inputs)?,
+        inputs_recorded: numbers(returned, "inputsRecorded", inputs)?,
+        inputs_cleared: numbers(returned, "inputsCleared", inputs)?,
+        feedback_buffered: numbers(returned, "feedbackBuffered", ports.feedback().len())?,
+    })
+}
+
+/// A graph's hub, on this host.
+pub(crate) struct WebHub {
+    pub(crate) callbacks: Callbacks,
+    pub(crate) ports: Rc<PortTable>,
+    /// Payload type of every Value input port (inner type when optional).
+    pub(crate) input_types: IndexVec<InputIdx, Option<Type>>,
+    /// Type of every Value output port.
+    pub(crate) output_types: IndexVec<OutputIdx, Option<Type>>,
+    /// The inputs the host wrote, to write again in the next instance: the only
+    /// values kept outside the hub.
+    pub(crate) retained: RefCell<IndexVec<InputIdx, Option<Rc<Data>>>>,
+    /// Whether an instance is up and built.
+    pub(crate) live: Cell<bool>,
+    /// Whether the next instance is the first, which the loader made.
+    fresh: Cell<bool>,
+    /// The server, and what says its instance is built.
+    server: RefCell<Option<Server>>,
+    /// Where a trap no call reports goes: one in a task a guest spawned, say.
+    traps: RefCell<Option<UnboundedSender<JsValue>>>,
+}
+
+/// The server, for a host waiting on a rebuild to drive.
+#[derive(Clone)]
+struct Server {
+    future: SharedFuture<LocalBoxFuture<'static, Outcome>>,
+    built: SharedFuture<oneshot::Receiver<()>>,
+}
+
+impl WebHub {
+    pub(crate) fn new(
+        callbacks: Callbacks,
+        ports: Rc<PortTable>,
+        input_types: IndexVec<InputIdx, Option<Type>>,
+        output_types: IndexVec<OutputIdx, Option<Type>>,
+    ) -> Rc<Self> {
+        let retained = IndexVec::from_fn(ports.inputs().len(), |_| None);
+        Rc::new(Self {
+            callbacks,
+            ports,
+            input_types,
+            output_types,
+            retained: RefCell::new(retained),
+            live: Cell::new(true),
+            fresh: Cell::new(true),
+            server: RefCell::new(None),
+            traps: RefCell::new(None),
+        })
+    }
+
+    fn exports(&self, which: &str) -> Result<JsValue, String> {
+        let instance = self
+            .callbacks
+            .instance
+            .call0(&JsValue::NULL)
+            .map_err(|e| thrown(&e))?;
+        Reflect::get(&instance, &JsValue::from_str(which)).map_err(|e| thrown(&e))
+    }
+
+    /// Calls the hub's function `name` (a WIT name) of `ports` or `control`.
+    fn call(&self, which: &str, name: &str, args: &[JsValue]) -> Result<JsValue, String> {
+        let exports = self.exports(which)?;
+        let function = Reflect::get(&exports, &JsValue::from_str(&camel(name)))
+            .ok()
+            .and_then(|f| f.dyn_into::<Function>().ok())
+            .ok_or_else(|| format!("the hub has no `{name}`"))?;
+        let args: Array = args.iter().collect();
+        function.apply(&exports, &args).map_err(|e| thrown(&e))
+    }
+
+    /// A getter's `option<T>`, as a value of `T`.
+    fn get(&self, name: &str, ty: &Type) -> Result<Option<Rc<Data>>, String> {
+        let js = self.call("ports", name, &[])?;
+        crate::value::option_payload_js(&js, ty)
+            .map(|payload| Data::from_output(payload, ty.clone()).map(Rc::new))
+            .transpose()
+    }
+
+    /// A setter: it takes the value as a one-element list.
+    fn set(&self, name: &str, data: &Data) -> Result<bool, String> {
+        let list: Array = std::iter::once(data.js().clone()).collect();
+        let changed = self.call("ports", name, &[list.into()])?;
+        Ok(changed.is_truthy())
+    }
+
+    pub(crate) fn get_output(&self, output: OutputIdx) -> Result<Option<Rc<Data>>, String> {
+        let ty = self.output_types[output]
+            .as_ref()
+            .ok_or("not a Value port")?;
+        self.get(&hub::get_output(output), ty)
+    }
+
+    pub(crate) fn get_input(&self, input: InputIdx) -> Result<Option<Rc<Data>>, String> {
+        let ty = self.input_types[input].as_ref().ok_or("not a Value port")?;
+        self.get(&hub::get_input(input), ty)
+    }
+
+    pub(crate) fn get_feedback(&self, connection: FeedbackIdx) -> Result<Option<Rc<Data>>, String> {
+        let from = self.ports.feedback()[connection].from;
+        let ty = self.output_types[from].as_ref().ok_or("not a Value port")?;
+        self.get(&hub::get_feedback(connection), ty)
+    }
+
+    pub(crate) fn set_input(&self, input: InputIdx, data: &Data) -> Result<bool, String> {
+        self.set(&hub::set_input(input), data)
+    }
+
+    pub(crate) fn set_output(&self, output: OutputIdx, data: &Data) -> Result<bool, String> {
+        self.set(&hub::set_output(output), data)
+    }
+
+    pub(crate) fn set_feedback(
+        &self,
+        connection: FeedbackIdx,
+        data: &Data,
+    ) -> Result<bool, String> {
+        self.set(&hub::set_feedback(connection), data)
+    }
+
+    pub(crate) fn clear_input(&self, input: InputIdx) -> Result<bool, String> {
+        let number = JsValue::from(input.position() as u32);
+        Ok(self.call("control", "clear-input", &[number])?.is_truthy())
+    }
+
+    pub(crate) fn read_handle(&self, output: OutputIdx) -> Result<Option<JsValue>, String> {
+        let number = JsValue::from(output.position() as u32);
+        let handle = self
+            .callbacks
+            .read_handle
+            .call1(&JsValue::NULL, &number)
+            .map_err(|e| thrown(&e))?;
+        Ok((!handle.is_undefined()).then_some(handle))
+    }
+
+    /// Reports a trap of the live instance, whichever task it was in.
+    pub(crate) fn report_trap(&self, error: JsValue) {
+        if let Some(traps) = &*self.traps.borrow() {
+            let _ = traps.unbounded_send(error);
+        }
+    }
+
+    /// Waits for the instance being served to be built, driving it. An instance
+    /// that cannot be, or none, is [`RuntimeError::InstanceStopped`].
+    pub(crate) async fn built(&self) -> Result<(), RuntimeError> {
+        let server = self.server.borrow().clone();
+        let Some(server) = server else {
+            return Err(RuntimeError::InstanceStopped);
+        };
+        match futures::future::select(server.built, server.future).await {
+            Either::Left((Ok(()), _)) => Ok(()),
+            Either::Left((Err(_), _)) | Either::Right(_) => Err(RuntimeError::InstanceStopped),
+        }
+    }
+}
+
+/// Per node, the stream and future inputs its outputs feed, for the loader to
+/// watch on their way.
+pub(crate) fn stream_inputs(
+    ports: &PortTable,
+    compiled: &witgraph_ir::CompiledGraph,
+) -> HashMap<NodeId, Vec<(String, PortKind, InputIdx)>> {
+    let mut edges: HashMap<NodeId, Vec<(String, PortKind, InputIdx)>> = HashMap::new();
+    for resolved in compiled.connections() {
+        let conn = resolved.connection;
+        if !resolved.from.kind.is_async() {
+            continue;
+        }
+        if let Some(input) = ports.input(&conn.to.node, &conn.to.port) {
+            edges.entry(conn.from.node.clone()).or_default().push((
+                conn.from.port.to_string(),
+                resolved.from.kind,
+                input,
+            ));
+        }
+    }
+    edges
+}
+
+/// What a call of a node's `run` ended with.
+type CallDone = (NodeIdx, Result<JsValue, JsValue>);
+
+/// Serves one instance.
+async fn serve(
+    hub: Rc<WebHub>,
+    fresh: bool,
+    built: oneshot::Sender<()>,
+    mut traps: UnboundedReceiver<JsValue>,
+    serving: Serving,
+) -> Outcome {
+    let Serving {
+        incarnation,
+        mut commands,
+        events,
+        ..
+    } = serving;
+    let send = |kind| {
+        // The receiver lives as long as the scheduler; a send can only fail
+        // while it is being dropped.
+        let _ = events.unbounded_send(ControlEvent { incarnation, kind });
+    };
+    if !fresh {
+        let rebuilt = match hub.callbacks.rebuild.call0(&JsValue::NULL) {
+            Ok(result) => settle(result).await,
+            Err(error) => Err(error),
+        };
+        rebuilt.map_err(|error| fault_of(&error, None, true))?;
+        hub.live.set(true);
+        let retained: Vec<(InputIdx, Rc<Data>)> = hub
+            .retained
+            .borrow()
+            .iter_enumerated()
+            .filter_map(|(input, data)| Some((input, data.clone()?)))
+            .collect();
+        for (input, data) in retained {
+            hub.set_input(input, &data)
+                .map_err(|message| (NodeFault::Restart { message }, None))?;
+        }
+        send(ControlKind::Built);
+    }
+    let _ = built.send(());
+    let trap = |message: String| (NodeFault::WasmTrap { message }, None);
+    let mut calls = FuturesUnordered::new();
+    let mut closed = false;
+    loop {
+        futures::select_biased! {
+            done = calls.select_next_some() => {
+                let (node, result): CallDone = done;
+                let id = hub.ports.node_id(node).clone();
+                let returned = result.map_err(|error| fault_of(&error, Some(id), false))?;
+                let returned = decode_returned(&returned, &hub.ports).map_err(trap)?;
+                send(ControlKind::RunReturned { node, returned });
+            }
+            error = traps.select_next_some() => {
+                return Err(fault_of(&error, None, false));
+            }
+            command = commands.next() => match command {
+                Some(Command::Run(node)) => {
+                    let number = JsValue::from(node.position() as u32);
+                    let called = hub.callbacks.run.call1(&JsValue::NULL, &number);
+                    calls.push(async move {
+                        let result = match called {
+                            Ok(result) => settle(result).await,
+                            Err(error) => Err(error),
+                        };
+                        (node, result)
+                    });
+                }
+                Some(Command::LatchFeedback(connection)) => {
+                    let number = JsValue::from(connection.position() as u32);
+                    let latched = hub
+                        .call("control", "latch-feedback", &[number])
+                        .map_err(trap)?;
+                    let latched = match latched.as_string().as_deref() {
+                        Some("changed") => Latched::Changed,
+                        Some("cleared") => Latched::Cleared,
+                        _ => Latched::Unchanged,
+                    };
+                    send(ControlKind::Latched { connection, latched });
+                }
+                Some(Command::DropFeedback(connection)) => {
+                    let number = JsValue::from(connection.position() as u32);
+                    hub.call("control", "drop-feedback", &[number]).map_err(trap)?;
+                }
+                Some(Command::AwaitQuiet(at)) => send(ControlKind::Quiet(at)),
+                None => closed = true,
+            },
+            complete => break,
+        }
+        if closed && calls.is_empty() {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// The data plane, as the scheduler sees it.
+pub(crate) struct WebPlane(pub(crate) Rc<WebHub>);
+
+impl DataPlane for WebPlane {
+    fn serve(&self, serving: Serving) -> BoxFuture<Outcome> {
+        let hub = self.0.clone();
+        let fresh = hub.fresh.replace(false);
+        hub.live.set(fresh);
+        let (built_tx, built) = oneshot::channel();
+        let (traps_tx, traps) = mpsc::unbounded();
+        *hub.traps.borrow_mut() = Some(traps_tx);
+        let future: LocalBoxFuture<'static, Outcome> =
+            serve(hub.clone(), fresh, built_tx, traps, serving).boxed_local();
+        let future = future.shared();
+        *hub.server.borrow_mut() = Some(Server {
+            future: future.clone(),
+            built: built.shared(),
+        });
+        boxed(future)
+    }
+
+    fn stopped(&self) {
+        self.0.live.set(false);
+        *self.0.traps.borrow_mut() = None;
+        // The last hold on the server, so calls in flight are abandoned now.
+        *self.0.server.borrow_mut() = None;
+        if let Some(abandon) = &self.0.callbacks.abandon {
+            let _ = abandon.call0(&JsValue::NULL);
+        }
+    }
+}

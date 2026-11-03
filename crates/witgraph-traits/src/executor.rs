@@ -8,9 +8,7 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
-use witgraph_ir::{
-    FeedbackIdx, InputIdx, NodeId, NodeIdx, OutputIdx, PortDirection, PortName, PortRef,
-};
+use witgraph_ir::{FeedbackIdx, InputIdx, NodeId, NodeIdx, OutputIdx, PortDirection, PortRef};
 
 use crate::error::NodeFault;
 use crate::plan::MemberPlan;
@@ -201,16 +199,6 @@ pub enum ControlKind {
     },
     /// No guest work was left when a [`Command::AwaitQuiet`] was served.
     Quiet(u64),
-    /// Items of a node's stream output passed through the data plane on their
-    /// way to the stream's reader, with stream items asked for.
-    StreamItems {
-        /// The node whose output the stream is.
-        node: NodeIdx,
-        /// The output port.
-        port: PortName,
-        /// How many items passed.
-        count: usize,
-    },
 }
 
 /// What is told of a new instance.
@@ -222,8 +210,6 @@ pub struct Serving {
     pub commands: UnboundedReceiver<Command>,
     /// Where it reports.
     pub events: UnboundedSender<ControlEvent>,
-    /// Whether stream items are wanted ([`ControlKind::StreamItems`]).
-    pub stream_items: bool,
 }
 
 /// What holds a graph's values and runs its nodes, as the scheduler sees it.

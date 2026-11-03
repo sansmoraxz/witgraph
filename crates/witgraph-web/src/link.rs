@@ -1,31 +1,29 @@
 //! Composing the providers a graph's links name into the nodes that use
 //! them, before the loader transpiles anything.
 //!
-//! A JavaScript host runs a node as the single component jco transpiled, so
-//! a link has to be resolved into that component's bytes: the same
+//! A link has to be resolved into a node's bytes before the graph is composed: the same
 //! composition the wasmtime runtime does
 //! ([`witgraph_wit::compose::link_node`]), once per node component and set
 //! of links.
 
 use std::collections::{HashMap, HashSet};
 
-use sha2::{Digest, Sha256};
 use wasm_bindgen::JsError;
 use witgraph_ir::{Capability, CompiledGraph, ComponentRef, Link, NodeId};
 use witgraph_wit::compose::{LinkedProvider, imported_as, link_node};
 use witgraph_wit::lower::Lowered;
 
-use crate::graph::{error, hex};
+use crate::graph::error;
 
 /// A node component with its links composed in.
 pub struct Composed {
     /// The composed component.
     pub bytes: Vec<u8>,
-    /// Its SHA-256, in hex.
-    pub sha256: String,
     /// What the composed component imports, as the host is asked for it:
     /// the node's unlinked imports and what its providers import.
     pub capabilities: Vec<Capability>,
+    /// The name it exports its `node` interface under.
+    pub export: String,
 }
 
 /// The compositions of a graph.
@@ -145,11 +143,10 @@ pub fn compose_links(
         let index = match result.bytes {
             std::borrow::Cow::Borrowed(_) => None,
             std::borrow::Cow::Owned(bytes) => {
-                let digest: [u8; 32] = Sha256::digest(&bytes).into();
                 linked.composed.push(Composed {
                     bytes,
-                    sha256: hex(&digest),
                     capabilities: result.capabilities,
+                    export: result.export,
                 });
                 Some(linked.composed.len() - 1)
             }

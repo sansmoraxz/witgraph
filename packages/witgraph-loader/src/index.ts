@@ -1,13 +1,13 @@
 // Runs a witgraph graph on a JavaScript host.
 //
-// Each node's component is transpiled with jco and instantiated on its
-// own; the witgraph scheduler (the `witgraph-web` crate, in `../pkg`)
-// decides when each node's `run` is called and carries values between
-// them, under the same rules as the wasmtime runtime. Every call to a
-// node goes through this module, which is where debugging and simulation
-// hook in: `beforeRun` and `afterRun` see (and may hold) each call,
-// `onStreamItem` sees every chunk of a stream between nodes, and `mocks`
-// replaces a node with a function.
+// The graph is composed into one component with a generated hub that holds its
+// values, which is transpiled with jco and instantiated once. The witgraph
+// scheduler (the `witgraph-web` crate, in `../pkg`) decides when each node's `run`
+// is called, under the same rules as the wasmtime runtime; values pass from node
+// to node inside the composite. Every call goes through this module, which is where
+// debugging and simulation hook in: `beforeRun` and `afterRun` see (and may hold)
+// each call, `onStreamItem` sees every chunk of a stream between nodes, and `mocks`
+// replaces a node with a function. A value reaches the host only when it asks.
 
 import { transpile } from '@bytecodealliance/jco/component';
 
@@ -75,7 +75,7 @@ export interface Capability {
   items?: Record<string, string>;
 }
 
-/** A component the graph instantiates. */
+/** A component the graph is composed of. */
 export interface ComponentSource {
   /** `namespace:name/world@version`, as the graph's component table names it. */
   id: string;
@@ -127,36 +127,46 @@ export interface SessionOptions {
   /** The compiled `witgraph-web` module: see {@link init}. */
   wasm?: Wasm;
   /**
-   * What a node imports: called for each import every time the node is
+   * What the graph imports: called for each import every time the graph is
    * instantiated (when the session loads, and on every rebuild after a
-   * fault, shutdown or restore), with the capability of the node's contract
-   * the import is, as a wasmtime host is asked for it. It returns the
+   * fault, shutdown or restore), with the capability it is, as a wasmtime host
+   * is asked for it. Nodes importing one name share one import; nodes that
+   * want different providers of one interface use labels. It returns the
    * import's implementation as jco expects it (functions by
    * `lowerCamelCase` name), or `undefined` when there is none. The
    * built-in `witgraph:runtime/host` is provided for every node.
    */
-  capabilities?: (node: string, capability: Capability) => object | undefined;
+  capabilities?: (capability: Capability) => object | undefined;
   /**
-   * Nodes replaced by a function of their inputs, for simulation. Only the
-   * object's own properties count, and each is called as its method.
+   * Nodes replaced by a function of their inputs, for simulation: left out of
+   * the composite, whose `run` of them calls this. Only the object's own
+   * properties count, each is called as its method, and its inputs and outputs
+   * are as jco represents them. Mocking another node composes the graph anew.
    */
   mocks?: Record<string, (inputs: PortValues) => PortValues | Promise<PortValues>>;
-  /** Called before a node's `run`; the run waits for the returned promise. */
-  beforeRun?: (node: string, inputs: PortValues) => void | Promise<void>;
-  /** Called after a node's `run` returned; delivery waits for the promise. */
-  afterRun?: (node: string, outputs: PortValues) => void | Promise<void>;
   /**
-   * Called for every chunk of every stream output, as its reader takes it
-   * (jco yields a stream in chunks, not item by item). What it throws is
+   * Called before a node's `run`; the run waits for the returned promise. Its
+   * inputs are read with {@link Session.readInputs}, if they are wanted: nothing
+   * crosses to the host unasked.
+   */
+  beforeRun?: (node: string) => void | Promise<void>;
+  /**
+   * Called after a node's `run` returned and its outputs were delivered; the
+   * scheduler waits for the promise. What it returned is read with `graph.readOutput`.
+   */
+  afterRun?: (node: string) => void | Promise<void>;
+  /**
+   * Called for every chunk of every stream output something reads, as its reader
+   * takes it (jco yields a stream in chunks, not item by item). What it throws is
    * reported to the console and does not reach the reader.
    */
   onStreamItem?: (item: StreamItem) => void;
   /**
-   * Called with the value of every future output once it resolves. Given
-   * this hook, a future is read as soon as its node's run returns, rather
-   * than when its reader takes it (the reader still gets the value), so its
-   * writer's write completes that much sooner. What it throws is reported
-   * to the console.
+   * Called with the value of every future output something reads, once it
+   * resolves. Given this hook, a future is read as soon as its node's run returns,
+   * rather than when its reader takes it (the reader still gets the value), so its
+   * writer's write completes that much sooner. What it throws is reported to the
+   * console.
    */
   onFutureValue?: (item: FutureItem) => void;
 }
@@ -207,16 +217,14 @@ function sameWasm(a: Wasm | undefined, b: Wasm | undefined): boolean {
 /** What the built-in `fatal` throws; the scheduler turns it into a fatal fault. */
 class FatalError extends Error {
   witgraphFatal = true;
+  witgraphNode: string;
+  constructor(message: string, node: string) {
+    super(message);
+    this.witgraphNode = node;
+  }
 }
 
-/** The built-in `witgraph:runtime/host`. */
-const host = {
-  fatal: (message: string): never => {
-    throw new FatalError(message);
-  },
-};
-
-/** A transpiled component: instantiate it as often as it is a node. */
+/** The transpiled composite: instantiate it as often as the graph is rebuilt. */
 interface Transpiled {
   instantiate: (
     getCoreModule: (path: string) => Promise<WebAssembly.Module>,
@@ -227,21 +235,55 @@ interface Transpiled {
   imports: string[];
 }
 
+/** What one of the composite's imports is. */
+type ImportKind =
+  | { kind: 'host'; node: string }
+  | { kind: 'lend' }
+  | { kind: 'mock'; node: string }
+  | { kind: 'capability'; capability: Capability };
+
+/** A node, by its position in the graph's topological order, as the hub numbers it. */
+type NodeNumber = number & { readonly brand: 'node' };
+/** A stream or future input, as the hub numbers it. */
+type InputNumber = number & { readonly brand: 'input' };
+/** An output port, as the hub numbers it. */
+type OutputNumber = number & { readonly brand: 'output' };
+
+/** How {@link instanceHooks}' code in jco's output reaches the loader, per instance. */
+const INSTANCE_HOOKS = '$witgraph';
+interface InstanceHooks {
+  /** Each table of host objects a guest or the hub holds, by rep. */
+  tables: Map<number, unknown>[];
+  /** Set once the instance is abandoned: its next call of a host import fails. */
+  stopped: boolean;
+  /** What jco disposed, when a guest dropped it: {@link dispose} leaves it alone. */
+  disposed: WeakSet<object>;
+  /** A guest trapped, in whichever task: not every trap reaches a call of `run`. */
+  trapped: (error: unknown) => void;
+}
+
+/** A live hub's exports, as jco names them. */
+interface HubInstance {
+  control: {
+    run: (node: NodeNumber) => Promise<unknown>;
+  } & Record<string, (...args: any[]) => any>;
+  ports: Record<string, (...args: any[]) => any>;
+}
+
+/** The objects {@link dispose} has been given: each is disposed once. */
+const disposed = new WeakSet<object>();
+
 /** Disposes a handle port's object, if it can be. */
 function dispose(object: unknown): void {
   const free = (object as { [Symbol.dispose]?: () => void } | undefined)?.[Symbol.dispose];
   if (typeof free !== 'function') return;
+  if (disposed.has(object as object)) return;
+  disposed.add(object as object);
   try {
     free.call(object);
   } catch (error) {
     console.error('disposing a handle threw:', error);
   }
-}
-
-/** A node's component, and what each of its imports is (`null`: the built-in host). */
-interface NodeComponent {
-  transpiled: Transpiled;
-  imports: [name: string, capability: Capability | null][];
 }
 
 /** The `witgraph-web` module's initialisation, the `wasm` it was given, and whether it is done. */
@@ -316,15 +358,22 @@ export class Session {
    */
   readonly warnings: readonly string[];
   #options: SessionOptions;
-  #components: Map<string, NodeComponent>;
-  #instances = new Map<string, Record<string, any>>();
+  #transpiled: Transpiled;
+  #imports: ImportKind[];
+  /** The nodes, by the number the hub knows them by. */
+  #nodes: string[];
+  #instance: HubInstance | undefined;
+  /** What the live instance's generated code told us of itself. */
+  #hooks: InstanceHooks | undefined;
+  /** What the hub lent the host last. */
+  #lent: unknown;
   /**
-   * Per node, how many of its instances were abandoned: a rebuild or run
-   * started under an older count belongs to none.
+   * How many instances were abandoned: a rebuild or run started under an older
+   * count belongs to none.
    */
-  #epoch = new Map<string, number>();
-  /** Per node, the stream outputs of its runs still open. */
-  #streams = new Map<string, Set<Tap>>();
+  #epoch = 0;
+  /** The stream outputs of the live instance still open. */
+  #streams = new Set<Tap>();
   #disposed = false;
   /** Set once the scheduler's module trapped: see {@link broken}. */
   #trapped: { broken?: Error } = {};
@@ -337,22 +386,24 @@ export class Session {
   private constructor(
     graph: WebGraph,
     options: SessionOptions,
-    components: Map<string, NodeComponent>,
+    transpiled: Transpiled,
+    imports: ImportKind[],
+    nodes: string[],
   ) {
     this.graph = watchTraps(graph, this.#trapped);
     Session.#live.add(this);
     Session.#watchUncaught();
     this.#options = options;
-    this.#components = components;
+    this.#transpiled = transpiled;
+    this.#imports = imports;
+    this.#nodes = nodes;
     // The contracts the graph was loaded with: lowered once, by `WebGraph.load`.
-    this.contracts = new Map(
-      [...components.keys()].map((node) => [node, graph.contract(node) as Contract]),
-    );
+    this.contracts = new Map(nodes.map((node) => [node, graph.contract(node) as Contract]));
     this.warnings = graph.warnings() as string[];
     for (const warning of this.warnings) console.warn(`witgraph: ${warning}`);
   }
 
-  /** Loads the graph, transpiles the components its nodes run and instantiates every node. */
+  /** Loads the graph, composes it, transpiles the composite and instantiates it. */
   static async load(options: SessionOptions): Promise<Session> {
     await init(options.wasm);
     const graph = typeof options.graph === 'string' ? options.graph : JSON.stringify(options.graph);
@@ -361,44 +412,29 @@ export class Session {
       if (session === undefined) throw new Error('the session is still loading');
       return session;
     };
-    const web = WebGraph.load(graph, options.components, {
-      run: (node: string, inputs: PortValues) => live().#run(node, inputs),
-      rebuild: (node: string) => live().#instantiate(node),
-      abandon: (nodes: string[]) => live().#abandon(nodes),
-      close: closeUnread,
-    });
+    const mocked = Object.keys(options.mocks ?? {}).filter(
+      (node) => typeof options.mocks![node] === 'function',
+    );
+    const known = new Set(mockableNodes(graph));
+    const web = WebGraph.load(
+      graph,
+      options.components,
+      {
+        run: (node: NodeNumber) => live().#run(node),
+        rebuild: () => live().#instantiate(),
+        instance: () => live().#instance,
+        readHandle: (output: OutputNumber) => live().#readHandle(output),
+        abandon: () => live().#abandon(),
+      },
+      mocked.filter((node) => known.has(node)),
+    );
     try {
-      // The component each node runs, as the graph resolved it: its entry of
-      // `components`, or, for a node whose links apply, that entry composed
-      // with its providers (`bytes`). Nodes running the same bytes share a
-      // transpile.
-      const nodes: string[] = web.nodes() as string[];
-      const entries = new Map<string, Promise<Transpiled>>();
-      const transpiled = nodes.map((node) => {
-        const { index, sha256, bytes } = web.component(node) as {
-          index: number;
-          sha256: string;
-          bytes?: Uint8Array;
-        };
-        let entry = entries.get(sha256);
-        if (entry === undefined) {
-          const { id } = options.components[index];
-          entry = transpileCached(sha256, bytes ? { id, bytes } : options.components[index]);
-          entries.set(sha256, entry);
-        }
-        return entry;
-      });
-      const components = new Map<string, NodeComponent>();
-      for (const [i, entry] of (await Promise.all(transpiled)).entries()) {
-        const node = nodes[i];
-        const capabilities = web.imports(node, entry.imports) as (Capability | null)[];
-        components.set(node, {
-          transpiled: entry,
-          imports: entry.imports.map((name, j) => [name, capabilities[j]]),
-        });
-      }
-      session = new Session(web, options, components);
-      await Promise.all(nodes.map((node) => live().#instantiate(node)));
+      const nodes = web.nodes() as string[];
+      const composite = web.composite() as { bytes: Uint8Array; sha256: string };
+      const transpiled = await transpileCached(composite.sha256, composite.bytes);
+      const imports = web.imports(transpiled.imports) as ImportKind[];
+      session = new Session(web, options, transpiled, imports, nodes);
+      await session.#instantiate();
       return session;
     } catch (error) {
       // The graph is never handed out: its memory in the module goes now.
@@ -409,8 +445,8 @@ export class Session {
   }
 
   /**
-   * Frees the graph's scheduler in the witgraph-web module and drops every
-   * node instance. The session cannot be used afterwards: a tick still
+   * Frees the graph's scheduler in the witgraph-web module and drops its
+   * instance. The session cannot be used afterwards: a tick still
    * running ends as `interrupted`, a run it holds is abandoned, and no hook
    * is called again. The scheduler holds this session's callbacks, so a
    * session that is only dropped is never collected: dispose each one (on
@@ -420,8 +456,7 @@ export class Session {
     if (this.#disposed) return;
     this.#disposed = true;
     Session.#live.delete(this);
-    for (const node of [...this.#streams.keys()]) this.#close(node);
-    this.#instances.clear();
+    this.#release();
     // A graph the scheduler trapped in is still held by the call that
     // trapped: freeing it throws. Its memory stays with the module.
     if (!this.#trapped.broken) this.graph.free();
@@ -503,134 +538,236 @@ export class Session {
   }
 
   /**
-   * Counts an instance of each node abandoned, and closes the streams its
-   * runs returned: their writers' next writes fail, so a guest's background
-   * writer stops instead of running on for nobody.
+   * Counts the instance abandoned, and closes its streams: their writers' next
+   * writes fail, so a guest's background writer stops instead of running on for
+   * nobody.
    */
-  #abandon(nodes: string[]): void {
-    for (const node of nodes) {
-      this.#epoch.set(node, (this.#epoch.get(node) ?? 0) + 1);
-      this.#close(node);
+  #abandon(): void {
+    this.#epoch++;
+    this.#release();
+  }
+
+  /**
+   * Lets go of the live instance. JavaScript cannot drop one, so what it does and
+   * holds is ended by hand: its streams, its next call of a host import, and
+   * every host object a guest or the hub still has.
+   */
+  #release(): void {
+    this.#closeStreams();
+    const hooks = this.#hooks;
+    this.#instance = undefined;
+    this.#hooks = undefined;
+    if (!hooks) return;
+    hooks.stopped = true;
+    for (const table of hooks.tables) {
+      for (const object of table.values()) dispose(object);
+      table.clear();
     }
   }
 
-  /** Closes the streams `node`'s runs returned that are still open. */
-  #close(node: string): void {
-    const taps = this.#streams.get(node);
-    this.#streams.delete(node);
-    for (const tap of taps ?? []) tap.close();
+  /** Closes the streams of the live instance that are still open. */
+  #closeStreams(): void {
+    const taps = this.#streams;
+    this.#streams = new Set();
+    for (const tap of taps) tap.close();
   }
 
-  /** Whether `node` is mocked: only the mocks' own properties count. */
-  #mocked(node: string): boolean {
-    const mocks = this.#options.mocks;
-    return mocks !== undefined && Object.hasOwn(mocks, node) && typeof mocks[node] === 'function';
+  /** Reads the Value inputs of `node`, by `lowerCamelCase` port, as they stand now. */
+  async readInputs(node: string): Promise<PortValues> {
+    const inputs: PortValues = {};
+    for (const port of this.contracts.get(node)?.inputs ?? []) {
+      if (port.kind !== 'value') continue;
+      inputs[camelCase(port.name)] = await this.graph.readInput(node, port.name);
+    }
+    return inputs;
   }
 
-  /** Gives one node fresh guest state: instantiates it again, unless it is mocked. */
-  async #instantiate(node: string): Promise<void> {
+  /** What the hub lends the host of a handle output. */
+  #readHandle(output: OutputNumber): unknown {
+    this.#lent = undefined;
+    this.#instance?.ports[`readHandle${output}`]();
+    const lent = this.#lent;
+    this.#lent = undefined;
+    return lent;
+  }
+
+  /** Gives the graph fresh guest state: instantiates the composite again. */
+  async #instantiate(): Promise<void> {
     if (this.#disposed) throw new Error('the session is disposed');
-    if (this.#mocked(node)) return;
-    const epoch = this.#epoch.get(node) ?? 0;
-    const { transpiled, imports } = this.#components.get(node)!;
+    const epoch = this.#epoch;
     const provided: Record<string, object> = {};
-    for (const [name, capability] of imports) {
-      const implementation =
-        capability === null ? host : this.#options.capabilities?.(node, capability);
-      if (!implementation) {
-        const what = capability!.implements
-          ? `\`${capability!.interface}\` (\`${capability!.implements}\`)`
-          : `\`${capability!.interface}\``;
-        throw new Error(`node \`${node}\` imports ${what}, which nothing provides`);
+    const options = this.#options;
+    for (const [i, name] of this.#transpiled.imports.entries()) {
+      const what = this.#imports[i];
+      switch (what.kind) {
+        case 'host':
+          provided[name] = {
+            fatal: (message: string): never => {
+              const error = new FatalError(message, what.node);
+              // Known at once, whichever task of the guest called it.
+              this.graph.reportTrap(error);
+              throw error;
+            },
+          };
+          break;
+        case 'lend':
+          provided[name] = new Proxy(
+            {},
+            {
+              get: () => (object: unknown) => {
+                this.#lent = object;
+              },
+            },
+          );
+          break;
+        case 'mock':
+          provided[name] = {
+            run: async (inputs: PortValues) => {
+              const outputs = this.graph.mockOutputs(
+                what.node,
+                (await options.mocks![what.node](inputs)) ?? ({} as PortValues),
+              ) as PortValues;
+              // A stream the host writes ends with the instance as any other.
+              for (const port of this.contracts.get(what.node)?.outputs ?? []) {
+                const key = camelCase(port.name);
+                if (port.kind !== 'stream' || !outputs[key]) continue;
+                const tap: Tap = tapped(
+                  outputs[key] as AsyncIterable<unknown>,
+                  () => {},
+                  () => this.#streams.delete(tap),
+                );
+                this.#streams.add(tap);
+                outputs[key] = tap;
+              }
+              return outputs;
+            },
+          };
+          break;
+        case 'capability': {
+          const implementation = options.capabilities?.(what.capability);
+          if (!implementation) {
+            const { capability } = what;
+            const named = capability.implements
+              ? `\`${capability.interface}\` (\`${capability.implements}\`)`
+              : `\`${capability.interface}\``;
+            throw new Error(`the graph imports ${named}, which nothing provides`);
+          }
+          provided[name] = implementation;
+          break;
+        }
       }
-      provided[name] = implementation;
     }
-    const getCoreModule = (path: string) => transpiled.modules.get(path)!;
-    const instance = await transpiled.instantiate(getCoreModule, provided);
-    // An instance abandoned meanwhile is nobody's: a
-    // newer rebuild may already have run on its own.
-    if (!this.#disposed && (this.#epoch.get(node) ?? 0) === epoch)
-      this.#instances.set(node, instance);
+    const { instantiate, modules } = this.#transpiled;
+    const hooks: InstanceHooks = {
+      tables: [],
+      stopped: false,
+      disposed,
+      // A call of `run` the trap ends rejects first, which names its node.
+      trapped: (error) => {
+        setTimeout(() => {
+          if (!hooks.stopped) this.graph.reportTrap(error);
+        }, 0);
+      },
+    };
+    provided[INSTANCE_HOOKS] = hooks;
+    const instance = await instantiate((path: string) => modules.get(path)!, provided);
+    // An instance abandoned meanwhile is nobody's: a newer rebuild may already
+    // have run on its own.
+    if (!this.#disposed && this.#epoch === epoch) {
+      this.#instance = instance as HubInstance;
+      this.#hooks = hooks;
+    } else {
+      hooks.stopped = true;
+    }
   }
 
-  /** One call of a node's `run`, with the hooks around it. */
-  async #run(node: string, inputs: PortValues): Promise<PortValues> {
-    // A run abandoned (shut down, say, while
-    // `beforeRun` held it) stops at the next step: its node may already be
-    // rebuilt, and nothing reads what it returns.
-    const epoch = this.#epoch.get(node) ?? 0;
-    const abandoned = () => this.#disposed || (this.#epoch.get(node) ?? 0) !== epoch;
+  /** One call of the hub's `run` of a node, with the hooks around it. */
+  async #run(number: NodeNumber): Promise<unknown> {
+    const node = this.#nodes[number];
+    // A run abandoned (shut down, say, while `beforeRun` held it) stops at the
+    // next step: the graph may already be rebuilt, and nothing reads what it
+    // returns.
+    const epoch = this.#epoch;
+    const abandoned = () => this.#disposed || this.#epoch !== epoch;
     const options = this.#options;
-    await options.beforeRun?.(node, inputs);
+    await options.beforeRun?.(node);
     if (abandoned()) throw new Error(`the run of \`${node}\` was abandoned`);
-    // Hooks and mocks are called as methods of their objects.
-    const outputs: PortValues =
-      (this.#mocked(node)
-        ? await options.mocks![node](inputs)
-        : await nodeExport(this.#instances.get(node)!).run(inputs)) ?? {};
-    if (abandoned()) {
-      // Nothing reads what an abandoned run returns: its streams' writers
-      // stop now, rather than run on for nobody.
-      for (const port of this.contracts.get(node)?.outputs ?? []) {
-        if (port.kind === 'stream' || port.kind === 'future') {
-          closeUnread(outputs[camelCase(port.name)]);
-        }
-        // Nothing will hold it, so nothing else would dispose it.
-        if (port.kind === 'handle') dispose(outputs[camelCase(port.name)]);
-      }
-      return outputs;
-    }
-    // Every stream output is tapped, so it can be closed when its
-    // instance is abandoned or the session disposed.
-    for (const port of this.contracts.get(node)?.outputs ?? []) {
-      const key = camelCase(port.name);
-      if (port.kind === 'future') {
+    const instance = this.#instance!;
+    const returned = await instance.control.run(number);
+    if (abandoned()) return returned;
+    this.#tap(node, instance);
+    await options.afterRun?.(node);
+    return returned;
+  }
+
+  /**
+   * Takes every stream and future the run of `node` delivered, and gives its
+   * reader what watches it, so a stream can be closed when its instance is
+   * abandoned or the session disposed.
+   */
+  #tap(node: string, instance: HubInstance): void {
+    const options = this.#options;
+    const contract = this.contracts.get(node);
+    const edges = this.graph.streamEdges(node) as {
+      port: string;
+      kind: 'stream' | 'future';
+      input: InputNumber;
+    }[];
+    const live = () => !this.#disposed && this.#instance === instance;
+    for (const { port, kind, input } of edges) {
+      const value = instance.ports[`takeStream${input}`]();
+      if (value === undefined) continue;
+      const give = instance.ports[`giveStream${input}`];
+      if (kind === 'future') {
+        const future = value as PromiseLike<unknown> & Disposable;
         // jco disposes a future its reader drops unread, but its writer's
         // write still waits, on a timer that keeps the process alive. Reading
         // the future ends the write, and hands over any handle it carries.
-        const future = outputs[key] as (PromiseLike<unknown> & Disposable) | undefined;
-        if (future) future[Symbol.dispose] = () => closeUnread(future);
+        future[Symbol.dispose] = () => closeUnread(future);
+        if (options.onFutureValue) {
+          // jco's future settles once, and its reader is given the same
+          // value: watching it takes nothing from the reader.
+          future.then?.(
+            (settled) => {
+              if (!live()) return;
+              try {
+                options.onFutureValue?.({ node, port, value: settled });
+              } catch (error) {
+                console.error(`onFutureValue threw on \`${node}.${port}\`:`, error);
+              }
+            },
+            () => {},
+          );
+        }
+        give(future);
+        continue;
       }
-      if (port.kind === 'future' && options.onFutureValue) {
-        // jco's future settles once, and its reader is given the same
-        // value: watching it takes nothing from the reader.
-        const future = outputs[key] as PromiseLike<unknown> | undefined;
-        future?.then?.(
-          (value) => {
-            if (this.#disposed || abandoned()) return;
-            try {
-              options.onFutureValue?.({ node, port: port.name, value });
-            } catch (error) {
-              console.error(`onFutureValue threw on \`${node}.${port.name}\`:`, error);
-            }
-          },
-          () => {},
-        );
-      }
-      if (port.kind !== 'stream' || !outputs[key]) continue;
-      const numeric = NUMERIC_TYPES.has(port.type_display);
-      const open = this.#streams.get(node) ?? new Set<Tap>();
-      this.#streams.set(node, open);
+      const type = contract?.outputs.find((output) => output.name === port)?.type_display ?? '';
+      const numeric = NUMERIC_TYPES.has(type);
       const tap: Tap = tapped(
-        outputs[key] as AsyncIterable<unknown>,
+        value as AsyncIterable<unknown>,
         (item) => {
           if (!options.onStreamItem || this.#disposed) return;
           const items =
             numeric && ArrayBuffer.isView(item) ? (item as unknown as ArrayLike<unknown>) : [item];
           try {
-            options.onStreamItem({ node, port: port.name, item, items });
+            options.onStreamItem({ node, port, item, items });
           } catch (error) {
-            console.error(`onStreamItem threw on \`${node}.${port.name}\`:`, error);
+            console.error(`onStreamItem threw on \`${node}.${port}\`:`, error);
           }
         },
-        () => open.delete(tap),
+        () => this.#streams.delete(tap),
       );
-      open.add(tap);
-      outputs[key] = tap;
+      this.#streams.add(tap);
+      give(tap);
     }
-    await options.afterRun?.(node, outputs);
-    return outputs;
   }
+}
+
+/** The ids of a graph's nodes, as its JSON has them. */
+function mockableNodes(graph: string): string[] {
+  const parsed = JSON.parse(graph) as { nodes?: { id: string }[] };
+  return (parsed.nodes ?? []).map((node) => node.id);
 }
 
 /**
@@ -705,6 +842,7 @@ const ASYNC_CALLS = new Set([
   'inject',
   'injectWave',
   'clearInput',
+  'readInput',
   'readOutput',
   'readHandle',
   'readOutputWave',
@@ -712,13 +850,6 @@ const ASYNC_CALLS = new Set([
   'restore',
   'tick',
 ]);
-
-/** A component's `node` export: inline, or a named `…/node` interface. */
-function nodeExport(instance: Record<string, any>): { run: (inputs: PortValues) => any } {
-  const key = Object.keys(instance).find((k) => k === 'node' || /\/node(@|$)/.test(k));
-  if (!key) throw new Error('the component exports no `node` interface');
-  return instance[key];
-}
 
 /** The number types: jco hands over a stream of one of them in typed arrays. */
 export const NUMERIC_TYPES: ReadonlySet<string> = new Set([
@@ -795,18 +926,18 @@ function tapped(
   };
 }
 
-/** Transpiled components by the SHA-256 of their bytes, kept across sessions (the latest {@link CACHED}). */
+/** Transpiled composites by the SHA-256 of their bytes, kept across sessions (the latest {@link CACHED}). */
 const transpileCache = new Map<string, Promise<Transpiled>>();
 const CACHED = 32;
 
 /**
- * `transpileComponent`, done once per distinct bytes (`sha256` being
- * theirs): an editor reloading its graph reuses the work.
+ * `transpileComposite`, done once per distinct bytes (`sha256` being
+ * theirs): an editor reloading a graph it has seen reuses the work.
  */
-function transpileCached(sha256: string, { id, bytes }: ComponentSource): Promise<Transpiled> {
+function transpileCached(sha256: string, bytes: Uint8Array): Promise<Transpiled> {
   let transpiled = transpileCache.get(sha256);
   if (transpiled === undefined) {
-    transpiled = transpileComponent(id, bytes);
+    transpiled = transpileComposite(bytes);
     // A failed transpile is not kept.
     transpiled.catch(() => transpileCache.delete(sha256));
   } else {
@@ -819,12 +950,20 @@ function transpileCached(sha256: string, { id, bytes }: ComponentSource): Promis
   return transpiled;
 }
 
-async function transpileComponent(id: string, bytes: Uint8Array): Promise<Transpiled> {
-  const { files, imports } = await transpile(bytes, {
-    name: 'node',
-    instantiation: { tag: 'async' },
-    noTypescript: true,
-  });
+/**
+ * How a composite is transpiled. `multiMemory` makes the members' calls to the
+ * hub run on the engine's own copies: without it, jco copies a list byte by byte
+ * in JavaScript, with no error, about 300 times slower.
+ */
+export const TRANSPILE_OPTIONS = {
+  name: 'graph',
+  instantiation: { tag: 'async' },
+  noTypescript: true,
+  multiMemory: true,
+} as const;
+
+async function transpileComposite(bytes: Uint8Array): Promise<Transpiled> {
+  const { files, imports } = await transpile(bytes, TRANSPILE_OPTIONS);
   const modules = new Map<string, Promise<WebAssembly.Module>>();
   let source: string | undefined;
   // jco makes each file's bytes itself, over an `ArrayBuffer`.
@@ -832,11 +971,83 @@ async function transpileComponent(id: string, bytes: Uint8Array): Promise<Transp
     if (name.endsWith('.wasm')) modules.set(name, WebAssembly.compile(contents));
     else if (name.endsWith('.js')) source = new TextDecoder().decode(contents);
   }
-  if (source === undefined) throw new Error(`\`${id}\` transpiled to no JavaScript`);
-  source = fastListLift(source);
+  if (source === undefined) throw new Error('the composite transpiled to no JavaScript');
+  source = instanceHooks(ownedFromWriter(countLoweredReturns(fastListLift(source))));
   const url = `data:text/javascript;base64,${base64(new TextEncoder().encode(source))}`;
   const { instantiate } = await import(/* @vite-ignore */ url);
   return { instantiate, modules, imports };
+}
+
+/**
+ * How jco returns from a host import a guest called async, one timer later.
+ * Its deadlock watchdog does not count that timer as work: when the host's promise
+ * settles at once and every other task is parked (a `run` the hub is waiting
+ * on, say), the watchdog can fire first and trap a graph that is fine.
+ */
+const LOWERED_RETURN = `      return new Promise((resolve, reject) => {
+        setTimeout(() => {
+          // NOTE: whether the import settled`;
+const LOWERED_RETURN_COUNTED = `      STORE_ASYNC_STATE.pendingHostOperations++;
+      return new Promise((resolve, reject) => {
+        setTimeout(() => {
+          STORE_ASYNC_STATE.pendingHostOperations--;
+          // NOTE: whether the import settled`;
+
+/** `source`, jco's output, with {@link LOWERED_RETURN} counted as work, if it has one. */
+export function countLoweredReturns(source: string): string {
+  return source.replace(LOWERED_RETURN, LOWERED_RETURN_COUNTED);
+}
+
+/**
+ * How jco lifts a resource a guest wrote to a stream or future: from the table of
+ * the host's imports, where it is not, rather than the writer's, where it is. So
+ * the host reading such a stream traps, with "unknown handle index".
+ */
+const OWNED_LIFT =
+  /(_liftFlatOwn\(\{\s*componentIdx: \d+,\s*tableIdx: (\d+),\s*classNameFn: \(\) => \w+,\s*createResourceFn:\s*\(handle\) => \{\s*const rep = )(handleTable\d+)(\[\(handle << 1\) \+ 1\] % T_OWN;[\s\S]*?rscTableRemove\()(handleTable\d+)(, handle\);)/g;
+
+/** `source`, jco's output, with {@link OWNED_LIFT} reading the writer's table. */
+export function ownedFromWriter(source: string): string {
+  return source.replace(
+    OWNED_LIFT,
+    (_, before, table, first, between, second, after) =>
+      `${before}(HANDLE_TABLES[${table}] ?? ${first})${between}(HANDLE_TABLES[${table}] ?? ${second})${after}`,
+  );
+}
+
+/**
+ * `source`, jco's output, telling the loader what it needs to let go of an
+ * instance, which JavaScript cannot drop: its tables of host objects, and a way to
+ * stop it: its calls of host imports fail, so a guest's endless task ends, and its
+ * scheduler stops polling for tasks that will never run, which keeps a process
+ * alive, and its deadlock watchdog stops watching them.
+ */
+export function instanceHooks(source: string): string {
+  return source
+    .replace(
+      /const (captureTable\d+)= new Map\(\);/g,
+      `const $1= new Map(); imports['${INSTANCE_HOOKS}']?.tables.push($1);`,
+    )
+    .replaceAll(
+      'if (rsc[symbolDispose]) rsc[symbolDispose]();',
+      `imports['${INSTANCE_HOOKS}']?.disposed.add(rsc); if (rsc[symbolDispose]) rsc[symbolDispose]();`,
+    )
+    .replace(
+      'err = _normalizeCoreTrap(err);',
+      `err = _normalizeCoreTrap(err); imports['${INSTANCE_HOOKS}']?.trapped(err);`,
+    )
+    .replace(
+      'while (result !== ComponentAsyncState.TickResult.DONE) {',
+      `while (result !== ComponentAsyncState.TickResult.DONE && !imports['${INSTANCE_HOOKS}']?.stopped) {`,
+    )
+    .replace(
+      'if (STORE_TRAP.error !== null || STORE_ASYNC_STATE.pendingHostOperations > 0) { return; }',
+      `if (imports['${INSTANCE_HOOKS}']?.stopped || STORE_TRAP.error !== null || STORE_ASYNC_STATE.pendingHostOperations > 0) { return; }`,
+    )
+    .replace(
+      "_debugLog('[_lowerImport()] calling lowered import', { importFn, params });",
+      `if (imports['${INSTANCE_HOOKS}']?.stopped) { throw new Error('the instance was abandoned'); }`,
+    );
 }
 
 /**

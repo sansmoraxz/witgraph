@@ -27,7 +27,8 @@ use super::module::{
 use super::text::{Printer, Resources};
 use super::{
     CONTROL_INTERFACE, HubError, HubMember, LEND_INTERFACE, PORTS_INTERFACE, get_feedback,
-    get_input, get_output, lend_handle, read_handle, set_feedback, set_input, set_output,
+    get_input, get_output, give_stream, lend_handle, read_handle, set_feedback, set_input,
+    set_output, take_stream,
 };
 
 /// The fixed part of a hub's world.
@@ -192,7 +193,7 @@ fn world_text(
             let Some(input) = ports.input(node.node, &port) else {
                 continue;
             };
-            if def.kind != PortKind::Value {
+            if def.kind == PortKind::Handle {
                 continue;
             }
             let payload = if def.optional {
@@ -201,6 +202,15 @@ fn world_text(
                 ty
             };
             let text = printer.ty(&payload)?;
+            if def.kind.is_async() {
+                let _ = writeln!(
+                    port_funcs,
+                    "  {}: func() -> option<{text}>;\n  {}: func(value: {text});",
+                    take_stream(input),
+                    give_stream(input),
+                );
+                continue;
+            }
             let _ = writeln!(
                 port_funcs,
                 "  {}: func() -> option<{text}>;\n  {}: func(value: list<{text}>) -> bool;",
@@ -378,6 +388,8 @@ enum BlockKind {
     Outputs(usize),
     /// One value the host wrote.
     Boxed(Type),
+    /// A stream or future the host gave an input, until its reader starts.
+    Given(InputIdx),
 }
 
 /// The canonical built-ins and helpers every function may call.
@@ -402,6 +414,8 @@ struct Imports {
     drops: Vec<HashMap<usize, FuncIdx<Import>>>,
     resource_drops: HashMap<TypeId, FuncIdx<Import>>,
     lends: HashMap<OutputIdx, FuncIdx<Import>>,
+    /// Per stream or future input: how to drop one its reader never took.
+    given_drops: HashMap<InputIdx, FuncIdx<Import>>,
     task_return: FuncIdx<Import>,
     set_new: FuncIdx<Import>,
     set_drop: FuncIdx<Import>,
@@ -421,6 +435,8 @@ struct Core<'a> {
     edges: HashMap<OutputIdx, Vec<Edge>>,
     /// Each input's payload type, each output's type.
     input_ty: BTreeMap<InputIdx, Type>,
+    /// Each stream or future input's type.
+    stream_ty: BTreeMap<InputIdx, Type>,
     output_ty: BTreeMap<OutputIdx, Type>,
     feedback_ty: BTreeMap<FeedbackIdx, Type>,
     control: WorldKey,
@@ -494,6 +510,7 @@ impl<'a> Core<'a> {
 
         let mut members = Vec::with_capacity(order.len());
         let mut input_ty = BTreeMap::new();
+        let mut stream_ty = BTreeMap::new();
         let mut output_ty = BTreeMap::new();
         for (at, member) in order.iter().enumerate() {
             let key = WorldKey::Name(format!("m{at}"));
@@ -526,6 +543,11 @@ impl<'a> Core<'a> {
                     && kind == PortKind::Value
                 {
                     input_ty.insert(index, optional.map_or(*ty, |(payload, _)| payload));
+                }
+                if let Some(index) = index
+                    && kind.is_async()
+                {
+                    stream_ty.insert(index, optional.map_or(*ty, |(payload, _)| payload));
                 }
                 inputs.push((
                     index,
@@ -665,6 +687,7 @@ impl<'a> Core<'a> {
             members,
             edges,
             input_ty,
+            stream_ty,
             output_ty,
             feedback_ty,
             control,
@@ -774,6 +797,37 @@ impl<'a> Core<'a> {
                 });
             }
         }
+        let mut given_drops = HashMap::new();
+        for member in &self.members {
+            for (index, field) in &member.inputs {
+                let Some(index) = index else { continue };
+                let ty = field.optional.map_or(field.ty, |(payload, _)| payload);
+                let Type::Id(id) = self.deref(&ty) else {
+                    continue;
+                };
+                let intrinsic = match self.resolve.types[id].kind {
+                    TypeDefKind::Stream(_) => WasmImport::StreamIntrinsic {
+                        interface: Some(&member.key),
+                        func: &member.func,
+                        ty: Some(id),
+                        intrinsic: StreamIntrinsic::DropReadable,
+                        exported: false,
+                        async_: false,
+                    },
+                    TypeDefKind::Future(_) => WasmImport::FutureIntrinsic {
+                        interface: Some(&member.key),
+                        func: &member.func,
+                        ty: Some(id),
+                        intrinsic: FutureIntrinsic::DropReadable,
+                        exported: false,
+                        async_: false,
+                    },
+                    _ => continue,
+                };
+                let (from, name) = self.resolve.wasm_import_name(callback, intrinsic);
+                given_drops.insert(*index, module.import(&from, &name, &Sig::i32s(1, 0)));
+            }
+        }
         let mut lends = HashMap::new();
         if let Some(key) = &self.lend_key {
             let Some(WorldItem::Interface { id, .. }) =
@@ -811,6 +865,7 @@ impl<'a> Core<'a> {
             drops,
             resource_drops,
             lends,
+            given_drops,
             task_return,
             set_new: intrinsic("[waitable-set-new]", Sig::i32s(0, 1)),
             set_drop: intrinsic("[waitable-set-drop]", Sig::i32s(1, 0)),
@@ -913,6 +968,11 @@ impl<'a> Core<'a> {
                 kinds.push(BlockKind::Boxed(*ty));
             }
         }
+        let mut given: HashMap<InputIdx, u32> = HashMap::new();
+        for input in self.stream_ty.keys() {
+            given.insert(*input, kinds.len() as u32);
+            kinds.push(BlockKind::Given(*input));
+        }
         self.write_free_block(&mut module, rt, &imports, &kinds);
         let mut eqs: HashMap<String, FuncIdx<EqFn>> = HashMap::new();
         for ty in self
@@ -928,7 +988,7 @@ impl<'a> Core<'a> {
             let f = self.write_eq(&mut module, rt, ty);
             eqs.insert(key, f);
         }
-        let types = TypeOps { eqs, boxed };
+        let types = TypeOps { eqs, boxed, given };
 
         let completes = (0..self.members.len())
             .map(|member| self.write_complete(&mut module, rt, &imports, &types, member))
@@ -1270,6 +1330,16 @@ impl<'a> Core<'a> {
                     }
                     BlockKind::Boxed(ty) => {
                         self.emit_free(b, rt, imports, ty, Place::At(block, payload));
+                    }
+                    BlockKind::Given(input) => {
+                        if let Some(drop) = imports.given_drops.get(input) {
+                            // Zero once it has moved to its reader.
+                            let handle = b.int();
+                            b.load32(Place::At(block, payload)).set(handle);
+                            b.get(handle).when(|b| {
+                                b.get(handle).call(*drop);
+                            });
+                        }
                     }
                 });
         }
@@ -2171,6 +2241,10 @@ impl<'a> Core<'a> {
             self.write_getter(module, &get_input(*input), held, ty)?;
             self.write_setter(module, rt, types, &set_input(*input), (held, ty), true)?;
         }
+        for (input, ty) in &self.stream_ty {
+            self.write_take(module, rt, *input, ty)?;
+            self.write_give(module, rt, types, *input)?;
+        }
         for (output, ty) in &self.output_ty {
             match self.ports.outputs()[*output].kind {
                 PortKind::Value => {
@@ -2257,6 +2331,77 @@ impl<'a> Core<'a> {
         self.export_port(module, name, f)
     }
 
+    /// `() -> option<stream<T>>`: the handle leaves the hub, and its slot.
+    fn write_take(
+        &self,
+        module: &mut ModuleBuilder<AddingFuncs>,
+        rt: Runtime,
+        input: InputIdx,
+        ty: &Type,
+    ) -> Result<(), HubError> {
+        let sig = Sig::i32s(0, 1);
+        let f: FuncIdx<Helper> = module.declare(&sig);
+        let (mut b, _) = Body::new(&sig);
+        let area = self.return_area;
+        let held = self.input_slot(input);
+        let payload = self.abi.payload_offset(Int::U8, &[None, Some(*ty)]);
+        let (block, value) = (b.int(), b.int());
+        b.load32(held).set(block);
+        b.load32(Place::Fixed(held).offset(Offset(4))).set(value);
+        b.store(
+            area,
+            |b| {
+                b.get(block).int_const(0).op(I::I32Ne);
+            },
+            I::I32Store8,
+        );
+        b.get(block).when(|b| {
+            b.copy(Place::Fixed(area).offset(payload), value, self.abi.size(ty));
+            // Whatever held it no longer does.
+            b.store32(value, |b| {
+                b.int_const(0);
+            });
+            b.addr(held).call(rt.slot_clear).op(I::Drop);
+        });
+        b.int_const(area.0);
+        module.define(f, b);
+        self.export_port(module, &take_stream(input), f)
+    }
+
+    /// `(value: stream<T>)`: the input holds it until its reader starts. A handle
+    /// it held already is dropped.
+    fn write_give(
+        &self,
+        module: &mut ModuleBuilder<AddingFuncs>,
+        rt: Runtime,
+        types: &TypeOps,
+        input: InputIdx,
+    ) -> Result<(), HubError> {
+        let sig = Sig::i32s(1, 0);
+        let f: FuncIdx<Helper> = module.declare(&sig);
+        let (mut b, params) = Body::new(&sig);
+        let held = self.input_slot(input);
+        let kind = types.given.get(&input).copied().unwrap_or(0);
+        let block = b.int();
+        b.int_const(kind)
+            .int_const(4)
+            .call(rt.alloc_block)
+            .set(block);
+        let value = b.int();
+        b.get(block)
+            .int_const(BLOCK_HEADER)
+            .op(I::I32Add)
+            .set(value);
+        b.store32(value, |b| {
+            b.get(params[0]);
+        });
+        b.addr(held).get(block).get(value).call(rt.slot_set);
+        // The slot holds it now; `alloc_block`'s reference is done.
+        b.get(block).call(rt.release);
+        module.define(f, b);
+        self.export_port(module, &give_stream(input), f)
+    }
+
     /// `(value: list<T>) -> bool`: the list holds the one value, in memory as
     /// the canonical ABI lays it out, whatever `T` flattens to. With `compare`,
     /// a value equal to the current one changes nothing.
@@ -2311,6 +2456,8 @@ impl<'a> Core<'a> {
 
 /// What compares and boxes each type, by its key.
 struct TypeOps {
+    /// What frees a stream or future given to each input, as a block kind.
+    given: HashMap<InputIdx, u32>,
     eqs: HashMap<String, FuncIdx<EqFn>>,
     boxed: HashMap<String, u32>,
 }

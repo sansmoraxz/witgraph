@@ -278,7 +278,6 @@ impl<P: DataPlane> SchedulerCore<P> {
             incarnation,
             commands: commands_rx,
             events: events_tx.clone(),
-            stream_items: mode.wants_stream_items(),
         });
         let mut owed = PortSet::new(ports.node_count());
         for at in 0..ports.node_count() {
@@ -590,11 +589,6 @@ impl SchedulerCore<dyn DataPlane> {
                 }
                 false
             }
-            ControlKind::StreamItems { node, port, count } => {
-                self.mode
-                    .on_stream_items(self.ports.node_id(node), &port, count);
-                true
-            }
         }
     }
 
@@ -756,7 +750,6 @@ impl SchedulerCore<dyn DataPlane> {
             incarnation: self.incarnation,
             commands: rx,
             events: self.events_tx.clone(),
-            stream_items: self.mode.wants_stream_items(),
         });
         self.state = Some(GraphState::Live(stopped.restart(tx, server)));
         self.owed_by_host.clear();
@@ -1222,7 +1215,6 @@ impl SchedulerCore<dyn DataPlane> {
             incarnation: self.incarnation,
             commands: rx,
             events: self.events_tx.clone(),
-            stream_items: self.mode.wants_stream_items(),
         });
         self.state = Some(GraphState::Live(stopped.restart(tx, server)));
         self.owed_by_host.clear();

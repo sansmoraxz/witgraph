@@ -54,6 +54,7 @@ fn compose(compiled: &CompiledGraph, guests: &[(&str, Guest)]) -> Vec<u8> {
             node,
             bytes,
             export: "node",
+            mocked: false,
         })
         .collect();
     hub::compose_graph(compiled, &members).unwrap().bytes

@@ -1,7 +1,7 @@
 //! `WebGraph`: a graph loaded on a JavaScript host.
 
 use std::cell::{Ref, RefCell, RefMut};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -13,36 +13,99 @@ use js_sys::{Array, ArrayBuffer, Function, Object, Promise, Reflect, Uint8Array}
 use sha2::{Digest, Sha256};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::{JsFuture, future_to_promise};
+use witgraph_ir::wasm_wave::value::Type;
 use witgraph_ir::{
-    CompiledGraph, ComponentContract, ComponentRef, Graph, NodeId, PortDirection, PortKind,
-    PortName, PortRef,
+    Capability, CompiledGraph, ComponentContract, ComponentRef, FeedbackIdx, Graph, Idx, IndexVec,
+    InputIdx, NodeId, OutputIdx, PortDirection, PortKind, PortName, PortTable,
 };
 use witgraph_sched::{
-    LatchReader, NodeFault, RunShape, RuntimeError, Scheduler, Snapshot, TickResult, TraceEvent,
+    DataPlane, NodeFault, PortVersions, RuntimeError, SchedulerCore, Snapshot, TickResult,
+    TraceEvent,
 };
 use witgraph_traits::{
-    FaultReport, NodeState, OutputReader, PortVersion, RunningGraph, SnapshotError,
+    FaultReport, NodeState, OutputReader, PortValues, PortVersion, RunningGraph, SnapshotError,
 };
 
-use crate::executor::{Callbacks, Js, OutputPort, Shared};
 use crate::link::{self, Composed};
 use crate::live::{Live, LiveMode, LiveState};
-use crate::value::{Data, WebValue, from_js, set};
-// The built-in interface, unversioned: as jco names the import.
-use witgraph_wit::lower::HOST_INTERFACE;
-
-type Sched = Scheduler<LiveMode, Js>;
+use crate::plane::{Callbacks, WebHub, WebPlane, stream_inputs};
+use crate::value::{Data, check_type, from_js, parse_wave, set, set_field, with_key};
+use witgraph_wit::hub::{self, HubMember};
 
 /// Reads a graph's latched outputs, as jco represents them, also while it
 /// ticks.
 #[derive(Clone)]
-pub(crate) struct WebReader(LatchReader<WebValue>);
+pub(crate) struct WebReader {
+    hub: Rc<WebHub>,
+    versions: PortVersions,
+}
 
 fn not_a_value_output(node: &NodeId, port: &PortName) -> RuntimeError {
     RuntimeError::NotAValuePort {
         node: node.clone(),
         port: port.clone(),
         direction: PortDirection::Output,
+    }
+}
+
+impl WebReader {
+    /// Checks that `node` exists and `port` is an output of it of a latched kind.
+    fn latched(
+        &self,
+        node: &NodeId,
+        port: &PortName,
+    ) -> Result<(OutputIdx, PortKind), RuntimeError> {
+        let ports = &self.hub.ports;
+        ports
+            .node(node)
+            .ok_or_else(|| RuntimeError::UnknownNode { node: node.clone() })?;
+        ports
+            .output(node, port)
+            .map(|output| (output, ports.outputs()[output].kind))
+            .filter(|(_, kind)| kind.is_latched())
+            .ok_or_else(|| not_a_value_output(node, port))
+    }
+
+    fn value(&self, node: &NodeId, port: &PortName) -> Result<Option<Rc<Data>>, RuntimeError> {
+        let (output, kind) = self.latched(node, port)?;
+        if kind != PortKind::Value {
+            return Err(not_a_value_output(node, port));
+        }
+        if !self.hub.live.get() {
+            return Ok(None);
+        }
+        self.hub
+            .get_output(output)
+            .map_err(|message| RuntimeError::ValueType {
+                node: node.clone(),
+                port: port.clone(),
+                message,
+            })
+    }
+
+    /// The latched value of a Value input port.
+    fn input(&self, node: &NodeId, port: &PortName) -> Result<Option<JsValue>, RuntimeError> {
+        let input =
+            self.hub
+                .ports
+                .input(node, port)
+                .ok_or_else(|| RuntimeError::NotAValuePort {
+                    node: node.clone(),
+                    port: port.clone(),
+                    direction: PortDirection::Input,
+                })?;
+        if !self.hub.live.get() || self.hub.input_types[input].is_none() {
+            return Ok(None);
+        }
+        let data = self
+            .hub
+            .get_input(input)
+            .map_err(|message| RuntimeError::ValueType {
+                node: node.clone(),
+                port: port.clone(),
+                message,
+            })?;
+        Ok(data.map(|data| data.js().clone()))
     }
 }
 
@@ -55,11 +118,7 @@ impl OutputReader for WebReader {
         node: &NodeId,
         port: &PortName,
     ) -> Result<Option<JsValue>, RuntimeError> {
-        match self.0.read_output(node, port)? {
-            Some(WebValue::Data(data)) => Ok(Some(data.js().clone())),
-            None if self.0.output_kind(node, port)? == PortKind::Value => Ok(None),
-            _ => Err(not_a_value_output(node, port)),
-        }
+        Ok(self.value(node, port)?.map(|data| data.js().clone()))
     }
 
     async fn read_output_wave(
@@ -67,19 +126,14 @@ impl OutputReader for WebReader {
         node: &NodeId,
         port: &PortName,
     ) -> Result<Option<String>, RuntimeError> {
-        match self.0.read_output(node, port)? {
-            Some(WebValue::Data(data)) => {
-                data.wave()
-                    .map(Some)
-                    .map_err(|message| RuntimeError::ValueType {
-                        node: node.clone(),
-                        port: port.clone(),
-                        message,
-                    })
-            }
-            None if self.0.output_kind(node, port)? == PortKind::Value => Ok(None),
-            _ => Err(not_a_value_output(node, port)),
-        }
+        self.value(node, port)?
+            .map(|data| data.wave())
+            .transpose()
+            .map_err(|message| RuntimeError::ValueType {
+                node: node.clone(),
+                port: port.clone(),
+                message,
+            })
     }
 
     async fn read_handle(
@@ -87,20 +141,141 @@ impl OutputReader for WebReader {
         node: &NodeId,
         port: &PortName,
     ) -> Result<Option<JsValue>, RuntimeError> {
-        match self.0.read_output(node, port)? {
-            Some(WebValue::Resource(resource)) => Ok(Some(resource.js().clone())),
-            None if self.0.output_kind(node, port)? == PortKind::Handle => Ok(None),
-            _ => Err(not_a_value_output(node, port)),
+        let (output, kind) = self.latched(node, port)?;
+        if kind != PortKind::Handle {
+            return Err(not_a_value_output(node, port));
         }
+        if !self.hub.live.get() {
+            return Ok(None);
+        }
+        self.hub
+            .read_handle(output)
+            .map_err(|message| RuntimeError::ValueType {
+                node: node.clone(),
+                port: port.clone(),
+                message,
+            })
     }
 
     fn output_version(&self, node: &NodeId, port: &PortName) -> Result<PortVersion, RuntimeError> {
-        self.0.output_version(node, port)
+        self.latched(node, port)
+            .map(|(output, _)| self.versions.get(output))
     }
 }
 
 /// The scheduler on this host, as [`RunningGraph`] has it.
-pub(crate) struct WebRuntime(Sched);
+pub(crate) struct WebRuntime {
+    core: SchedulerCore<WebPlane>,
+    hub: Rc<WebHub>,
+    reader: WebReader,
+}
+
+/// A failure of a port call, of `node.port`.
+fn port_error(node: &NodeId, port: &PortName, message: String) -> RuntimeError {
+    RuntimeError::ValueType {
+        node: node.clone(),
+        port: port.clone(),
+        message,
+    }
+}
+
+impl WebRuntime {
+    fn core(&mut self) -> &mut SchedulerCore<dyn DataPlane> {
+        &mut self.core
+    }
+
+    /// A Value input the host may write, and its type.
+    fn host_input(&self, node: &NodeId, port: &PortName) -> Result<(InputIdx, Type), RuntimeError> {
+        let ports = self.core.ports();
+        ports
+            .node(node)
+            .ok_or_else(|| RuntimeError::UnknownNode { node: node.clone() })?;
+        let not_a_port = || RuntimeError::NotAValuePort {
+            node: node.clone(),
+            port: port.clone(),
+            direction: PortDirection::Input,
+        };
+        let input = ports.input(node, port).ok_or_else(not_a_port)?;
+        let ty = self.hub.input_types[input].clone().ok_or_else(not_a_port)?;
+        if let Some(connection) = self.core.connected(input) {
+            return Err(RuntimeError::ConnectedInput {
+                node: node.clone(),
+                port: port.clone(),
+                connection: connection.clone(),
+            });
+        }
+        Ok((input, ty))
+    }
+
+    /// Writes `data` to `input`: the hub says whether that changed anything, and
+    /// a stopped graph has it written when it next starts.
+    fn write_input(
+        &mut self,
+        node: &NodeId,
+        port: &PortName,
+        input: InputIdx,
+        data: Rc<Data>,
+    ) -> Result<(), RuntimeError> {
+        self.core().drain();
+        let same = self.hub.retained.borrow()[input]
+            .as_ref()
+            .is_some_and(|old| old.equals(&data));
+        self.hub.retained.borrow_mut()[input] = Some(data.clone());
+        let changed = if self.hub.live.get() {
+            self.hub
+                .set_input(input, &data)
+                .map_err(|message| port_error(node, port, message))?
+        } else {
+            !same
+        };
+        if changed {
+            self.core().host_set(input);
+        }
+        Ok(())
+    }
+
+    /// The Value ports of `entries` as WAVE text, by node and port.
+    fn wave_values<I: witgraph_ir::Idx>(
+        entries: &IndexVec<I, witgraph_ir::PortEntry>,
+        get: impl Fn(I) -> Result<Option<Rc<Data>>, String>,
+    ) -> Result<PortValues, SnapshotError> {
+        let mut values: PortValues = BTreeMap::new();
+        for (index, entry) in entries.iter_enumerated() {
+            if entry.kind != PortKind::Value {
+                continue;
+            }
+            let at = || format!("`{}.{}`", entry.port.node, entry.port.port);
+            let text = get(index)
+                .and_then(|data| data.map(|data| data.wave()).transpose())
+                .map_err(|message| SnapshotError { at: at(), message })?;
+            if let Some(text) = text {
+                values
+                    .entry(entry.port.node.clone())
+                    .or_default()
+                    .insert(entry.port.port.clone(), text);
+            }
+        }
+        Ok(values)
+    }
+
+    /// `text` as a value of the type at `ty`.
+    fn parse_snapshot_value(
+        node: &NodeId,
+        port: &PortName,
+        ty: Option<&Type>,
+        direction: PortDirection,
+        text: &str,
+    ) -> Result<Rc<Data>, RuntimeError> {
+        let invalid = |message: String| RuntimeError::SnapshotValue {
+            node: node.clone(),
+            port: port.clone(),
+            message,
+        };
+        let ty = ty.ok_or_else(|| invalid(format!("not a Value {direction} port")))?;
+        let value = parse_wave(ty, text).map_err(invalid)?;
+        Ok(Rc::new(Data::from_value(value, ty.clone())))
+    }
+}
 
 impl RunningGraph for WebRuntime {
     type Value = JsValue;
@@ -108,7 +283,7 @@ impl RunningGraph for WebRuntime {
     type Reader = WebReader;
 
     fn reader(&self) -> WebReader {
-        WebReader(self.0.reader())
+        self.reader.clone()
     }
 
     async fn inject(
@@ -117,19 +292,11 @@ impl RunningGraph for WebRuntime {
         port: &PortName,
         value: JsValue,
     ) -> Result<(), RuntimeError> {
-        // Checked as `inject` checks it: a connected input is refused before
-        // its value is looked at.
-        let ty = self.0.host_input_type(node, port).cloned()?;
-        let value = from_js(&value, &ty).map_err(|message| RuntimeError::ValueType {
-            node: node.clone(),
-            port: port.clone(),
-            message,
-        })?;
-        self.0.inject(
-            node,
-            port,
-            WebValue::Data(Rc::new(Data::from_value(value, ty))),
-        )
+        // A connected input is refused before its value is looked at.
+        let (input, ty) = self.host_input(node, port)?;
+        let value = from_js(&value, &ty).map_err(|m| port_error(node, port, m))?;
+        check_type(&value, &ty).map_err(|m| port_error(node, port, m))?;
+        self.write_input(node, port, input, Rc::new(Data::from_value(value, ty)))
     }
 
     async fn inject_wave(
@@ -138,11 +305,26 @@ impl RunningGraph for WebRuntime {
         port: &PortName,
         text: &str,
     ) -> Result<(), RuntimeError> {
-        self.0.inject_wave(node, port, text)
+        let (input, ty) = self.host_input(node, port)?;
+        let value = parse_wave(&ty, text).map_err(|m| port_error(node, port, m))?;
+        self.write_input(node, port, input, Rc::new(Data::from_value(value, ty)))
     }
 
     async fn clear_input(&mut self, node: &NodeId, port: &PortName) -> Result<(), RuntimeError> {
-        self.0.clear_input(node, port)
+        self.core().drain();
+        let (input, _) = self.host_input(node, port)?;
+        let held = self.hub.retained.borrow_mut()[input].take().is_some();
+        let cleared = if self.hub.live.get() {
+            self.hub
+                .clear_input(input)
+                .map_err(|m| port_error(node, port, m))?
+        } else {
+            held
+        };
+        if cleared {
+            self.core().host_cleared(input);
+        }
+        Ok(())
     }
 
     async fn read_output(
@@ -150,7 +332,7 @@ impl RunningGraph for WebRuntime {
         node: &NodeId,
         port: &PortName,
     ) -> Result<Option<JsValue>, RuntimeError> {
-        self.reader().read_output(node, port).await
+        self.reader.read_output(node, port).await
     }
 
     async fn read_output_wave(
@@ -158,7 +340,7 @@ impl RunningGraph for WebRuntime {
         node: &NodeId,
         port: &PortName,
     ) -> Result<Option<String>, RuntimeError> {
-        self.reader().read_output_wave(node, port).await
+        self.reader.read_output_wave(node, port).await
     }
 
     async fn read_handle(
@@ -166,47 +348,153 @@ impl RunningGraph for WebRuntime {
         node: &NodeId,
         port: &PortName,
     ) -> Result<Option<JsValue>, RuntimeError> {
-        self.reader().read_handle(node, port).await
+        self.reader.read_handle(node, port).await
     }
 
     fn output_version(&self, node: &NodeId, port: &PortName) -> Result<PortVersion, RuntimeError> {
-        self.0.output_version(node, port)
+        self.reader.output_version(node, port)
     }
 
     fn rerun(&mut self, node: &NodeId) -> Result<(), RuntimeError> {
-        self.0.rerun(node)
+        self.core().rerun(node)
     }
 
     fn node_state(&self, node: &NodeId) -> Result<NodeState, RuntimeError> {
-        self.0.node_state(node)
+        let core: &SchedulerCore<dyn DataPlane> = &self.core;
+        core.node_state(node)
     }
 
     fn take_faults(&mut self) -> Vec<FaultReport> {
-        self.0.take_faults()
+        self.core().take_faults()
     }
 
     fn shutdown(&mut self) {
-        self.0.shutdown();
+        self.core().shutdown();
     }
 
     async fn tick(&mut self) -> TickResult {
-        self.0.tick().await
+        self.core().tick().await
     }
 
     async fn tick_until(&mut self, stop: impl Future<Output = ()>) -> TickResult {
-        self.0.tick_until(stop).await
+        self.core().tick_until(stop).await
     }
 
     async fn snapshot(&mut self) -> Result<Snapshot, SnapshotError> {
-        self.0.snapshot()
+        self.core().drain();
+        let core: &SchedulerCore<dyn DataPlane> = &self.core;
+        let mut snapshot = core.snapshot_base();
+        let ports = self.core.ports().clone();
+        if !self.hub.live.get() {
+            let retained = self.hub.retained.borrow();
+            snapshot.inputs =
+                Self::wave_values(ports.inputs(), |input| Ok(retained[input].clone()))?;
+            return Ok(snapshot);
+        }
+        let hub = &self.hub;
+        snapshot.inputs = Self::wave_values(ports.inputs(), |input| hub.get_input(input))?;
+        snapshot.outputs = Self::wave_values(ports.outputs(), |output| hub.get_output(output))?;
+        for (connection, entry) in ports.feedback().iter_enumerated() {
+            if ports.outputs()[entry.from].kind != PortKind::Value {
+                continue;
+            }
+            let id = &entry.id;
+            let at = || format!("feedback `{id}`");
+            let text = hub
+                .get_feedback(connection)
+                .and_then(|data| data.map(|data| data.wave()).transpose())
+                .map_err(|message| SnapshotError { at: at(), message })?;
+            if let Some(text) = text {
+                snapshot.feedback.insert(id.clone(), text);
+            }
+        }
+        Ok(snapshot)
     }
 
     async fn restore(&mut self, snapshot: &Snapshot) -> Result<(), RuntimeError> {
-        self.0.restore(snapshot)
+        self.core().check_snapshot(snapshot)?;
+        let ports = self.core.ports().clone();
+        let mut inputs: Vec<(InputIdx, Rc<Data>)> = Vec::new();
+        for (node, values) in &snapshot.inputs {
+            for (port, text) in values {
+                let index = ports.input(node, port);
+                let ty = index.and_then(|input| self.hub.input_types[input].as_ref());
+                let val = Self::parse_snapshot_value(node, port, ty, PortDirection::Input, text)?;
+                if let Some(index) = index {
+                    inputs.push((index, val));
+                }
+            }
+        }
+        let mut outputs: Vec<(OutputIdx, Rc<Data>)> = Vec::new();
+        for (node, values) in &snapshot.outputs {
+            for (port, text) in values {
+                let index = ports.output(node, port);
+                let ty = index.and_then(|output| self.hub.output_types[output].as_ref());
+                let val = Self::parse_snapshot_value(node, port, ty, PortDirection::Output, text)?;
+                if let Some(index) = index {
+                    outputs.push((index, val));
+                }
+            }
+        }
+        let mut feedback: Vec<(FeedbackIdx, Rc<Data>)> = Vec::new();
+        for (connection, text) in &snapshot.feedback {
+            let index =
+                ports
+                    .feedback_index(connection)
+                    .ok_or_else(|| RuntimeError::SnapshotMismatch {
+                        message: format!(
+                            "`{connection}` is not a feedback connection of this graph"
+                        ),
+                    })?;
+            let from = ports.feedback()[index].from;
+            let source = &ports.outputs()[from].port;
+            let val = Self::parse_snapshot_value(
+                &source.node,
+                &source.port,
+                self.hub.output_types[from].as_ref(),
+                PortDirection::Output,
+                text,
+            )?;
+            feedback.push((index, val));
+        }
+
+        // Nothing fails from here on, but building the instance.
+        {
+            let mut retained = self.hub.retained.borrow_mut();
+            *retained = IndexVec::from_fn(ports.inputs().len(), |_| None);
+            for (input, val) in &inputs {
+                if self.core.connected(*input).is_none() {
+                    retained[*input] = Some(val.clone());
+                }
+            }
+        }
+        self.core().restart_for_restore();
+        let presence: Vec<InputIdx> = inputs.iter().map(|(input, _)| *input).collect();
+        let pending: Vec<FeedbackIdx> = feedback.iter().map(|(conn, _)| *conn).collect();
+        // An instance that cannot be built is a fault for the next tick to report.
+        if self.hub.built().await.is_ok() {
+            let wrote = || -> Result<(), String> {
+                for (input, val) in &inputs {
+                    if self.core.connected(*input).is_some() {
+                        self.hub.set_input(*input, val)?;
+                    }
+                }
+                for (output, val) in &outputs {
+                    self.hub.set_output(*output, val)?;
+                }
+                for (connection, val) in &feedback {
+                    self.hub.set_feedback(*connection, val)?;
+                }
+                Ok(())
+            };
+            wrote().map_err(|message| RuntimeError::SnapshotMismatch { message })?;
+        }
+        self.core().apply_restore(&presence, &pending, snapshot);
+        Ok(())
     }
 
     fn compiled(&self) -> &CompiledGraph {
-        self.0.compiled()
+        self.core.compiled()
     }
 }
 
@@ -283,6 +571,8 @@ fn json(value: &impl serde::Serialize) -> Result<JsValue, JsError> {
 #[derive(Clone)]
 struct Lowered {
     contract: ComponentContract,
+    /// The name it exports its `node` interface under.
+    export: String,
     warnings: Vec<String>,
 }
 
@@ -342,6 +632,7 @@ fn lower(id: &str, bytes: &[u8], wit: Option<&str>) -> Result<Lowered, JsError> 
             }
             Ok(Lowered {
                 contract,
+                export: found.export,
                 warnings: found.warnings,
             })
         }
@@ -360,6 +651,7 @@ fn lower(id: &str, bytes: &[u8], wit: Option<&str>) -> Result<Lowered, JsError> 
             }
             Ok(Lowered {
                 contract,
+                export: lowered.export,
                 warnings: lowered.warnings,
             })
         }
@@ -403,6 +695,13 @@ pub fn js_name(name: &str) -> String {
     crate::value::camel(name)
 }
 
+/// The composed component.
+struct Composite {
+    bytes: Vec<u8>,
+    /// Its SHA-256, in hex.
+    sha256: String,
+}
+
 /// A compiled graph running on this JavaScript host.
 #[wasm_bindgen]
 pub struct WebGraph {
@@ -412,15 +711,15 @@ pub struct WebGraph {
     reader: WebReader,
     /// What the read methods report while a tick has `sched`.
     live: Arc<Live>,
-    /// Per node, the index of the `components` entry it runs.
-    components: HashMap<NodeId, u32>,
-    /// Per `components` entry, the SHA-256 of its bytes, in hex.
-    digests: Vec<String>,
-    /// The nodes' components with their links composed in.
-    composed: Vec<Composed>,
-    /// Per node with links that apply, the index in `composed` of what it
-    /// runs.
-    composed_of: HashMap<NodeId, usize>,
+    /// The graph as one component.
+    composite: Composite,
+    /// What the composite imports, as the host is asked for it.
+    capabilities: Vec<Capability>,
+    /// The nodes the composite leaves for the host to implement.
+    mocked: Vec<NodeId>,
+    /// Per node, the stream and future inputs its outputs feed: where the loader
+    /// takes each one and gives it back.
+    stream_edges: HashMap<NodeId, Vec<(String, PortKind, InputIdx)>>,
     /// What was wrong with the components but did not stop the load.
     warnings: Vec<String>,
     /// Dropped with the graph, which completes `freed`.
@@ -447,34 +746,47 @@ impl WebGraph {
     ///   uses count). Which entry each node runs is `component(node)`.
     ///   Contracts are kept for later loads, by the SHA-256 of the bytes
     ///   and of `wit`.
-    /// - `callbacks` is `{ run, rebuild, close?, abandon? }`:
-    ///   `run(node, inputs)` calls the node's `run` (as jco transpiles it)
-    ///   and returns its outputs or a promise of them; `rebuild(node)`
-    ///   gives the node fresh guest state (a new instance), throwing or
-    ///   rejecting if it cannot (with an error marked `witgraphFatal` when
-    ///   a start function called `fatal`); `close(value)` drops a stream
-    ///   or future nothing reads; `abandon(nodes)` says the instance of
-    ///   those nodes ended before their `rebuild` or `run` calls did (a
-    ///   cancel, shutdown or restore, or a sibling's failed `run`), so
-    ///   whatever those calls still do belongs to nothing.
+    /// - `callbacks` is `{ run, rebuild, instance, readHandle, abandon? }`:
+    ///   `run(number)` calls the hub's `run` of the node with that number in
+    ///   `nodes()` and returns what it returned, or a promise of it;
+    ///   `rebuild()` makes a new instance of the composite, throwing or rejecting
+    ///   if it cannot (with an error marked `witgraphFatal` when a start function
+    ///   called `fatal`); `instance()` returns the live instance's exports,
+    ///   `{ control, ports }`; `readHandle(output)` has the hub lend it a handle
+    ///   output and returns the object; `abandon()` says the instance stopped, so
+    ///   whatever it holds and still does belongs to nothing.
+    /// - `mocked` names the nodes left out of the composite, which imports each
+    ///   as `m<number>` for the host to implement.
     ///
     /// A graph that does not compile throws with every diagnostic.
-    pub fn load(graph: &str, components: Array, callbacks: JsValue) -> Result<WebGraph, JsError> {
+    pub fn load(
+        graph: &str,
+        components: Array,
+        callbacks: JsValue,
+        mocked: Vec<String>,
+    ) -> Result<WebGraph, JsError> {
         let graph: Graph = serde_json::from_str(graph).map_err(error)?;
+        let required = |name: &str, key: &str| -> Result<Function, JsError> {
+            function(&callbacks, key)?
+                .ok_or_else(|| error(format!("`callbacks.{name}` is required")))
+        };
         let callbacks = Callbacks {
-            run: function(&callbacks, "run")?
-                .ok_or_else(|| error("`callbacks.run` is required"))?,
-            rebuild: function(&callbacks, "rebuild")?
-                .ok_or_else(|| error("`callbacks.rebuild` is required"))?,
-            close: function(&callbacks, "close")?,
+            run: required("run", "run")?,
+            rebuild: required("rebuild", "rebuild")?,
+            instance: required("instance", "instance")?,
+            read_handle: required("readHandle", "readHandle")?,
             abandon: function(&callbacks, "abandon")?,
         };
+        let mocked: Vec<NodeId> = mocked
+            .iter()
+            .map(|node| NodeId::from(node.as_str()))
+            .collect();
         let mut contracts = Vec::new();
         let mut warnings = Vec::new();
         // Per contract, the `components` entry it came from.
         let mut contract_entry = Vec::new();
+        let mut exports = Vec::new();
         let mut entries: Vec<(ComponentRef, Vec<u8>)> = Vec::new();
-        let mut digests = Vec::new();
         for (index, entry) in components.iter().enumerate() {
             let id = Reflect::get(&entry, &text("id"))
                 .ok()
@@ -507,9 +819,9 @@ impl WebGraph {
                         .map(|w| format!("component `{id}`: {w}")),
                 );
                 contracts.push(lowered.contract);
+                exports.push(lowered.export);
                 contract_entry.push(index);
             }
-            digests.push(hex(&digest));
             entries.push((component, bytes));
         }
         let compiled = graph.compile(&contracts).map_err(|failure| {
@@ -529,89 +841,85 @@ impl WebGraph {
             first_of.entry(&contract.id).or_insert(index);
         }
         let mut node_components = HashMap::new();
+        let mut node_exports = HashMap::new();
         for node in compiled.nodes() {
-            let index = first_of
+            let contract_at = first_of
                 .get(&node.contract.id)
-                .and_then(|&index| u32::try_from(contract_entry[index]).ok())
+                .copied()
                 .ok_or_else(|| error(format!("node `{}` has no component", node.node.id)))?;
+            let index = u32::try_from(contract_entry[contract_at]).map_err(error)?;
             node_components.insert(node.node.id.clone(), index);
+            node_exports.insert(node.node.id.clone(), exports[contract_at].as_str());
         }
         let linked = link::compose_links(&compiled, &entries, &node_components)?;
 
-        let mut shared = Shared {
-            callbacks,
-            input_types: HashMap::new(),
-            output_types: HashMap::new(),
-            outputs: HashMap::new(),
-            nodes: Vec::new(),
-        };
-        let mut shapes = HashMap::new();
-        for node in compiled.topological_order() {
-            shared.nodes.push(node.clone());
-            let contract = compiled
-                .contract_for(node)
-                .ok_or_else(|| error(format!("unknown node `{node}`")))?;
-            for port in &contract.inputs {
-                if let (PortKind::Value, Some(ty)) = (port.kind, &port.ty) {
-                    let port = PortRef::new(node.clone(), port.name.clone());
-                    shared.input_types.insert(port, ty.clone());
-                }
+        // jco lowers a resource a future carries into the hub's table, not its
+        // reader's, and traps; moved directly, the reader never wakes.
+        for resolved in compiled.connections() {
+            if resolved.from.kind == PortKind::Future && resolved.from.handle.is_some() {
+                let port = &resolved.connection.from;
+                return Err(error(format!(
+                    "`{}.{}`: a future of a resource cannot pass between nodes on a JavaScript \
+                     host yet; use a stream",
+                    port.node, port.port
+                )));
             }
-            let mut outputs = Vec::new();
-            for port in &contract.outputs {
-                if let (PortKind::Value, Some(ty)) = (port.kind, &port.ty) {
-                    let port = PortRef::new(node.clone(), port.name.clone());
-                    shared.output_types.insert(port, ty.clone());
-                }
-                outputs.push(OutputPort {
-                    name: port.name.to_string(),
-                    kind: port.kind,
-                    ty: port.ty.clone(),
-                });
-            }
-            shared.outputs.insert(node.clone(), outputs);
-            shapes.insert(
-                node.clone(),
-                RunShape {
-                    inputs: (!contract.inputs.is_empty())
-                        .then(|| contract.inputs.iter().map(|p| p.name.to_string()).collect()),
-                    has_result: !contract.outputs.is_empty(),
-                },
-            );
         }
-        let shared = Rc::new(shared);
-        let executor = Js {
-            shared: shared.clone(),
-        };
+        let (composite, capabilities) = compose(
+            &compiled,
+            &entries,
+            &node_components,
+            &node_exports,
+            &linked.composed,
+            &linked.of_node,
+            &mocked,
+        )?;
+
+        let ports = Rc::new(PortTable::new(&compiled));
+        let input_types = IndexVec::from_fn(ports.inputs().len(), |input: InputIdx| {
+            value_type(&compiled, &ports.inputs()[input], PortDirection::Input)
+        });
+        let output_types = IndexVec::from_fn(ports.outputs().len(), |output: OutputIdx| {
+            value_type(&compiled, &ports.outputs()[output], PortDirection::Output)
+        });
+        let stream_edges = stream_inputs(&ports, &compiled);
+        let hub = WebHub::new(callbacks, ports, input_types, output_types);
         let live = Live::new(TRACE_LIMIT);
-        let mode = LiveMode(live.clone());
-        let sched = Scheduler::new(
+        let mode = Arc::new(LiveMode(live.clone()));
+        let plane_hub = hub.clone();
+        let core = SchedulerCore::new(
             compiled,
             mode,
-            executor,
-            &shapes,
             witgraph_sched::DEFAULT_MAX_STEPS_PER_TICK,
+            |_, _| WebPlane(plane_hub),
         )
         .map_err(error)?;
-        let sched = WebRuntime(sched);
+        let reader = WebReader {
+            hub: hub.clone(),
+            versions: core.versions().clone(),
+        };
+        let sched = WebRuntime {
+            core,
+            hub,
+            reader: reader.clone(),
+        };
         refresh(&sched, &live);
-        let reader = sched.reader();
         let (alive, freed) = oneshot::channel();
         Ok(Self {
             sched: Rc::new(RefCell::new(Some(sched))),
             reader,
             live,
-            components: node_components,
-            digests,
-            composed: linked.composed,
-            composed_of: linked.of_node,
+            composite,
+            capabilities,
+            mocked,
+            stream_edges,
             warnings,
             _alive: alive,
             freed: freed.shared(),
         })
     }
 
-    /// Runs one iteration of the graph (see `Scheduler::tick`). Resolves to
+    /// Runs one iteration of the graph (see `SchedulerCore::tick`). Resolves to
     /// `{ result }`, one of `progress`, `idle`, `interrupted`,
     /// `step-limit`, or `aborted` with `node` and `message`. When `stop` (a
     /// promise) settles first, the tick ends early with `interrupted`, as
@@ -685,61 +993,54 @@ impl WebGraph {
         Ref::filter_map(self.sched.try_borrow().ok()?, Option::as_ref).ok()
     }
 
-    /// The `components` entry node `node` runs: `{ index, sha256, bytes? }`,
-    /// its position in the array `load` was given and the SHA-256 of its
-    /// bytes (hex). A node whose links apply runs those bytes with its
-    /// providers composed in: `bytes` are the composed component and
-    /// `sha256` theirs, and `index` is still the node's own entry.
-    pub fn component(&self, node: &str) -> Result<JsValue, JsError> {
-        let index = *self
-            .components
-            .get(&NodeId::from(node))
-            .ok_or_else(|| error(format!("unknown node `{node}`")))?;
-        let digest = self
-            .digests
-            .get(index as usize)
-            .ok_or_else(|| error(format!("unknown node `{node}`")))?;
+    /// The graph as one component: `{ bytes, sha256 }`.
+    pub fn composite(&self) -> JsValue {
         let object = Object::new();
-        set(&object, "index", &JsValue::from(index));
-        match self.composed_of.get(&NodeId::from(node)) {
-            Some(&at) => {
-                let composed = &self.composed[at];
-                set(&object, "sha256", &text(&composed.sha256));
-                set(
-                    &object,
-                    "bytes",
-                    &Uint8Array::from(composed.bytes.as_slice()),
-                );
-            }
-            None => set(&object, "sha256", &text(digest)),
-        }
-        Ok(object.into())
+        set(&object, "sha256", &text(&self.composite.sha256));
+        set(
+            &object,
+            "bytes",
+            &Uint8Array::from(self.composite.bytes.as_slice()),
+        );
+        object.into()
     }
 
-    /// What each of a node's imports is, by the name `jco transpile` lists
-    /// it under (an interface id without its version, or a label): the
-    /// capability of the node's contract it is, `{ interface, implements?,
-    /// items? }` as a wasmtime host is asked for it (`interface` the full
-    /// id, version included, or the label, with `implements` the interface
-    /// the label stands for), or `null` for the built-in
-    /// `witgraph:runtime/host`. An import that is neither throws.
-    pub fn imports(&self, node: &str, names: Vec<String>) -> Result<Array, JsError> {
+    /// What each of the composite's imports is, by the name `jco transpile` lists
+    /// it under: `{ kind: 'host', node }` for a node's `witgraph:runtime/host`;
+    /// `{ kind: 'lend' }` for what lends the host a handle; `{ kind: 'mock', node }`
+    /// for a mocked node's `node` interface; or `{ kind: 'capability', capability }`,
+    /// `{ interface, implements?, items? }` as a wasmtime host is asked for it
+    /// (`interface` the full id, version included, or the label, with `implements`
+    /// the interface the label stands for). An import that is none of them throws.
+    pub fn imports(&self, names: Vec<String>) -> Result<Array, JsError> {
         let sched = self.idle()?;
-        let contract = sched
-            .compiled()
-            .contract_for(&node.into())
-            .ok_or_else(|| error(format!("unknown node `{node}`")))?;
-        // A composed node imports what its providers do as well, and not
-        // what they satisfy.
-        let capabilities = match self.composed_of.get(&NodeId::from(node)) {
-            Some(&at) => &self.composed[at].capabilities,
-            None => &contract.capabilities,
-        };
+        let order = sched.compiled().topological_order();
         names
             .iter()
-            .map(|name| {
-                let named = |by: fn(&str) -> &str| -> Vec<_> {
-                    capabilities
+            .map(|name| -> Result<JsValue, JsError> {
+                let object = Object::new();
+                let number = |prefix: &str, suffix: &str| {
+                    name.strip_prefix(prefix)
+                        .and_then(|rest| rest.strip_suffix(suffix))
+                        .and_then(|at| at.parse::<usize>().ok())
+                        .and_then(|at| order.get(at))
+                };
+                if let Some(node) = number("node-", "-host") {
+                    set(&object, "kind", &text("host"));
+                    set(&object, "node", &text(node.as_str()));
+                    return Ok(object.into());
+                }
+                if let Some(node) = number("m", "") {
+                    set(&object, "kind", &text("mock"));
+                    set(&object, "node", &text(node.as_str()));
+                    return Ok(object.into());
+                }
+                if unversioned(name) == unversioned(hub::LEND_INTERFACE) {
+                    set(&object, "kind", &text("lend"));
+                    return Ok(object.into());
+                }
+                let named = |by: fn(&str) -> &str| -> Vec<&Capability> {
+                    self.capabilities
                         .iter()
                         .filter(|c| by(c.link_name()) == name)
                         .collect()
@@ -749,13 +1050,16 @@ impl WebGraph {
                     found = named(unversioned);
                 }
                 match found.as_slice() {
-                    [capability] => json(capability),
-                    [] if unversioned(name) == HOST_INTERFACE => Ok(JsValue::NULL),
+                    [capability] => {
+                        set(&object, "kind", &text("capability"));
+                        set(&object, "capability", &json(capability)?);
+                        Ok(object.into())
+                    }
                     [] => Err(error(format!(
-                        "node `{node}` imports `{name}`, which its contract does not list"
+                        "the graph imports `{name}`, which no node's contract lists"
                     ))),
                     many => Err(error(format!(
-                        "node `{node}` imports `{name}`, which several capabilities match: {}",
+                        "the graph imports `{name}`, which several capabilities match: {}",
                         many.iter()
                             .map(|c| format!("`{}`", c.interface))
                             .collect::<Vec<_>>()
@@ -764,6 +1068,73 @@ impl WebGraph {
                 }
             })
             .collect()
+    }
+
+    /// The stream and future inputs a node's outputs feed: an array of
+    /// `{ port, kind, input }`, the output port, its kind, and the input's number
+    /// for `take-stream` and `give-stream`.
+    #[wasm_bindgen(js_name = streamEdges)]
+    pub fn stream_edges(&self, node: &str) -> Array {
+        self.stream_edges
+            .get(&NodeId::from(node))
+            .into_iter()
+            .flatten()
+            .map(|(port, kind, input)| {
+                let object = Object::new();
+                set(&object, "port", &text(port));
+                set(
+                    &object,
+                    "kind",
+                    &text(if *kind == PortKind::Future {
+                        "future"
+                    } else {
+                        "stream"
+                    }),
+                );
+                set(&object, "input", &JsValue::from(input.position() as u32));
+                JsValue::from(object)
+            })
+            .collect()
+    }
+
+    /// Reports a trap of the live instance that no call may report: one in a task
+    /// a guest spawned, say. It faults the graph, as a `run` rejecting does.
+    #[wasm_bindgen(js_name = reportTrap)]
+    pub fn report_trap(&self, error: JsValue) {
+        self.reader.hub.report_trap(error);
+    }
+
+    /// What a mock returned for `node`, each Value output in the form jco lowers:
+    /// a mock may write one as WAVE text, or as anything `inject` takes. Stream,
+    /// future and handle outputs are left as they are. A value that is no value
+    /// of its port throws, naming it.
+    #[wasm_bindgen(js_name = mockOutputs)]
+    pub fn mock_outputs(&self, node: &str, outputs: JsValue) -> Result<JsValue, JsError> {
+        let id = NodeId::from(node);
+        let hub = &self.reader.hub;
+        let result = Object::new();
+        for (output, entry) in hub.ports.outputs().iter_enumerated() {
+            if entry.port.node != id {
+                continue;
+            }
+            let name = entry.port.port.as_str();
+            let js =
+                with_key(name, |key| Reflect::get(&outputs, key)).unwrap_or(JsValue::UNDEFINED);
+            let js = match &hub.output_types[output] {
+                Some(ty) => Data::from_output(js, ty.clone())
+                    .map_err(|e| error(format!("`{node}` returned a bad `{name}`: {e}")))?
+                    .js()
+                    .clone(),
+                None => js,
+            };
+            set_field(&result, name, &js);
+        }
+        Ok(result.into())
+    }
+
+    /// The nodes left for the host to implement.
+    pub fn mocked(&self) -> Array {
+        self.mocked.iter().map(|node| text(node.as_str())).collect()
     }
 
     /// Runs `work` on the scheduler, unless a tick has it. As a JavaScript
@@ -862,9 +1233,22 @@ impl WebGraph {
         })
     }
 
+    /// The latched value of a Value input port, in jco's JavaScript
+    /// representation; `undefined` while it has none. It works while a tick runs
+    /// too: what a breakpoint shows.
+    #[wasm_bindgen(js_name = readInput)]
+    pub fn read_input(&self, node: &str, port: &str) -> Promise {
+        let reader = self.reader.clone();
+        let (node, port) = (NodeId::from(node), PortName::from(port));
+        settled(async move {
+            let value = reader.input(&node, &port).map_err(error)?;
+            Ok(value.unwrap_or(JsValue::UNDEFINED))
+        })
+    }
+
     /// The latched object of a handle output port, as its maker returned it;
     /// `undefined` before the node has run. It works while a tick runs too.
-    /// It is disposed once no latch holds it.
+    /// It is disposed once nothing in the graph holds it.
     #[wasm_bindgen(js_name = readHandle)]
     pub fn read_handle(&self, node: &str, port: &str) -> Promise {
         let (reader, on_error) = (self.reader.clone(), output_error(node, port));
@@ -952,9 +1336,8 @@ impl WebGraph {
         })
     }
 
-    /// Replaces the graph's host-visible state with a snapshot, given as
-    /// JSON. Every node gets fresh guest state (`rebuild`) when it next
-    /// runs.
+    /// Replaces the graph's host-visible state with a snapshot, given as JSON, on
+    /// a new instance (`rebuild`).
     pub fn restore(&self, snapshot: String) -> Promise {
         let live = self.live.clone();
         self.on_idle(async move |sched| {
@@ -1012,6 +1395,80 @@ impl WebGraph {
             .map(|node| text(node.as_str()))
             .collect())
     }
+}
+
+/// The type of a Value port, as its contract has it.
+fn value_type(
+    compiled: &CompiledGraph,
+    entry: &witgraph_ir::PortEntry,
+    direction: PortDirection,
+) -> Option<Type> {
+    let contract = compiled.contract_for(&entry.port.node)?;
+    let ports = match direction {
+        PortDirection::Input => &contract.inputs,
+        PortDirection::Output => &contract.outputs,
+    };
+    ports
+        .iter()
+        .find(|p| p.name == entry.port.port && p.kind == PortKind::Value)
+        .and_then(|p| p.ty.clone())
+}
+
+/// Makes `compiled` one component: its hub, and each node with its links composed
+/// in, but for the `mocked`. Returns it with what it imports.
+fn compose(
+    compiled: &CompiledGraph,
+    entries: &[(ComponentRef, Vec<u8>)],
+    of_node: &HashMap<NodeId, u32>,
+    exports: &HashMap<NodeId, &str>,
+    composed: &[Composed],
+    composed_of: &HashMap<NodeId, usize>,
+    mocked: &[NodeId],
+) -> Result<(Composite, Vec<Capability>), JsError> {
+    let mut capabilities: Vec<Capability> = Vec::new();
+    let mut members = Vec::with_capacity(compiled.graph().nodes.len());
+    for node in &compiled.graph().nodes {
+        let unknown = || error(format!("unknown node `{}`", node.id));
+        let contract = compiled.contract_for(&node.id).ok_or_else(unknown)?;
+        let is_mocked = mocked.contains(&node.id);
+        let linked = composed_of.get(&node.id).map(|at| &composed[*at]);
+        let (bytes, export, imports): (&[u8], &str, &[Capability]) = match linked {
+            Some(linked) => (&linked.bytes, &linked.export, &linked.capabilities),
+            None => {
+                let (_, bytes) = of_node
+                    .get(&node.id)
+                    .and_then(|index| entries.get(*index as usize))
+                    .ok_or_else(unknown)?;
+                let export = exports.get(&node.id).ok_or_else(unknown)?;
+                (bytes, export, &contract.capabilities)
+            }
+        };
+        if !is_mocked {
+            for capability in imports {
+                if !capabilities
+                    .iter()
+                    .any(|c| c.link_name() == capability.link_name())
+                {
+                    capabilities.push(capability.clone());
+                }
+            }
+        }
+        members.push(HubMember {
+            node: &node.id,
+            bytes,
+            export,
+            mocked: is_mocked,
+        });
+    }
+    let composed = hub::compose_graph(compiled, &members).map_err(error)?;
+    let digest: [u8; 32] = Sha256::digest(&composed.bytes).into();
+    Ok((
+        Composite {
+            bytes: composed.bytes,
+            sha256: hex(&digest),
+        },
+        capabilities,
+    ))
 }
 
 /// A promise for `work`, which runs at once up to its first wait, as a
@@ -1130,16 +1587,6 @@ fn trace_event(event: &TraceEvent) -> JsValue {
         TraceEvent::Restarted { node: id } => {
             named("restarted");
             node(id);
-        }
-        TraceEvent::StreamItems {
-            node: id,
-            port,
-            count,
-        } => {
-            named("stream-items");
-            node(id);
-            set(&object, "port", &text(port.as_str()));
-            set(&object, "count", &JsValue::from(*count as u32));
         }
     }
     object.into()

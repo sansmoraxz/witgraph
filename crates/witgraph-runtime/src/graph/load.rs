@@ -231,6 +231,7 @@ impl PreparedGraph {
                 node,
                 bytes: &checked[at].bytes,
                 export: &checked[at].export,
+                mocked: false,
             })
             .collect();
         let composed =

@@ -54,7 +54,7 @@ export async function edgesOnBoth(frames: number): Promise<number> {
       connections: [...wires('cpu'), ...wires('gpu')],
     },
     components,
-    capabilities: (_node: string, capability: Capability) => {
+    capabilities: (capability: Capability) => {
       if (capability.interface.startsWith('wasi:clocks/monotonic-clock')) return monotonicClock;
       if (capability.interface.startsWith('test:accel/cnn')) return cpu();
       if (capability.interface.startsWith('wasi:webgpu/webgpu')) return webgpu;

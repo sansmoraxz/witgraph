@@ -12,7 +12,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use witgraph_ir::{NodeId, PortName};
+use witgraph_ir::NodeId;
 use witgraph_sched::{NodeFault, NodePhase, RuntimeMode, Trace, TraceEvent};
 
 /// A node's state as the view has it.
@@ -37,8 +37,6 @@ impl Live {
     /// A view whose trace keeps the latest `trace_limit` events.
     pub(crate) fn new(trace_limit: usize) -> Arc<Self> {
         Arc::new(Self {
-            // The JavaScript executor moves no stream items itself (the
-            // loader taps streams in JavaScript): no `StreamItems` events.
             trace: Trace::bounded(trace_limit),
             states: Mutex::new(HashMap::new()),
             touched: Mutex::new(HashSet::new()),
@@ -123,13 +121,5 @@ impl RuntimeMode for LiveMode {
 
     fn on_restarted(&self, node: &NodeId) {
         self.0.trace.on_restarted(node);
-    }
-
-    fn wants_stream_items(&self) -> bool {
-        self.0.trace.wants_stream_items()
-    }
-
-    fn on_stream_items(&self, node: &NodeId, port: &PortName, count: usize) {
-        self.0.trace.on_stream_items(node, port, count);
     }
 }

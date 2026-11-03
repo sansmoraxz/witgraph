@@ -1,78 +1,14 @@
-//! Values of the JavaScript executor, and their jco representation.
+//! Values on a JavaScript host, and their jco representation.
 
 use std::borrow::Cow;
 use std::cell::{OnceCell, RefCell};
 use std::collections::HashMap;
-use std::rc::Rc;
 
 use js_sys::{Array, ArrayBuffer, BigInt, JsString, Object, Reflect};
 use wasm_bindgen::prelude::wasm_bindgen;
 use wasm_bindgen::{JsCast, JsValue};
 use witgraph_ir::wasm_wave::value::{Type, Value};
 use witgraph_ir::wasm_wave::wasm::{WasmType, WasmTypeKind, WasmValue};
-
-/// What a port carries on a JavaScript host.
-#[derive(Debug, Clone)]
-pub(crate) enum WebValue {
-    /// A Value port's value, shared: the scheduler, its consumers and the
-    /// live view hold the same one.
-    Data(Rc<Data>),
-    /// A stream or future, as its producer returned it. Two handles are
-    /// equal only when they are the same object.
-    Handle(JsValue),
-    /// What a handle port carries: an object the host provides, which the
-    /// scheduler, its readers and the live view share. Equal only to
-    /// itself.
-    Resource(Rc<Resource>),
-}
-
-/// An object a handle port carries, as its maker returned it: the host's
-/// (whatever it holds, a buffer on a device, say) until no latch or view
-/// holds it any more, when its `[Symbol.dispose]()` is called, if it has
-/// one, so what it holds is freed then rather than when it is collected.
-#[derive(Debug)]
-pub(crate) struct Resource(JsValue);
-
-impl Resource {
-    pub(crate) fn new(js: JsValue) -> Self {
-        Self(js)
-    }
-
-    pub(crate) fn js(&self) -> &JsValue {
-        &self.0
-    }
-}
-
-impl Drop for Resource {
-    fn drop(&mut self) {
-        // `Symbol.dispose`, where the engine has it; else the symbol jco
-        // falls back to.
-        let symbol = js_sys::Reflect::get(&js_sys::global(), &"Symbol".into())
-            .and_then(|symbol| js_sys::Reflect::get(&symbol, &"dispose".into()))
-            .ok()
-            .filter(JsValue::is_symbol)
-            .unwrap_or_else(|| js_sys::Symbol::for_("dispose").into());
-        if let Ok(dispose) = js_sys::Reflect::get(&self.0, &symbol)
-            && let Some(dispose) = dispose.dyn_ref::<js_sys::Function>()
-        {
-            // Best effort: a provider's failure to free is its own.
-            let _ = dispose.call0(&self.0);
-        }
-    }
-}
-
-/// Values compare as on wasmtime: floats by their bits, except that every
-/// NaN equals every other (so `0.0` and `-0.0` differ).
-impl PartialEq for WebValue {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Data(a), Self::Data(b)) => Rc::ptr_eq(a, b) || a.equals(b),
-            (Self::Handle(a), Self::Handle(b)) => a == b,
-            (Self::Resource(a), Self::Resource(b)) => Rc::ptr_eq(a, b),
-            _ => false,
-        }
-    }
-}
 
 /// A Value port's value of type `ty`, in the forms it has been needed in:
 /// as jco represents it, as a WAVE value, or both, each made from the other
@@ -152,10 +88,9 @@ impl Data {
         }
     }
 
-    /// Whether `self` and `other` are the same value, as [`WebValue`]'s
-    /// equality has it: compared as JavaScript values when both are, so a
+    /// Whether `self` and `other` are the same value, by value: compared as JavaScript values when both are, so a
     /// guest's outputs compare without converting.
-    fn equals(&self, other: &Self) -> bool {
+    pub(crate) fn equals(&self, other: &Self) -> bool {
         match (self.js.get(), other.js.get()) {
             (Some(a), Some(b)) => same_js(a, b, &self.ty),
             _ => match (self.value(), other.value()) {
@@ -163,33 +98,6 @@ impl Data {
                 _ => false,
             },
         }
-    }
-
-    /// For an option, what its `some` holds (as a value of the payload
-    /// type), or `None` for `none`; `Err` for anything else.
-    pub(crate) fn option_payload(&self) -> Result<Option<Self>, ()> {
-        let Some(some) = self.ty.option_some_type() else {
-            return Err(());
-        };
-        if let Some(value) = self.value.get() {
-            return Ok(value
-                .unwrap_option()
-                .map(|payload| Self::from_value(payload.into_owned(), some)));
-        }
-        let js = self.js();
-        let payload = if nullable(&self.ty) {
-            (!js.is_undefined() && !js.is_null()).then(|| js.clone())
-        } else {
-            match get(js, "tag").as_string().as_deref() {
-                Some("some") => Some(get(js, "val")),
-                _ => None,
-            }
-        };
-        Ok(payload.map(|js| Self {
-            ty: some,
-            js: OnceCell::from(js),
-            value: OnceCell::new(),
-        }))
     }
 }
 
@@ -303,14 +211,19 @@ fn conversion_cost(js: &JsValue, ty: &Type, limit: usize) -> usize {
     }
 }
 
-/// The value of an optional input whose payload is `data`, of type `ty`,
-/// as jco represents `some` of it (see [`some_to_js`]).
-pub(crate) fn some_js(data: &Data, ty: &Type) -> JsValue {
+/// What a getter's `option<ty>` holds, `ty` being the payload type, as jco
+/// represents it: the inverse of [`some_js`] and [`none_to_js`].
+pub(crate) fn option_payload_js(js: &JsValue, ty: &Type) -> Option<JsValue> {
     if nullable(ty) {
-        tagged("some", Some(data.js().clone()))
-    } else {
-        data.js().clone()
+        let tag = Reflect::get(js, &JsValue::from_str("tag"))
+            .ok()?
+            .as_string()?;
+        if tag == "some" {
+            return Reflect::get(js, &JsValue::from_str("val")).ok();
+        }
+        return None;
     }
+    (!js.is_undefined() && !js.is_null()).then(|| js.clone())
 }
 
 /// Whether jco hands over a list of `element` as a typed array.
@@ -467,7 +380,7 @@ pub(crate) fn exact(js: &JsValue, ty: &Type) -> bool {
 }
 
 /// Whether two exact values of type `ty` (see [`exact`]) are the same, as
-/// [`WebValue`]'s equality has it: floats by their bits, every NaN equal to
+/// a port's values compare: floats by their bits, every NaN equal to
 /// every other. Typed arrays compare by their bytes.
 fn same_js(a: &JsValue, b: &JsValue, ty: &Type) -> bool {
     let float = |x: f64, y: f64| (x.is_nan() && y.is_nan()) || x.to_bits() == y.to_bits();
@@ -588,7 +501,7 @@ fn same_js(a: &JsValue, b: &JsValue, ty: &Type) -> bool {
     }
 }
 
-/// Whether two values are the same, as [`WebValue`]'s equality has it.
+/// Whether two values are the same, as a port's values compare.
 fn same(a: &Value, b: &Value) -> bool {
     // Walked side by side, without collecting either.
     fn all<'v, T: 'v>(

@@ -1,16 +1,14 @@
 //! The witgraph scheduler for JavaScript hosts.
 //!
-//! This crate is `witgraph-sched` over an executor whose nodes are
-//! JavaScript functions: each node's `run`, as `jco transpile` exposes it
-//! (an object of inputs in, a promise of an object of outputs out). The
-//! scheduling rules are the scheduler's, so a graph ticks, latches,
-//! feeds back, faults and snapshots in a browser under the same rules as
-//! on wasmtime. What differs is the engine's own business: there is no fuel
-//! or memory limit. wasmtime also waits for work a guest keeps doing after its
-//! `run` returns (a stream writer, say); a JavaScript host cannot see that work,
-//! so a node's next `run` may start while its previous stream is still being
-//! written. And each node is an instance of its own, so a failed call is always
-//! pinned on its node, where wasmtime names no culprit beside a stream.
+//! This crate is `witgraph-sched` over a graph composed into one component
+//! (`witgraph_wit::hub`), which `jco transpile` turns into JavaScript: the
+//! scheduling rules are the scheduler's, and the hub is the one wasmtime runs, so a
+//! graph ticks, latches, feeds back, faults and snapshots in a browser under the
+//! same rules as on wasmtime. What differs is the engine's own business: there is
+//! no fuel or memory limit. wasmtime also waits for work a guest keeps doing after
+//! its `run` returns (a stream writer, say); a JavaScript host cannot see that
+//! work, so a node's next `run` may start while its previous stream is still being
+//! written. And what a failed call is pinned on is the node whose call failed.
 //!
 //! Built for `wasm32-unknown-unknown` (or, opting in, for
 //! `wasm64-unknown-unknown`: a 64-bit memory, for values past what 4 GiB
@@ -19,9 +17,8 @@
 //!
 //! # Values
 //!
-//! A Value port's value is kept as a WAVE value of the port's type, so
-//! values compare structurally and snapshots are the same WAVE text as on
-//! wasmtime. They cross to and from JavaScript in jco's representation:
+//! A Value port's value is the hub's. Snapshots are the same WAVE text as on
+//! wasmtime, and values cross to and from JavaScript in jco's representation:
 //! records are objects with `lowerCamelCase` keys, `option<T>` is the value
 //! or `undefined` unless `T` is itself an option represented so, in which
 //! case it is `{ tag: 'none' }` or `{ tag: 'some', val }` (the form
@@ -29,17 +26,17 @@
 //! `option<option<option<u32>>>` is not), `result` and variants are
 //! `{ tag, val }`, enums are their case names, flags are objects of
 //! booleans, 64-bit integers are `BigInt`s, and numeric lists are typed
-//! arrays. A stream or future is whatever the node returned (an async
-//! iterable, a thenable) and is handed to its reader untouched.
+//! arrays. A stream or future is what jco hands the host (an async iterable, a
+//! thenable), which the loader may watch on its way to its reader.
 
-#[cfg(target_family = "wasm")]
-mod executor;
 #[cfg(target_family = "wasm")]
 mod graph;
 #[cfg(target_family = "wasm")]
 mod link;
 #[cfg(target_family = "wasm")]
 mod live;
+#[cfg(target_family = "wasm")]
+mod plane;
 #[cfg(target_family = "wasm")]
 mod value;
 

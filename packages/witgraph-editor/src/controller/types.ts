@@ -84,8 +84,6 @@ export interface TraceEntry {
   to?: string;
   fault?: { kind: string; message: string };
   message?: string;
-  port?: string;
-  count?: number;
 }
 
 /** A fault report taken from the scheduler after a tick. */
@@ -239,7 +237,7 @@ export interface EditorLoadOptions {
   /** The compiled `witgraph-web` WASM module. */
   wasm?: Wasm;
   /** Host-provided capabilities for node imports. */
-  capabilities?: (node: string, capability: Capability) => object | undefined;
+  capabilities?: (capability: Capability) => object | undefined;
   /** Mock replacements for nodes, keyed by node id. */
   mocks?: Record<string, (inputs: PortValues) => PortValues | Promise<PortValues>>;
 }

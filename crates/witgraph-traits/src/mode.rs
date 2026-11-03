@@ -5,16 +5,11 @@
 //! callbacks are empty. In [`Trace`] mode every
 //! callback records a [`TraceEvent`] behind a mutex for post-mortem
 //! inspection.
-//!
-//! Stream items that move guest-to-guest are never seen by the host. Where
-//! an executor moves them itself (the wasmtime executor does between
-//! Stores), it reports how many passed, as [`TraceEvent::StreamItems`], which
-//! [`Trace`] records when built [`with_stream_items`](Trace::with_stream_items).
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
-use witgraph_ir::{NodeId, PortName};
+use witgraph_ir::NodeId;
 
 use crate::error::NodeFault;
 use crate::node::NodePhase;
@@ -65,21 +60,6 @@ pub enum TraceEvent {
         /// The restarted node.
         node: NodeId,
     },
-    /// Items of a stream output passed through the host on their way to
-    /// the stream's reader. Only streams the executor moves itself are
-    /// reported. Items pass from the moment the stream exists, so the
-    /// first may be reported before the node's
-    /// [`RunReturned`](Self::RunReturned) and before its reader's
-    /// [`RunStarted`](Self::RunStarted); they always belong to the
-    /// run the stream was made in.
-    StreamItems {
-        /// The node whose output the stream is.
-        node: NodeId,
-        /// The output port.
-        port: PortName,
-        /// How many items passed.
-        count: usize,
-    },
 }
 
 /// Callbacks fired at runtime instrumentation points.
@@ -101,15 +81,6 @@ pub trait RuntimeMode: Send + Sync + 'static {
     fn on_cancelled(&self, _node: &NodeId) {}
     /// The graph was rebuilt, and this node with it.
     fn on_restarted(&self, _node: &NodeId) {}
-    /// Whether [`on_stream_items`](Self::on_stream_items) is wanted. An
-    /// executor that sees stream items pass (not every one does, and none
-    /// sees those passed guest-to-guest) reports them only when it is.
-    fn wants_stream_items(&self) -> bool {
-        false
-    }
-    /// `count` items of a node's stream output passed through the host on
-    /// their way to the stream's reader.
-    fn on_stream_items(&self, _node: &NodeId, _port: &PortName, _count: usize) {}
 }
 
 /// Performance mode: every instrumentation callback is a no-op, so it
@@ -123,8 +94,6 @@ pub struct Trace {
     trace: Mutex<VecDeque<TraceEvent>>,
     /// The most events kept; `None` keeps every one.
     limit: Option<usize>,
-    /// Whether [`TraceEvent::StreamItems`] are recorded.
-    stream_items: bool,
 }
 
 impl Trace {
@@ -134,7 +103,6 @@ impl Trace {
         Self {
             trace: Mutex::new(VecDeque::new()),
             limit: None,
-            stream_items: false,
         }
     }
 
@@ -145,16 +113,7 @@ impl Trace {
         Self {
             trace: Mutex::new(VecDeque::new()),
             limit: Some(limit.max(1)),
-            stream_items: false,
         }
-    }
-
-    /// Records [`TraceEvent::StreamItems`] too: one event per batch of
-    /// stream items the executor moves, so an endless stream adds events
-    /// for as long as it runs (bound the trace, or take it often).
-    pub fn with_stream_items(mut self) -> Self {
-        self.stream_items = true;
-        self
     }
 
     /// A snapshot of every recorded event. Empty if the lock is poisoned.
@@ -225,18 +184,6 @@ impl RuntimeMode for Trace {
 
     fn on_restarted(&self, node: &NodeId) {
         self.record(TraceEvent::Restarted { node: node.clone() });
-    }
-
-    fn wants_stream_items(&self) -> bool {
-        self.stream_items
-    }
-
-    fn on_stream_items(&self, node: &NodeId, port: &PortName, count: usize) {
-        self.record(TraceEvent::StreamItems {
-            node: node.clone(),
-            port: port.clone(),
-            count,
-        });
     }
 }
 

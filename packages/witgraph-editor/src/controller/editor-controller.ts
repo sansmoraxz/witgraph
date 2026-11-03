@@ -1657,10 +1657,12 @@ export class EditorController extends EventTarget {
       capabilities: this.#originalOptions.capabilities,
       mocks: Object.keys(mocks).length > 0 ? mocks : undefined,
 
-      beforeRun: (node, inputs): void | Promise<void> => {
+      beforeRun: async (node): Promise<void> => {
         if (this.#breakpoints.has(node)) {
+          // Read when it is hit, as nothing crosses to the host unasked.
+          const inputs = (await session?.readInputs(node)) ?? {};
           this.#pausedNode = node;
-          this.#breakpointState = { node, inputs: inputs as Record<string, unknown> };
+          this.#breakpointState = { node, inputs };
           this.#mode = 'paused';
           this.#pullSoon();
           this.#dispatch('state-changed');
@@ -1680,8 +1682,6 @@ export class EditorController extends EventTarget {
           if (port.kind === 'future') this.#observation(node, port.name).pending = true;
         }
       },
-
-      afterRun: (): void => {},
 
       onStreamItem: ({ node, port, items }): void => {
         if (this.#session !== session || !this.isObserved(node, port)) return;

@@ -67,6 +67,18 @@ pub fn set_feedback(connection: FeedbackIdx) -> String {
     format!("set-feedback-{}", connection.position())
 }
 
+/// The name of the function taking a stream or future input's handle out of the
+/// hub: `() -> option<stream<T>>`. So a host can watch what passes, and close it.
+pub fn take_stream(input: InputIdx) -> String {
+    format!("take-stream-{}", input.position())
+}
+
+/// The name of the function putting a stream or future in an input:
+/// `(value: stream<T>)`.
+pub fn give_stream(input: InputIdx) -> String {
+    format!("give-stream-{}", input.position())
+}
+
 /// The name of the function lending the host a handle output, through the
 /// import of [`lend_handle`]: `()`.
 pub fn read_handle(output: OutputIdx) -> String {
@@ -77,6 +89,12 @@ pub fn read_handle(output: OutputIdx) -> String {
 /// handle output: `(it: borrow<R>)`.
 pub fn lend_handle(output: OutputIdx) -> String {
     format!("lend-handle-{}", output.position())
+}
+
+/// The name the hub imports a member's `node` interface under. A mocked node
+/// (see [`HubMember::mocked`]) leaves it an import of the composite, for the host.
+pub fn member_import(node: usize) -> String {
+    format!("m{node}")
 }
 
 /// The name a node's `witgraph:runtime/host` is imported under by the composed

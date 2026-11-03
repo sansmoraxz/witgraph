@@ -257,7 +257,7 @@ test('trace events are collected', async () => {
 // ---------------------------------------------------------------------------
 
 /** `wasi:clocks/monotonic-clock`, as the WASI shim provides it. */
-const clock = (_node: string, capability: Capability) =>
+const clock = (capability: Capability) =>
   capability.interface === 'wasi:clocks/monotonic-clock@0.3.2' ? monotonicClock : undefined;
 
 interface Frame {
@@ -587,7 +587,7 @@ function cpuTensors() {
   }
   return {
     live,
-    capabilities: (_: string, capability: Capability) =>
+    capabilities: (capability: Capability) =>
       capability.interface === 'test:data/tensor@0.1.0' ? { Tensor } : undefined,
   };
 }
@@ -698,29 +698,4 @@ test('without a way to keep them, a preview describes a stream of handles', asyn
   assert.equal(view.count, 2);
   assert.equal(view.latest, '<tensor>');
   assert.equal(tensors.live.size, 0, 'it holds on to none');
-});
-
-test('a future of a handle is kept and released like a stream item', async () => {
-  const tensors = cpuTensors();
-  registerViewer({
-    id: 'tensor',
-    mount: () => ({ update() {}, dispose() {} }),
-    keep: (item) => (item as { clone(): unknown }).clone(),
-  });
-  const controller = await loadController(
-    [
-      ['src', 'tensor-future-source'],
-      ['sink', 'tensor-future-sink'],
-    ],
-    [['a', 'src.tensor', 'sink.tensor']],
-    { capabilities: tensors.capabilities },
-  );
-  controller.setPreview('src', 'tensor');
-  controller.select('src');
-  await settled(controller);
-  const view = controller.observe('src', 'tensor');
-  assert.equal(view.count, 1);
-  assert.equal(view.pending, false);
-  assert.equal(typeof view.latest, 'string', 'its component names no viewer: described');
-  assert.equal(tensors.live.size, 0);
 });
