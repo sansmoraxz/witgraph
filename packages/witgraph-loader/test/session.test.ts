@@ -304,32 +304,35 @@ test('values flow between nodes and equal inputs do not rerun', async () => {
     ],
     [['c', 'a.out', 'b.in']],
   );
-  session.graph.inject('a', 'in', 5);
+  await session.graph.inject('a', 'in', 5);
   await session.settle();
-  assert.equal(session.graph.readOutput('a', 'out'), 5);
-  assert.equal(session.graph.readOutput('b', 'out'), 5);
-  assert.equal(session.graph.readOutputWave('b', 'out'), '5');
+  assert.equal(await session.graph.readOutput('a', 'out'), 5);
+  assert.equal(await session.graph.readOutput('b', 'out'), 5);
+  assert.equal(await session.graph.readOutputWave('b', 'out'), '5');
 
   const runs = () => session.graph.takeTrace().filter((e: any) => e.event === 'run-started');
   assert.equal(runs().length, 2);
-  session.graph.inject('a', 'in', 5);
+  await session.graph.inject('a', 'in', 5);
   await session.settle();
   assert.equal(runs().length, 0, 'the same value is not a change');
-  session.graph.injectWave('a', 'in', '6.5');
+  await session.graph.injectWave('a', 'in', '6.5');
   await session.settle();
   assert.deepEqual(
     runs().map((e: any) => e.node),
     ['a', 'b'],
   );
-  assert.equal(session.graph.readOutput('b', 'out'), 6.5);
+  assert.equal(await session.graph.readOutput('b', 'out'), 6.5);
 
-  assert.throws(() => session.graph.inject('a', 'in', 'five'), /expected a number/);
-  assert.throws(() => session.graph.inject('b', 'in', 1), /written by connection/);
+  await assert.rejects(() => session.graph.inject('a', 'in', 'five'), /expected a number/);
+  await assert.rejects(() => session.graph.inject('b', 'in', 1), /written by connection/);
   // The connection is the error, whatever the value.
-  assert.throws(() => session.graph.inject('b', 'in', 'five'), /written by connection/);
-  assert.throws(() => session.graph.inject('a', 'nope', 1), /not a Value input port/);
-  assert.throws(() => session.graph.readOutput('x', 'out'), /unknown node `x`/);
-  assert.throws(() => session.graph.readOutput('a', 'nope'), /not a Value or handle output port/);
+  await assert.rejects(() => session.graph.inject('b', 'in', 'five'), /written by connection/);
+  await assert.rejects(() => session.graph.inject('a', 'nope', 1), /not a Value input port/);
+  await assert.rejects(() => session.graph.readOutput('x', 'out'), /unknown node `x`/);
+  await assert.rejects(
+    () => session.graph.readOutput('a', 'nope'),
+    /not an output port of that kind/,
+  );
 });
 
 test('a stream passes between two nodes of an island, and a tap sees its items', async () => {
@@ -343,11 +346,11 @@ test('a stream passes between two nodes of an island, and a tap sees its items',
     { onStreamItem: (item) => seen.push(item) },
   );
   assert.deepEqual(session.graph.islands(), [['prod', 'cons']]);
-  session.graph.inject('prod', 'burst-size', 5);
+  await session.graph.inject('prod', 'burst-size', 5);
   await session.settle();
-  assert.equal(session.graph.readOutput('cons', 'count'), 5);
-  assert.equal(session.graph.readOutput('cons', 'total'), 10);
-  assert.equal(session.graph.readOutput('prod', 'limit'), 5);
+  assert.equal(await session.graph.readOutput('cons', 'count'), 5);
+  assert.equal(await session.graph.readOutput('cons', 'total'), 10);
+  assert.equal(await session.graph.readOutput('prod', 'limit'), 5);
   const items = seen.flatMap(({ node, port, item, items }) => {
     assert.deepEqual([node, port], ['prod', 'items']);
     // A chunk of numbers is a typed array: its items, not copied.
@@ -382,11 +385,11 @@ test('a stream of records reaches the tap one record a chunk, and outputs carry 
     ],
     { capabilities: clock, onStreamItem: (item) => seen.push(item) },
   );
-  session.graph.inject('source', 'frames', 3);
-  session.graph.inject('source', 'fps', 100);
+  await session.graph.inject('source', 'frames', 3);
+  await session.graph.inject('source', 'fps', 100);
   await session.settle();
-  assert.equal(session.graph.readOutput('sink', 'count'), 3);
-  assert.equal(session.graph.readOutput('sink', 'gray'), true);
+  assert.equal(await session.graph.readOutput('sink', 'count'), 3);
+  assert.equal(await session.graph.readOutput('sink', 'gray'), true);
 
   for (const node of ['source', 'gray']) {
     const chunks = seen.filter((s) => s.node === node);
@@ -489,7 +492,7 @@ test('disposing a session stops the streams its nodes are still writing', async 
     { capabilities: clock, onStreamItem: () => frames++ },
   );
   // Endless, paced: the tick lasts as long as the stream.
-  session.graph.inject('source', 'fps', 200);
+  await session.graph.inject('source', 'fps', 200);
   const tick = session.tick().catch(() => undefined);
   while (frames < 3) await new Promise((resolve) => setTimeout(resolve, 5));
   session.dispose();
@@ -503,20 +506,20 @@ test('a feedback loop advances one iteration per tick, and a snapshot carries it
   const nodes: [string, string][] = [['n', 'relay']];
   const loop: Connection[] = [['loop', 'n.out', 'n.in', true]];
   const session = await load(nodes, loop);
-  session.graph.inject('n', 'in', 1);
-  session.graph.inject('n', 'add', 1);
+  await session.graph.inject('n', 'in', 1);
+  await session.graph.inject('n', 'add', 1);
   for (const expected of [2, 3, 4]) {
     assert.deepEqual(await session.tick(), { result: 'progress' });
-    assert.equal(session.graph.readOutput('n', 'out'), expected);
+    assert.equal(await session.graph.readOutput('n', 'out'), expected);
   }
-  const snapshot = session.graph.snapshot();
+  const snapshot = await session.graph.snapshot();
   assert.equal(JSON.parse(snapshot).outputs.n.out, '4');
 
   const restored = await load(nodes, loop);
-  restored.graph.restore(snapshot);
+  await restored.graph.restore(snapshot);
   assert.equal(restored.graph.nodeState('n').phase, 'pending');
   await restored.tick();
-  assert.equal(restored.graph.readOutput('n', 'out'), 5);
+  assert.equal(await restored.graph.readOutput('n', 'out'), 5);
 });
 
 test('a mock replaces a node, and the hooks see every run', async () => {
@@ -533,9 +536,9 @@ test('a mock replaces a node, and the hooks see every run', async () => {
       afterRun: (node, outputs) => void calls.push(`after ${node} ${JSON.stringify(outputs)}`),
     },
   );
-  session.graph.inject('a', 'in', 2);
+  await session.graph.inject('a', 'in', 2);
   await session.settle();
-  assert.equal(session.graph.readOutput('b', 'out'), 200);
+  assert.equal(await session.graph.readOutput('b', 'out'), 200);
   assert.deepEqual(calls, [
     'before a {"in":2}',
     'after a {"out":200}',
@@ -546,7 +549,7 @@ test('a mock replaces a node, and the hooks see every run', async () => {
 
 test('a trap names its frames only in a scheduler built with `addr2line`', async () => {
   const session = await load([['busy', 'busy-loop']]);
-  session.graph.inject('busy', 'action', 'trap');
+  await session.graph.inject('busy', 'action', 'trap');
   await session.settle();
   const [{ fault }] = session.graph.takeFaults();
   const [trap, ...frames] = fault.message.split('\n');
@@ -568,23 +571,23 @@ test('a trap faults its island, and fatal aborts the tick', async () => {
     ['busy', 'busy-loop'],
     ['e', 'echo'],
   ]);
-  session.graph.inject('e', 'in', 1);
-  session.graph.inject('busy', 'action', 'trap');
+  await session.graph.inject('e', 'in', 1);
+  await session.graph.inject('busy', 'action', 'trap');
   assert.deepEqual(await session.tick(), { result: 'progress' });
   const [fault] = session.graph.takeFaults();
   assert.deepEqual(fault.members, ['busy']);
   assert.equal(fault.fault.kind, 'trap');
   assert.equal(session.graph.nodeState('busy').phase, 'faulted');
-  assert.equal(session.graph.readOutput('e', 'out'), 1, 'the other island ran');
+  assert.equal(await session.graph.readOutput('e', 'out'), 1, 'the other island ran');
 
-  session.graph.inject('busy', 'action', 'fatal');
+  await session.graph.inject('busy', 'action', 'fatal');
   const tick = await session.tick();
   assert.equal(tick.result, 'aborted');
   assert.equal((tick as any).node, 'busy');
   assert.equal(session.graph.nodeState('busy').fault.kind, 'fatal');
 
   // A new input rebuilds the island.
-  session.graph.inject('busy', 'action', 'finish');
+  await session.graph.inject('busy', 'action', 'finish');
   await session.settle();
   assert.equal(session.graph.nodeState('busy').phase, 'idle');
   assert.ok(session.graph.takeTrace().some((e: any) => e.event === 'restarted'));
@@ -618,13 +621,13 @@ test('capabilities and labelled imports come from the registry, named as on wasm
       },
     },
   );
-  session.graph.inject('kv', 'key', 'k');
-  session.graph.inject('busy', 'action', 'finish');
+  await session.graph.inject('kv', 'key', 'k');
+  await session.graph.inject('busy', 'action', 'finish');
   await session.settle();
-  assert.equal(session.graph.readOutput('cons', 'count'), 3);
-  assert.equal(session.graph.readOutput('cons', 'total-bytes'), 6);
-  assert.equal(session.graph.readOutput('kv', 'primary'), 'primary:k@kv');
-  assert.equal(session.graph.readOutput('kv', 'backup'), 'backup:k@kv');
+  assert.equal(await session.graph.readOutput('cons', 'count'), 3);
+  assert.equal(await session.graph.readOutput('cons', 'total-bytes'), 6);
+  assert.equal(await session.graph.readOutput('kv', 'primary'), 'primary:k@kv');
+  assert.equal(await session.graph.readOutput('kv', 'backup'), 'backup:k@kv');
   // The contract's capabilities, version and labelled interface included;
   // the built-in host is never asked for.
   const seen = asked.map(([node, { interface: name, implements: of }]) => [node, name, of]);
@@ -642,15 +645,15 @@ test('a graph that does not compile reports why', async () => {
 
 test('values compare as on wasmtime: NaN equals NaN, -0 differs from 0', async () => {
   const session = await load([['n', 'echo']], [['loop', 'n.out', 'n.in', true]]);
-  session.graph.inject('n', 'in', Number.NaN);
+  await session.graph.inject('n', 'in', Number.NaN);
   await session.settle();
-  assert.ok(Number.isNaN(session.graph.readOutput('n', 'out')), 'a NaN loop settles');
+  assert.ok(Number.isNaN(await session.graph.readOutput('n', 'out')), 'a NaN loop settles');
 
   const runs = () => session.graph.takeTrace().filter((e: any) => e.event === 'run-started');
-  session.graph.inject('n', 'in', 0);
+  await session.graph.inject('n', 'in', 0);
   await session.settle();
   runs();
-  session.graph.inject('n', 'in', -0);
+  await session.graph.inject('n', 'in', -0);
   await session.settle();
   assert.equal(runs().length, 1, '-0 is a change');
 });
@@ -675,20 +678,20 @@ test('a paused tick can be inspected', async () => {
           : undefined,
     },
   );
-  session.graph.inject('a', 'in', 7);
+  await session.graph.inject('a', 'in', 7);
   const tick = session.tick();
   await pause;
-  assert.equal(session.graph.readOutput('a', 'out'), 7, 'what `a` returned');
-  assert.equal(session.graph.readOutputWave('a', 'out'), '7');
-  assert.equal(session.graph.readOutput('b', 'out'), undefined, '`b` has not returned');
+  assert.equal(await session.graph.readOutput('a', 'out'), 7, 'what `a` returned');
+  assert.equal(await session.graph.readOutputWave('a', 'out'), '7');
+  assert.equal(await session.graph.readOutput('b', 'out'), undefined, '`b` has not returned');
   assert.equal(session.graph.nodeState('b').phase, 'running');
   assert.ok(
     session.graph.takeTrace().some((e: any) => e.event === 'run-started' && e.node === 'b'),
   );
-  assert.throws(() => session.graph.inject('a', 'in', 1), /a tick is in progress/);
+  await assert.rejects(() => session.graph.inject('a', 'in', 1), /a tick is in progress/);
   resume();
   await tick;
-  assert.equal(session.graph.readOutput('b', 'out'), 7);
+  assert.equal(await session.graph.readOutput('b', 'out'), 7);
 });
 
 test('with its WIT source, a component resolves against the source contract', async () => {
@@ -712,9 +715,9 @@ test('with its WIT source, a component resolves against the source contract', as
     components: [{ id: `${ids.echo}#${hash}`, bytes, wit }],
     wasm,
   });
-  session.graph.inject('a', 'in', 3);
+  await session.graph.inject('a', 'in', 3);
   await session.settle();
-  assert.equal(session.graph.readOutput('a', 'out'), 3);
+  assert.equal(await session.graph.readOutput('a', 'out'), 3);
 
   const relay = await readFile(
     new URL('test-fixtures/test-components/guests/relay/wit/world.wit', root),
@@ -760,7 +763,7 @@ test('a run whose generation is abandoned stops', async () => {
       }),
     afterRun: (node) => void after.push(node),
   });
-  session.graph.inject('a', 'in', 1);
+  await session.graph.inject('a', 'in', 1);
   // Interrupt the tick while `a` is held, then cancel `a`: its generation
   // is dropped.
   let stop!: () => void;
@@ -825,10 +828,10 @@ test('each node runs the component its contract was resolved from', async () => 
       session.graph.component('n').index,
       components.findIndex((c) => c.bytes === echo.bytes),
     );
-    session.graph.inject('n', 'in', 4);
+    await session.graph.inject('n', 'in', 4);
     await session.settle();
     assert.deepEqual(session.graph.takeFaults(), []);
-    assert.equal(session.graph.readOutput('n', 'out'), 4);
+    assert.equal(await session.graph.readOutput('n', 'out'), 4);
   }
 });
 
@@ -839,12 +842,12 @@ test('nested options cross in the representation jco picks at each depth', async
   });
   const wave = (port: string) => session.graph.readOutputWave('n', port);
   // Absent optional inputs: `none` of `option<option<u32>>` is tagged.
-  session.graph.inject('n', 'xs', []);
+  await session.graph.inject('n', 'xs', []);
   await session.settle();
   assert.deepEqual(session.graph.takeFaults(), []);
-  assert.deepEqual([wave('a'), wave('b')], ['none', 'none']);
-  assert.deepEqual(session.graph.readOutput('n', 'a'), { tag: 'none' });
-  assert.equal(session.graph.readOutput('n', 'b'), undefined);
+  assert.deepEqual([await wave('a'), await wave('b')], ['none', 'none']);
+  assert.deepEqual(await session.graph.readOutput('n', 'a'), { tag: 'none' });
+  assert.equal(await session.graph.readOutput('n', 'b'), undefined);
 
   const cases: [a: string, b: string, jsA: unknown, jsB: unknown][] = [
     ['some(none)', 'some(none)', { tag: 'some', val: undefined }, { tag: 'none' }],
@@ -854,25 +857,25 @@ test('nested options cross in the representation jco picks at each depth', async
   for (const [a, b, jsA, jsB] of cases) {
     // An optional input takes the payload: `a`'s is `option<u32>`.
     const payload = (text: string) => text.replace(/^some\((.*)\)$/, '$1');
-    if (a === 'none') session.graph.clearInput('n', 'a');
-    else session.graph.injectWave('n', 'a', payload(a));
-    session.graph.injectWave('n', 'b', payload(b));
+    if (a === 'none') await session.graph.clearInput('n', 'a');
+    else await session.graph.injectWave('n', 'a', payload(a));
+    await session.graph.injectWave('n', 'b', payload(b));
     await session.settle();
     assert.deepEqual(session.graph.takeFaults(), []);
-    assert.deepEqual([wave('a'), wave('b')], [a, b], 'through jco and back');
-    assert.deepEqual(session.graph.readOutput('n', 'a'), jsA);
-    assert.deepEqual(session.graph.readOutput('n', 'b'), jsB);
+    assert.deepEqual([await wave('a'), await wave('b')], [a, b], 'through jco and back');
+    assert.deepEqual(await session.graph.readOutput('n', 'a'), jsA);
+    assert.deepEqual(await session.graph.readOutput('n', 'b'), jsB);
     assert.deepEqual(runs.at(-1).a, jsA, 'as jco lifted it');
     assert.deepEqual(runs.at(-1).b, jsB, 'as jco lifted it');
   }
   // And in: `b`'s payload is `option<option<u32>>`, tagged.
-  session.graph.inject('n', 'b', { tag: 'some', val: undefined });
+  await session.graph.inject('n', 'b', { tag: 'some', val: undefined });
   await session.settle();
-  assert.equal(wave('b'), 'some(some(none))');
-  session.graph.inject('n', 'b', { tag: 'none' });
+  assert.equal(await wave('b'), 'some(some(none))');
+  await session.graph.inject('n', 'b', { tag: 'none' });
   await session.settle();
-  assert.equal(wave('b'), 'some(none)');
-  assert.throws(
+  assert.equal(await wave('b'), 'some(none)');
+  await assert.rejects(
     () => session.graph.inject('n', 'b', 3),
     /expected `\{ tag: 'none' \| 'some', val \}`/,
   );
@@ -880,16 +883,16 @@ test('nested options cross in the representation jco picks at each depth', async
 
 test('lists cross as typed arrays and arrays', async () => {
   const session = await load([['n', 'values']]);
-  session.graph.inject('n', 'xs', Uint32Array.of(1, 2, 3));
+  await session.graph.inject('n', 'xs', Uint32Array.of(1, 2, 3));
   await session.settle();
-  const xs = session.graph.readOutput('n', 'xs');
+  const xs = await session.graph.readOutput('n', 'xs');
   assert.ok(xs instanceof Uint32Array);
   assert.deepEqual(Array.from(xs), [1, 2, 3]);
-  session.graph.inject('n', 'xs', [4, 5]);
+  await session.graph.inject('n', 'xs', [4, 5]);
   await session.settle();
-  assert.equal(session.graph.readOutputWave('n', 'xs'), 'some([4, 5])');
-  assert.throws(() => session.graph.inject('n', 'xs', [1, -1]), /item 1/);
-  assert.throws(() => session.graph.inject('n', 'xs', Int8Array.of(-1)), /item 0/);
+  assert.equal(await session.graph.readOutputWave('n', 'xs'), 'some([4, 5])');
+  await assert.rejects(() => session.graph.inject('n', 'xs', [1, -1]), /item 1/);
+  await assert.rejects(() => session.graph.inject('n', 'xs', Int8Array.of(-1)), /item 0/);
 });
 
 test('a value JavaScript fails to convert is an error, not a wedged graph', async () => {
@@ -906,16 +909,16 @@ test('a value JavaScript fails to convert is an error, not a wedged graph', asyn
     },
   );
   for (const value of [proxy, { length: Infinity }]) {
-    assert.throws(() => session.graph.inject('n', 'xs', value));
-    assert.throws(() => session.graph.inject('n', 'b', value));
+    await assert.rejects(() => session.graph.inject('n', 'xs', value));
+    await assert.rejects(() => session.graph.inject('n', 'b', value));
   }
-  session.graph.inject('n', 'xs', [1]);
-  session.graph.inject('m', 'xs', [1]);
+  await session.graph.inject('n', 'xs', [1]);
+  await session.graph.inject('m', 'xs', [1]);
   assert.deepEqual(await within(session.tick()), { result: 'progress' });
   const [fault] = session.graph.takeFaults();
   assert.deepEqual(fault.members, ['m']);
   assert.match(fault.fault.message, /returned a bad `xs`/);
-  assert.equal(session.graph.readOutputWave('n', 'xs'), 'some([1])');
+  assert.equal(await session.graph.readOutputWave('n', 'xs'), 'some([1])');
 });
 
 test('a tick started while one runs rejects at once', async () => {
@@ -926,7 +929,7 @@ test('a tick started while one runs rejects at once', async () => {
       await Promise.allSettled(nested);
     },
   });
-  session.graph.inject('a', 'in', 1);
+  await session.graph.inject('a', 'in', 1);
   assert.deepEqual(await within(session.tick()), { result: 'progress' });
   for (const result of await Promise.allSettled(nested)) {
     assert.equal(result.status, 'rejected');
@@ -937,12 +940,12 @@ test('a tick started while one runs rejects at once', async () => {
 
 test('a stop that is not a promise is refused, and the graph ticks on', async () => {
   const session = await load([['a', 'echo']]);
-  session.graph.inject('a', 'in', 1);
+  await session.graph.inject('a', 'in', 1);
   for (const stop of [new AbortController().signal, 5, {}]) {
     await assert.rejects(session.graph.tick(stop), /`stop` is not a promise/);
   }
   assert.deepEqual(await within(session.tick()), { result: 'progress' });
-  assert.equal(session.graph.readOutput('a', 'out'), 1);
+  assert.equal(await session.graph.readOutput('a', 'out'), 1);
 });
 
 test('a failed run abandons its siblings still in flight', async () => {
@@ -981,7 +984,7 @@ test('a failed run abandons its siblings still in flight', async () => {
     },
   );
   assert.deepEqual(session.graph.islands(), [['p1', 'm', 'c1', 'c2']]);
-  session.graph.inject('m', 'burst-size', 2);
+  await session.graph.inject('m', 'burst-size', 2);
   const ticked = session.tick();
   await paused.promise;
   assert.deepEqual(await within(ticked), { result: 'progress' });
@@ -1004,7 +1007,7 @@ test('a disposed session stops its tick, and disposing twice is harmless', async
     afterRun: (node) => void after.push(node),
   });
   sessions.splice(sessions.indexOf(session), 1);
-  session.graph.inject('a', 'in', 1);
+  await session.graph.inject('a', 'in', 1);
   const ticked = session.tick();
   await paused.promise;
   session.dispose();
@@ -1023,7 +1026,7 @@ test('a fatal start function during a rebuild aborts the tick, naming its node',
       capability.interface === 'demo:startfatal/ctl@0.1.0' ? { shouldFail: () => fail } : undefined,
   });
   assert.deepEqual(await session.tick(), { result: 'progress' });
-  assert.equal(session.graph.readOutput('n', 'out'), 7);
+  assert.equal(await session.graph.readOutput('n', 'out'), 7);
   fail = true;
   session.graph.cancel('n');
   session.graph.rerun('n');
@@ -1129,16 +1132,16 @@ test('mocks are own properties, called as methods, with an empty result as no ou
     },
   );
   for (const node of ['constructor', 'toString', 'scaled', 'none'])
-    session.graph.inject(node, 'in', 2);
+    await session.graph.inject(node, 'in', 2);
   await session.settle();
   assert.deepEqual(
     session.graph.takeFaults().map((f: any) => f.members),
     [['none']],
     'only the empty mock is short of `out`',
   );
-  assert.equal(session.graph.readOutput('constructor', 'out'), 2, 'not mocked: it ran');
-  assert.equal(session.graph.readOutput('toString', 'out'), 2, 'not mocked: it ran');
-  assert.equal(session.graph.readOutput('scaled', 'out'), 20);
+  assert.equal(await session.graph.readOutput('constructor', 'out'), 2, 'not mocked: it ran');
+  assert.equal(await session.graph.readOutput('toString', 'out'), 2, 'not mocked: it ran');
+  assert.equal(await session.graph.readOutput('scaled', 'out'), 20);
   assert.deepEqual(
     after.find(([node]) => node === 'none'),
     ['none', []],
@@ -1178,10 +1181,10 @@ test('hooks are called as methods, and a throwing stream observer does not reach
   console.error = (...args: unknown[]) => void errors.push(args);
   try {
     const session = await loaded(debug);
-    session.graph.inject('prod', 'burst-size', 5);
+    await session.graph.inject('prod', 'burst-size', 5);
     await session.settle();
     assert.deepEqual(session.graph.takeFaults(), []);
-    assert.equal(session.graph.readOutput('cons', 'count'), 5);
+    assert.equal(await session.graph.readOutput('cons', 'count'), 5);
     assert.deepEqual(debug.before, ['prod', 'cons']);
     assert.ok(debug.items.length > 0);
     assert.ok(errors.length > 0, 'what the observer threw is reported');
@@ -1195,14 +1198,14 @@ test('a future output nothing reads is consumed, so its writer finishes', async 
   await session.settle();
   // A generation here ends when `run` returns, before the writer's task
   // does: run again until a run reports an ended write.
-  for (let again = 1; again <= 50 && session.graph.readOutput('w', 'last') === 0; again++) {
+  for (let again = 1; again <= 50 && (await session.graph.readOutput('w', 'last')) === 0; again++) {
     await new Promise((resolve) => setTimeout(resolve, 10));
-    session.graph.inject('w', 'again', again);
+    await session.graph.inject('w', 'again', again);
     await session.settle();
   }
   // Unlike wasmtime, which drops the read end (2), the loader takes the
   // value.
-  assert.equal(session.graph.readOutput('w', 'last'), 1);
+  assert.equal(await session.graph.readOutput('w', 'last'), 1);
 });
 
 test('a Value is passed on as its producer returned it, and compared without converting', async () => {
@@ -1219,32 +1222,32 @@ test('a Value is passed on as its producer returned it, and compared without con
     ],
     { afterRun: (node) => void runs.push(node) },
   );
-  session.graph.inject('source', 'size', 1000);
-  session.graph.inject('source', 'seed', 7);
+  await session.graph.inject('source', 'size', 1000);
+  await session.graph.inject('source', 'seed', 7);
   await session.settle();
   assert.deepEqual(runs, ['source', 'a', 'sink']);
-  const blob = session.graph.readOutput('source', 'blob');
+  const blob = await session.graph.readOutput('source', 'blob');
   assert.ok(blob instanceof Uint8Array);
   assert.equal(blob.length, 1000);
   assert.equal(blob[3], 10);
   // The very value, shared, not a copy made for each read.
-  assert.equal(session.graph.readOutput('source', 'blob'), blob);
-  assert.equal(session.graph.readOutput('sink', 'len'), 1000);
+  assert.equal(await session.graph.readOutput('source', 'blob'), blob);
+  assert.equal(await session.graph.readOutput('sink', 'len'), 1000);
   // WAVE text is made when asked for.
-  assert.equal(session.graph.readOutputWave('sink', 'len'), '1000');
-  assert.match(session.graph.readOutputWave('a', 'blob')!, /^\[7, 8, 9, /);
+  assert.equal(await session.graph.readOutputWave('sink', 'len'), '1000');
+  assert.match(await session.graph.readOutputWave('a', 'blob')!, /^\[7, 8, 9, /);
 
   // An equal value runs nothing downstream; another one does.
   runs.length = 0;
-  session.graph.inject('source', 'size', 1000);
+  await session.graph.inject('source', 'size', 1000);
   session.graph.rerun('source');
   await session.settle();
   assert.deepEqual(runs, ['source'], 'the same bytes again: `a` does not rerun');
   runs.length = 0;
-  session.graph.inject('source', 'seed', 8);
+  await session.graph.inject('source', 'seed', 8);
   await session.settle();
   assert.deepEqual(runs, ['source', 'a', 'sink']);
-  assert.equal((session.graph.readOutput('a', 'blob') as Uint8Array)[0], 8);
+  assert.equal(((await session.graph.readOutput('a', 'blob')) as Uint8Array)[0], 8);
 });
 
 test('the list loop jco generates is there to be replaced', async () => {
@@ -1293,29 +1296,32 @@ test('a value too large to convert is refused, naming it, and the session goes o
     [['c', 'source.blob', 'sink.blob']],
   );
   const size = 64 * 1024 * 1024;
-  session.graph.inject('source', 'size', size);
+  await session.graph.inject('source', 'size', size);
   await session.settle();
   if (memory64(wasm)) {
     // A 64-bit memory affords it.
-    assert.match(session.graph.readOutputWave('source', 'blob')!, /^\[0, 1, 2, /);
+    assert.match(await session.graph.readOutputWave('source', 'blob')!, /^\[0, 1, 2, /);
     return;
   }
   // As WAVE text it would not fit the scheduler's 32-bit memory.
-  assert.throws(
+  await assert.rejects(
     () => session.graph.readOutputWave('source', 'blob'),
     /`source\.blob`: too large to convert/,
   );
   // A snapshot names the first such value it meets: the output, or the
   // sink's latched input holding the same bytes.
-  assert.throws(() => session.graph.snapshot(), /`(source|sink)\.blob`: too large to convert/);
+  await assert.rejects(
+    () => session.graph.snapshot(),
+    /`(source|sink)\.blob`: too large to convert/,
+  );
   // Nothing trapped: the session is as it was.
   assert.equal(session.broken, undefined);
-  assert.equal((session.graph.readOutput('source', 'blob') as Uint8Array).length, size);
-  assert.equal(session.graph.readOutputWave('sink', 'len'), String(size));
-  session.graph.inject('source', 'size', 3);
+  assert.equal(((await session.graph.readOutput('source', 'blob')) as Uint8Array).length, size);
+  assert.equal(await session.graph.readOutputWave('sink', 'len'), String(size));
+  await session.graph.inject('source', 'size', 3);
   await session.settle();
-  assert.equal(session.graph.readOutputWave('source', 'blob'), '[0, 1, 2]');
-  assert.ok(session.graph.snapshot().length > 0);
+  assert.equal(await session.graph.readOutputWave('source', 'blob'), '[0, 1, 2]');
+  assert.ok((await session.graph.snapshot()).length > 0);
 });
 
 test('a trap of the scheduler breaks the session, naming the call', async () => {
@@ -1337,14 +1343,14 @@ test('a trap of the scheduler breaks the session, naming the call', async () => 
   );
   // Other errors pass through, and leave the session as it is.
   assert.throws(() => graph.parse(), /^Error: not a trap$/);
-  assert.equal(graph.readOutput(), 3);
-  assert.throws(
+  assert.equal(await graph.readOutput(), 3);
+  await assert.rejects(
     () => graph.readOutputWave('source', 'blob'),
     /the scheduler stopped in `readOutputWave\("source", "blob"\)` \(unreachable \(source\.blob\)\): the session can no longer be used/,
   );
   // Every call after throws the same.
   assert.equal(state.broken?.cause instanceof WebAssembly.RuntimeError, true);
-  assert.throws(
+  await assert.rejects(
     () => graph.readOutput(),
     (e) => e === state.broken,
   );
@@ -1389,7 +1395,7 @@ test('a trap of the scheduler during a tick fails the tick and breaks every sess
   await assert.rejects(tick, /the scheduler stopped while running a tick \(unreachable\)/);
   for (const s of [session, bystander]) {
     assert.match(String(s.broken), /load the graph again/);
-    assert.throws(
+    await assert.rejects(
       () => s.graph.readOutput('cons', 'count'),
       (e) => e === s.broken,
     );
@@ -1411,7 +1417,7 @@ test('a hook sees what a future resolves to, and its reader still gets it', asyn
     { onFutureValue: (item) => seen.push(item) },
   );
   await session.settle();
-  assert.equal(session.graph.readOutput('r', 'value'), 7);
+  assert.equal(await session.graph.readOutput('r', 'value'), 7);
   // The unread one too, once it settles.
   for (let i = 0; i < 50 && seen.length < 2; i++) await new Promise((r) => setTimeout(r, 10));
   const values = seen.map(({ node, port, value }) => [node, port, value]).sort();
@@ -1426,9 +1432,9 @@ test('nothing needs a secure context', async () => {
   Object.defineProperty(globalThis.crypto, 'subtle', { value: undefined, configurable: true });
   try {
     const session = await load([['a', 'echo']]);
-    session.graph.inject('a', 'in', 1);
+    await session.graph.inject('a', 'in', 1);
     await session.settle();
-    assert.equal(session.graph.readOutput('a', 'out'), 1);
+    assert.equal(await session.graph.readOutput('a', 'out'), 1);
   } finally {
     if (subtle) Object.defineProperty(globalThis.crypto, 'subtle', subtle);
     else delete (globalThis.crypto as any).subtle;
@@ -1461,24 +1467,28 @@ async function loadLinked(
 test('a node runs with the provider its link names composed in', async () => {
   // No `capabilities`: the link satisfies the only import `calc` has.
   const session = await loadLinked(['n']);
-  session.graph.inject('n', 'x', 3);
+  await session.graph.inject('n', 'x', 3);
   await session.settle();
-  assert.equal(session.graph.readOutput('n', 'doubled'), 6);
-  assert.equal(session.graph.readOutput('n', 'slow'), 6);
-  assert.equal(session.graph.readOutput('n', 'total'), 3, '0 + 1 + 2, streamed by the provider');
-  assert.equal(session.graph.readOutput('n', 'calls'), 1);
+  assert.equal(await session.graph.readOutput('n', 'doubled'), 6);
+  assert.equal(await session.graph.readOutput('n', 'slow'), 6);
+  assert.equal(
+    await session.graph.readOutput('n', 'total'),
+    3,
+    '0 + 1 + 2, streamed by the provider',
+  );
+  assert.equal(await session.graph.readOutput('n', 'calls'), 1);
 });
 
 test('each node gets an instance of the provider of its own', async () => {
   const session = await loadLinked(['a', 'b']);
-  session.graph.inject('a', 'x', 2);
-  session.graph.inject('b', 'x', 5);
+  await session.graph.inject('a', 'x', 2);
+  await session.graph.inject('b', 'x', 5);
   await session.settle();
-  assert.equal(session.graph.readOutput('a', 'doubled'), 4);
-  assert.equal(session.graph.readOutput('b', 'doubled'), 10);
-  assert.equal(session.graph.readOutput('a', 'calls'), 1);
+  assert.equal(await session.graph.readOutput('a', 'doubled'), 4);
+  assert.equal(await session.graph.readOutput('b', 'doubled'), 10);
+  assert.equal(await session.graph.readOutput('a', 'calls'), 1);
   assert.equal(
-    session.graph.readOutput('b', 'calls'),
+    await session.graph.readOutput('b', 'calls'),
     1,
     'not the 2 a shared instance would count',
   );
@@ -1584,20 +1594,30 @@ test('tensors pass between nodes as the objects their makers returned, disposed 
   await session.settle();
 
   const bytes = 64 * 48 * 3;
-  const sum = session.graph.readOutput('direct', 'sum') as bigint;
-  assert.equal(session.graph.readOutput('direct', 'len'), BigInt(bytes));
+  const sum = (await session.graph.readOutput('direct', 'sum')) as bigint;
+  assert.equal(await session.graph.readOutput('direct', 'len'), BigInt(bytes));
   const inverted = 255n * BigInt(bytes) - sum;
-  assert.equal(session.graph.readOutput('inv-sink', 'sum'), inverted, 'inverted by the host');
-  assert.equal(session.graph.readOutput('copy-sink', 'sum'), inverted, 'inverted by the guest');
-  const source = session.graph.readOutput('src', 'tensor');
+  assert.equal(await session.graph.readOutput('inv-sink', 'sum'), inverted, 'inverted by the host');
+  assert.equal(
+    await session.graph.readOutput('copy-sink', 'sum'),
+    inverted,
+    'inverted by the guest',
+  );
+  const source = await session.graph.readHandle('src', 'tensor');
   assert.ok(source instanceof tensors.imports.Tensor, 'the object its maker returned');
-  assert.throws(() => session.graph.readOutputWave('src', 'tensor'), /has no WAVE text/);
-  assert.throws(() => session.graph.inject('inv', 'tensor', source), /not a Value input port/);
+  await assert.rejects(
+    () => session.graph.readOutputWave('src', 'tensor'),
+    /not an output port of that kind/,
+  );
+  await assert.rejects(
+    () => session.graph.inject('inv', 'tensor', source),
+    /not a Value input port/,
+  );
   assert.equal(tensors.live(), 3, 'the source tensor and the two inverted ones');
 
-  session.graph.inject('src', 'seed', 7);
+  await session.graph.inject('src', 'seed', 7);
   await session.settle();
-  assert.notEqual(session.graph.readOutput('direct', 'sum'), sum);
+  assert.notEqual(await session.graph.readOutput('direct', 'sum'), sum);
   assert.equal(tensors.live(), 3, 'the old ones are disposed');
   assert.ok(
     [...tensors.disposed.values()].every((times) => times === 1),
@@ -1622,10 +1642,10 @@ test('a node keeps its own reference to a tensor across runs', async () => {
     },
   );
   await session.settle();
-  assert.equal(session.graph.readOutput('keep', 'previous'), 0n);
-  session.graph.inject('src', 'seed', 1);
+  assert.equal(await session.graph.readOutput('keep', 'previous'), 0n);
+  await session.graph.inject('src', 'seed', 1);
   await session.settle();
-  assert.ok((session.graph.readOutput('keep', 'previous') as bigint) > 0n);
+  assert.ok(((await session.graph.readOutput('keep', 'previous')) as bigint) > 0n);
   // The latched second tensor, and `keep`'s clone of it.
   assert.equal(tensors.live(), 2);
 });
@@ -1639,16 +1659,16 @@ test('a future its reader drops unread does not leave its writer waiting', async
     [['a', 'w.done', 'd.data']],
   );
   await within(session.settle());
-  assert.equal(session.graph.readOutput('d', 'done'), true);
+  assert.equal(await session.graph.readOutput('d', 'done'), true);
   // `last` is how the previous run's write ended: 0 until one has. As for an
   // unread future, its value was read and discarded, so it reads as taken.
   await within(
     (async () => {
       let last = 0;
       for (let again = 1; last === 0; again++) {
-        session.graph.inject('w', 'again', again);
+        await session.graph.inject('w', 'again', again);
         await session.settle();
-        last = session.graph.readOutput('w', 'last') as number;
+        last = (await session.graph.readOutput('w', 'last')) as number;
         await tick();
       }
       assert.equal(last, 1);
@@ -1705,12 +1725,12 @@ test('a stream of tensors flows, and each is disposed once', async () => {
   const [output] = session.contracts.get('src')?.outputs ?? [];
   assert.equal(output?.kind, 'stream');
   assert.deepEqual(output?.handle, { interface: 'test:data/tensor@0.1.0', resource: 'tensor' });
-  session.graph.inject('src', 'frames', 20);
+  await session.graph.inject('src', 'frames', 20);
   await within(session.settle(), 20000);
-  assert.equal(session.graph.readOutput('sink', 'count'), 20);
+  assert.equal(await session.graph.readOutput('sink', 'count'), 20);
   let sum = 0n;
   for (let i = 0n; i < 20n; i++) sum += 255n - i;
-  assert.equal(session.graph.readOutput('sink', 'sum'), sum, 'inverted by the host');
+  assert.equal(await session.graph.readOutput('sink', 'sum'), sum, 'inverted by the host');
   assert.equal(tensors.made.length, 40, 'each frame, and each inverted');
   await allDisposed(tensors);
 });
@@ -1727,7 +1747,7 @@ test('onStreamItem sees each tensor of a stream, before its reader has it', asyn
       seen.push(items[0]);
     },
   });
-  session.graph.inject('src', 'frames', 5);
+  await session.graph.inject('src', 'frames', 5);
   await within(session.settle(), 20000);
   assert.equal(seen.length, 5);
   await allDisposed(tensors);
@@ -1736,9 +1756,9 @@ test('onStreamItem sees each tensor of a stream, before its reader has it', asyn
 test('a reader stopping early frees the tensors in flight', async () => {
   const tensors = cpuTensors();
   const session = await streamChain(tensors);
-  session.graph.inject('sink', 'take', 3);
+  await session.graph.inject('sink', 'take', 3);
   await within(session.settle(), 20000);
-  assert.equal(session.graph.readOutput('sink', 'count'), 3);
+  assert.equal(await session.graph.readOutput('sink', 'count'), 3);
   await allDisposed(tensors);
 });
 
@@ -1801,18 +1821,18 @@ test('a stream nothing reads frees its tensors', async () => {
 test('a future moves its tensor to its reader', async () => {
   const tensors = cpuTensors();
   const session = await futureChain(tensors);
-  session.graph.inject('src', 'seed', 42);
+  await session.graph.inject('src', 'seed', 42);
   await within(session.settle(), 20000);
-  assert.equal(session.graph.readOutput('sink', 'first'), 42);
+  assert.equal(await session.graph.readOutput('sink', 'first'), 42);
   await allDisposed(tensors);
 });
 
 test('a future its reader drops frees its tensor', async () => {
   const tensors = cpuTensors();
   const session = await futureChain(tensors);
-  session.graph.inject('sink', 'ignore', true);
+  await session.graph.inject('sink', 'ignore', true);
   await within(session.settle(), 20000);
-  assert.equal(session.graph.readOutput('sink', 'first'), 1000);
+  assert.equal(await session.graph.readOutput('sink', 'first'), 1000);
   await allDisposed(tensors);
 });
 
@@ -1834,9 +1854,9 @@ test('a future read to watch it still reaches its reader, and frees its tensor',
     [['a', 'src.tensor', 'sink.tensor']],
     { ...tensorsFor(tensors), onFutureValue: ({ value }) => void watched.push(value) },
   );
-  session.graph.inject('src', 'seed', 9);
+  await session.graph.inject('src', 'seed', 9);
   await within(session.settle(), 20000);
-  assert.equal(session.graph.readOutput('sink', 'first'), 9);
+  assert.equal(await session.graph.readOutput('sink', 'first'), 9);
   assert.ok(watched[0] instanceof tensors.imports.Tensor);
   await allDisposed(tensors);
 });

@@ -57,8 +57,10 @@ interface Observation {
   recent: unknown[];
   count: number;
   pending: boolean;
-  /** Value outputs only: the tick its latest value was recorded at. */
-  tick: number;
+  /** Value and handle outputs: the version of the port's value recorded last. */
+  version: number;
+  /** When a value was last pulled from the port, for the preview interval. */
+  pulledAt: number;
   /** Whether `latest` is ours to dispose: a reference a viewer kept. */
   kept: boolean;
   bytes: number;
@@ -111,6 +113,7 @@ export class EditorController extends EventTarget {
   #breakpointState: BreakpointState | null = null;
 
   #tickCount = 0;
+  #previewIntervalMs = 0;
   /** Per node and output, what it carried: see {@link observe}. */
   #observed = new Map<string, Map<string, Observation>>();
   #stopRequested = false;
@@ -243,8 +246,9 @@ export class EditorController extends EventTarget {
   }
 
   /**
-   * What an output has carried: its latest value and those before it, as a
-   * node's preview shows them. A Value output's latest is read from the
+   * What an output has carried, as recorded so far: its latest value and those
+   * before it, as a node's preview shows them. It reads nothing: new values
+   * are pulled between tick slices. A Value output's latest was read from the
    * scheduler, so it is current even mid-tick.
    */
   observe(node: string, port: string): OutputView {
@@ -257,22 +261,35 @@ export class EditorController extends EventTarget {
       count: seen?.count ?? 0,
       pending: seen?.pending ?? false,
     };
-    if ((kind === 'value' || kind === 'handle') && this.#session) {
-      // The latched value itself, not a copy: another one is a new value.
-      let latest: unknown;
-      try {
-        latest = this.#session.graph.readOutput(node, port);
-      } catch {}
-      if (latest !== undefined && latest !== seen?.latest) {
-        // Mid-tick, the value so far is not recorded yet: show it last.
-        view.latest = latest;
-        view.recent = [...view.recent, latest];
-      }
-    }
     return view;
   }
 
-  /** What an output carried last: {@link observe}'s `latest`. */
+  /**
+   * The least time between two reads of one output for its preview, in
+   * milliseconds, while a run or step is going; 0, the default, reads a new
+   * value as soon as it is there. An output is read at most this often, and
+   * always once more as the run ends. Reading is what a preview costs: a
+   * value in a node's linear memory is copied out to be read.
+   */
+  get previewIntervalMs(): number {
+    return this.#previewIntervalMs;
+  }
+
+  set previewIntervalMs(ms: number) {
+    this.#previewIntervalMs = Math.max(0, ms);
+  }
+
+  /** Whether a run is going and `seen` was read too recently to read again. */
+  #previewsLag(seen: Observation | undefined): boolean {
+    return (
+      this.#previewIntervalMs > 0 &&
+      this.#mode === 'running' &&
+      seen !== undefined &&
+      performance.now() - seen.pulledAt < this.#previewIntervalMs
+    );
+  }
+
+  /** What was recorded of an output last: {@link observe}'s `latest`. */
   latestOutput(node: string, port: string): unknown {
     return this.observe(node, port).latest;
   }
@@ -293,7 +310,8 @@ export class EditorController extends EventTarget {
         recent: [],
         count: 0,
         pending: false,
-        tick: -1,
+        version: 0,
+        pulledAt: Number.NEGATIVE_INFINITY,
         bytes: 0,
         kept: false,
       };
@@ -509,6 +527,7 @@ export class EditorController extends EventTarget {
   setPreview(nodeId: string, port: string | null): void {
     if (port === null) this.removeNodeAttr(nodeId, 'editor.preview');
     else this.setNodeAttr(nodeId, 'editor.preview', port);
+    this.#pullSoon();
   }
 
   /** Resizes a node (an undoable edit); its preview region takes the height. */
@@ -937,6 +956,7 @@ export class EditorController extends EventTarget {
     } finally {
       const mode = this.#mode as EditorMode;
       if (mode === 'running' || mode === 'paused') this.#mode = 'idle';
+      await this.#pullObserved(true);
       this.#lastRunDurationMs = performance.now() - startTime;
       this.#lastRunTicks = ticks;
       this.#dispatch('state-changed');
@@ -975,6 +995,7 @@ export class EditorController extends EventTarget {
       const msg = err instanceof Error ? err.message : String(err);
       this.#pushError(`Step failed: ${msg}`);
     }
+    await this.#pullObserved(true);
     this.#lastRunDurationMs = performance.now() - startTime;
     this.#lastRunTicks = 1;
 
@@ -1017,6 +1038,7 @@ export class EditorController extends EventTarget {
     const stop = this.#stopRequested;
     if (stop) this.#shutdown();
     this.#pollState();
+    await this.#pullObserved(stop);
     if (stop) return 'stopped';
     if (result === 'aborted') return 'aborted';
     return result === 'idle' ? 'idle' : 'progress';
@@ -1198,21 +1220,60 @@ export class EditorController extends EventTarget {
 
   // -- Inspection / Injection -------------------------------------------------
 
-  readOutput(node: string, port: string): unknown {
+  async readOutput(node: string, port: string): Promise<unknown> {
     if (!this.#session) throw new Error('no session loaded');
-    return this.#session.graph.readOutput(node, port);
+    const kind = this.#nodes.get(node)?.outputs.find((p) => p.name === port)?.kind;
+    return kind === 'handle'
+      ? this.#session.graph.readHandle(node, port)
+      : this.#session.graph.readOutput(node, port);
   }
 
-  readOutputWave(node: string, port: string): string | undefined {
+  async readOutputWave(node: string, port: string): Promise<string | undefined> {
     if (!this.#session) throw new Error('no session loaded');
     return this.#session.graph.readOutputWave(node, port);
   }
 
+  /** Per node and port, WAVE text fetched for what the port latches. */
+  #waves = new Map<string, { version: number; text?: string }>();
+
+  /**
+   * An output's latest value as WAVE text, for drawing: what was fetched
+   * for its latest version, or `undefined` while that is being fetched, with
+   * a `state-changed` when it is there. An error's message stands in for the
+   * text.
+   */
+  outputWave(node: string, port: string): string | undefined {
+    const session = this.#session;
+    if (!session) return undefined;
+    const key = `${node}\0${port}`;
+    let version: number;
+    try {
+      version = session.graph.outputVersion(node, port);
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error);
+    }
+    const known = this.#waves.get(key);
+    if (known?.version === version) return known.text;
+    const entry: { version: number; text?: string } = { version };
+    this.#waves.set(key, entry);
+    session.graph.readOutputWave(node, port).then(
+      (text: string | undefined) => {
+        entry.text = text ?? '-';
+        this.#dispatch('state-changed');
+      },
+      (error: unknown) => {
+        entry.text = error instanceof Error ? error.message : String(error);
+        this.#dispatch('state-changed');
+      },
+    );
+    return known?.text;
+  }
+
   #injectedValues = new Map<string, Map<string, string>>();
 
-  injectValue(node: string, port: string, wave: string): void {
+  async injectValue(node: string, port: string, wave: string): Promise<void> {
     if (!this.#session) throw new Error('no session loaded');
-    this.#session.graph.injectWave(node, port, wave);
+    await this.#session.graph.injectWave(node, port, wave);
     if (!this.#injectedValues.has(node)) this.#injectedValues.set(node, new Map());
     this.#injectedValues.get(node)!.set(port, wave);
     const graphNode = this.#graphJson?.nodes.find((n) => n.id === node);
@@ -1223,9 +1284,9 @@ export class EditorController extends EventTarget {
     this.#dispatch('state-changed');
   }
 
-  clearInput(node: string, port: string): void {
+  async clearInput(node: string, port: string): Promise<void> {
     if (!this.#session) throw new Error('no session loaded');
-    this.#session.graph.clearInput(node, port);
+    await this.#session.graph.clearInput(node, port);
     this.#injectedValues.get(node)?.delete(port);
     const graphNode = this.#graphJson?.nodes.find((n) => n.id === node);
     if (graphNode?.attrs) {
@@ -1303,11 +1364,11 @@ export class EditorController extends EventTarget {
    * (a value too large to convert, say) is reported in the trace, naming
    * the value, and nothing is saved.
    */
-  saveSnapshot(name?: string): void {
+  async saveSnapshot(name?: string): Promise<void> {
     if (!this.#session) throw new Error('no session loaded');
     let data: string;
     try {
-      data = this.#session.graph.snapshot();
+      data = await this.#session.graph.snapshot();
     } catch (err) {
       this.#pushError(`Snapshot failed: ${err instanceof Error ? err.message : String(err)}`);
       return;
@@ -1317,12 +1378,13 @@ export class EditorController extends EventTarget {
     this.#dispatch('state-changed');
   }
 
-  restoreNamedSnapshot(name: string): void {
+  async restoreNamedSnapshot(name: string): Promise<void> {
     const snap = this.#savedSnapshots.find((s) => s.name === name);
     if (!snap) throw new Error(`no snapshot named "${name}"`);
     if (!this.#session) throw new Error('no session loaded');
-    this.#session.graph.restore(snap.data);
+    await this.#session.graph.restore(snap.data);
     this.#pollState();
+    await this.#pullObserved(true);
   }
 
   deleteSnapshot(name: string): void {
@@ -1335,6 +1397,7 @@ export class EditorController extends EventTarget {
   select(nodeId: string | null): void {
     this.#selectedNode = nodeId;
     if (nodeId !== null) this.#selectedEdge = null;
+    this.#pullSoon();
     this.#dispatch('state-changed');
   }
 
@@ -1521,15 +1584,16 @@ export class EditorController extends EventTarget {
     URL.revokeObjectURL(url);
   }
 
-  snapshot(): string {
+  async snapshot(): Promise<string> {
     if (!this.#session) throw new Error('no session loaded');
     return this.#session.graph.snapshot();
   }
 
-  restore(snapshot: string): void {
+  async restore(snapshot: string): Promise<void> {
     if (!this.#session) throw new Error('no session loaded');
-    this.#session.graph.restore(snapshot);
+    await this.#session.graph.restore(snapshot);
     this.#pollState();
+    await this.#pullObserved(true);
   }
 
   // -- Auto-layout ------------------------------------------------------------
@@ -1597,6 +1661,7 @@ export class EditorController extends EventTarget {
           this.#pausedNode = node;
           this.#breakpointState = { node, inputs: inputs as Record<string, unknown> };
           this.#mode = 'paused';
+          this.#pullSoon();
           this.#dispatch('state-changed');
           return new Promise<void>((resolve) => {
             this.#breakpointResolve = resolve;
@@ -1644,7 +1709,7 @@ export class EditorController extends EventTarget {
     this.#islands = session.graph.islands() as string[][];
     this.#dirty = false;
     this.#buildVisuals();
-    this.#restoreInjections(graph);
+    await this.#restoreInjections(graph);
     this.#collectCapabilities();
   }
 
@@ -1670,7 +1735,7 @@ export class EditorController extends EventTarget {
     }
   }
 
-  #restoreInjections(graph: GraphJson): void {
+  async #restoreInjections(graph: GraphJson): Promise<void> {
     if (!this.#session) return;
     for (const node of graph.nodes) {
       if (!node.attrs) continue;
@@ -1678,7 +1743,7 @@ export class EditorController extends EventTarget {
         if (!key.startsWith('inject.')) continue;
         const port = key.slice('inject.'.length);
         try {
-          this.#session.graph.injectWave(node.id, port, value);
+          await this.#session.graph.injectWave(node.id, port, value);
           if (!this.#injectedValues.has(node.id)) this.#injectedValues.set(node.id, new Map());
           this.#injectedValues.get(node.id)!.set(port, value);
         } catch {
@@ -1774,23 +1839,44 @@ export class EditorController extends EventTarget {
       }
     }
 
-    // Record what the observed Value outputs carry, once a tick: the
-    // latched value itself, never converted (to WAVE text, say).
+    this.#dispatch('state-changed');
+  }
+
+  /**
+   * Records what the observed Value and handle outputs carry, if they carry
+   * something new: the latched value itself, never converted (to WAVE text,
+   * say). `final` ignores the preview interval, as a run ends.
+   */
+  async #pullObserved(final: boolean): Promise<void> {
+    const session = this.#session;
+    if (!session) return;
     for (const [id, visual] of this.#nodes) {
       for (const port of visual.outputs) {
         if ((port.kind !== 'value' && port.kind !== 'handle') || !this.isObserved(id, port.name))
           continue;
-        if (this.#observed.get(id)?.get(port.name)?.tick === this.#tickCount) continue;
+        const seen = this.#observed.get(id)?.get(port.name);
+        if (!final && this.#previewsLag(seen)) continue;
         try {
-          const value = this.#session.graph.readOutput(id, port.name);
-          if (value === undefined) continue;
+          const version = session.graph.outputVersion(id, port.name);
+          if (version === (seen?.version ?? 0)) continue;
+          // Claimed before the wait, so an overlapping pull reads it no more.
+          const claimed = this.#observation(id, port.name);
+          claimed.version = version;
+          claimed.pulledAt = performance.now();
+          const value =
+            port.kind === 'handle'
+              ? await session.graph.readHandle(id, port.name)
+              : await session.graph.readOutput(id, port.name);
+          if (this.#session !== session || value === undefined) continue;
           this.#record(id, port.name, value);
-          this.#observation(id, port.name).tick = this.#tickCount;
         } catch {}
       }
     }
+  }
 
-    this.#dispatch('state-changed');
+  /** Pulls what became observed, or new, outside of a tick slice. */
+  #pullSoon(): void {
+    void this.#pullObserved(true).then(() => this.#dispatch('state-changed'));
   }
 
   #dispatchQueued = false;

@@ -14,8 +14,9 @@
 //! # Crate layout
 //!
 //! - [`scheduler`] — [`Scheduler`] and the scheduling model.
-//! - [`executor`] — the seam: [`Executor`], [`PortValue`], [`Generation`],
-//!   and the in-island loop ([`drive`], [`NodeCaller`]).
+//! - [`latches`] — the values, held in the host ([`LatchReader`]).
+//! - [`executor`] — the seams: [`DataPlane`], [`Executor`], [`PortValue`],
+//!   [`Generation`], and the in-island loop ([`drive`], [`NodeCaller`]).
 //! - [`plan`] — static island wiring ([`IslandPlan`], [`RunShape`]).
 //! - [`snapshot`] — [`Snapshot`].
 //! - [`node`] — a node's lifecycle state ([`NodeState`], [`NodePhase`]).
@@ -24,32 +25,23 @@
 //! - [`schedule`] — [`TickResult`], [`FaultReport`].
 //! - [`error`] — [`RuntimeError`], [`NodeFault`].
 
-pub mod error;
+pub(crate) mod control;
+pub use witgraph_traits::{error, mode, node, schedule};
 pub mod executor;
 pub(crate) mod island;
-pub mod mode;
-pub mod node;
+pub mod latches;
 pub mod plan;
 pub(crate) mod resource;
 mod run;
-pub mod schedule;
 pub mod scheduler;
 pub mod snapshot;
 #[cfg(test)]
 mod tests;
 
-pub use error::{NodeFault, RuntimeError};
-pub use executor::{
-    Canonical, Executor, Generation, GenerationFuture, IslandEvent, IslandEventKind, MaybeSend,
-    MaybeSync, NodeCaller, OptionPayload, OptionPayloadFn, Outcome, PortValue, Reporter, drive,
-    missing_input_message,
-};
-pub use mode::{Perf, RuntimeMode, Trace, TraceEvent};
-pub use node::{NodePhase, NodeState};
-pub use plan::{IslandPlan, MemberPlan, RunShape};
-pub use schedule::{FaultReport, TickResult};
-pub use scheduler::{
-    DEFAULT_MAX_STEPS_PER_TICK, Scheduler, check_max_steps_per_tick, check_resources,
-};
-pub use snapshot::{IslandSnapshot, PortValues, Snapshot, SnapshotError};
+pub use control::{DEFAULT_MAX_STEPS_PER_TICK, check_max_steps_per_tick, check_resources};
+pub use executor::{NodeCaller, drive, missing_input_message};
+pub use latches::LatchReader;
+pub use scheduler::Scheduler;
+pub use snapshot::SnapshotError;
 pub use witgraph_ir;
+pub use witgraph_traits::*;

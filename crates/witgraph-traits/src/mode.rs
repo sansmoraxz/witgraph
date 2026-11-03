@@ -1,8 +1,8 @@
 //! Runtime mode trait and implementations.
 //!
 //! [`RuntimeMode`] is a zero-cost generic parameter on
-//! [`Scheduler`](crate::Scheduler). In [`Perf`] mode all
-//! callbacks are empty and monomorphized away. In [`Trace`] mode every
+//! the scheduler. In [`Perf`] mode all
+//! callbacks are empty. In [`Trace`] mode every
 //! callback records a [`TraceEvent`] behind a mutex for post-mortem
 //! inspection.
 //!

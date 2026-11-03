@@ -58,8 +58,11 @@ for (const { graph, name, backend, everywhere } of BACKENDS) {
         expect(inverted.pixels.slice(0, 3)).toEqual(edges.pixels.slice(0, 3).map((v) => 255 - v));
         expect(image.pixels).not.toEqual(edges.pixels);
         const sum = await canvas.evaluate(
-          (el: HTMLElement & { controller?: { latestOutput(n: string, p: string): unknown } }) =>
-            el.controller?.latestOutput('sum', 'len'),
+          (
+            el: HTMLElement & {
+              controller?: { readOutput(n: string, p: string): Promise<unknown> };
+            },
+          ) => el.controller?.readOutput('sum', 'len'),
         );
         expect(sum).toBe(BigInt(64 * 48 * 3));
       } else {

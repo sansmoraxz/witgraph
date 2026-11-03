@@ -1,0 +1,21 @@
+[package]
+name = "witgraph-traits"
+description = "What witgraph's hosts have in common: the API of a running graph, and what runs one"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+witgraph-ir = { workspace = true }
+thiserror = { workspace = true }
+miette = { workspace = true }
+futures = "0.3"
+serde = { workspace = true, features = ["std"] }

@@ -4,21 +4,21 @@ use witgraph_ir::NodeId;
 
 use crate::error::NodeFault;
 
-/// The outcome of one [`Scheduler::tick`](crate::Scheduler::tick).
+/// The outcome of one `tick`(crate::Scheduler::tick).
 #[derive(Debug, Clone)]
 #[must_use = "a tick can end in an abort or a step limit"]
 pub enum TickResult {
     /// Work happened: a generation started or finished (or faulted), or a
     /// feedback edge latched a new value. Tick again to continue. Faults
     /// other than `fatal` do not end a tick: see
-    /// [`Scheduler::take_faults`](crate::Scheduler::take_faults).
+    /// `take_faults`(crate::Scheduler::take_faults).
     Progress,
     /// Nothing ran, and nothing can make progress: every island is idle,
     /// stopped, or owes a run it cannot start (a required input has no
     /// value yet).
     Idle,
     /// The `stop` future of
-    /// [`Scheduler::tick_until`](crate::Scheduler::tick_until) fired
+    /// `tick_until`(crate::Scheduler::tick_until) fired
     /// first. The tick ended as a dropped one does: generations in flight
     /// carry on with the next tick, and every feedback loop whose iteration
     /// is over was latched.
@@ -37,7 +37,7 @@ pub enum TickResult {
     },
 }
 
-/// An island fault, as [`Scheduler::take_faults`](crate::Scheduler::take_faults)
+/// An island fault, as `take_faults`(crate::Scheduler::take_faults)
 /// reports it.
 #[derive(Debug, Clone)]
 pub struct FaultReport {

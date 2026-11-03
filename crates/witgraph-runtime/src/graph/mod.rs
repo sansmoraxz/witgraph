@@ -19,12 +19,15 @@ use wasmtime::component::{Type, Val};
 
 use crate::shared::Shared;
 use crate::value::Value;
-use witgraph_ir::{CompiledGraph, NodeId, PortDirection, PortName};
-use witgraph_sched::{Scheduler, Snapshot, SnapshotError};
+use witgraph_ir::{CompiledGraph, NodeId, PortDirection, PortKind, PortName};
+use witgraph_sched::{LatchReader, Scheduler};
+use witgraph_traits::{OutputReader, RunningGraph, Snapshot, SnapshotError};
 
 pub use self::load::PreparedComponent;
 use crate::engine::{self, Host, NoCapabilities, StoreSettings, Wasmtime};
-use witgraph_sched::{FaultReport, NodeState, Perf, RuntimeError, RuntimeMode, TickResult};
+use witgraph_sched::{
+    FaultReport, NodeState, Perf, PortVersion, RuntimeError, RuntimeMode, TickResult,
+};
 #[cfg(feature = "compile")]
 pub use witgraph_wit::compose::LinkedProvider;
 
@@ -178,17 +181,78 @@ fn not_a_value_output(node: &NodeId, port: &PortName) -> RuntimeError {
     }
 }
 
-impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
-    /// Writes a value to a Value input port, as an external source would.
-    /// See [`Scheduler::inject`] for which ports qualify and when the
-    /// island re-runs.
-    pub fn inject(&mut self, node: &NodeId, port: &PortName, val: Val) -> Result<(), RuntimeError> {
-        self.sched.inject(node, port, Value::from_val(val))
+/// Reads a [`RuntimeGraph`]'s latched outputs, also while it ticks.
+#[derive(Clone)]
+pub struct ValReader(LatchReader<Value>);
+
+impl OutputReader for ValReader {
+    type Value = Val;
+    type Handle = Shared;
+
+    async fn read_output(
+        &self,
+        node: &NodeId,
+        port: &PortName,
+    ) -> Result<Option<Val>, RuntimeError> {
+        match self.0.read_output(node, port)? {
+            Some(Value::Handle(_)) => Err(not_a_value_output(node, port)),
+            value => Ok(value.map(|value| value.to_val())),
+        }
     }
 
-    /// [`inject`](Self::inject)s a value written as WAVE text, parsed
-    /// against the port's payload type. See [`Scheduler::inject_wave`].
-    pub fn inject_wave(
+    async fn read_output_wave(
+        &self,
+        node: &NodeId,
+        port: &PortName,
+    ) -> Result<Option<String>, RuntimeError> {
+        let Some(val) = self.read_output(node, port).await? else {
+            return Ok(None);
+        };
+        val.to_wave()
+            .map(Some)
+            .map_err(|e| RuntimeError::ValueType {
+                node: node.clone(),
+                port: port.clone(),
+                message: e.to_string(),
+            })
+    }
+
+    async fn read_handle(
+        &self,
+        node: &NodeId,
+        port: &PortName,
+    ) -> Result<Option<Shared>, RuntimeError> {
+        match self.0.read_output(node, port)? {
+            Some(Value::Handle(shared)) => Ok(Some(shared)),
+            None if self.0.output_kind(node, port)? == PortKind::Handle => Ok(None),
+            _ => Err(not_a_value_output(node, port)),
+        }
+    }
+
+    fn output_version(&self, node: &NodeId, port: &PortName) -> Result<PortVersion, RuntimeError> {
+        self.0.output_version(node, port)
+    }
+}
+
+impl<M: RuntimeMode, H: Host> RunningGraph for RuntimeGraph<M, H> {
+    type Value = Val;
+    type Handle = Shared;
+    type Reader = ValReader;
+
+    fn reader(&self) -> ValReader {
+        ValReader(self.sched.reader())
+    }
+
+    async fn inject(
+        &mut self,
+        node: &NodeId,
+        port: &PortName,
+        value: Val,
+    ) -> Result<(), RuntimeError> {
+        self.sched.inject(node, port, Value::from_val(value))
+    }
+
+    async fn inject_wave(
         &mut self,
         node: &NodeId,
         port: &PortName,
@@ -197,52 +261,76 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
         self.sched.inject_wave(node, port, text)
     }
 
-    /// Clears an injected Value input, as if nothing had been injected. See
-    /// [`Scheduler::clear_input`].
-    pub fn clear_input(&mut self, node: &NodeId, port: &PortName) -> Result<(), RuntimeError> {
+    async fn clear_input(&mut self, node: &NodeId, port: &PortName) -> Result<(), RuntimeError> {
         self.sched.clear_input(node, port)
     }
 
-    /// Makes the node's island owe a run on its latched inputs, as an input
-    /// change would. See [`Scheduler::rerun`].
-    pub fn rerun(&mut self, node: &NodeId) -> Result<(), RuntimeError> {
-        self.sched.rerun(node)
+    async fn read_output(
+        &mut self,
+        node: &NodeId,
+        port: &PortName,
+    ) -> Result<Option<Val>, RuntimeError> {
+        self.reader().read_output(node, port).await
     }
 
-    /// The latched value of a Value output port: what the node's `run`
-    /// returned last, or `None` if it has not run yet. See
-    /// [`Scheduler::read_output`].
-    pub fn read_output(&self, node: &NodeId, port: &PortName) -> Result<Option<Val>, RuntimeError> {
-        match self.sched.read_output(node, port)? {
-            Some(Value::Handle(_)) => Err(not_a_value_output(node, port)),
-            value => Ok(value.map(|value| value.to_val())),
-        }
+    async fn read_output_wave(
+        &mut self,
+        node: &NodeId,
+        port: &PortName,
+    ) -> Result<Option<String>, RuntimeError> {
+        self.reader().read_output_wave(node, port).await
     }
 
-    /// The latched object of a handle output port: what the node's `run`
-    /// returned last, or `None` if it has not run yet. A port that is no
-    /// handle output is [`RuntimeError::NotAValuePort`].
-    pub fn read_handle(
-        &self,
+    async fn read_handle(
+        &mut self,
         node: &NodeId,
         port: &PortName,
     ) -> Result<Option<Shared>, RuntimeError> {
-        match self.sched.read_output(node, port)? {
-            Some(Value::Handle(shared)) => Ok(Some(shared)),
-            None if self.is_handle_output(node, port) => Ok(None),
-            _ => Err(not_a_value_output(node, port)),
-        }
+        self.reader().read_handle(node, port).await
     }
 
-    fn is_handle_output(&self, node: &NodeId, port: &PortName) -> bool {
-        self.compiled().contract_for(node).is_some_and(|contract| {
-            contract
-                .outputs
-                .iter()
-                .any(|p| &p.name == port && p.kind == witgraph_ir::PortKind::Handle)
-        })
+    fn output_version(&self, node: &NodeId, port: &PortName) -> Result<PortVersion, RuntimeError> {
+        self.sched.output_version(node, port)
     }
 
+    fn rerun(&mut self, node: &NodeId) -> Result<(), RuntimeError> {
+        self.sched.rerun(node)
+    }
+
+    fn node_state(&self, node: &NodeId) -> Result<NodeState, RuntimeError> {
+        self.sched.node_state(node)
+    }
+
+    fn take_faults(&mut self) -> Vec<FaultReport> {
+        self.sched.take_faults()
+    }
+
+    fn shutdown(&mut self) {
+        self.sched.shutdown();
+    }
+
+    async fn tick(&mut self) -> TickResult {
+        self.sched.tick().await
+    }
+
+    async fn tick_until(&mut self, stop: impl Future<Output = ()> + Send) -> TickResult {
+        self.sched.tick_until(stop).await
+    }
+
+    async fn snapshot(&mut self) -> Result<Snapshot, SnapshotError> {
+        self.sched.snapshot()
+    }
+
+    async fn restore(&mut self, snapshot: &Snapshot) -> Result<(), RuntimeError> {
+        self.sched.restore(snapshot)
+    }
+
+    fn compiled(&self) -> &CompiledGraph {
+        self.sched.compiled()
+    }
+}
+
+impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
     /// The memory the graph's shared objects take now, as their providers
     /// reported it: what counts against
     /// [`max_shared_memory`](RuntimeConfig::max_shared_memory).
@@ -262,63 +350,10 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
         self.sched.port_type(node, port, PortDirection::Output)
     }
 
-    /// A node's current lifecycle state: a view of its island's state at
-    /// this moment (see [`NodeState`]). An unknown node is an error
-    /// ([`RuntimeError::UnknownNode`]).
-    pub fn node_state(&self, node: &NodeId) -> Result<NodeState, RuntimeError> {
-        self.sched.node_state(node)
-    }
-
-    /// Takes the faults reported since the last call. See
-    /// [`Scheduler::take_faults`].
-    pub fn take_faults(&mut self) -> Vec<FaultReport> {
-        self.sched.take_faults()
-    }
-
     /// Cancels a node's island: an in-flight generation is dropped, with
     /// the island's Stores. See [`Scheduler::cancel`].
     pub fn cancel(&mut self, node: &NodeId) -> Result<(), RuntimeError> {
         self.sched.cancel(node)
-    }
-
-    /// Stops everything: drops every in-flight generation and every Store.
-    /// See [`Scheduler::shutdown`].
-    pub fn shutdown(&mut self) {
-        self.sched.shutdown();
-    }
-
-    /// Runs one iteration of the graph: until it is quiescent, then latches
-    /// feedback connections. Dropping the future is safe: in-flight
-    /// generations resume on the next tick. See [`Scheduler::tick`].
-    pub async fn tick(&mut self) -> TickResult {
-        self.sched.tick().await
-    }
-
-    /// Like [`tick`](Self::tick), but ends early when `stop` completes (a
-    /// timer, say), with [`TickResult::Interrupted`]. See
-    /// [`Scheduler::tick_until`].
-    pub async fn tick_until(&mut self, stop: impl Future<Output = ()>) -> TickResult {
-        self.sched.tick_until(stop).await
-    }
-
-    /// Captures the graph's host-visible state, at any time. Stream and
-    /// future contents are not captured. See [`Scheduler::snapshot`] and
-    /// [`Snapshot`].
-    pub fn snapshot(&self) -> Result<Snapshot, SnapshotError> {
-        self.sched.snapshot()
-    }
-
-    /// Replaces the graph's host-visible state with `snapshot`; the next
-    /// [`tick`](Self::tick) replays every generation that was in flight.
-    /// See [`Scheduler::restore`] for the preconditions and what is
-    /// restored.
-    pub fn restore(&mut self, snapshot: &Snapshot) -> Result<(), RuntimeError> {
-        self.sched.restore(snapshot)
-    }
-
-    /// The compiled graph this runtime was loaded from.
-    pub fn compiled(&self) -> &CompiledGraph {
-        self.sched.compiled()
     }
 
     /// The runtime configuration.

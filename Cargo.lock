@@ -3461,6 +3461,7 @@ dependencies = [
  "wit-parser",
  "witgraph-ir",
  "witgraph-sched",
+ "witgraph-traits",
  "witgraph-wit",
 ]
 
@@ -3469,11 +3470,10 @@ name = "witgraph-sched"
 version = "0.1.0"
 dependencies = [
  "futures",
- "miette",
  "serde",
  "serde_json",
- "thiserror 2.0.21",
  "witgraph-ir",
+ "witgraph-traits",
 ]
 
 [[package]]
@@ -3496,6 +3496,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "witgraph-traits"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "miette",
+ "serde",
+ "thiserror 2.0.21",
+ "witgraph-ir",
+]
+
+[[package]]
 name = "witgraph-web"
 version = "0.1.0"
 dependencies = [
@@ -3508,6 +3519,7 @@ dependencies = [
  "wasm-bindgen-futures",
  "witgraph-ir",
  "witgraph-sched",
+ "witgraph-traits",
  "witgraph-wit",
 ]
 

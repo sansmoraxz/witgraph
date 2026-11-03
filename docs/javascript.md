@@ -17,9 +17,9 @@ const session = await Session.load({
   },
   onStreamItem: ({ node, port, items }) => console.log(node, port, items),
 });
-session.graph.inject('scale', 'factor', 10);
+await session.graph.inject('scale', 'factor', 10);
 await session.tick();
-session.graph.readOutput('scale', 'out');
+await session.graph.readOutput('scale', 'out');
 session.dispose();
 ```
 
@@ -85,6 +85,15 @@ the TypeScript and let `init` fetch the module from beside the script.
   streams are async iterables. A Value a node returns is passed to its
   readers as it is, not copied or converted, and `readOutput` returns that
   same value: don't change it.
+- **The same calls as on wasmtime.** `inject`, `injectWave`, `clearInput`,
+  `readOutput`, `readOutputWave`, `readHandle`, `snapshot` and `restore` return
+  promises, on both hosts, and `tick` too. A handle output is read with
+  `readHandle`. Reads work while a tick runs. Writes reject while one does.
+- **Reading only what's new.** `outputVersion` says which value of an output is
+  latched: a number that moves on each time the node writes it, or a snapshot
+  is restored. It costs nothing to ask, so a host previewing an output on its
+  own schedule can call `readOutput` only when the number has moved. Both work
+  while a tick runs.
 
 - **Large values.** WAVE text of a value (`readOutputWave`, `snapshot`) is
   refused, with an error naming the value, when it would not fit the

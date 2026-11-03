@@ -16,6 +16,7 @@ workspace = true
 [dependencies]
 witgraph-ir = { workspace = true }
 witgraph-sched = { workspace = true }
+witgraph-traits = { workspace = true }
 witgraph-wit = { workspace = true }
 thiserror = { workspace = true }
 miette = { workspace = true }

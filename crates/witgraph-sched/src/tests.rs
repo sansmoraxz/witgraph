@@ -14,8 +14,8 @@ use witgraph_ir::{
 };
 
 use crate::executor::{
-    Canonical, Executor, Generation, GenerationFuture, IslandEvent, IslandEventKind, NodeCaller,
-    OptionPayload, drive,
+    Canonical, EventSink, Executor, Generation, GenerationFuture, IslandEvent, IslandEventKind,
+    NodeCaller, OptionPayload, drive,
 };
 use crate::plan::RunShape;
 use crate::{NodeFault, NodePhase, Perf, Scheduler, TickResult};
@@ -206,11 +206,11 @@ fn cancel_handles_events_a_dropped_tick_left_behind() {
     assert!(sched.tick().now_or_never().is_none());
     let a = NodeId::from("a");
     let island = sched.compiled().island_of(&a).unwrap();
-    let slot = &sched.slots[island];
+    let slot = &sched.core.slots[island];
     let generation = slot.state.running_generation().unwrap();
     let member = slot.plan.members.iter().position(|m| m.node == a).unwrap();
     // As if `a` returned during the dropped tick's last poll.
-    let _ = sched.events_tx.unbounded_send(IslandEvent {
+    sched.core.plane.sink.send(IslandEvent {
         island,
         generation,
         kind: IslandEventKind::RunReturned {
@@ -242,7 +242,7 @@ fn work_owed_during_a_failing_rebuild_survives_it() {
     sched.inject(&a, &"add".into(), 1).unwrap();
     // The rebuild starts, then an input changes before it fails.
     let island = sched.compiled().island_of(&a).unwrap();
-    sched.start_generation(island);
+    sched.core().start_generation(island);
     sched.inject(&a, &"add".into(), 2).unwrap();
     // The attempt fails; the change it never saw is still owed, so the
     // island is rebuilt again (successfully, now) and runs on it.
@@ -416,4 +416,54 @@ fn snapshots_leave_handles_out_and_rerun_their_producers() {
         "the producer made its handle anew"
     );
     assert_eq!(out(&restored, "b"), Some(5));
+}
+
+#[test]
+fn a_version_moves_when_a_run_writes_the_port() {
+    let mut sched = load(None, &Arc::new(AtomicBool::new(false)));
+    let (a, port) = (NodeId::from("a"), PortName::from("out"));
+    assert_eq!(sched.output_version(&a, &port).unwrap().get(), 0);
+    settle(&mut sched);
+    let first = sched.output_version(&a, &port).unwrap();
+    assert!(first.get() > 0);
+    // Nothing ran: the same version, and nothing to read.
+    assert!(matches!(block_on(sched.tick()), TickResult::Idle));
+    assert_eq!(sched.output_version(&a, &port).unwrap(), first);
+    sched.inject(&a, &"add".into(), 7).unwrap();
+    settle(&mut sched);
+    assert!(sched.output_version(&a, &port).unwrap() > first);
+    assert!(matches!(
+        sched.output_version(&a, &"in".into()),
+        Err(crate::RuntimeError::NotAValuePort { .. })
+    ));
+    assert!(matches!(
+        sched.output_version(&"nobody".into(), &port),
+        Err(crate::RuntimeError::UnknownNode { .. })
+    ));
+}
+
+#[test]
+fn a_restore_moves_every_version() {
+    let mut sched = load(None, &Arc::new(AtomicBool::new(false)));
+    settle(&mut sched);
+    let (a, port) = (NodeId::from("a"), PortName::from("out"));
+    let before = sched.output_version(&a, &port).unwrap();
+    let snapshot = sched.snapshot().unwrap();
+    sched.restore(&snapshot).unwrap();
+    assert!(sched.output_version(&a, &port).unwrap() > before);
+}
+
+#[test]
+fn a_reader_reads_while_a_tick_holds_the_scheduler() {
+    let mut sched = load(Some("b"), &Arc::new(AtomicBool::new(false)));
+    let reader = sched.reader();
+    let (a, out) = (NodeId::from("a"), PortName::from("out"));
+    {
+        // `b` never returns, so the tick stays in flight, holding `sched`.
+        let tick = sched.tick();
+        futures::pin_mut!(tick);
+        assert!(tick.as_mut().now_or_never().is_none());
+        assert_eq!(reader.read_output(&a, &out).unwrap(), Some(1));
+        assert!(reader.output_version(&a, &out).unwrap().get() > 0);
+    }
 }

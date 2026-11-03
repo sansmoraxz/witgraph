@@ -201,11 +201,7 @@ export class WitgraphInspector extends HTMLElement {
     // A handle has no text: its object may describe itself.
     if (handle) return describeHandle(value, handle.resource);
     if (weight(value) > MAX_WAVE_BYTES) return `${summarize(value)} (too large to show as WAVE)`;
-    try {
-      return this.#controller?.readOutputWave(node, port) ?? '-';
-    } catch (error) {
-      return error instanceof Error ? error.message : String(error);
-    }
+    return this.#controller?.outputWave(node, port) ?? '…';
   }
 
   #el(tag: string, cls: string, text?: string): HTMLElement {
@@ -373,9 +369,7 @@ export class WitgraphInspector extends HTMLElement {
 
         row.appendChild(
           this.#iconButton(History, `Restore ${snap.name}`, '', () => {
-            try {
-              this.#controller?.restoreNamedSnapshot(snap.name);
-            } catch {}
+            void this.#controller?.restoreNamedSnapshot(snap.name).catch(() => {});
           }),
         );
         const delBtn = this.#iconButton(Trash2, `Delete ${snap.name}`, 'danger', () =>
@@ -923,10 +917,10 @@ export class WitgraphInspector extends HTMLElement {
     (clearBtn as HTMLElement).title = 'Clear';
     form.append(input, injectBtn, clearBtn);
 
-    injectBtn.addEventListener('click', () => {
+    injectBtn.addEventListener('click', async () => {
       form.parentElement?.querySelector('.inject-error')?.remove();
       try {
-        this.#controller!.injectValue(node.id, port.name, input.value);
+        await this.#controller!.injectValue(node.id, port.name, input.value);
       } catch (err: unknown) {
         const errEl = this.#el(
           'div',
@@ -938,9 +932,7 @@ export class WitgraphInspector extends HTMLElement {
     });
 
     clearBtn.addEventListener('click', () => {
-      try {
-        this.#controller!.clearInput(node.id, port.name);
-      } catch {}
+      void this.#controller!.clearInput(node.id, port.name).catch(() => {});
     });
 
     wrap.appendChild(form);

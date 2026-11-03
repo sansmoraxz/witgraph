@@ -10,15 +10,14 @@ use std::task::{Context, Poll};
 use futures::future::Either;
 use futures::stream::StreamExt;
 use futures::task::{ArcWake, AtomicWaker};
-use witgraph_ir::{FeedbackIdx, Idx, InputIdx, NodeId, NodeIdx, PortName, PortSet};
+use witgraph_ir::{FeedbackIdx, Idx, InputIdx, NodeId, NodeIdx, PortSet};
 
+use crate::control::{ControlEvent, ControlKind, SchedulerCore, Slot};
 use crate::error::NodeFault;
-use crate::executor::{Executor, Generation, IslandEvent, IslandEventKind, OptionPayload, Outcome};
-use crate::island::{self, IslandState, StartInputs, StopCause, Work};
+use crate::executor::{DataPlane, Latched, LiveIsland, Outcome, Returned, StartGeneration};
+use crate::island::{self, IslandState, StopCause, Work};
 use crate::mode::RuntimeMode;
-use crate::plan::MemberPlan;
 use crate::schedule::{FaultReport, TickResult};
-use crate::scheduler::{Route, Scheduler, Slot};
 
 /// The running islands whose generations asked to be polled again, so a
 /// wake polls those islands only, each once.
@@ -78,38 +77,23 @@ impl ArcWake for IslandWaker {
 }
 
 /// What the tick loop woke up for.
-enum Wake<X: Executor> {
-    Event(IslandEvent<X::Value>),
-    Finished(usize, Outcome<X::Island>),
+enum Wake {
+    Event(ControlEvent),
+    Finished(usize, Outcome<Box<dyn LiveIsland>>),
 }
 
 /// Ends a tick that did not run to its end (it was dropped, say) the way
-/// [`Scheduler::tick_until`] ends an interrupted one.
-struct TickGuard<'a, M: RuntimeMode, X: Executor> {
-    rt: &'a mut Scheduler<M, X>,
+/// [`SchedulerCore::tick_until`] ends an interrupted one.
+struct TickGuard<'a> {
+    rt: &'a mut SchedulerCore<dyn DataPlane>,
     finished: bool,
 }
 
-impl<M: RuntimeMode, X: Executor> Drop for TickGuard<'_, M, X> {
+impl Drop for TickGuard<'_> {
     fn drop(&mut self) {
         if !self.finished {
             self.rt.tick_interrupted();
         }
-    }
-}
-
-/// What a connection delivers to its input: the value itself, or, when the
-/// connection unwraps an option, its payload
-/// ([`Executor::option_payload`]).
-fn delivered<X: Executor>(val: &Arc<X::Value>, unwrap_option: bool) -> Option<Arc<X::Value>> {
-    if !unwrap_option {
-        return Some(val.clone());
-    }
-    match X::option_payload(val) {
-        // Not an option: delivered itself, shared rather than copied.
-        OptionPayload::NotOption => Some(val.clone()),
-        OptionPayload::Some(payload) => Some(Arc::new(payload.into_owned())),
-        OptionPayload::None => None,
     }
 }
 
@@ -121,7 +105,7 @@ enum Started {
     LimitReached,
 }
 
-impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
+impl SchedulerCore<dyn DataPlane> {
     /// Runs one iteration of the graph: until it is quiescent, then latches
     /// feedback connections.
     ///
@@ -216,7 +200,7 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
     /// [`tick_until`](Self::tick_until)).
     pub(crate) fn tick_interrupted(&mut self) {
         self.drain_events();
-        if self.feedback.iter().all(Option::is_none) {
+        if self.pending.is_empty() {
             return;
         }
         let (blocked, unsettled) = self.unsettled();
@@ -230,9 +214,9 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
                     .iter()
                     .all(|&source| !unsettled.contains(source))
         };
-        let mut latch = PortSet::new(self.feedback.len());
-        for (conn, val) in self.feedback.iter_enumerated() {
-            if val.is_some() && settled(self.island_of_feedback_target(conn)) {
+        let mut latch = PortSet::new(self.ports.feedback().len());
+        for conn in self.pending.iter() {
+            if settled(self.island_of_feedback_target(conn)) {
                 latch.insert(conn);
             }
         }
@@ -249,24 +233,39 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
         self.island_of_node[self.ports.inputs()[input].node]
     }
 
+    /// Makes the island of `input`, whose value changed, owe a run.
+    pub(crate) fn owe_for(&mut self, input: InputIdx) {
+        self.dirty = true;
+        let index = self.island_of_input(input);
+        self.slots[index].owed.push_latched();
+    }
+
     /// Applies an island transition, keeps the count of running islands,
     /// and reports the resulting node-phase change for every member.
     pub(crate) fn transition(
         &mut self,
         index: usize,
-        step: impl FnOnce(IslandState<X::Island, X::Value>) -> IslandState<X::Island, X::Value>,
+        step: impl FnOnce(IslandState<Box<dyn LiveIsland>>) -> IslandState<Box<dyn LiveIsland>>,
     ) {
-        Self::transition_in(&mut self.slots, &mut self.running, &self.mode, index, step);
+        Self::transition_in(
+            &mut self.slots,
+            &mut self.running,
+            &*self.mode,
+            &self.plane,
+            index,
+            step,
+        );
     }
 
     /// [`transition`](Self::transition) over the fields it touches, so
     /// `step` may borrow the others.
     fn transition_in(
-        slots: &mut [Slot<X>],
+        slots: &mut [Slot],
         running: &mut usize,
-        mode: &M,
+        mode: &dyn RuntimeMode,
+        plane: &dyn DataPlane,
         index: usize,
-        step: impl FnOnce(IslandState<X::Island, X::Value>) -> IslandState<X::Island, X::Value>,
+        step: impl FnOnce(IslandState<Box<dyn LiveIsland>>) -> IslandState<Box<dyn LiveIsland>>,
     ) {
         let state = std::mem::replace(&mut slots[index].state, IslandState::placeholder());
         let (from, was_running) = (state.node_phase(), state.is_running());
@@ -275,7 +274,10 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
         slots[index].state = next;
         match (was_running, is_running) {
             (false, true) => *running += 1,
-            (true, false) => *running -= 1,
+            (true, false) => {
+                *running -= 1;
+                plane.generation_ended(index);
+            }
             _ => {}
         }
         if from != to {
@@ -290,7 +292,8 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
     /// a replay owed) is stale, never overwriting it.
     pub(crate) fn note_host_write(&mut self, port: InputIdx) {
         for &(conn, source) in &self.feedback_into[port] {
-            self.feedback[conn] = None;
+            self.pending.remove(conn);
+            self.plane.drop_feedback(conn);
             let slot = &mut self.slots[source];
             if slot.state.is_running() {
                 slot.stale_feedback.insert(conn);
@@ -299,41 +302,6 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
                 replay.stale.insert(conn);
             }
         }
-    }
-
-    /// Forgets a Value input's latched value. Returns whether it had one
-    /// (and so made the island owe a generation).
-    pub(crate) fn clear_input_value(&mut self, port: InputIdx) -> bool {
-        if self.inputs[port].take().is_none() {
-            return false;
-        }
-        self.dirty = true;
-        let index = self.island_of_input(port);
-        self.slots[index].owed.push_latched();
-        true
-    }
-
-    /// Writes a delivered Value into an input from outside its island:
-    /// unwrapped first when the connection unwraps an option, where `none`
-    /// clears the input. Returns whether the input changed.
-    fn write_input(&mut self, port: InputIdx, val: &Arc<X::Value>, unwrap_option: bool) -> bool {
-        match delivered::<X>(val, unwrap_option) {
-            Some(val) => self.set_input(port, val),
-            None => self.clear_input_value(port),
-        }
-    }
-
-    /// Writes a Value input from outside its island. Returns whether the
-    /// value changed (and so made the island owe a generation).
-    pub(crate) fn set_input(&mut self, port: InputIdx, val: Arc<X::Value>) -> bool {
-        if self.inputs[port].as_ref().is_some_and(|old| **old == *val) {
-            return false;
-        }
-        self.dirty = true;
-        let index = self.island_of_input(port);
-        self.slots[index].owed.push_latched();
-        self.inputs[port] = Some(val);
-        true
     }
 
     /// Whether the island's next owed generation has what it needs to
@@ -345,7 +313,7 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
         if slot.owed.next_is_replay() {
             return true;
         }
-        slot.owed.has_latched() && slot.required.iter().all(|&p| self.inputs[p].is_some())
+        slot.owed.has_latched() && slot.required.iter().all(|&p| self.presence.contains(p))
     }
 
     /// Per island, whether something upstream of it can still change its
@@ -443,45 +411,37 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
         let Some(work) = self.slots[index].owed.take_next() else {
             return;
         };
-        let (started_with, stale) = match work {
-            Work::Replay(replay) => (replay.inputs, replay.stale),
-            Work::Latched => (
-                self.external_inputs(index),
-                PortSet::new(self.feedback.len()),
-            ),
+        let (replay, stale) = match work {
+            Work::Replay(replay) => (true, replay.stale),
+            Work::Latched => (false, PortSet::new(self.ports.feedback().len())),
         };
-        let external: Vec<Vec<Option<X::Value>>> = started_with
-            .iter()
-            .map(|fields| fields.iter().map(|v| v.as_deref().cloned()).collect())
-            .collect();
         let plan = self.slots[index].plan.clone();
-        let events = self.events_tx.clone();
         let stream_items = self.mode.wants_stream_items();
-        let generation = |number| Generation {
+        let generation = |number| StartGeneration {
             plan,
-            external,
             number,
             stream_items,
-            events,
+            replay,
         };
         let mut number = 0;
-        let executor = &self.executor;
+        let plane = &self.plane;
         Self::transition_in(
             &mut self.slots,
             &mut self.running,
-            &self.mode,
+            &*self.mode,
+            plane,
             index,
             |state| match state {
                 IslandState::Stopped(island) => island
-                    .start_rebuilt(started_with, |n| {
+                    .start_rebuilt(|n| {
                         number = n;
-                        executor.rebuild_and_run(generation(n))
+                        plane.rebuild_and_run(generation(n))
                     })
                     .into(),
                 IslandState::Idle(island) => island
-                    .start(started_with, |live, n| {
+                    .start(|live, n| {
                         number = n;
-                        executor.run(live, generation(n))
+                        plane.run(live, generation(n))
                     })
                     .into(),
                 other => island::misuse(other, if stopped { "Stopped" } else { "Idle" }),
@@ -495,26 +455,10 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
         self.mode.on_generation_started(index, number);
     }
 
-    /// The latched external Value inputs of each member, per field.
-    fn external_inputs(&self, index: usize) -> StartInputs<X::Value> {
-        self.slots[index]
-            .plan
-            .members
-            .iter()
-            .map(|member| {
-                let mut fields = vec![None; member.field_count()];
-                for (field, input) in member.external_values() {
-                    fields[field] = self.inputs[input.index].clone();
-                }
-                fields
-            })
-            .collect()
-    }
-
     /// Waits for the next island event or finished generation, polling
     /// only the islands whose generations asked to be polled. A generation
     /// lives in its island's state, so dropping this future loses nothing.
-    async fn next_wake(&mut self) -> Wake<X> {
+    async fn next_wake(&mut self) -> Wake {
         let Self {
             slots,
             events_rx,
@@ -560,7 +504,7 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
 
     /// Handles one event. Returns `false` for a stale one (from a dropped
     /// generation).
-    fn handle_event(&mut self, event: IslandEvent<X::Value>) -> bool {
+    fn handle_event(&mut self, event: ControlEvent) -> bool {
         let current = self
             .slots
             .get(event.island)
@@ -570,17 +514,17 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
         }
         let plan = self.slots[event.island].plan.clone();
         match event.kind {
-            IslandEventKind::RunStarted { member } => {
+            ControlKind::RunStarted { member } => {
                 if let Some(member) = plan.members.get(member) {
                     self.mode.on_run_started(&member.node);
                 }
             }
-            IslandEventKind::Rebuilt => {
+            ControlKind::Rebuilt => {
                 for member in &plan.members {
                     self.mode.on_restarted(&member.node);
                 }
             }
-            IslandEventKind::StreamItems {
+            ControlKind::StreamItems {
                 member,
                 port,
                 count,
@@ -589,7 +533,7 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
                     self.mode.on_stream_items(&member.node, &port, count);
                 }
             }
-            IslandEventKind::RunReturned { member, values } => {
+            ControlKind::RunReturned { member, returned } => {
                 if let Some(awaiting) = self.slots[event.island].awaiting.get_mut(member) {
                     *awaiting = false;
                 }
@@ -597,43 +541,46 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
                 self.dirty = true;
                 if let Some(member) = plan.members.get(member) {
                     self.mode.on_run_returned(&member.node);
-                    self.deliver(event.island, member, values);
+                    self.apply_returned(event.island, returned);
                 }
             }
         }
         true
     }
 
-    /// Latches a returned `run`'s Value outputs and routes them. Each value
-    /// is shared, not copied, between the outputs, the inputs it reaches
-    /// and buffered feedback. Guest values are already canonical.
-    fn deliver(&mut self, island: usize, member: &MemberPlan, values: Vec<(PortName, X::Value)>) {
-        for (port, val) in values {
-            let Some(output) = member.outputs.get(&port).map(|output| output.index) else {
-                continue;
-            };
-            let val = Arc::new(val);
-            let edges = self.out_edges[output].clone();
-            for edge in edges.iter() {
-                match edge.route {
-                    // Computed from inputs older than a host write to its
-                    // target: the host's value stands.
-                    Route::Feedback(conn) => {
-                        if !self.slots[island].stale_feedback.contains(conn) {
-                            self.feedback[conn] = Some(val.clone());
-                        }
-                    }
-                    // Consumed inside this generation; recorded, not a
-                    // change.
-                    Route::Internal => {
-                        self.inputs[edge.to] = delivered::<X>(&val, edge.unwrap_option);
-                    }
-                    Route::External => {
-                        self.write_input(edge.to, &val, edge.unwrap_option);
-                    }
-                }
+    /// Records what a returned `run` of `island` changed.
+    fn apply_returned(&mut self, island: usize, returned: Returned) {
+        let Returned {
+            outputs_changed,
+            inputs_changed,
+            inputs_recorded,
+            inputs_cleared,
+            feedback_buffered,
+        } = returned;
+        for output in outputs_changed {
+            self.versions.bump(output);
+        }
+        for input in inputs_changed {
+            self.presence.insert(input);
+            self.owe_for(input);
+        }
+        for input in inputs_recorded {
+            self.presence.insert(input);
+        }
+        for input in inputs_cleared {
+            self.presence.remove(input);
+            if !self.internal.contains(input) {
+                self.owe_for(input);
             }
-            self.outputs[output] = Some(val);
+        }
+        for conn in feedback_buffered {
+            // Computed from inputs older than a host write to its target:
+            // the host's value stands.
+            if self.slots[island].stale_feedback.contains(conn) {
+                self.plane.drop_feedback(conn);
+            } else {
+                self.pending.insert(conn);
+            }
         }
     }
 
@@ -641,7 +588,11 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
     /// result when a `fatal` call aborts it. Work the island owes survives
     /// a fault: if an input changed while the failing generation ran, the
     /// island is rebuilt and runs again.
-    fn handle_finished(&mut self, index: usize, outcome: Outcome<X::Island>) -> Option<TickResult> {
+    fn handle_finished(
+        &mut self,
+        index: usize,
+        outcome: Outcome<Box<dyn LiveIsland>>,
+    ) -> Option<TickResult> {
         let generation = self.slots[index].state.running_generation().unwrap_or(0);
         self.resources.release(index);
         self.dirty = true;
@@ -709,9 +660,9 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
     pub(crate) fn stop_island(&mut self, index: usize, cause: StopCause) {
         self.dirty = true;
         self.slots[index].owed.clear();
-        for conn in (0..self.feedback.len()).map(FeedbackIdx::at) {
-            if self.island_of_feedback_target(conn) == index {
-                self.feedback[conn] = None;
+        for conn in (0..self.ports.feedback().len()).map(FeedbackIdx::at) {
+            if self.island_of_feedback_target(conn) == index && self.pending.remove(conn) {
+                self.plane.drop_feedback(conn);
             }
         }
         let keep = match self.slots[index].state.stop_cause() {
@@ -739,14 +690,24 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
     /// keeping the others buffered. Returns whether any input changed.
     pub(crate) fn latch_feedback(&mut self, mut latch: impl FnMut(FeedbackIdx) -> bool) -> bool {
         let mut changed = false;
-        for conn in (0..self.feedback.len()).map(FeedbackIdx::at) {
-            if self.feedback[conn].is_none() || !latch(conn) {
+        for conn in (0..self.ports.feedback().len()).map(FeedbackIdx::at) {
+            if !self.pending.contains(conn) || !latch(conn) {
                 continue;
             }
-            if let Some(val) = self.feedback[conn].take() {
-                let entry = &self.ports.feedback()[conn];
-                let (to, unwrap_option) = (entry.to, entry.unwraps_option);
-                changed |= self.write_input(to, &val, unwrap_option);
+            self.pending.remove(conn);
+            let to = self.ports.feedback()[conn].to;
+            match self.plane.latch_feedback(conn) {
+                Latched::Unchanged => {}
+                Latched::Changed => {
+                    self.presence.insert(to);
+                    self.owe_for(to);
+                    changed = true;
+                }
+                Latched::Cleared => {
+                    self.presence.remove(to);
+                    self.owe_for(to);
+                    changed = true;
+                }
             }
         }
         changed

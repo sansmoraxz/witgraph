@@ -264,15 +264,13 @@ export class WitgraphControls extends HTMLElement {
     this.#btnLayout.addEventListener('click', () => this.#controller?.autoLayout());
     this.#btnSnapSave.addEventListener('click', () => {
       try {
-        this.#controller?.saveSnapshot();
+        void this.#controller?.saveSnapshot();
       } catch {}
     });
     this.#btnSnapRestore.addEventListener('click', () => {
       const snaps = this.#controller?.savedSnapshots ?? [];
       if (snaps.length > 0) {
-        try {
-          this.#controller?.restoreNamedSnapshot(snaps[snaps.length - 1].name);
-        } catch {}
+        void this.#controller?.restoreNamedSnapshot(snaps[snaps.length - 1].name).catch(() => {});
       }
     });
 

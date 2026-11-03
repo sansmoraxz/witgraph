@@ -56,12 +56,13 @@ pub use engine::{CapabilityGap, Host, HostState, IslandData, NoCapabilities};
 pub use error::LoadError;
 #[cfg(feature = "compile")]
 pub use graph::LinkedProvider;
-pub use graph::{PreparedComponent, RuntimeConfig, RuntimeGraph};
+pub use graph::{PreparedComponent, RuntimeConfig, RuntimeGraph, ValReader};
 pub use plugin::{CapabilityPlugin, Extensions, PluginData, Plugins};
 pub use shared::Shared;
 pub use wasmtime::component::Val;
 pub use witgraph_sched::{
-    FaultReport, IslandSnapshot, NodeFault, NodePhase, NodeState, Perf, PortValues, RuntimeError,
-    RuntimeMode, Snapshot, SnapshotError, TickResult, Trace, TraceEvent,
+    FaultReport, IslandSnapshot, NodeFault, NodePhase, NodeState, Perf, PortValues, PortVersion,
+    RuntimeError, RuntimeMode, Snapshot, SnapshotError, TickResult, Trace, TraceEvent,
 };
-pub use {wasmtime, witgraph_ir, witgraph_sched};
+pub use witgraph_traits::{OutputReader, RunningGraph};
+pub use {wasmtime, witgraph_ir, witgraph_sched, witgraph_traits};

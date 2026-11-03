@@ -351,7 +351,7 @@ impl IslandData for HostState {
 /// The Store data type is the embedder's, so capability state can live in
 /// it (per island, rebuilt with the island) and implementations that need
 /// a particular data type (WASI, `bindgen!` hosts) can be linked.
-pub trait Host: 'static {
+pub trait Host: Send + 'static {
     /// The data of every island Store.
     type Data: IslandData;
 

@@ -10,7 +10,7 @@ use test_components::ECHO;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use witgraph_ir::{ComponentRef, Graph};
-use witgraph_runtime::{Perf, RuntimeConfig, RuntimeGraph, TickResult, Val};
+use witgraph_runtime::{Perf, RunningGraph, RuntimeConfig, RuntimeGraph, TickResult, Val};
 use witgraph_source::{ComponentSource, Digest, Location, Resolver, SourceError};
 
 /// A fresh directory under the test target directory.
@@ -341,6 +341,7 @@ async fn a_graph_loads_from_resolved_artifacts_alone() {
         .await
         .expect("loads");
     rt.inject(&"n".into(), &"in".into(), Val::Float64(2.5))
+        .await
         .unwrap();
     for _ in 0..4 {
         if matches!(rt.tick().await, TickResult::Idle) {
@@ -348,7 +349,7 @@ async fn a_graph_loads_from_resolved_artifacts_alone() {
         }
     }
     assert_eq!(
-        rt.read_output(&"n".into(), &"out".into()).unwrap(),
+        rt.read_output(&"n".into(), &"out".into()).await.unwrap(),
         Some(Val::Float64(2.5))
     );
 }

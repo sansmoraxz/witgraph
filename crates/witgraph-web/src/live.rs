@@ -5,9 +5,9 @@
 //! The scheduler is the tick's until it ends, so the view is kept beside
 //! it: copied from the scheduler at load and on a restore, then kept up to
 //! date by the scheduler's [`RuntimeMode`] callbacks (phases, faults, the
-//! trace) and the executor's calls (Value outputs). What those touched is
-//! made exact again from the scheduler when a tick ends, so no tick copies
-//! the whole graph.
+//! trace). What those touched is made exact again from the scheduler when a
+//! tick ends, so no tick copies the whole graph. Latched values need no view:
+//! they are not the scheduler's, and read the same while a tick runs.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};

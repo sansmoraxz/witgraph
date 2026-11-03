@@ -82,10 +82,14 @@ node previews the first one it names.
 - **Choosing.** _Preview_ in the inspector picks another output, or none. An
   output its component names no viewer for is plotted when it carries
   numbers and shown as text otherwise.
+- **How often.** A preview reads a Value output only when it has a new value,
+  and by default as soon as it does. Set `previewIntervalMs` on the controller
+  to read one output at most that often during a run: it is always read once
+  more as the run ends.
 - **Resizing.** Drag a node's bottom-right corner to resize it; its preview
   takes the height. Undo works.
-- **Every kind of port.** A Value output's preview keeps a value a tick (the
-  value so far while a tick runs), a stream's every item as its reader takes
+- **Every kind of port.** A Value output's preview keeps each new value it sees
+  (the value so far while a tick runs), a stream's every item as its reader takes
   it, and a future's value once it resolves, showing it _pending_ while its
   node runs again. A handle output's preview is given the object itself, as
   its maker returned it: a viewer for it reads what it needs through the

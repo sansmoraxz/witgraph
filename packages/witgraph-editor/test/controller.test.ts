@@ -155,9 +155,9 @@ test('the catalog describes a component by the docs it carries', async () => {
 
 test('step and read output', async () => {
   const controller = await loadController([['a', 'echo']]);
-  controller.injectValue('a', 'in', '5');
+  await controller.injectValue('a', 'in', '5');
   await controller.step();
-  assert.equal(controller.readOutputWave('a', 'out'), '5');
+  assert.equal(await controller.readOutputWave('a', 'out'), '5');
 });
 
 test('run settles the graph', async () => {
@@ -168,16 +168,16 @@ test('run settles the graph', async () => {
     ],
     [['c', 'a.out', 'b.in']],
   );
-  controller.injectValue('a', 'in', '5');
+  await controller.injectValue('a', 'in', '5');
   await controller.run();
-  assert.equal(controller.readOutputWave('a', 'out'), '5');
-  assert.equal(controller.readOutputWave('b', 'out'), '5');
+  assert.equal(await controller.readOutputWave('a', 'out'), '5');
+  assert.equal(await controller.readOutputWave('b', 'out'), '5');
 });
 
 test('breakpoint pauses execution', async () => {
   const controller = await loadController([['a', 'echo']]);
   controller.toggleBreakpoint('a');
-  controller.injectValue('a', 'in', '5');
+  await controller.injectValue('a', 'in', '5');
 
   const paused = new Promise<void>((resolve) => {
     controller.addEventListener('state-changed', function handler() {
@@ -247,7 +247,7 @@ test('autoLayout positions nodes', async () => {
 
 test('trace events are collected', async () => {
   const controller = await loadController([['a', 'echo']]);
-  controller.injectValue('a', 'in', '5');
+  await controller.injectValue('a', 'in', '5');
   await controller.run();
   assert.ok(controller.traceEvents.length > 0, 'should have trace events after a run');
 });
@@ -294,11 +294,11 @@ test('a node previews the output its component declares a viewer for', async () 
 
   let changes = 0;
   controller.addEventListener('output-changed', () => changes++);
-  controller.injectValue('source', 'frames', '3');
+  await controller.injectValue('source', 'frames', '3');
   await controller.run();
   await pause(50);
   assert.ok(changes >= 1, 'stream items are announced');
-  assert.equal(controller.latestOutput('sink', 'count'), 3);
+  assert.equal(await controller.readOutput('sink', 'count'), 3);
 
   // Row 40, column 50: below the moving square.
   const rgb = (node: string) => {
@@ -351,7 +351,7 @@ test('a node is resized and its preview picked by undoable edits', async () => {
 test('a graph is not edited while it runs, until the run stops', async () => {
   const controller = await loadVideo();
   // Endless, paced: a run lasts until it is stopped.
-  controller.injectValue('source', 'fps', '200');
+  await controller.injectValue('source', 'fps', '200');
   assert.equal(controller.editable, true);
 
   const running = controller.run();
@@ -386,7 +386,7 @@ test('a graph is not edited while it runs, until the run stops', async () => {
 test('stop ends a stream still being written, and run starts it again', async () => {
   const controller = await loadVideo();
   // Endless, paced: a run lasts until it is stopped.
-  controller.injectValue('source', 'fps', '200');
+  await controller.injectValue('source', 'fps', '200');
   const frame = () => controller.latestOutput('gray', 'frames');
   const waitForFrame = async (previous: unknown) => {
     for (let i = 0; i < 400 && frame() === previous; i++) await pause(5);
@@ -416,20 +416,20 @@ test('a stream output keeps its recent items and their count', async () => {
     [['s', 'prod.items', 'cons.items']],
   );
   assert.equal(controller.nodes.get('prod')?.preview?.viewer, 'series');
-  controller.injectValue('prod', 'burst-size', '5');
+  await controller.injectValue('prod', 'burst-size', '5');
   await controller.step();
   const items = controller.observe('prod', 'items');
   assert.deepEqual([items.kind, items.count, items.latest], ['stream', 5, 4]);
   assert.deepEqual(items.recent, [0, 1, 2, 3, 4]);
 
-  controller.injectValue('prod', 'burst-size', '3');
+  await controller.injectValue('prod', 'burst-size', '3');
   await controller.step();
   const more = controller.observe('prod', 'items');
   assert.equal(more.count, 8, 'counted across runs');
   assert.deepEqual(more.recent, [0, 1, 2, 3, 4, 0, 1, 2]);
 
   // Only the newest are kept; all are counted.
-  controller.injectValue('prod', 'burst-size', '500');
+  await controller.injectValue('prod', 'burst-size', '500');
   await controller.run();
   const many = controller.observe('prod', 'items');
   assert.equal(many.count, 508);
@@ -456,14 +456,14 @@ test('a future output is pending until it resolves', async () => {
   for (let i = 0; i < 50 && controller.observe('w', 'done').count === 0; i++) await pause(10);
   const done = controller.observe('w', 'done');
   assert.deepEqual([done.latest, done.count, done.pending], [7, 1, false]);
-  assert.equal(controller.latestOutput('r', 'value'), 7);
+  assert.equal(await controller.readOutput('r', 'value'), 7);
 });
 
-test('a Value output keeps one value a tick', async () => {
+test('a Value output keeps each new value', async () => {
   const controller = await loadController([['n', 'relay']], [['loop', 'n.out', 'n.in', true]]);
   assert.equal(controller.nodes.get('n')?.preview?.viewer, 'series');
-  controller.injectValue('n', 'in', '1');
-  controller.injectValue('n', 'add', '2');
+  await controller.injectValue('n', 'in', '1');
+  await controller.injectValue('n', 'add', '2');
   for (let i = 0; i < 3; i++) await controller.step();
   const out = controller.observe('n', 'out');
   assert.equal(out.kind, 'value');
@@ -479,8 +479,8 @@ test('a Value output keeps one value a tick', async () => {
 
 test('a run that never settles goes on until it is stopped', async () => {
   const controller = await loadController([['n', 'relay']], [['loop', 'n.out', 'n.in', true]]);
-  controller.injectValue('n', 'in', '0');
-  controller.injectValue('n', 'add', '1');
+  await controller.injectValue('n', 'in', '0');
+  await controller.injectValue('n', 'add', '1');
   const running = controller.run();
   await pause(600);
   assert.equal(controller.mode, 'running');
@@ -493,7 +493,7 @@ test('a run that never settles goes on until it is stopped', async () => {
 
 test('a step is one bounded tick; what it left running stops on stop', async () => {
   const controller = await loadVideo();
-  controller.injectValue('source', 'fps', '100');
+  await controller.injectValue('source', 'fps', '100');
   const started = performance.now();
   await controller.step();
   assert.ok(performance.now() - started < 2000, 'the endless stream does not hold the step');
@@ -513,8 +513,8 @@ test('a step is one bounded tick; what it left running stops on stop', async () 
 
 test('a run ticks no faster than its tick rate, which can change as it runs', async () => {
   const controller = await loadController([['n', 'relay']], [['loop', 'n.out', 'n.in', true]]);
-  controller.injectValue('n', 'in', '0');
-  controller.injectValue('n', 'add', '1');
+  await controller.injectValue('n', 'in', '0');
+  await controller.injectValue('n', 'add', '1');
   controller.tickRate = 5;
   const running = controller.run();
   await pause(1_000);
@@ -534,8 +534,8 @@ test('a run ticks no faster than its tick rate, which can change as it runs', as
 
 test('only what is previewed or selected is recorded', async () => {
   const controller = await loadController([['n', 'relay']], [['loop', 'n.out', 'n.in', true]]);
-  controller.injectValue('n', 'in', '0');
-  controller.injectValue('n', 'add', '1');
+  await controller.injectValue('n', 'in', '0');
+  await controller.injectValue('n', 'add', '1');
   controller.setPreview('n', 'none');
   controller.select(null);
   assert.equal(controller.isObserved('n', 'out'), false);
@@ -543,13 +543,15 @@ test('only what is previewed or selected is recorded', async () => {
   await controller.step();
   assert.equal(controller.observe('n', 'out').count, 0, 'nothing recorded');
   // Its latest value is still read when asked for.
-  assert.equal(controller.latestOutput('n', 'out'), 2);
+  assert.equal(await controller.readOutput('n', 'out'), 2);
 
   // Selected, the inspector shows it: it is recorded from then on.
   controller.select('n');
   assert.equal(controller.isObserved('n', 'out'), true);
+  await pause(0);
+  assert.equal(controller.observe('n', 'out').count, 1, 'what it holds now');
   await controller.step();
-  assert.equal(controller.observe('n', 'out').count, 1);
+  assert.equal(controller.observe('n', 'out').count, 2);
 });
 
 /** `test:data/tensor` in host memory, counting what is left undisposed. */
@@ -667,7 +669,7 @@ test('a preview keeps a reference to a stream of handles, one at a time', async 
   const controller = await loadController(...streamOfTensors, {
     capabilities: tensors.capabilities,
   });
-  controller.injectValue('src', 'frames', '4');
+  await controller.injectValue('src', 'frames', '4');
   await settled(controller);
   const view = controller.observe('src', 'tensors');
   assert.equal(view.count, 4);
@@ -690,7 +692,7 @@ test('without a way to keep them, a preview describes a stream of handles', asyn
   const controller = await loadController(...streamOfTensors, {
     capabilities: tensors.capabilities,
   });
-  controller.injectValue('src', 'frames', '2');
+  await controller.injectValue('src', 'frames', '2');
   await settled(controller);
   const view = controller.observe('src', 'tensors');
   assert.equal(view.count, 2);

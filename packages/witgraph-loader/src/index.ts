@@ -669,7 +669,12 @@ export function watchTraps<T extends object>(graph: T, state: { broken?: Error }
       const member: unknown = Reflect.get(target, key, target);
       if (typeof member !== 'function') return member;
       return (...args: unknown[]) => {
-        if (state.broken) throw state.broken;
+        // What returns a promise never throws: it rejects.
+        const fail = (error: unknown) => {
+          if (ASYNC_CALLS.has(String(key))) return Promise.reject(error);
+          throw error;
+        };
+        if (state.broken) return fail(state.broken);
         const seen = (error: unknown) => {
           if (!(error instanceof WebAssembly.RuntimeError)) return error;
           state.broken = new Error(
@@ -688,12 +693,25 @@ export function watchTraps<T extends object>(graph: T, state: { broken?: Error }
           }
           return result;
         } catch (error) {
-          throw seen(error);
+          return fail(seen(error));
         }
       };
     },
   });
 }
+
+/** The scheduler's calls that return a promise. */
+const ASYNC_CALLS = new Set([
+  'inject',
+  'injectWave',
+  'clearInput',
+  'readOutput',
+  'readHandle',
+  'readOutputWave',
+  'snapshot',
+  'restore',
+  'tick',
+]);
 
 /** A component's `node` export: inline, or a named `…/node` interface. */
 function nodeExport(instance: Record<string, any>): { run: (inputs: PortValues) => any } {

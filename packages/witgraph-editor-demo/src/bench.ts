@@ -86,11 +86,11 @@ interface Case {
 }
 
 /** Milliseconds a frame, the median of `runs`, after one warming up. */
-async function timed(s: Session, run: (n: number) => void, frames: number, runs = 3) {
+async function timed(s: Session, run: (n: number) => unknown, frames: number, runs = 3) {
   const times: number[] = [];
   for (let i = 0; i <= runs; i++) {
     const n = i === 0 ? Math.min(5, frames - 1) : frames + i;
-    run(n);
+    await run(n);
     const start = performance.now();
     await s.settle();
     if (i > 0) times.push((performance.now() - start) / n);
@@ -114,12 +114,12 @@ async function handles(c: Case) {
     path.slice(1).map((to, i): [string, string] => [`${path[i]}.tensors`, `${to}.tensors`]),
     (_, cap) => (cap.interface.startsWith('test:data/tensor') ? imports : undefined),
   );
-  s.graph.inject('src', 'width', c.width);
-  s.graph.inject('src', 'height', c.height);
-  s.graph.inject('src', 'reuse', c.reuse);
-  s.graph.inject('sink', 'read-last', c.readLast);
+  await s.graph.inject('src', 'width', c.width);
+  await s.graph.inject('src', 'height', c.height);
+  await s.graph.inject('src', 'reuse', c.reuse);
+  await s.graph.inject('sink', 'read-last', c.readLast);
   const ms = await timed(s, (n) => s.graph.inject('sink', 'take', n), c.frames);
-  const count = s.graph.readOutput('sink', 'count');
+  const count = await s.graph.readOutput('sink', 'count');
   s.dispose();
   for (let i = 0; i < 100 && live() > 0; i++) await new Promise((r) => setTimeout(r, 20));
   return { ...c, msPerFrame: Number(ms.toFixed(2)), count, liveAfter: live() };
@@ -150,9 +150,9 @@ async function cameraChain(c: { backend: string; frames: number }) {
           ? imports
           : undefined,
   );
-  s.graph.inject('sink', 'read-last', true);
+  await s.graph.inject('sink', 'read-last', true);
   const ms = await timed(s, (n) => s.graph.inject('sink', 'take', n), c.frames);
-  const count = s.graph.readOutput('sink', 'count');
+  const count = await s.graph.readOutput('sink', 'count');
   s.dispose();
   for (let i = 0; i < 100 && live() > 0; i++) await new Promise((r) => setTimeout(r, 20));
   return { camera: true, ...c, msPerFrame: Number(ms.toFixed(2)), count, liveAfter: live() };

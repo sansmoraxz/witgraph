@@ -72,9 +72,9 @@ components. See [docs/graphs.md](docs/graphs.md).
 
 ```rust
 let mut rt = RuntimeGraph::load(compiled, &wasm, RuntimeConfig::default(), Perf).await?;
-rt.inject(&"scale".into(), &"value".into(), Val::Float64(21.0))?;
+rt.inject(&"scale".into(), &"value".into(), Val::Float64(21.0)).await?;
 rt.tick().await;
-let out = rt.read_output(&"scale".into(), &"out".into())?;
+let out = rt.read_output(&"scale".into(), &"out".into()).await?;
 ```
 
 `wasm` maps each component to its bytes. `witgraph-source` can fetch them from
@@ -84,7 +84,8 @@ key-value store) get them through capability plugins. See
 [docs/running.md](docs/running.md).
 
 The same scheduler runs in a browser or in Node.js through `witgraph-web` and
-`packages/witgraph-loader`: see [docs/javascript.md](docs/javascript.md).
+`packages/witgraph-loader`, with the same calls: both hosts implement
+`RunningGraph` from `witgraph-traits`. See [docs/javascript.md](docs/javascript.md).
 
 ## Editor
 
@@ -101,6 +102,7 @@ nodes, snapshots, undo and redo, and JSON import and export. See
 | ------------------------------- | ------------------------------------------------------------------------------ |
 | `witgraph-ir`                   | Graph types, validation, and the `GraphBuilder → Graph → CompiledGraph` chain. |
 | `witgraph-wit`                  | Reads WIT and produces component contracts and the editor catalog.             |
+| `witgraph-traits`               | What the hosts have in common: the API of a running graph, and what runs one.  |
 | `witgraph-sched`                | The scheduler. It has no engine in it and also builds for `wasm32`.            |
 | `witgraph-runtime`              | The scheduler on wasmtime.                                                     |
 | `witgraph-web`                  | The scheduler for JavaScript hosts, via `wasm-bindgen`.                        |

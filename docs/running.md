@@ -2,7 +2,7 @@
 
 ```rust
 let mut rt = RuntimeGraph::load(compiled, &wasm, RuntimeConfig::default(), Perf).await?;
-rt.inject(&"scale".into(), &"factor".into(), Val::U32(10))?;
+rt.inject(&"scale".into(), &"factor".into(), Val::U32(10)).await?;
 
 for _ in 0..100 {
     match rt.tick_until(tokio::time::sleep(Duration::from_secs(1))).await {
@@ -14,7 +14,7 @@ for _ in 0..100 {
         eprintln!("{:?} faulted: {}", report.members, report.fault);
     }
 }
-let scaled = rt.read_output(&"scale".into(), &"out".into())?;
+let scaled = rt.read_output(&"scale".into(), &"out".into()).await?;
 ```
 
 ## Loading
@@ -160,12 +160,19 @@ A tick returns `Progress`, `Idle`, `Interrupted`, `StepLimitReached` or
 
 ## Inputs and outputs
 
+These are the methods of `RunningGraph`, from `witgraph-traits`, which every host
+implements. `use witgraph_runtime::RunningGraph` to call them. Reads are never
+pushed to you: you read an output when you choose.
+
 - `inject(node, port, value)` sets a value input, and `inject_wave` does the
   same from text. Required inputs fed only by feedback need an initial value.
 - `clear_input` removes an injected value.
-- `read_output` returns the last value a node produced, and `read_handle`
-  the object behind a handle output. `shared_memory()` is what the graph's
+- `read_output` returns the last value a node produced, `read_output_wave` the
+  same as text, and `read_handle` the object behind a handle output. `reader()`
+  gives you something that reads them while a tick is running too. `shared_memory()` is what the graph's
   shared objects take.
+- `output_version` says which value of an output is latched, a number that moves
+  on each time the node writes it, so you can tell it is new without reading it.
 - `rerun(node)` runs a node again with its current inputs.
 
 A node only reruns when an input actually changes.

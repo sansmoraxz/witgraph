@@ -4,6 +4,7 @@
 
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
+use witgraph_runtime::RunningGraph;
 
 use test_components::{CALC, ECHO, Guest, MATH};
 use witgraph_ir::{ComponentContract, ComponentRef, Graph};
@@ -59,10 +60,11 @@ async fn a_saved_component_runs_on_a_new_engine() {
     .await
     .unwrap();
     rt.inject(&"e".into(), &"in".into(), Val::Float64(1.5))
+        .await
         .unwrap();
     settle(&mut rt).await;
     assert_eq!(
-        rt.read_output(&"e".into(), &"out".into()).unwrap(),
+        rt.read_output(&"e".into(), &"out".into()).await.unwrap(),
         Some(Val::Float64(1.5))
     );
 }
@@ -100,10 +102,14 @@ async fn a_saved_component_keeps_its_links() {
     )
     .await
     .expect("the link came back with the component");
-    rt.inject(&"n".into(), &"x".into(), Val::U32(2)).unwrap();
+    rt.inject(&"n".into(), &"x".into(), Val::U32(2))
+        .await
+        .unwrap();
     settle(&mut rt).await;
     assert_eq!(
-        rt.read_output(&"n".into(), &"doubled".into()).unwrap(),
+        rt.read_output(&"n".into(), &"doubled".into())
+            .await
+            .unwrap(),
         Some(Val::U32(4))
     );
 }

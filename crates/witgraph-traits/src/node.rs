@@ -35,10 +35,10 @@ pub enum NodePhase {
     /// input changes.
     Idle,
     /// Its island faulted. Restartable: new input, or
-    /// [`rerun`](crate::Scheduler::rerun), rebuilds the island.
+    /// `rerun`, rebuilds the island.
     Faulted,
     /// Its island was cancelled or shut down. Restartable: new input, or
-    /// [`rerun`](crate::Scheduler::rerun), rebuilds the island.
+    /// `rerun`, rebuilds the island.
     Cancelled,
 }
 
@@ -64,7 +64,8 @@ pub struct NodeState {
 }
 
 impl NodeState {
-    pub(crate) fn new(
+    /// A node's state as its scheduler knows it.
+    pub fn new(
         id: NodeId,
         shape: NodeShape,
         phase: NodePhase,

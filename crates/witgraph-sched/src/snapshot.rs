@@ -1,117 +1,25 @@
 //! Snapshots of the host-visible state, and restoring them.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use witgraph_ir::{
-    ComponentRef, Connection, ConnectionId, FeedbackIdx, Idx, IndexVec, Link, NodeId,
-    PortDirection, PortEntry, PortKind, PortName, PortRef, PortSet,
+    FeedbackIdx, Idx, IndexVec, NodeId, PortDirection, PortEntry, PortKind, PortName, PortRef,
+    PortSet,
 };
+pub use witgraph_traits::snapshot::*;
 
+use crate::control::SchedulerCore;
 use crate::error::RuntimeError;
-use crate::executor::Executor;
-use crate::island::{Replay, StartInputs, StopCause};
+use crate::executor::{DataPlane, Executor};
+use crate::island::{Replay, StopCause};
+use crate::latches::{Latches, StartInputs};
 use crate::mode::RuntimeMode;
-use crate::node::NodePhase;
-use crate::scheduler::{Latches, Scheduler};
-
-/// WAVE text per port, keyed by node id then port name.
-pub type PortValues = BTreeMap<NodeId, BTreeMap<PortName, String>>;
-
-/// The host-visible state of a runtime graph at one point in time, for
-/// point-in-time restores and debugging. Produced by
-/// [`Scheduler::snapshot`] (at any time), applied by
-/// [`Scheduler::restore`].
-///
-/// Values are WAVE text, parsed against the port types on restore. Only
-/// what the host sees is captured: latched Values, pending feedback, node
-/// phases, and the inputs each in-flight or queued generation starts with.
-/// Guest memory (including suspended tasks) is not captured either.
-///
-/// Snapshots do not store stream or future contents. Restoring re-runs any
-/// generation that was in flight, which recreates its streams from the
-/// recorded inputs; the result matches the original only if the guests are
-/// deterministic.
-///
-/// Nor do they store handles, which are the host's and not text: a latched
-/// handle is left out, and the island that produced it is recorded as
-/// queued, so after a restore it runs again and makes a new one. A
-/// generation in flight that started with a handle is recorded as queued
-/// instead of replayed: it runs once its producers have delivered.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Snapshot {
-    /// Each node's resolved component (id and content hash). A snapshot
-    /// restores only onto a graph with exactly these nodes and components.
-    pub nodes: BTreeMap<NodeId, ComponentRef>,
-    /// The graph's connections, sorted by id. A snapshot restores only onto
-    /// a graph wired exactly the same way.
-    pub connections: Vec<Connection>,
-    /// The graph's links, sorted by id. A snapshot restores only onto a
-    /// graph whose nodes are linked to the same providers, by ref. Like
-    /// nodes, providers are named, not their bytes, and a provider's content
-    /// hash is not checked against its bytes (it has no contract to hash):
-    /// a pinned ref only selects the key its bytes are loaded under. Keep
-    /// the bytes behind a provider's key unchanged for a restore to replay
-    /// the same code.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub links: Vec<Link>,
-    /// Whether no generation was in flight when the snapshot was taken. A
-    /// replay owed after a restore is not in flight, so it is listed in
-    /// [`islands`](Self::islands) while this is `true`.
-    pub quiescent: bool,
-    /// Every node's phase when the snapshot was taken. Informational:
-    /// [`Scheduler::restore`] does not re-fault or re-cancel islands.
-    pub phases: BTreeMap<NodeId, NodePhase>,
-    /// Latched Value inputs: injected, delivered by connections, or latched
-    /// from feedback.
-    pub inputs: PortValues,
-    /// Latched Value outputs: what each node's `run` returned last
-    /// (including `run`s of an in-flight generation that already returned).
-    pub outputs: PortValues,
-    /// Feedback values waiting for the next latch, by connection, as the
-    /// source port produced them.
-    pub feedback: BTreeMap<ConnectionId, String>,
-    /// Islands with an in-flight or queued generation.
-    pub islands: Vec<IslandSnapshot>,
-}
-
-/// An island with work outstanding when a [`Snapshot`] was taken.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct IslandSnapshot {
-    /// The island's members, sorted. [`Scheduler::restore`] matches
-    /// islands by their set of members, in any order.
-    pub members: Vec<NodeId>,
-    /// The external Value inputs the in-flight generation started with, by
-    /// member, or those of a restored replay not started yet; `None` when
-    /// there is neither.
-    pub running: Option<PortValues>,
-    /// Whether another generation was queued (an input changed since the
-    /// last start). It runs with the latched inputs.
-    pub queued: bool,
-    /// The feedback connections out of this island whose target the host
-    /// wrote after the [`running`](Self::running) generation started: what
-    /// that generation feeds back there is stale, and its replay drops it.
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
-    pub stale_feedback: BTreeSet<ConnectionId>,
-}
+use crate::scheduler::Scheduler;
 
 /// What a snapshot says an island owes: a replay, and whether a run on the
 /// latched inputs is queued.
-type OwedWork<V> = (Option<Replay<V>>, bool);
-
-/// Why a snapshot could not be taken: a value it holds could not be written
-/// as WAVE text ([`Executor::to_wave`]).
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("{at}: {message}")]
-pub struct SnapshotError {
-    /// Which value: an output or input (`` `node.port` ``), a feedback
-    /// connection, or an input a generation started with.
-    pub at: String,
-    /// Why it could not be written.
-    pub message: String,
-}
+type OwedWork<V> = (Option<(StartInputs<V>, Replay)>, bool);
 
 impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
     /// Captures the graph's host-visible state, at any time: latched Value
@@ -130,34 +38,42 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
     /// Fails, naming it, on a value the executor cannot write as WAVE text.
     pub fn snapshot(&self) -> Result<Snapshot, SnapshotError> {
         let wave = |val: &X::Value, at: &dyn Fn() -> String| self.wave(val, at);
+        let core = &self.core;
+        let latches = core.plane.lock();
         // A handle is the host's, not text: it is left out, and the island
         // that produced it owes a run, which makes a new one.
-        let producers: BTreeSet<usize> = self
+        let producers: BTreeSet<usize> = latches
             .outputs
             .iter_enumerated()
             .filter(|(output, val)| {
-                val.is_some() && self.ports.outputs()[*output].kind == PortKind::Handle
+                val.is_some() && core.ports.outputs()[*output].kind == PortKind::Handle
             })
-            .map(|(output, _)| self.island_of_node[self.ports.outputs()[output].node])
+            .map(|(output, _)| core.island_of_node[core.ports.outputs()[output].node])
             .collect();
         let mut feedback = BTreeMap::new();
-        for (conn, val) in self.feedback.iter_enumerated() {
-            let entry = &self.ports.feedback()[conn];
+        for (conn, val) in latches.feedback.iter_enumerated() {
+            let entry = &core.ports.feedback()[conn];
             if let Some(val) = val
-                && self.ports.outputs()[entry.from].kind != PortKind::Handle
+                && core.ports.outputs()[entry.from].kind != PortKind::Handle
             {
                 let id = &entry.id;
                 feedback.insert(id.clone(), wave(val, &|| format!("feedback `{id}`"))?);
             }
         }
         let mut islands = Vec::new();
-        for (index, slot) in self.slots.iter().enumerate() {
+        for (index, slot) in core.slots.iter().enumerate() {
             // In flight, or a restored replay not started yet: its inputs,
             // and what it must not feed back.
-            let started = match (slot.state.started_with(), slot.owed.replay()) {
-                (Some(inputs), _) => Some((inputs, &slot.stale_feedback)),
-                (None, Some(replay)) => Some((&replay.inputs, &replay.stale)),
-                (None, None) => None,
+            let started = if slot.state.is_running() {
+                latches.started[index]
+                    .as_ref()
+                    .map(|inputs| (inputs, &slot.stale_feedback))
+            } else {
+                slot.owed.replay().and_then(|replay| {
+                    latches.replays[index]
+                        .as_ref()
+                        .map(|inputs| (inputs, &replay.stale))
+                })
             };
             // One that started with a handle cannot be replayed: it owes a
             // run instead, on the handles its producers make anew.
@@ -195,7 +111,7 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
                 .map(|(_, stale)| {
                     stale
                         .iter()
-                        .map(|conn| self.ports.feedback()[conn].id.clone())
+                        .map(|conn| core.ports.feedback()[conn].id.clone())
                         .collect()
                 })
                 .unwrap_or_default();
@@ -210,11 +126,11 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
             }
         }
         Ok(Snapshot {
-            nodes: self.components.clone(),
-            connections: self.connections.clone(),
-            links: self.links.clone(),
-            quiescent: self.running == 0,
-            phases: self
+            nodes: core.components.clone(),
+            connections: core.connections.clone(),
+            links: core.links.clone(),
+            quiescent: core.running == 0,
+            phases: core
                 .slots
                 .iter()
                 .flat_map(|slot| {
@@ -225,8 +141,8 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
                         .map(move |m| (m.node.clone(), phase))
                 })
                 .collect(),
-            inputs: self.latched_values(self.ports.inputs(), &self.inputs)?,
-            outputs: self.latched_values(self.ports.outputs(), &self.outputs)?,
+            inputs: self.latched_values(core.ports.inputs(), &latches.inputs)?,
+            outputs: self.latched_values(core.ports.outputs(), &latches.outputs)?,
             feedback,
             islands,
         })
@@ -264,12 +180,12 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
     /// writes after the restore is stale, and so is its feedback the
     /// snapshot recorded as stale ([`IslandSnapshot::stale_feedback`]).
     pub fn restore(&mut self, snapshot: &Snapshot) -> Result<(), RuntimeError> {
-        self.drain_events();
-        if self.running > 0 {
+        self.core().drain_events();
+        if self.core.running > 0 {
             return Err(RuntimeError::NotQuiescent);
         }
         let mismatch = |message: String| RuntimeError::SnapshotMismatch { message };
-        let ours = &self.components;
+        let ours = &self.core.components;
         if snapshot.nodes != *ours {
             let differs = ours
                 .keys()
@@ -285,48 +201,51 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
                 "the phases are not those of the graph's nodes".into(),
             ));
         }
-        if snapshot.connections != self.connections {
+        if snapshot.connections != self.core.connections {
             return Err(mismatch("the graph's connections differ".into()));
         }
-        if snapshot.links != self.links {
+        if snapshot.links != self.core.links {
             return Err(mismatch("the graph's links differ".into()));
         }
+        let ports = self.core.ports.clone();
         let inputs = self.parse_values(
             &snapshot.inputs,
             PortDirection::Input,
-            self.ports.inputs().len(),
-            |node, port| self.ports.input(node, port),
+            ports.inputs().len(),
+            |node, port| ports.input(node, port),
         )?;
         let outputs = self.parse_values(
             &snapshot.outputs,
             PortDirection::Output,
-            self.ports.outputs().len(),
-            |node, port| self.ports.output(node, port),
+            ports.outputs().len(),
+            |node, port| ports.output(node, port),
         )?;
-        let mut feedback = IndexVec::from_fn(self.feedback.len(), |_| None);
+        let mut feedback = IndexVec::from_fn(ports.feedback().len(), |_| None);
         for (conn, text) in &snapshot.feedback {
-            let index = self.ports.feedback_index(conn).ok_or_else(|| {
+            let index = ports.feedback_index(conn).ok_or_else(|| {
                 mismatch(format!(
                     "`{conn}` is not a feedback connection of this graph"
                 ))
             })?;
-            let from = self.ports.feedback()[index].from;
-            let port = &self.ports.outputs()[from].port;
+            let from = ports.feedback()[index].from;
+            let port = &ports.outputs()[from].port;
             feedback[index] = Some(self.parse_port(port, PortDirection::Output, text)?);
         }
-        let mut work: HashMap<usize, OwedWork<X::Value>> = HashMap::new();
+        let mut work: std::collections::HashMap<usize, OwedWork<X::Value>> =
+            std::collections::HashMap::new();
         for island in &snapshot.islands {
             let mut members = island.members.clone();
             members.sort();
-            let index =
-                self.island_index.get(&members).copied().ok_or_else(|| {
-                    mismatch(format!("no island with members {:?}", island.members))
-                })?;
-            let outgoing = &self.slots[index].feedback_out;
-            let mut stale: PortSet<FeedbackIdx> = PortSet::new(self.feedback.len());
+            let index = self
+                .core
+                .island_index
+                .get(&members)
+                .copied()
+                .ok_or_else(|| mismatch(format!("no island with members {:?}", island.members)))?;
+            let outgoing = &self.core.slots[index].feedback_out;
+            let mut stale: PortSet<FeedbackIdx> = PortSet::new(ports.feedback().len());
             for conn in &island.stale_feedback {
-                let Some(index) = self
-                    .ports
+                let Some(index) = ports
                     .feedback_index(conn)
                     .filter(|index| outgoing.contains(index))
                 else {
@@ -345,10 +264,7 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
                     )));
                 }
                 None => None,
-                Some(by_member) => Some(Replay {
-                    inputs: self.parse_replay(index, by_member)?,
-                    stale,
-                }),
+                Some(by_member) => Some((self.parse_replay(index, by_member)?, Replay { stale })),
             };
             if work.insert(index, (replay, island.queued)).is_some() {
                 return Err(mismatch(format!(
@@ -359,36 +275,50 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
         }
 
         // Nothing fails from here on.
-        self.inputs = inputs;
-        self.outputs = outputs;
-        self.feedback = feedback;
-        for index in 0..self.slots.len() {
-            // Guest state must not outlive the restore: every island drops
-            // its Store and is rebuilt when it next runs.
-            if !matches!(
-                self.slots[index].state.stop_cause(),
-                Some(StopCause::Restored)
-            ) {
-                self.transition(index, |state| state.stop(StopCause::Restored));
-            }
-            let slot = &mut self.slots[index];
-            let (replay, queued) = work.remove(&index).unwrap_or((None, false));
-            slot.owed.clear();
-            slot.stale_feedback.clear();
-            if let Some(replay) = replay {
-                slot.owed.set_replay(replay);
-            }
-            if queued {
-                slot.owed.push_latched();
-            }
+        let islands = self.core.slots.len();
+        let mut replays: Vec<Option<StartInputs<X::Value>>> = (0..islands).map(|_| None).collect();
+        let mut owed: Vec<(Option<Replay>, bool)> = (0..islands).map(|_| (None, false)).collect();
+        for (index, (replay, queued)) in work {
+            let replay = replay.map(|(inputs, replay)| {
+                replays[index] = Some(inputs);
+                replay
+            });
+            owed[index] = (replay, queued);
         }
-        self.dirty = true;
+        {
+            let mut latches = self.core.plane.lock();
+            latches.inputs = inputs;
+            latches.outputs = outputs;
+            latches.feedback = feedback;
+            latches.replays = replays;
+        }
+        let presence: Vec<_> = {
+            let latches = self.core.plane.lock();
+            latches
+                .inputs
+                .iter_enumerated()
+                .filter(|(_, val)| val.is_some())
+                .map(|(input, _)| input)
+                .collect()
+        };
+        let pending: Vec<_> = {
+            let latches = self.core.plane.lock();
+            latches
+                .feedback
+                .iter_enumerated()
+                .filter(|(_, val)| val.is_some())
+                .map(|(conn, _)| conn)
+                .collect()
+        };
+        self.core().apply_restore(&presence, &pending, owed);
         Ok(())
     }
 
     /// `val` as WAVE text; `at` says which value it is, if it cannot be.
     fn wave(&self, val: &X::Value, at: &dyn Fn() -> String) -> Result<String, SnapshotError> {
-        self.executor
+        self.core
+            .plane
+            .executor
             .to_wave(val)
             .map_err(|message| SnapshotError { at: at(), message })
     }
@@ -428,11 +358,11 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
             port: port.port.clone(),
             message,
         };
-        let ty = self
-            .executor
+        let executor = &self.core.plane.executor;
+        let ty = executor
             .port_type(port, direction)
             .ok_or_else(|| invalid(format!("not a Value {direction} port")))?;
-        self.executor
+        executor
             .parse_wave(ty, text)
             .map(|val| Arc::new(val.into_inner()))
             .map_err(invalid)
@@ -466,7 +396,7 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
         index: usize,
         by_member: &PortValues,
     ) -> Result<StartInputs<X::Value>, RuntimeError> {
-        let plan = &self.slots[index].plan;
+        let plan = &self.core.slots[index].plan;
         let mut external: StartInputs<X::Value> = plan
             .members
             .iter()
@@ -494,10 +424,14 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
                         invalid("not an external Value input of the replayed generation")
                     })?;
                 let ty = self
+                    .core
+                    .plane
                     .executor
                     .port_type(&input.port, PortDirection::Input)
                     .ok_or_else(|| invalid("not a Value input port"))?;
                 let val = self
+                    .core
+                    .plane
                     .executor
                     .parse_wave(ty, text)
                     .map_err(|e| invalid(&e))?;
@@ -517,5 +451,47 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
             }
         }
         Ok(external)
+    }
+}
+
+impl SchedulerCore<dyn DataPlane> {
+    /// Puts a restored state in place: what `presence` and `pending` name
+    /// holds a value, each island owes what `owed` says, and no guest state
+    /// outlives the restore.
+    fn apply_restore(
+        &mut self,
+        presence: &[witgraph_ir::InputIdx],
+        pending: &[FeedbackIdx],
+        owed: Vec<(Option<Replay>, bool)>,
+    ) {
+        self.presence.clear();
+        for input in presence {
+            self.presence.insert(*input);
+        }
+        self.pending.clear();
+        for conn in pending {
+            self.pending.insert(*conn);
+        }
+        self.versions.bump_all();
+        for (index, (replay, queued)) in owed.into_iter().enumerate() {
+            // Guest state must not outlive the restore: every island drops
+            // its Store and is rebuilt when it next runs.
+            if !matches!(
+                self.slots[index].state.stop_cause(),
+                Some(StopCause::Restored)
+            ) {
+                self.transition(index, |state| state.stop(StopCause::Restored));
+            }
+            let slot = &mut self.slots[index];
+            slot.owed.clear();
+            slot.stale_feedback.clear();
+            if let Some(replay) = replay {
+                slot.owed.set_replay(replay);
+            }
+            if queued {
+                slot.owed.push_latched();
+            }
+        }
+        self.dirty = true;
     }
 }

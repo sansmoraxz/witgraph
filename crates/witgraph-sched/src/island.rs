@@ -24,7 +24,6 @@
 //! [`Owed`]: input changes owe a generation whatever phase the island is
 //! in, and the scheduler starts the island once it can.
 
-use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use futures::FutureExt;
@@ -33,12 +32,6 @@ use witgraph_ir::{FeedbackIdx, NodeId, PortSet};
 use crate::error::NodeFault;
 use crate::executor::{GenerationFuture, Outcome};
 use crate::node::NodePhase;
-
-/// The external Value inputs of a generation: per member in plan order,
-/// per field of its `inputs` record (`None` for a field with no value, or
-/// one a member of the island writes). Shared with the latched values they
-/// were read from.
-pub(crate) type StartInputs<V> = Vec<Vec<Option<Arc<V>>>>;
 
 mod sealed {
     pub trait Sealed {}
@@ -56,10 +49,8 @@ pub(crate) struct Idle<L> {
 
 /// A generation is in flight. Owns the generation future, which owns the
 /// Store until it resolves.
-pub(crate) struct Running<L, V> {
+pub(crate) struct Running<L> {
     future: GenerationFuture<L>,
-    /// The external inputs the generation started with, for snapshots.
-    started_with: StartInputs<V>,
 }
 
 /// Faulted, cancelled or shut down. Owns no Store; rebuilt before it runs
@@ -84,10 +75,10 @@ pub(crate) enum StopCause {
 }
 
 impl<L> sealed::Sealed for Idle<L> {}
-impl<L, V> sealed::Sealed for Running<L, V> {}
+impl<L> sealed::Sealed for Running<L> {}
 impl sealed::Sealed for Stopped {}
 impl<L> Phase for Idle<L> {}
-impl<L, V> Phase for Running<L, V> {}
+impl<L> Phase for Running<L> {}
 impl Phase for Stopped {}
 
 /// An island in lifecycle phase `S`.
@@ -120,23 +111,21 @@ impl<L> Island<Idle<L>> {
 
     /// Starts the next generation: `drive` turns the Store and the new
     /// generation number into the generation future.
-    pub(crate) fn start<V>(
+    pub(crate) fn start(
         self,
-        started_with: StartInputs<V>,
         drive: impl FnOnce(L, u64) -> GenerationFuture<L>,
-    ) -> Island<Running<L, V>> {
+    ) -> Island<Running<L>> {
         let generation = self.generation + 1;
         Island {
             generation,
             state: Running {
                 future: drive(self.state.store, generation),
-                started_with,
             },
         }
     }
 }
 
-impl<L, V> Island<Running<L, V>> {
+impl<L> Island<Running<L>> {
     /// Polls the generation. After it returns `Ready`, the island must be
     /// finished or stopped, not polled again.
     pub(crate) fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Outcome<L>> {
@@ -156,17 +145,15 @@ impl Island<Stopped> {
     /// Starts the next generation from no Store: `drive` turns the new
     /// generation number into a future that rebuilds the island's Store and
     /// then runs the generation in it.
-    pub(crate) fn start_rebuilt<L, V>(
+    pub(crate) fn start_rebuilt<L>(
         self,
-        started_with: StartInputs<V>,
         drive: impl FnOnce(u64) -> GenerationFuture<L>,
-    ) -> Island<Running<L, V>> {
+    ) -> Island<Running<L>> {
         let generation = self.generation + 1;
         Island {
             generation,
             state: Running {
                 future: drive(generation),
-                started_with,
             },
         }
     }
@@ -175,34 +162,34 @@ impl Island<Stopped> {
 /// An island in whichever phase it is currently in: the element type of
 /// the scheduler's island table. Transitions dispatch to the typed
 /// [`Island<S>`] for the current phase.
-pub(crate) enum IslandState<L, V> {
+pub(crate) enum IslandState<L> {
     /// See [`Idle`].
     Idle(Island<Idle<L>>),
     /// See [`Running`].
-    Running(Island<Running<L, V>>),
+    Running(Island<Running<L>>),
     /// See [`Stopped`].
     Stopped(Island<Stopped>),
 }
 
-impl<L, V> From<Island<Idle<L>>> for IslandState<L, V> {
+impl<L> From<Island<Idle<L>>> for IslandState<L> {
     fn from(island: Island<Idle<L>>) -> Self {
         Self::Idle(island)
     }
 }
 
-impl<L, V> From<Island<Running<L, V>>> for IslandState<L, V> {
-    fn from(island: Island<Running<L, V>>) -> Self {
+impl<L> From<Island<Running<L>>> for IslandState<L> {
+    fn from(island: Island<Running<L>>) -> Self {
         Self::Running(island)
     }
 }
 
-impl<L, V> From<Island<Stopped>> for IslandState<L, V> {
+impl<L> From<Island<Stopped>> for IslandState<L> {
     fn from(island: Island<Stopped>) -> Self {
         Self::Stopped(island)
     }
 }
 
-impl<L, V> IslandState<L, V> {
+impl<L> IslandState<L> {
     /// A stand-in for the moment a transition holds the real state.
     pub(crate) fn placeholder() -> Self {
         Self::Stopped(Island {
@@ -224,14 +211,6 @@ impl<L, V> IslandState<L, V> {
     /// Whether a generation is in flight.
     pub(crate) fn is_running(&self) -> bool {
         matches!(self, Self::Running(_))
-    }
-
-    /// The external inputs of the generation in flight.
-    pub(crate) fn started_with(&self) -> Option<&StartInputs<V>> {
-        match self {
-            Self::Running(island) => Some(&island.state.started_with),
-            _ => None,
-        }
     }
 
     /// Why the island stopped, if it did.
@@ -304,7 +283,7 @@ impl<L, V> IslandState<L, V> {
 /// The scheduler always knows which phase an island is in, so this is a
 /// bug: it trips a debug assertion, and in release builds the island is
 /// left as it was.
-pub(crate) fn misuse<L, V>(state: IslandState<L, V>, expected: &str) -> IslandState<L, V> {
+pub(crate) fn misuse<L>(state: IslandState<L>, expected: &str) -> IslandState<L> {
     debug_assert!(
         false,
         "island is {:?}, expected {expected}",
@@ -313,10 +292,9 @@ pub(crate) fn misuse<L, V>(state: IslandState<L, V>, expected: &str) -> IslandSt
     state
 }
 
-/// A restored generation to replay.
-pub(crate) struct Replay<V> {
-    /// The external inputs it started with.
-    pub(crate) inputs: StartInputs<V>,
+/// A restored generation to replay. The inputs it started with are the data
+/// plane's.
+pub(crate) struct Replay {
     /// Feedback connections whose target the host wrote after the original
     /// generation started, or after the restore: what it feeds back there
     /// is stale.
@@ -324,39 +302,31 @@ pub(crate) struct Replay<V> {
 }
 
 /// One generation to start.
-pub(crate) enum Work<V> {
+pub(crate) enum Work {
     /// Run with the latched external inputs current when it starts.
     Latched,
     /// Replay a restored generation.
-    Replay(Replay<V>),
+    Replay(Replay),
 }
 
 /// What an island owes: a replay of a restored generation, which runs
 /// first, and a run on the latched inputs. Kept apart from the island's
 /// phase: an input change owes a run whether the island is idle, running,
 /// or stopped, and any number of changes before the next start owe one.
-pub(crate) struct Owed<V> {
-    replay: Option<Replay<V>>,
+#[derive(Default)]
+pub(crate) struct Owed {
+    replay: Option<Replay>,
     latched: bool,
 }
 
-impl<V> Default for Owed<V> {
-    fn default() -> Self {
-        Self {
-            replay: None,
-            latched: false,
-        }
-    }
-}
-
-impl<V> Owed<V> {
+impl Owed {
     /// Owes a run on the latched inputs.
     pub(crate) fn push_latched(&mut self) {
         self.latched = true;
     }
 
     /// Owes a replay of a restored generation, before any run.
-    pub(crate) fn set_replay(&mut self, replay: Replay<V>) {
+    pub(crate) fn set_replay(&mut self, replay: Replay) {
         self.replay = Some(replay);
     }
 
@@ -371,7 +341,7 @@ impl<V> Owed<V> {
     }
 
     /// Takes the next generation owed.
-    pub(crate) fn take_next(&mut self) -> Option<Work<V>> {
+    pub(crate) fn take_next(&mut self) -> Option<Work> {
         if let Some(replay) = self.replay.take() {
             return Some(Work::Replay(replay));
         }
@@ -389,12 +359,12 @@ impl<V> Owed<V> {
     }
 
     /// The replay owed, if one is.
-    pub(crate) fn replay(&self) -> Option<&Replay<V>> {
+    pub(crate) fn replay(&self) -> Option<&Replay> {
         self.replay.as_ref()
     }
 
     /// The replay owed, if one is, to mark more of its feedback stale.
-    pub(crate) fn replay_mut(&mut self) -> Option<&mut Replay<V>> {
+    pub(crate) fn replay_mut(&mut self) -> Option<&mut Replay> {
         self.replay.as_mut()
     }
 }
@@ -403,16 +373,15 @@ impl<V> Owed<V> {
 mod tests {
     use super::*;
 
-    fn replay() -> Replay<u32> {
+    fn replay() -> Replay {
         Replay {
-            inputs: vec![Vec::new()],
             stale: PortSet::new(0),
         }
     }
 
     #[test]
     fn latched_runs_coalesce() {
-        let mut owed = Owed::<u32>::default();
+        let mut owed = Owed::default();
         owed.push_latched();
         owed.push_latched();
         assert!(owed.has_latched());
@@ -445,7 +414,7 @@ mod tests {
 
     #[test]
     fn stopped_phases_project_onto_node_phases() {
-        let faulted: IslandState<(), u32> = Island {
+        let faulted: IslandState<()> = Island {
             generation: 3,
             state: Stopped {
                 cause: StopCause::Faulted(NodeFault::FuelExhausted, None),

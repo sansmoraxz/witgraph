@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::time::Duration;
+use witgraph_runtime::RunningGraph;
 
 use wasmtime::component::{Linker, ResourceType, Val};
 use wit_component::{ComponentEncoder, StringEncoding};
@@ -67,7 +68,7 @@ struct Linking<F>(F);
 
 impl<F> Host for Linking<F>
 where
-    F: Fn(&mut Linker<HostState>) -> wasmtime::Result<()> + 'static,
+    F: Send + Fn(&mut Linker<HostState>) -> wasmtime::Result<()> + 'static,
 {
     type Data = HostState;
 
@@ -92,7 +93,7 @@ async fn load<F>(
     linker: F,
 ) -> Result<RuntimeGraph<witgraph_runtime::Perf, Linking<F>>, LoadError>
 where
-    F: Fn(&mut Linker<HostState>) -> wasmtime::Result<()> + 'static,
+    F: Fn(&mut Linker<HostState>) -> wasmtime::Result<()> + Send + 'static,
 {
     let graph = Graph::builder("t")
         .add_component(contract)
@@ -537,25 +538,30 @@ async fn flags_are_kept_in_declaration_order() {
     let flags = |names: &[&str]| Val::Flags(names.iter().map(|n| n.to_string()).collect());
     let err = rt
         .inject(&"n".into(), &"p".into(), flags(&["read", "read"]))
+        .await
         .unwrap_err();
     assert!(matches!(err, RuntimeError::ValueType { .. }), "{err}");
 
     rt.inject(&"n".into(), &"p".into(), flags(&["read", "write"]))
+        .await
         .unwrap();
     // The stub traps, which settles the island with nothing owed.
     let _ = tokio::time::timeout(Duration::from_secs(30), rt.tick()).await;
-    let snapshot = rt.snapshot().unwrap();
+    let snapshot = rt.snapshot().await.unwrap();
     assert_eq!(snapshot.inputs[&"n".into()][&"p".into()], "{write, read}");
     assert!(snapshot.islands.is_empty());
 
     rt.inject(&"n".into(), &"p".into(), flags(&["write", "read"]))
+        .await
         .unwrap();
     assert!(
-        rt.snapshot().unwrap().islands.is_empty(),
+        rt.snapshot().await.unwrap().islands.is_empty(),
         "the same set in another order is not a change"
     );
-    rt.restore(&snapshot).expect("restores its own snapshot");
-    let mut after = rt.snapshot().unwrap();
+    rt.restore(&snapshot)
+        .await
+        .expect("restores its own snapshot");
+    let mut after = rt.snapshot().await.unwrap();
     assert!(
         after.phases.values().all(|p| *p == NodePhase::Pending),
         "a restore drops guest state"
@@ -1103,7 +1109,7 @@ async fn fatal_from_a_start_function_during_a_rebuild_aborts_the_tick() {
         .unwrap();
     assert!(matches!(tick, TickResult::Progress), "{tick:?}");
     assert_eq!(
-        rt.read_output(&"n".into(), &"out".into()).unwrap(),
+        rt.read_output(&"n".into(), &"out".into()).await.unwrap(),
         Some(Val::U32(7))
     );
 
@@ -1180,4 +1186,70 @@ async fn a_link_to_an_import_the_code_never_uses_satisfies_nothing() {
     )
     .await
     .expect("the link has nothing to satisfy, and that is fine");
+}
+
+/// The calls every host has, with nothing but the trait in view.
+async fn through_the_trait<G: witgraph_runtime::RunningGraph>(graph: &mut G, value: G::Value)
+where
+    G::Value: std::fmt::Debug + PartialEq + Clone,
+{
+    use witgraph_runtime::OutputReader;
+    let (node, input, output) = ("n".into(), "in".into(), "out".into());
+    assert_eq!(graph.output_version(&node, &output).unwrap().get(), 0);
+    graph.inject(&node, &input, value.clone()).await.unwrap();
+    graph.inject_wave(&node, &input, "1.5").await.unwrap();
+    graph.inject(&node, &input, value.clone()).await.unwrap();
+    let mut idle = false;
+    for _ in 0..8 {
+        if matches!(graph.tick().await, witgraph_runtime::TickResult::Idle) {
+            idle = true;
+            break;
+        }
+    }
+    assert!(idle, "the graph settles");
+    assert!(graph.output_version(&node, &output).unwrap().get() > 0);
+    assert_eq!(
+        graph.read_output(&node, &output).await.unwrap(),
+        Some(value.clone())
+    );
+    assert_eq!(
+        graph.reader().read_output(&node, &output).await.unwrap(),
+        Some(value)
+    );
+    assert!(
+        graph
+            .read_output_wave(&node, &output)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let snapshot = graph.snapshot().await.unwrap();
+    graph.restore(&snapshot).await.unwrap();
+    assert!(graph.take_faults().is_empty());
+    assert!(graph.node_state(&node).is_ok());
+    graph.clear_input(&node, &input).await.unwrap();
+    graph.shutdown();
+}
+
+#[tokio::test]
+async fn a_graph_runs_through_the_common_trait() {
+    let contract = witgraph_wit::load_components(test_components::ECHO.wit)
+        .unwrap()
+        .remove(0);
+    let compiled = witgraph_ir::Graph::builder("t")
+        .add_component(&contract)
+        .add_node("n", contract.id.clone())
+        .build()
+        .compile(std::slice::from_ref(&contract))
+        .unwrap();
+    let wasm = std::collections::HashMap::from([(contract.id.clone(), test_components::ECHO.wasm)]);
+    let mut rt = RuntimeGraph::load(
+        compiled,
+        &wasm,
+        RuntimeConfig::default(),
+        witgraph_runtime::Perf,
+    )
+    .await
+    .unwrap();
+    through_the_trait(&mut rt, Val::Float64(2.5)).await;
 }

@@ -1,7 +1,8 @@
 //! `WebGraph`: a graph loaded on a JavaScript host.
 
 use std::cell::{Ref, RefCell, RefMut};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::future::Future;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -12,9 +13,15 @@ use js_sys::{Array, ArrayBuffer, Function, Object, Promise, Reflect, Uint8Array}
 use sha2::{Digest, Sha256};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::{JsFuture, future_to_promise};
-use witgraph_ir::{ComponentContract, ComponentRef, Graph, NodeId, PortKind, PortName, PortRef};
+use witgraph_ir::{
+    CompiledGraph, ComponentContract, ComponentRef, Graph, NodeId, PortDirection, PortKind,
+    PortName, PortRef,
+};
 use witgraph_sched::{
-    NodeFault, RunShape, RuntimeError, Scheduler, Snapshot, TickResult, TraceEvent,
+    LatchReader, NodeFault, RunShape, RuntimeError, Scheduler, Snapshot, TickResult, TraceEvent,
+};
+use witgraph_traits::{
+    FaultReport, NodeState, OutputReader, PortVersion, RunningGraph, SnapshotError,
 };
 
 use crate::executor::{Callbacks, Js, OutputPort, Shared};
@@ -25,6 +32,183 @@ use crate::value::{Data, WebValue, from_js, set};
 use witgraph_wit::lower::HOST_INTERFACE;
 
 type Sched = Scheduler<LiveMode, Js>;
+
+/// Reads a graph's latched outputs, as jco represents them, also while it
+/// ticks.
+#[derive(Clone)]
+pub(crate) struct WebReader(LatchReader<WebValue>);
+
+fn not_a_value_output(node: &NodeId, port: &PortName) -> RuntimeError {
+    RuntimeError::NotAValuePort {
+        node: node.clone(),
+        port: port.clone(),
+        direction: PortDirection::Output,
+    }
+}
+
+impl OutputReader for WebReader {
+    type Value = JsValue;
+    type Handle = JsValue;
+
+    async fn read_output(
+        &self,
+        node: &NodeId,
+        port: &PortName,
+    ) -> Result<Option<JsValue>, RuntimeError> {
+        match self.0.read_output(node, port)? {
+            Some(WebValue::Data(data)) => Ok(Some(data.js().clone())),
+            None if self.0.output_kind(node, port)? == PortKind::Value => Ok(None),
+            _ => Err(not_a_value_output(node, port)),
+        }
+    }
+
+    async fn read_output_wave(
+        &self,
+        node: &NodeId,
+        port: &PortName,
+    ) -> Result<Option<String>, RuntimeError> {
+        match self.0.read_output(node, port)? {
+            Some(WebValue::Data(data)) => {
+                data.wave()
+                    .map(Some)
+                    .map_err(|message| RuntimeError::ValueType {
+                        node: node.clone(),
+                        port: port.clone(),
+                        message,
+                    })
+            }
+            None if self.0.output_kind(node, port)? == PortKind::Value => Ok(None),
+            _ => Err(not_a_value_output(node, port)),
+        }
+    }
+
+    async fn read_handle(
+        &self,
+        node: &NodeId,
+        port: &PortName,
+    ) -> Result<Option<JsValue>, RuntimeError> {
+        match self.0.read_output(node, port)? {
+            Some(WebValue::Resource(resource)) => Ok(Some(resource.js().clone())),
+            None if self.0.output_kind(node, port)? == PortKind::Handle => Ok(None),
+            _ => Err(not_a_value_output(node, port)),
+        }
+    }
+
+    fn output_version(&self, node: &NodeId, port: &PortName) -> Result<PortVersion, RuntimeError> {
+        self.0.output_version(node, port)
+    }
+}
+
+/// The scheduler on this host, as [`RunningGraph`] has it.
+pub(crate) struct WebRuntime(Sched);
+
+impl RunningGraph for WebRuntime {
+    type Value = JsValue;
+    type Handle = JsValue;
+    type Reader = WebReader;
+
+    fn reader(&self) -> WebReader {
+        WebReader(self.0.reader())
+    }
+
+    async fn inject(
+        &mut self,
+        node: &NodeId,
+        port: &PortName,
+        value: JsValue,
+    ) -> Result<(), RuntimeError> {
+        // Checked as `inject` checks it: a connected input is refused before
+        // its value is looked at.
+        let ty = self.0.host_input_type(node, port).cloned()?;
+        let value = from_js(&value, &ty).map_err(|message| RuntimeError::ValueType {
+            node: node.clone(),
+            port: port.clone(),
+            message,
+        })?;
+        self.0.inject(
+            node,
+            port,
+            WebValue::Data(Rc::new(Data::from_value(value, ty))),
+        )
+    }
+
+    async fn inject_wave(
+        &mut self,
+        node: &NodeId,
+        port: &PortName,
+        text: &str,
+    ) -> Result<(), RuntimeError> {
+        self.0.inject_wave(node, port, text)
+    }
+
+    async fn clear_input(&mut self, node: &NodeId, port: &PortName) -> Result<(), RuntimeError> {
+        self.0.clear_input(node, port)
+    }
+
+    async fn read_output(
+        &mut self,
+        node: &NodeId,
+        port: &PortName,
+    ) -> Result<Option<JsValue>, RuntimeError> {
+        self.reader().read_output(node, port).await
+    }
+
+    async fn read_output_wave(
+        &mut self,
+        node: &NodeId,
+        port: &PortName,
+    ) -> Result<Option<String>, RuntimeError> {
+        self.reader().read_output_wave(node, port).await
+    }
+
+    async fn read_handle(
+        &mut self,
+        node: &NodeId,
+        port: &PortName,
+    ) -> Result<Option<JsValue>, RuntimeError> {
+        self.reader().read_handle(node, port).await
+    }
+
+    fn output_version(&self, node: &NodeId, port: &PortName) -> Result<PortVersion, RuntimeError> {
+        self.0.output_version(node, port)
+    }
+
+    fn rerun(&mut self, node: &NodeId) -> Result<(), RuntimeError> {
+        self.0.rerun(node)
+    }
+
+    fn node_state(&self, node: &NodeId) -> Result<NodeState, RuntimeError> {
+        self.0.node_state(node)
+    }
+
+    fn take_faults(&mut self) -> Vec<FaultReport> {
+        self.0.take_faults()
+    }
+
+    fn shutdown(&mut self) {
+        self.0.shutdown();
+    }
+
+    async fn tick(&mut self) -> TickResult {
+        self.0.tick().await
+    }
+
+    async fn tick_until(&mut self, stop: impl Future<Output = ()>) -> TickResult {
+        self.0.tick_until(stop).await
+    }
+
+    async fn snapshot(&mut self) -> Result<Snapshot, SnapshotError> {
+        self.0.snapshot()
+    }
+
+    async fn restore(&mut self, snapshot: &Snapshot) -> Result<(), RuntimeError> {
+        self.0.restore(snapshot)
+    }
+
+    fn compiled(&self) -> &CompiledGraph {
+        self.0.compiled()
+    }
+}
 
 /// The most trace events a graph keeps between two `takeTrace` calls; older
 /// ones are dropped.
@@ -223,10 +407,11 @@ pub fn js_name(name: &str) -> String {
 #[wasm_bindgen]
 pub struct WebGraph {
     /// The scheduler; `None` while a tick has it.
-    sched: Rc<RefCell<Option<Sched>>>,
+    sched: Rc<RefCell<Option<WebRuntime>>>,
+    /// Reads the latched outputs, while a tick holds the scheduler too.
+    reader: WebReader,
     /// What the read methods report while a tick has `sched`.
     live: Arc<Live>,
-    shared: Rc<Shared>,
     /// Per node, the index of the `components` entry it runs.
     components: HashMap<NodeId, u32>,
     /// Per `components` entry, the SHA-256 of its bytes, in hex.
@@ -358,8 +543,6 @@ impl WebGraph {
             input_types: HashMap::new(),
             output_types: HashMap::new(),
             outputs: HashMap::new(),
-            latest: RefCell::new(HashMap::new()),
-            touched: RefCell::new(HashSet::new()),
         };
         let mut islands = Vec::new();
         for members in compiled.islands() {
@@ -409,12 +592,14 @@ impl WebGraph {
             witgraph_sched::DEFAULT_MAX_STEPS_PER_TICK,
         )
         .map_err(error)?;
-        refresh(&sched, &live, &shared);
+        let sched = WebRuntime(sched);
+        refresh(&sched, &live);
+        let reader = sched.reader();
         let (alive, freed) = oneshot::channel();
         Ok(Self {
             sched: Rc::new(RefCell::new(Some(sched))),
+            reader,
             live,
-            shared,
             components: node_components,
             digests,
             composed: linked.composed,
@@ -458,7 +643,7 @@ impl WebGraph {
             .and_then(|mut slot| slot.take())
             .ok_or_else(busy)?;
         let slot = self.sched.clone();
-        let (live, shared) = (self.live.clone(), self.shared.clone());
+        let live = self.live.clone();
         let freed = self.freed.clone().map(|_| ());
         Ok(future_to_promise(async move {
             let stop = match stop {
@@ -466,7 +651,7 @@ impl WebGraph {
                 None => Either::Right(freed),
             };
             let result = sched.tick_until(stop).await;
-            reconcile(&sched, &live, &shared);
+            reconcile(&sched, &live);
             // Back for the other methods (dropped here if the graph was
             // freed meanwhile). Nothing borrows the slot across a turn of
             // the event loop, so it is free.
@@ -489,13 +674,13 @@ impl WebGraph {
     }
 
     /// The scheduler, unless a tick has it.
-    fn idle(&self) -> Result<RefMut<'_, Sched>, JsError> {
+    fn idle(&self) -> Result<RefMut<'_, WebRuntime>, JsError> {
         let slot = self.sched.try_borrow_mut().map_err(|_| busy())?;
         RefMut::filter_map(slot, Option::as_mut).map_err(|_| busy())
     }
 
     /// The scheduler to read from, unless a tick has it.
-    fn readable(&self) -> Option<Ref<'_, Sched>> {
+    fn readable(&self) -> Option<Ref<'_, WebRuntime>> {
         Ref::filter_map(self.sched.try_borrow().ok()?, Option::as_ref).ok()
     }
 
@@ -580,43 +765,63 @@ impl WebGraph {
             .collect()
     }
 
+    /// Runs `work` on the scheduler, unless a tick has it. As a JavaScript
+    /// `async` function does, it runs at once up to its first wait, so calls
+    /// keep their order, and what fails rejects the promise.
+    fn on_idle(
+        &self,
+        work: impl AsyncFnOnce(&mut WebRuntime) -> Result<JsValue, JsError> + 'static,
+    ) -> Promise {
+        let taken = self
+            .sched
+            .try_borrow_mut()
+            .ok()
+            .and_then(|mut slot| slot.take());
+        let Some(mut sched) = taken else {
+            return Promise::reject(&JsValue::from(busy()));
+        };
+        let slot = self.sched.clone();
+        settled(async move {
+            let result = work(&mut sched).await;
+            // Back for the other methods (dropped here if the graph was
+            // freed meanwhile).
+            slot.replace(Some(sched));
+            result
+        })
+    }
+
     /// Writes a value, in jco's JavaScript representation, to a Value
-    /// input port.
-    pub fn inject(&self, node: &str, port: &str, value: JsValue) -> Result<(), JsError> {
+    /// input port. Resolves when it is written.
+    pub fn inject(&self, node: &str, port: &str, value: JsValue) -> Promise {
         let (node, port) = (NodeId::from(node), PortName::from(port));
-        // Checked as `inject` checks it: a connected input is refused
-        // before its value is looked at.
-        let ty = self
-            .idle()?
-            .host_input_type(&node, &port)
-            .cloned()
-            .map_err(error)?;
-        // Not under the scheduler: converting may call back into
-        // JavaScript (a getter), and that into this graph.
-        let value = from_js(&value, &ty).map_err(error)?;
-        self.idle()?
-            .inject(
-                &node,
-                &port,
-                WebValue::Data(Rc::new(Data::from_value(value, ty))),
-            )
-            .map_err(error)
+        self.on_idle(async move |sched| {
+            sched.inject(&node, &port, value).await.map_err(error)?;
+            Ok(JsValue::UNDEFINED)
+        })
     }
 
-    /// Writes a value, as WAVE text, to a Value input port.
+    /// Writes a value, as WAVE text, to a Value input port. Resolves when it
+    /// is written.
     #[wasm_bindgen(js_name = injectWave)]
-    pub fn inject_wave(&self, node: &str, port: &str, wave: &str) -> Result<(), JsError> {
-        self.idle()?
-            .inject_wave(&node.into(), &port.into(), wave)
-            .map_err(error)
+    pub fn inject_wave(&self, node: &str, port: &str, wave: String) -> Promise {
+        let (node, port) = (NodeId::from(node), PortName::from(port));
+        self.on_idle(async move |sched| {
+            sched
+                .inject_wave(&node, &port, &wave)
+                .await
+                .map_err(error)?;
+            Ok(JsValue::UNDEFINED)
+        })
     }
 
-    /// Clears an injected Value input.
+    /// Clears an injected Value input. Resolves when it is cleared.
     #[wasm_bindgen(js_name = clearInput)]
-    pub fn clear_input(&self, node: &str, port: &str) -> Result<(), JsError> {
-        self.idle()?
-            .clear_input(&node.into(), &port.into())
-            .map_err(error)
+    pub fn clear_input(&self, node: &str, port: &str) -> Promise {
+        let (node, port) = (NodeId::from(node), PortName::from(port));
+        self.on_idle(async move |sched| {
+            sched.clear_input(&node, &port).await.map_err(error)?;
+            Ok(JsValue::UNDEFINED)
+        })
     }
 
     /// Makes the node's island owe a run on its latched inputs.
@@ -626,7 +831,7 @@ impl WebGraph {
 
     /// Cancels the node's island.
     pub fn cancel(&self, node: &str) -> Result<(), JsError> {
-        self.idle()?.cancel(&node.into()).map_err(error)
+        self.idle()?.0.cancel(&node.into()).map_err(error)
     }
 
     /// Stops every island.
@@ -635,62 +840,59 @@ impl WebGraph {
         Ok(())
     }
 
-    /// The latched value of a Value or handle output port: from the
-    /// scheduler, or, while a tick holds it, from the tick so far.
-    fn output(&self, node: &str, port: &str) -> Result<Option<WebValue>, JsError> {
-        let port_ref = PortRef::new(node, port);
-        // As the scheduler checks it, which a tick may be holding.
-        let Some(outputs) = self.shared.outputs.get(&port_ref.node) else {
-            return Err(error(format!("unknown node `{node}`")));
-        };
-        if !outputs
-            .iter()
-            .any(|p| p.name == port && p.kind.is_latched())
-        {
-            return Err(error(format!(
-                "`{node}.{port}` is not a Value or handle output port"
-            )));
-        }
-        Ok(match self.readable() {
-            Some(sched) => sched
-                .read_output(&port_ref.node, &port_ref.port)
-                .map_err(error)?,
-            None => self.shared.latest.borrow().get(&port_ref).cloned(),
-        })
+    /// Which value of a Value or handle output port is latched: a number
+    /// that moves on each time the node's `run` writes the port, or a
+    /// snapshot is restored. So a preview need read the port only when it
+    /// differs from the number it last saw. It works while a tick runs too.
+    #[wasm_bindgen(js_name = outputVersion)]
+    pub fn output_version(&self, node: &str, port: &str) -> Result<f64, JsError> {
+        self.reader
+            .output_version(&node.into(), &port.into())
+            .map(|version| version.get() as f64)
+            .map_err(output_error(node, port))
     }
 
     /// The latched value of a Value output port, in jco's JavaScript
-    /// representation, or the object of a handle output port, as its maker
-    /// returned it; `undefined` before the node has run. While a tick runs,
-    /// the latest value a `run` of it returned. The value is the one the
-    /// node's consumers are given, not a copy: it must not be changed. A
-    /// handle's object is disposed once no latch holds it.
+    /// representation; `undefined` before the node has run. It works while a
+    /// tick runs too. The value is the one the node's consumers are given,
+    /// not a copy: it must not be changed.
     #[wasm_bindgen(js_name = readOutput)]
-    pub fn read_output(&self, node: &str, port: &str) -> Result<JsValue, JsError> {
-        Ok(match self.output(node, port)? {
-            Some(WebValue::Data(data)) => data.js().clone(),
-            Some(WebValue::Resource(resource)) => resource.js().clone(),
-            _ => JsValue::UNDEFINED,
+    pub fn read_output(&self, node: &str, port: &str) -> Promise {
+        let (reader, on_error) = (self.reader.clone(), output_error(node, port));
+        let (node, port) = (NodeId::from(node), PortName::from(port));
+        settled(async move {
+            let value = reader.read_output(&node, &port).await.map_err(on_error)?;
+            Ok(value.unwrap_or(JsValue::UNDEFINED))
+        })
+    }
+
+    /// The latched object of a handle output port, as its maker returned it;
+    /// `undefined` before the node has run. It works while a tick runs too.
+    /// It is disposed once no latch holds it.
+    #[wasm_bindgen(js_name = readHandle)]
+    pub fn read_handle(&self, node: &str, port: &str) -> Promise {
+        let (reader, on_error) = (self.reader.clone(), output_error(node, port));
+        let (node, port) = (NodeId::from(node), PortName::from(port));
+        settled(async move {
+            let value = reader.read_handle(&node, &port).await.map_err(on_error)?;
+            Ok(value.unwrap_or(JsValue::UNDEFINED))
         })
     }
 
     /// The latched value of a Value output port as WAVE text; `undefined`
-    /// before the node has run. While a tick runs, as `readOutput`. Throws,
-    /// naming the port, for a value too large to convert (see
-    /// `readOutput` for the value itself), and for a handle, which has no
-    /// text.
+    /// before the node has run. Rejects, naming the port, for a value too
+    /// large to convert (see `readOutput` for the value itself).
     #[wasm_bindgen(js_name = readOutputWave)]
-    pub fn read_output_wave(&self, node: &str, port: &str) -> Result<Option<String>, JsError> {
-        match self.output(node, port)? {
-            Some(WebValue::Data(data)) => data
-                .wave()
-                .map(Some)
-                .map_err(|e| error(format!("`{node}.{port}`: {e}"))),
-            Some(WebValue::Resource(_)) => Err(error(format!(
-                "`{node}.{port}` is a handle: it has no WAVE text"
-            ))),
-            _ => Ok(None),
-        }
+    pub fn read_output_wave(&self, node: &str, port: &str) -> Promise {
+        let (reader, on_error) = (self.reader.clone(), output_error(node, port));
+        let (node, port) = (NodeId::from(node), PortName::from(port));
+        settled(async move {
+            let text = reader
+                .read_output_wave(&node, &port)
+                .await
+                .map_err(on_error)?;
+            Ok(text.map_or(JsValue::UNDEFINED, |text| text.into()))
+        })
     }
 
     /// A node's lifecycle state: `{ phase, fault?, culprit? }`. While a
@@ -748,22 +950,28 @@ impl WebGraph {
     }
 
     /// The graph's host-visible state, as JSON (`Snapshot`).
-    pub fn snapshot(&self) -> Result<String, JsError> {
-        let snapshot = self.idle()?.snapshot().map_err(error)?;
-        serde_json::to_string(&snapshot).map_err(error)
+    pub fn snapshot(&self) -> Promise {
+        self.on_idle(async move |sched| {
+            let snapshot = sched.snapshot().await.map_err(error)?;
+            let text = serde_json::to_string(&snapshot).map_err(error)?;
+            Ok(text.into())
+        })
     }
 
     /// Replaces the graph's host-visible state with a snapshot, given as
     /// JSON. Every node gets fresh guest state (`rebuild`) when it next
     /// runs.
-    pub fn restore(&self, snapshot: &str) -> Result<(), JsError> {
-        let snapshot: Snapshot = serde_json::from_str(snapshot).map_err(error)?;
-        let mut sched = self.idle()?;
-        sched
-            .restore(&snapshot)
-            .map_err(|e: RuntimeError| error(e))?;
-        refresh(&sched, &self.live, &self.shared);
-        Ok(())
+    pub fn restore(&self, snapshot: String) -> Promise {
+        let live = self.live.clone();
+        self.on_idle(async move |sched| {
+            let snapshot: Snapshot = serde_json::from_str(&snapshot).map_err(error)?;
+            sched
+                .restore(&snapshot)
+                .await
+                .map_err(|e: RuntimeError| error(e))?;
+            refresh(sched, &live);
+            Ok(JsValue::UNDEFINED)
+        })
     }
 
     /// A node's contract, as `describeComponent` describes one (without
@@ -800,6 +1008,30 @@ impl WebGraph {
     }
 }
 
+/// A promise for `work`, which runs at once up to its first wait, as a
+/// JavaScript `async` function does.
+fn settled(work: impl Future<Output = Result<JsValue, JsError>> + 'static) -> Promise {
+    let mut work = Box::pin(work);
+    match (&mut work).now_or_never() {
+        Some(Ok(value)) => Promise::resolve(&value),
+        Some(Err(e)) => Promise::reject(&JsValue::from(e)),
+        None => future_to_promise(async move { work.await.map_err(JsValue::from) }),
+    }
+}
+
+/// The error reading an output port reports.
+fn output_error(node: &str, port: &str) -> impl FnOnce(RuntimeError) -> JsError + use<> {
+    let (node, port) = (node.to_string(), port.to_string());
+    move |e| match e {
+        RuntimeError::UnknownNode { .. } => error(format!("unknown node `{node}`")),
+        RuntimeError::NotAValuePort { .. } => error(format!(
+            "`{node}.{port}` is not an output port of that kind"
+        )),
+        RuntimeError::ValueType { message, .. } => error(format!("`{node}.{port}`: {message}")),
+        other => error(other),
+    }
+}
+
 /// A node's state, as the live view keeps it.
 fn live_state(state: &witgraph_sched::NodeState) -> LiveState {
     LiveState {
@@ -810,43 +1042,23 @@ fn live_state(state: &witgraph_sched::NodeState) -> LiveState {
 }
 
 /// Copies what the read methods report into the live view, whole: every
-/// node's state and every latched Value output. At load and on a restore.
-fn refresh(sched: &Sched, live: &Live, shared: &Shared) {
+/// node's state. At load and on a restore.
+fn refresh(sched: &WebRuntime, live: &Live) {
     for node in &sched.compiled().graph().nodes {
         if let Ok(state) = sched.node_state(&node.id) {
             live.set_state(node.id.clone(), live_state(&state));
         }
     }
     live.take_touched();
-    shared.touched.borrow_mut().clear();
-    let latest = shared
-        .output_types
-        .keys()
-        .filter_map(|port| {
-            Some((
-                port.clone(),
-                sched.read_output(&port.node, &port.port).ok()??,
-            ))
-        })
-        .collect();
-    *shared.latest.borrow_mut() = latest;
 }
 
 /// Makes exact, from the scheduler, what changed in the live view since it
 /// last was: when a tick ends. Only what was touched is copied.
-fn reconcile(sched: &Sched, live: &Live, shared: &Shared) {
+fn reconcile(sched: &WebRuntime, live: &Live) {
     for node in live.take_touched() {
         if let Ok(state) = sched.node_state(&node) {
             live.set_state(node, live_state(&state));
         }
-    }
-    let touched: Vec<PortRef> = shared.touched.borrow_mut().drain().collect();
-    let mut latest = shared.latest.borrow_mut();
-    for port in touched {
-        match sched.read_output(&port.node, &port.port) {
-            Ok(Some(value)) => latest.insert(port, value),
-            _ => latest.remove(&port),
-        };
     }
 }
 

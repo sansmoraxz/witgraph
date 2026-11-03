@@ -91,11 +91,12 @@ async function median(runs: number, once: (i: number) => Promise<void>): Promise
 async function session(size: number, runs: number): Promise<number> {
   const s = await Session.load({ graph: graph(size, false), components, wasm });
   try {
-    s.graph.inject('source', 'size', size);
+    await s.graph.inject('source', 'size', size);
     return await median(runs, async (i) => {
-      s.graph.inject('source', 'seed', i);
+      await s.graph.inject('source', 'seed', i);
       await s.settle();
-      if (s.graph.readOutput('sink', 'len') !== size) throw new Error('the bytes did not arrive');
+      if ((await s.graph.readOutput('sink', 'len')) !== size)
+        throw new Error('the bytes did not arrive');
     });
   } finally {
     s.dispose();
@@ -107,9 +108,9 @@ async function editor(size: number, runs: number, previews: boolean): Promise<nu
   await controller.load({ graph: graph(size, previews), components, wasm });
   try {
     return await median(runs, async (i) => {
-      controller.injectValue('source', 'seed', String(i));
+      await controller.injectValue('source', 'seed', String(i));
       await controller.run();
-      if (controller.latestOutput('sink', 'len') !== size)
+      if ((await controller.readOutput('sink', 'len')) !== size)
         throw new Error('the bytes did not arrive');
     });
   } finally {

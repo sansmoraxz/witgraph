@@ -55,7 +55,7 @@ for (const { graph, name } of ACCELERATORS) {
         expect(bright).toBeGreaterThan(0.01);
         expect(bright).toBeLessThan(0.5);
         const backend = await canvas.evaluate((el: WitgraphCanvas) =>
-          el.controller?.latestOutput('edges', 'backend'),
+          el.controller?.readOutput('edges', 'backend'),
         );
         expect(backend).toBe(graph);
         await page.locator('witgraph-controls').locator('button.stop').click();

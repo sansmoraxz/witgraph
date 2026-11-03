@@ -4,6 +4,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use witgraph_runtime::RunningGraph;
 
 use test_components::{
     BLOB_SINK, BLOB_SOURCE, BUSY_LOOP, BYTES_CONSUMER, CALC, CONFIGURABLE, ECHO, EDGE_DETECT,
@@ -128,27 +129,47 @@ fn port(node: &str, port: &str) -> PortRef {
     PortRef::new(node, port)
 }
 
-fn read<M: RuntimeMode, H: Host>(rt: &RuntimeGraph<M, H>, node: &str, port: &str) -> Option<Val> {
+async fn read<M: RuntimeMode, H: Host>(
+    rt: &mut RuntimeGraph<M, H>,
+    node: &str,
+    port: &str,
+) -> Option<Val> {
     rt.read_output(&id(node), &port.into())
+        .await
         .expect("a Value output")
 }
 
-fn read_f64<M: RuntimeMode, H: Host>(rt: &RuntimeGraph<M, H>, node: &str, port: &str) -> f64 {
-    match read(rt, node, port) {
+async fn read_f64<M: RuntimeMode, H: Host>(
+    rt: &mut RuntimeGraph<M, H>,
+    node: &str,
+    port: &str,
+) -> f64 {
+    match read(rt, node, port).await {
         Some(Val::Float64(v)) => v,
         other => panic!("{node}.{port}: expected f64, got {other:?}"),
     }
 }
 
-fn read_u32<M: RuntimeMode, H: Host>(rt: &RuntimeGraph<M, H>, node: &str, port: &str) -> u32 {
-    match read(rt, node, port) {
+async fn read_u32<M: RuntimeMode, H: Host>(
+    rt: &mut RuntimeGraph<M, H>,
+    node: &str,
+    port: &str,
+) -> u32 {
+    match read(rt, node, port).await {
         Some(Val::U32(v)) => v,
         other => panic!("{node}.{port}: expected u32, got {other:?}"),
     }
 }
 
-fn inject<M: RuntimeMode, H: Host>(rt: &mut RuntimeGraph<M, H>, node: &str, port: &str, val: Val) {
-    rt.inject(&id(node), &port.into(), val).expect("inject");
+async fn inject<M: RuntimeMode, H: Host>(
+    rt: &mut RuntimeGraph<M, H>,
+    node: &str,
+    port: &str,
+    val: Val,
+) {
+    rt.inject(&id(node), &port.into(), val)
+        .await
+        .expect("inject");
 }
 
 fn phase<M: RuntimeMode, H: Host>(rt: &RuntimeGraph<M, H>, node: &str) -> NodePhase {
@@ -198,12 +219,12 @@ async fn injected_inputs_feed_runs_and_absent_optionals_read_none() {
     let mut rt = kit
         .load(graph, RuntimeConfig::default(), Trace::new())
         .await;
-    inject(&mut rt, "a", "in", Val::Float64(2.5));
+    inject(&mut rt, "a", "in", Val::Float64(2.5)).await;
     settle(&mut rt).await;
 
-    assert_eq!(read_f64(&rt, "a", "out"), 2.5);
+    assert_eq!(read_f64(&mut rt, "a", "out").await, 2.5);
     assert_eq!(
-        read_f64(&rt, "b", "out"),
+        read_f64(&mut rt, "b", "out").await,
         0.0,
         "absent optional input reads none"
     );
@@ -220,10 +241,10 @@ async fn multi_port_inject() {
     let mut rt = kit
         .load(graph, RuntimeConfig::default(), Trace::new())
         .await;
-    inject(&mut rt, "cfg", "rate", Val::U32(4));
-    inject(&mut rt, "cfg", "gain", Val::Float64(3.0));
+    inject(&mut rt, "cfg", "rate", Val::U32(4)).await;
+    inject(&mut rt, "cfg", "gain", Val::Float64(3.0)).await;
     settle(&mut rt).await;
-    assert_eq!(read_f64(&rt, "cfg", "result"), 12.0);
+    assert_eq!(read_f64(&mut rt, "cfg", "result").await, 12.0);
 }
 
 #[tokio::test]
@@ -241,9 +262,9 @@ async fn values_propagate_and_unchanged_inputs_do_not_rerun() {
     let mut rt = kit
         .load(graph, RuntimeConfig::default(), Trace::new())
         .await;
-    inject(&mut rt, "a", "in", Val::Float64(1.0));
+    inject(&mut rt, "a", "in", Val::Float64(1.0)).await;
     settle(&mut rt).await;
-    assert_eq!(read_f64(&rt, "c", "out"), 1.0);
+    assert_eq!(read_f64(&mut rt, "c", "out").await, 1.0);
     assert_eq!(
         runs_of(&rt.mode().trace(), "c"),
         1,
@@ -251,13 +272,15 @@ async fn values_propagate_and_unchanged_inputs_do_not_rerun() {
     );
 
     rt.inject(&id("a"), &"in".into(), Val::Float64(2.0))
+        .await
         .unwrap();
     settle(&mut rt).await;
-    assert_eq!(read_f64(&rt, "c", "out"), 2.0);
+    assert_eq!(read_f64(&mut rt, "c", "out").await, 2.0);
     assert_eq!(runs_of(&rt.mode().trace(), "c"), 2);
 
     // Writing the same value again is not a change.
     rt.inject(&id("a"), &"in".into(), Val::Float64(2.0))
+        .await
         .unwrap();
     assert!(matches!(rt.tick().await, TickResult::Idle));
     assert_eq!(runs_of(&rt.mode().trace(), "a"), 2);
@@ -277,18 +300,24 @@ async fn inject_rejects_bad_targets_and_types() {
         .build();
     let mut rt = kit.load(graph, RuntimeConfig::default(), Perf).await;
 
-    let err = rt.inject(&id("e"), &"in".into(), Val::U32(1)).unwrap_err();
+    let err = rt
+        .inject(&id("e"), &"in".into(), Val::U32(1))
+        .await
+        .unwrap_err();
     assert!(matches!(err, RuntimeError::ValueType { .. }), "{err}");
     let err = rt
         .inject(&id("cons"), &"items".into(), Val::U32(1))
+        .await
         .unwrap_err();
     assert!(matches!(err, RuntimeError::NotAValuePort { .. }), "{err}");
     let err = rt
         .inject(&id("ghost"), &"in".into(), Val::Float64(1.0))
+        .await
         .unwrap_err();
     assert!(matches!(err, RuntimeError::UnknownNode { .. }), "{err}");
     let err = rt
         .inject(&id("f"), &"in".into(), Val::Float64(1.0))
+        .await
         .unwrap_err();
     assert!(
         matches!(err, RuntimeError::ConnectedInput { ref connection, .. } if connection.as_str() == "ef"),
@@ -309,6 +338,7 @@ async fn inject_rejects_an_input_fed_inside_its_island() {
     let mut rt = kit.load(graph, RuntimeConfig::default(), Perf).await;
     let err = rt
         .inject(&id("cons"), &"take".into(), Val::U32(2))
+        .await
         .unwrap_err();
     assert!(
         matches!(err, RuntimeError::ConnectedInput { .. }),
@@ -332,14 +362,18 @@ async fn an_option_output_feeds_an_optional_input_straight_through() {
     let mut rt = kit
         .load(graph, RuntimeConfig::default(), Trace::new())
         .await;
-    inject(&mut rt, "prod", "burst-size", Val::U32(10));
-    inject(&mut rt, "m", "x", Val::U32(3));
-    settle(&mut rt).await;
-    assert_eq!(read_u32(&rt, "cons", "count"), 3, "`some(3)` arrives as 3");
-    rt.clear_input(&id("m"), &"x".into()).unwrap();
+    inject(&mut rt, "prod", "burst-size", Val::U32(10)).await;
+    inject(&mut rt, "m", "x", Val::U32(3)).await;
     settle(&mut rt).await;
     assert_eq!(
-        read_u32(&rt, "cons", "count"),
+        read_u32(&mut rt, "cons", "count").await,
+        3,
+        "`some(3)` arrives as 3"
+    );
+    rt.clear_input(&id("m"), &"x".into()).await.unwrap();
+    settle(&mut rt).await;
+    assert_eq!(
+        read_u32(&mut rt, "cons", "count").await,
         10,
         "`none` reads as an absent `take`"
     );
@@ -397,9 +431,9 @@ async fn a_zero_memory_reservation_is_valid() {
     let graph = kit.builder("zero").add_node("e", kit.get(ECHO)).build();
     let mut rt = kit.load(graph, config, Perf).await;
     assert!(rt.config().engine.is_some(), "the config holds the engine");
-    inject(&mut rt, "e", "in", Val::Float64(3.0));
+    inject(&mut rt, "e", "in", Val::Float64(3.0)).await;
     settle(&mut rt).await;
-    assert_eq!(read_f64(&rt, "e", "out"), 3.0);
+    assert_eq!(read_f64(&mut rt, "e", "out").await, 3.0);
 }
 
 // ---- Several implementations and contracts in one graph ----
@@ -424,16 +458,20 @@ async fn two_versions_of_one_contract_run_side_by_side() {
     let mut rt = kit
         .load(graph, RuntimeConfig::default(), Trace::new())
         .await;
-    inject(&mut rt, "a", "in", Val::U32(10));
-    inject(&mut rt, "a", "add", Val::U32(1));
-    inject(&mut rt, "b", "add", Val::U32(1));
+    inject(&mut rt, "a", "in", Val::U32(10)).await;
+    inject(&mut rt, "a", "add", Val::U32(1)).await;
+    inject(&mut rt, "b", "add", Val::U32(1)).await;
     assert!(
         matches!(rt.tick().await, TickResult::Progress),
         "one iteration"
     );
-    assert_eq!(read_u32(&rt, "a", "out"), 11, "0.1.0: in + add");
-    assert_eq!(read_u32(&rt, "b", "out"), 13, "0.2.0: in + add + 1");
-    let snapshot = rt.snapshot().unwrap();
+    assert_eq!(read_u32(&mut rt, "a", "out").await, 11, "0.1.0: in + add");
+    assert_eq!(
+        read_u32(&mut rt, "b", "out").await,
+        13,
+        "0.2.0: in + add + 1"
+    );
+    let snapshot = rt.snapshot().await.unwrap();
     let minor = |node: &str| {
         snapshot.nodes[&id(node)]
             .package
@@ -467,18 +505,22 @@ async fn two_revisions_of_one_world_are_told_apart_by_hash() {
     let mut rt = kit
         .load(graph, RuntimeConfig::default(), Trace::new())
         .await;
-    inject(&mut rt, "n", "in", Val::U32(3));
-    inject(&mut rt, "n", "add", Val::U32(2));
+    inject(&mut rt, "n", "in", Val::U32(3)).await;
+    inject(&mut rt, "n", "add", Val::U32(2)).await;
     assert!(
         matches!(rt.tick().await, TickResult::Progress),
         "one iteration"
     );
-    assert_eq!(read_u32(&rt, "n", "out"), 5);
-    assert_eq!(read_u32(&rt, "w", "out"), 5);
-    assert_eq!(read_u32(&rt, "w", "doubled"), 10, "the wide revision ran");
+    assert_eq!(read_u32(&mut rt, "n", "out").await, 5);
+    assert_eq!(read_u32(&mut rt, "w", "out").await, 5);
+    assert_eq!(
+        read_u32(&mut rt, "w", "doubled").await,
+        10,
+        "the wide revision ran"
+    );
     assert!(
         matches!(
-            rt.read_output(&id("n"), &"doubled".into()),
+            rt.read_output(&id("n"), &"doubled".into()).await,
             Err(RuntimeError::NotAValuePort { .. })
         ),
         "the narrow one has no such port"
@@ -531,14 +573,14 @@ async fn named_and_inline_node_contracts_mix_in_one_graph() {
     let mut rt = kit
         .load(graph, RuntimeConfig::default(), Trace::new())
         .await;
-    inject(&mut rt, "e", "in", Val::Float64(1.5));
+    inject(&mut rt, "e", "in", Val::Float64(1.5)).await;
     settle(&mut rt).await;
     assert_eq!(
-        read_f64(&rt, "n", "out"),
+        read_f64(&mut rt, "n", "out").await,
         3.0,
         "the named-interface node ran"
     );
-    assert_eq!(read_f64(&rt, "f", "out"), 3.0);
+    assert_eq!(read_f64(&mut rt, "f", "out").await, 3.0);
 
     // Different contracts connect only where their port types agree.
     let mismatched = kit
@@ -584,16 +626,16 @@ fn split() -> RuntimeConfig {
 
 /// Sets the producer's burst size and the consumer's take count; `None`
 /// leaves the optional input absent (endless producer / take everything).
-fn feed_pipeline<M: RuntimeMode, H: Host>(
+async fn feed_pipeline<M: RuntimeMode, H: Host>(
     rt: &mut RuntimeGraph<M, H>,
     burst: Option<u32>,
     take: Option<u32>,
 ) {
     if let Some(burst) = burst {
-        inject(rt, "prod", "burst-size", Val::U32(burst));
+        inject(rt, "prod", "burst-size", Val::U32(burst)).await;
     }
     if let Some(take) = take {
-        inject(rt, "cons", "take", Val::U32(take));
+        inject(rt, "cons", "take", Val::U32(take)).await;
     }
 }
 
@@ -603,12 +645,20 @@ async fn stream_producer_consumer_share_an_island() {
     for config in both_layouts() {
         let split = config.split_islands;
         let mut rt = kit.load(pipeline(&kit), config, Trace::new()).await;
-        feed_pipeline(&mut rt, Some(5), None);
+        feed_pipeline(&mut rt, Some(5), None).await;
         assert_eq!(rt.compiled().islands().len(), 1);
         settle(&mut rt).await;
 
-        assert_eq!(read_u32(&rt, "cons", "total"), 10, "split: {split}");
-        assert_eq!(read_u32(&rt, "cons", "count"), 5, "split: {split}");
+        assert_eq!(
+            read_u32(&mut rt, "cons", "total").await,
+            10,
+            "split: {split}"
+        );
+        assert_eq!(
+            read_u32(&mut rt, "cons", "count").await,
+            5,
+            "split: {split}"
+        );
         assert_eq!(phase(&rt, "prod"), NodePhase::Idle, "split: {split}");
         assert_eq!(phase(&rt, "cons"), NodePhase::Idle, "split: {split}");
         let trace = rt.mode().trace();
@@ -629,12 +679,20 @@ async fn backpressure_slow_consumer_gets_every_item() {
     for config in both_layouts() {
         let split = config.split_islands;
         let mut rt = kit.load(pipeline(&kit), config, Trace::new()).await;
-        feed_pipeline(&mut rt, Some(2000), None);
-        inject(&mut rt, "cons", "delay", Val::U32(3));
+        feed_pipeline(&mut rt, Some(2000), None).await;
+        inject(&mut rt, "cons", "delay", Val::U32(3)).await;
         settle(&mut rt).await;
-        assert_eq!(read_u32(&rt, "cons", "count"), 2000, "split: {split}");
+        assert_eq!(
+            read_u32(&mut rt, "cons", "count").await,
+            2000,
+            "split: {split}"
+        );
         let total = (0..2000).sum::<u32>();
-        assert_eq!(read_u32(&rt, "cons", "total"), total, "split: {split}");
+        assert_eq!(
+            read_u32(&mut rt, "cons", "total").await,
+            total,
+            "split: {split}"
+        );
     }
 }
 
@@ -646,10 +704,18 @@ async fn early_reader_drop_stops_an_infinite_producer() {
         // No burst-size: the producer streams forever unless its reader
         // goes.
         let mut rt = kit.load(pipeline(&kit), config, Trace::new()).await;
-        feed_pipeline(&mut rt, None, Some(3));
+        feed_pipeline(&mut rt, None, Some(3)).await;
         settle(&mut rt).await;
-        assert_eq!(read_u32(&rt, "cons", "count"), 3, "split: {split}");
-        assert_eq!(read_u32(&rt, "cons", "total"), 3, "split: {split}");
+        assert_eq!(
+            read_u32(&mut rt, "cons", "count").await,
+            3,
+            "split: {split}"
+        );
+        assert_eq!(
+            read_u32(&mut rt, "cons", "total").await,
+            3,
+            "split: {split}"
+        );
         // The generation finished, so the producer's writer task exited.
         assert_eq!(phase(&rt, "prod"), NodePhase::Idle, "split: {split}");
     }
@@ -675,11 +741,19 @@ async fn a_stream_passed_through_a_node_reaches_its_reader() {
         let mut rt = kit.load(relayed(&kit), config, Trace::new()).await;
         // More items than a pump holds at once, so the relay's Store keeps
         // forwarding after the relay returned.
-        feed_pipeline(&mut rt, Some(100_000), None);
+        feed_pipeline(&mut rt, Some(100_000), None).await;
         settle(&mut rt).await;
-        assert_eq!(read_u32(&rt, "cons", "count"), 100_000, "split: {split}");
+        assert_eq!(
+            read_u32(&mut rt, "cons", "count").await,
+            100_000,
+            "split: {split}"
+        );
         let total = (0..100_000u32).fold(0u32, u32::wrapping_add);
-        assert_eq!(read_u32(&rt, "cons", "total"), total, "split: {split}");
+        assert_eq!(
+            read_u32(&mut rt, "cons", "total").await,
+            total,
+            "split: {split}"
+        );
         for node in ["prod", "relay", "cons"] {
             assert_eq!(phase(&rt, node), NodePhase::Idle, "{node}, split: {split}");
         }
@@ -700,7 +774,7 @@ async fn a_passed_through_stream_is_forwarded_after_its_reader_returned() {
     for config in both_layouts() {
         let split = config.split_islands;
         let mut rt = kit.load(graph.clone(), config, Trace::new()).await;
-        inject(&mut rt, "prod", "burst-size", Val::U32(100_000));
+        inject(&mut rt, "prod", "burst-size", Val::U32(100_000)).await;
         // Every call returns before the stream ends: the generation lasts
         // until the producer has written it all and the drain read it.
         settle(&mut rt).await;
@@ -717,9 +791,13 @@ async fn a_reader_dropping_a_passed_through_stream_stops_its_producer() {
         let split = config.split_islands;
         for _ in 0..10 {
             let mut rt = kit.load(relayed(&kit), config.clone(), Trace::new()).await;
-            feed_pipeline(&mut rt, None, Some(3));
+            feed_pipeline(&mut rt, None, Some(3)).await;
             settle(&mut rt).await;
-            assert_eq!(read_u32(&rt, "cons", "count"), 3, "split: {split}");
+            assert_eq!(
+                read_u32(&mut rt, "cons", "count").await,
+                3,
+                "split: {split}"
+            );
             // The generation finished, so the producer's writer task exited.
             assert_eq!(phase(&rt, "prod"), NodePhase::Idle, "split: {split}");
         }
@@ -737,10 +815,10 @@ async fn a_future_output_nothing_reads_is_closed() {
         .load(graph, RuntimeConfig::default(), Trace::new())
         .await;
     settle(&mut rt).await;
-    inject(&mut rt, "w", "again", Val::U32(1));
+    inject(&mut rt, "w", "again", Val::U32(1)).await;
     settle(&mut rt).await;
     // The first run's write found the read end dropped.
-    assert_eq!(read_u32(&rt, "w", "last"), 2);
+    assert_eq!(read_u32(&mut rt, "w", "last").await, 2);
     assert!(faults(&rt.mode().trace()).is_empty());
 }
 
@@ -772,8 +850,8 @@ async fn capability_import_feeds_a_stream() {
     .await
     .expect("loads with the capability");
     settle(&mut rt).await;
-    assert_eq!(read_u32(&rt, "cons", "count"), 5);
-    assert_eq!(read_u32(&rt, "cons", "total-bytes"), 8);
+    assert_eq!(read_u32(&mut rt, "cons", "count").await, 5);
+    assert_eq!(read_u32(&mut rt, "cons", "total-bytes").await, 8);
     assert!(feed.lock().unwrap().is_empty());
 }
 
@@ -839,15 +917,19 @@ async fn video(
         RuntimeGraph::load_with_host(compiled, &kit.wasm, RuntimeConfig::default(), Perf, Clock)
             .await
             .expect("loads with the clock");
-    inject(&mut rt, "source", "frames", Val::U32(frames));
+    inject(&mut rt, "source", "frames", Val::U32(frames)).await;
     if let Some(fps) = fps {
-        inject(&mut rt, "source", "fps", Val::U32(fps));
+        inject(&mut rt, "source", "fps", Val::U32(fps)).await;
     }
     rt
 }
 
-fn read_bool<M: RuntimeMode, H: Host>(rt: &RuntimeGraph<M, H>, node: &str, port: &str) -> bool {
-    match read(rt, node, port) {
+async fn read_bool<M: RuntimeMode, H: Host>(
+    rt: &mut RuntimeGraph<M, H>,
+    node: &str,
+    port: &str,
+) -> bool {
+    match read(rt, node, port).await {
         Some(Val::Bool(v)) => v,
         other => panic!("{node}.{port}: expected bool, got {other:?}"),
     }
@@ -861,17 +943,17 @@ async fn a_video_pipeline_filters_frames_as_they_stream() {
     let filters = [("gray", FRAME_GRAYSCALE), ("invert", FRAME_INVERT)];
     let mut rt = video(&kit, &filters, 5, Some(200)).await;
     settle(&mut rt).await;
-    assert_eq!(read_u32(&rt, "sink", "count"), 5);
-    assert!(read_bool(&rt, "sink", "gray"));
+    assert_eq!(read_u32(&mut rt, "sink", "count").await, 5);
+    assert!(read_bool(&mut rt, "sink", "gray").await);
     // The last frame's first pixel is hue 24 (255, 102, 0): luma 136,
     // inverted 119.
-    assert_eq!(read_u32(&rt, "sink", "first-pixel"), 0x7777_77ff);
+    assert_eq!(read_u32(&mut rt, "sink", "first-pixel").await, 0x7777_77ff);
 
     // Unpaced and unfiltered, the frames are in colour.
     let mut rt = video(&kit, &[], 3, None).await;
     settle(&mut rt).await;
-    assert_eq!(read_u32(&rt, "sink", "count"), 3);
-    assert!(!read_bool(&rt, "sink", "gray"));
+    assert_eq!(read_u32(&mut rt, "sink", "count").await, 3);
+    assert!(!read_bool(&mut rt, "sink", "gray").await);
 }
 
 /// `test:accel/cnn`'s types, as the host sees them.
@@ -1049,7 +1131,7 @@ async fn edges(accel: Accel) -> RuntimeGraph<Perf, Accel> {
         RuntimeGraph::load_with_host(compiled, &kit.wasm, RuntimeConfig::default(), Perf, accel)
             .await
             .expect("loads");
-    inject(&mut rt, "source", "frames", Val::U32(3));
+    inject(&mut rt, "source", "frames", Val::U32(3)).await;
     rt
 }
 
@@ -1057,11 +1139,11 @@ async fn edges(accel: Accel) -> RuntimeGraph<Perf, Accel> {
 async fn edges_are_detected_on_the_host_s_accelerator() {
     let mut rt = edges(Accel { accelerated: true }).await;
     settle(&mut rt).await;
-    assert_eq!(read_string(&rt, "edges", "backend"), "cpu");
-    assert_eq!(read_u32(&rt, "sink", "count"), 3);
-    assert!(read_bool(&rt, "sink", "gray"), "edges are gray");
+    assert_eq!(read_string(&mut rt, "edges", "backend").await, "cpu");
+    assert_eq!(read_u32(&mut rt, "sink", "count").await, 3);
+    assert!(read_bool(&mut rt, "sink", "gray").await, "edges are gray");
     // The frame's corner is an edge: beyond it, the padding is zeros.
-    assert_eq!(read_u32(&rt, "sink", "first-pixel"), 0xffff_ffff);
+    assert_eq!(read_u32(&mut rt, "sink", "first-pixel").await, 0xffff_ffff);
 }
 
 #[tokio::test]
@@ -1210,8 +1292,12 @@ async fn load_labelled(plugins: Plugins) -> Result<RuntimeGraph<Perf, Plugins>, 
     RuntimeGraph::load_with_host(compiled, &kit.wasm, RuntimeConfig::default(), Perf, plugins).await
 }
 
-fn read_string<M: RuntimeMode, H: Host>(rt: &RuntimeGraph<M, H>, node: &str, port: &str) -> String {
-    match read(rt, node, port) {
+async fn read_string<M: RuntimeMode, H: Host>(
+    rt: &mut RuntimeGraph<M, H>,
+    node: &str,
+    port: &str,
+) -> String {
+    match read(rt, node, port).await {
         Some(Val::String(s)) => s,
         other => panic!("expected a string, got {other:?}"),
     }
@@ -1227,12 +1313,12 @@ async fn labels_route_one_interface_to_two_plugins() {
     let mut rt = load_labelled(plugins)
         .await
         .expect("both labels name a plugin");
-    inject(&mut rt, "n", "key", Val::String("k".into()));
+    inject(&mut rt, "n", "key", Val::String("k".into())).await;
     settle(&mut rt).await;
     // Each label reached the plugin of its name; the call count is the
     // island's, shared by both plugins.
-    assert_eq!(read_string(&rt, "n", "primary"), "primary:k#1");
-    assert_eq!(read_string(&rt, "n", "backup"), "backup:k#2");
+    assert_eq!(read_string(&mut rt, "n", "primary").await, "primary:k#1");
+    assert_eq!(read_string(&mut rt, "n", "backup").await, "backup:k#2");
 }
 
 #[tokio::test]
@@ -1242,8 +1328,8 @@ async fn labels_naming_no_plugin_reach_the_only_one_serving_the_interface() {
         .await
         .expect("one plugin serves both");
     settle(&mut rt).await;
-    assert_eq!(read_string(&rt, "n", "primary"), "only:#1");
-    assert_eq!(read_string(&rt, "n", "backup"), "only:#2");
+    assert_eq!(read_string(&mut rt, "n", "primary").await, "only:#1");
+    assert_eq!(read_string(&mut rt, "n", "backup").await, "only:#2");
 }
 
 #[tokio::test]
@@ -1323,41 +1409,41 @@ async fn a_link_satisfies_an_import_with_a_providers_export() {
     let mut rt = RuntimeGraph::load(compiled, &kit.wasm, RuntimeConfig::default(), Perf)
         .await
         .expect("the provider is composed in");
-    inject(&mut rt, "a", "x", Val::U32(5));
-    inject(&mut rt, "b", "x", Val::U32(3));
+    inject(&mut rt, "a", "x", Val::U32(5)).await;
+    inject(&mut rt, "b", "x", Val::U32(3)).await;
     settle(&mut rt).await;
     // A sync call, an async call and a stream all cross the link.
-    assert_eq!(read_u32(&rt, "a", "doubled"), 10);
-    assert_eq!(read_u32(&rt, "a", "slow"), 10);
-    assert_eq!(read_u32(&rt, "a", "total"), 10);
-    assert_eq!(read_u32(&rt, "b", "doubled"), 6);
-    assert_eq!(read_u32(&rt, "b", "total"), 3);
+    assert_eq!(read_u32(&mut rt, "a", "doubled").await, 10);
+    assert_eq!(read_u32(&mut rt, "a", "slow").await, 10);
+    assert_eq!(read_u32(&mut rt, "a", "total").await, 10);
+    assert_eq!(read_u32(&mut rt, "b", "doubled").await, 6);
+    assert_eq!(read_u32(&mut rt, "b", "total").await, 3);
 
     // Each node has a provider of its own, which lives as long as the
     // node's island does.
-    assert_eq!(read_u32(&rt, "a", "calls"), 1);
-    assert_eq!(read_u32(&rt, "b", "calls"), 1);
-    inject(&mut rt, "a", "x", Val::U32(4));
+    assert_eq!(read_u32(&mut rt, "a", "calls").await, 1);
+    assert_eq!(read_u32(&mut rt, "b", "calls").await, 1);
+    inject(&mut rt, "a", "x", Val::U32(4)).await;
     settle(&mut rt).await;
-    assert_eq!(read_u32(&rt, "a", "calls"), 2);
-    assert_eq!(read_u32(&rt, "b", "calls"), 1);
+    assert_eq!(read_u32(&mut rt, "a", "calls").await, 2);
+    assert_eq!(read_u32(&mut rt, "b", "calls").await, 1);
     // A rebuilt island gets a fresh provider with the node.
     rt.cancel(&id("a")).unwrap();
     rt.rerun(&id("a")).unwrap();
     settle(&mut rt).await;
-    assert_eq!(read_u32(&rt, "a", "calls"), 1);
+    assert_eq!(read_u32(&mut rt, "a", "calls").await, 1);
 
     // A snapshot names the links: it restores only onto the same ones.
-    let snapshot = rt.snapshot().unwrap();
+    let snapshot = rt.snapshot().await.unwrap();
     assert_eq!(snapshot.links.len(), 2);
     let mut other = snapshot.clone();
     other.links[0].export = "test:math/other@0.1.0".into();
-    let err = rt.restore(&other).expect_err("the links differ");
+    let err = rt.restore(&other).await.expect_err("the links differ");
     assert!(
         matches!(err, RuntimeError::SnapshotMismatch { .. }),
         "{err}"
     );
-    rt.restore(&snapshot).expect("the same links");
+    rt.restore(&snapshot).await.expect("the same links");
 }
 
 #[tokio::test]
@@ -1374,9 +1460,9 @@ async fn an_unpinned_provider_is_found_under_its_one_pinned_key() {
     let mut rt = RuntimeGraph::load(compiled, &kit.wasm, RuntimeConfig::default(), Perf)
         .await
         .expect("the provider is found under its pinned key");
-    inject(&mut rt, "a", "x", Val::U32(5));
+    inject(&mut rt, "a", "x", Val::U32(5)).await;
     settle(&mut rt).await;
-    assert_eq!(read_u32(&rt, "a", "doubled"), 10);
+    assert_eq!(read_u32(&mut rt, "a", "doubled").await, 10);
 }
 
 /// A provider of `ops` like `math`, whose every function traps.
@@ -1421,9 +1507,13 @@ async fn each_node_runs_the_composition_built_for_its_links() {
     let mut rt = RuntimeGraph::load(compiled, &kit.wasm, RuntimeConfig::default(), Perf)
         .await
         .expect("loads");
-    inject(&mut rt, "a", "x", Val::U32(5));
+    inject(&mut rt, "a", "x", Val::U32(5)).await;
     settle(&mut rt).await;
-    assert_eq!(read_u32(&rt, "a", "doubled"), 10, "`a` runs `math`");
+    assert_eq!(
+        read_u32(&mut rt, "a", "doubled").await,
+        10,
+        "`a` runs `math`"
+    );
     assert!(
         matches!(
             rt.node_state(&id("b")).unwrap().fault_cause(),
@@ -1566,9 +1656,9 @@ async fn a_linked_node_is_prepared_with_its_links() {
     }];
     let linked = PreparedComponent::linked(&engine, contract, CALC.wasm, &links).unwrap();
     let mut rt = load(linked).await.expect("prepared with the link");
-    inject(&mut rt, "n", "x", Val::U32(2));
+    inject(&mut rt, "n", "x", Val::U32(2)).await;
     settle(&mut rt).await;
-    assert_eq!(read_u32(&rt, "n", "doubled"), 4);
+    assert_eq!(read_u32(&mut rt, "n", "doubled").await, 4);
 }
 
 #[tokio::test]
@@ -1620,22 +1710,22 @@ async fn wide_graph_full_flow() {
     )
     .await
     .expect("loads");
-    inject(&mut rt, "cfg", "rate", Val::U32(4));
-    inject(&mut rt, "cfg", "gain", Val::Float64(3.0));
-    inject(&mut rt, "prod", "burst-size", Val::U32(8));
-    inject(&mut rt, "plus", "add", Val::U32(1));
+    inject(&mut rt, "cfg", "rate", Val::U32(4)).await;
+    inject(&mut rt, "cfg", "gain", Val::Float64(3.0)).await;
+    inject(&mut rt, "prod", "burst-size", Val::U32(8)).await;
+    inject(&mut rt, "plus", "add", Val::U32(1)).await;
     let ticks = settle(&mut rt).await;
     assert!(
         ticks <= 3,
         "no feedback, so one productive tick: took {ticks}"
     );
 
-    assert_eq!(read_f64(&rt, "echo_b", "out"), 12.0, "4 * 3.0");
-    assert_eq!(read_u32(&rt, "cons", "total"), 28, "sum(0..8)");
-    assert_eq!(read_u32(&rt, "sink_a", "out"), 29);
-    assert_eq!(read_u32(&rt, "sink_b", "out"), 29);
+    assert_eq!(read_f64(&mut rt, "echo_b", "out").await, 12.0, "4 * 3.0");
+    assert_eq!(read_u32(&mut rt, "cons", "total").await, 28, "sum(0..8)");
+    assert_eq!(read_u32(&mut rt, "sink_a", "out").await, 29);
+    assert_eq!(read_u32(&mut rt, "sink_b", "out").await, 29);
     assert_eq!(
-        read_u32(&rt, "count", "count"),
+        read_u32(&mut rt, "count", "count").await,
         4,
         "4 byte messages from mqtt feed"
     );
@@ -1672,7 +1762,7 @@ async fn a_value_latched_mid_generation_wakes_downstream_islands() {
     );
     assert_eq!(phase(&rt, "cons"), NodePhase::Running);
     assert_eq!(
-        read_u32(&rt, "r", "out"),
+        read_u32(&mut rt, "r", "out").await,
         u32::MAX,
         "`r` ran on `limit` while the stream still flows"
     );
@@ -1694,13 +1784,17 @@ async fn an_endless_island_owing_another_run_does_not_hold_back_downstream() {
         .load(graph, RuntimeConfig::default(), Trace::new())
         .await;
     let _ = tokio::time::timeout(Duration::from_secs(2), rt.tick()).await;
-    assert_eq!(read_u32(&rt, "r", "out"), u32::MAX);
+    assert_eq!(read_u32(&mut rt, "r", "out").await, u32::MAX);
 
     // The endless island now owes another run it can never start.
-    inject(&mut rt, "cons", "delay", Val::U32(1));
-    inject(&mut rt, "r", "add", Val::U32(1));
+    inject(&mut rt, "cons", "delay", Val::U32(1)).await;
+    inject(&mut rt, "r", "add", Val::U32(1)).await;
     let _ = tokio::time::timeout(Duration::from_secs(2), rt.tick()).await;
-    assert_eq!(read_u32(&rt, "r", "out"), 0, "u32::MAX + 1, wrapping");
+    assert_eq!(
+        read_u32(&mut rt, "r", "out").await,
+        0,
+        "u32::MAX + 1, wrapping"
+    );
 }
 
 #[tokio::test]
@@ -1720,12 +1814,12 @@ async fn a_value_round_trip_through_another_node_runs_in_one_generation() {
     let mut rt = kit
         .load(graph, RuntimeConfig::default(), Trace::new())
         .await;
-    inject(&mut rt, "prod", "burst-size", Val::U32(10));
+    inject(&mut rt, "prod", "burst-size", Val::U32(10)).await;
     // take = 10 + add, wrapping: 3.
-    inject(&mut rt, "r", "add", Val::U32(u32::MAX - 6));
+    inject(&mut rt, "r", "add", Val::U32(u32::MAX - 6)).await;
     settle(&mut rt).await;
-    assert_eq!(read_u32(&rt, "cons", "count"), 3);
-    assert_eq!(read_u32(&rt, "cons", "total"), 3, "0+1+2");
+    assert_eq!(read_u32(&mut rt, "cons", "count").await, 3);
+    assert_eq!(read_u32(&mut rt, "cons", "total").await, 3, "0+1+2");
     assert_eq!(
         runs_of(&rt.mode().trace(), "cons"),
         1,
@@ -1752,7 +1846,7 @@ async fn a_node_reading_an_island_that_will_rerun_waits_for_it() {
     let mut rt = kit
         .load(graph, RuntimeConfig::default(), Trace::new())
         .await;
-    inject(&mut rt, "prod", "burst-size", Val::U32(3));
+    inject(&mut rt, "prod", "burst-size", Val::U32(3)).await;
     settle(&mut rt).await;
     assert_eq!(
         runs_of(&rt.mode().trace(), "j"),
@@ -1772,9 +1866,9 @@ async fn graphs_can_share_an_engine() {
     };
     let mut second = kit.load(graph(), config, Perf).await;
     assert!(wasmtime::Engine::same(first.engine(), second.engine()));
-    inject(&mut second, "e", "in", Val::Float64(2.0));
+    inject(&mut second, "e", "in", Val::Float64(2.0)).await;
     settle(&mut second).await;
-    assert_eq!(read_f64(&second, "e", "out"), 2.0);
+    assert_eq!(read_f64(&mut second, "e", "out").await, 2.0);
 }
 
 #[tokio::test]
@@ -1807,7 +1901,7 @@ async fn bytes_can_be_keyed_by_an_unhashed_ref() {
     let mut rt = RuntimeGraph::load(compiled, &wasm, RuntimeConfig::default(), Trace::new())
         .await
         .expect("the unhashed key matches by package and world");
-    inject(&mut rt, "e", "in", Val::Float64(1.0));
+    inject(&mut rt, "e", "in", Val::Float64(1.0)).await;
     settle(&mut rt).await;
     let phases: Vec<(NodePhase, NodePhase)> = rt
         .mode()
@@ -1850,13 +1944,25 @@ async fn a_cycle_through_three_stream_islands_runs() {
         .load(graph, RuntimeConfig::default(), Trace::new())
         .await;
     assert_eq!(rt.compiled().islands().len(), 1);
-    inject(&mut rt, "s1", "burst-size", Val::U32(2));
-    inject(&mut rt, "s2", "burst-size", Val::U32(3));
-    inject(&mut rt, "s3", "burst-size", Val::U32(4));
+    inject(&mut rt, "s1", "burst-size", Val::U32(2)).await;
+    inject(&mut rt, "s2", "burst-size", Val::U32(3)).await;
+    inject(&mut rt, "s3", "burst-size", Val::U32(4)).await;
     settle(&mut rt).await;
-    assert_eq!(read_u32(&rt, "t1", "count"), 2, "s1 streams only 2");
-    assert_eq!(read_u32(&rt, "t2", "count"), 2, "takes s1's limit");
-    assert_eq!(read_u32(&rt, "t3", "count"), 3, "takes s2's limit");
+    assert_eq!(
+        read_u32(&mut rt, "t1", "count").await,
+        2,
+        "s1 streams only 2"
+    );
+    assert_eq!(
+        read_u32(&mut rt, "t2", "count").await,
+        2,
+        "takes s1's limit"
+    );
+    assert_eq!(
+        read_u32(&mut rt, "t3", "count").await,
+        3,
+        "takes s2's limit"
+    );
     let trace = rt.mode().trace();
     for node in ["t1", "t2", "t3"] {
         assert_eq!(runs_of(&trace, node), 1, "{node}");
@@ -1880,11 +1986,11 @@ async fn feedback_loop_reruns_each_iteration() {
         .load(graph, RuntimeConfig::default(), Trace::new())
         .await;
     // `a.in` is required: fed by the feedback edge, seeded by the host.
-    inject(&mut rt, "a", "in", Val::U32(0));
-    inject(&mut rt, "a", "add", Val::U32(1));
+    inject(&mut rt, "a", "in", Val::U32(0)).await;
+    inject(&mut rt, "a", "add", Val::U32(1)).await;
     for i in 1..=5u32 {
         assert!(matches!(rt.tick().await, TickResult::Progress));
-        assert_eq!(read_u32(&rt, "b", "out"), i, "iteration {i}");
+        assert_eq!(read_u32(&mut rt, "b", "out").await, i, "iteration {i}");
     }
     let trace = rt.mode().trace();
     assert_eq!(runs_of(&trace, "a"), 5);
@@ -1916,12 +2022,12 @@ async fn shutdown_forgets_feedback_buffered_by_an_unfinished_tick() {
             Trace::new(),
         )
         .await;
-    inject(&mut rt, "a", "in", Val::U32(0));
-    inject(&mut rt, "a", "add", Val::U32(1));
+    inject(&mut rt, "a", "in", Val::U32(0)).await;
+    inject(&mut rt, "a", "add", Val::U32(1)).await;
     let tick = tokio::time::timeout(Duration::from_millis(500), rt.tick()).await;
     assert!(tick.is_err(), "the endless pipeline keeps the tick running");
-    assert_eq!(read_u32(&rt, "b", "out"), 1);
-    let snapshot = rt.snapshot().unwrap();
+    assert_eq!(read_u32(&mut rt, "b", "out").await, 1);
+    let snapshot = rt.snapshot().await.unwrap();
     assert_eq!(
         snapshot.inputs[&id("a")][&"in".into()],
         "1",
@@ -1930,9 +2036,9 @@ async fn shutdown_forgets_feedback_buffered_by_an_unfinished_tick() {
     assert_eq!(snapshot.islands.len(), 2, "`a` owes its next iteration");
 
     rt.shutdown();
-    assert!(rt.snapshot().unwrap().feedback.is_empty());
+    assert!(rt.snapshot().await.unwrap().feedback.is_empty());
     assert!(matches!(rt.tick().await, TickResult::Idle));
-    assert_eq!(read_u32(&rt, "b", "out"), 1);
+    assert_eq!(read_u32(&mut rt, "b", "out").await, 1);
     assert_eq!(runs_of(&rt.mode().trace(), "a"), 1, "nothing restarted");
 }
 
@@ -1946,12 +2052,16 @@ async fn feedback_loops_advance_beside_an_island_that_never_finishes() {
             Trace::new(),
         )
         .await;
-    inject(&mut rt, "a", "in", Val::U32(0));
-    inject(&mut rt, "a", "add", Val::U32(1));
+    inject(&mut rt, "a", "in", Val::U32(0)).await;
+    inject(&mut rt, "a", "add", Val::U32(1)).await;
     for i in 1..=3u32 {
         let tick = tokio::time::timeout(Duration::from_millis(300), rt.tick()).await;
         assert!(tick.is_err(), "the pipeline never finishes");
-        assert_eq!(read_u32(&rt, "b", "out"), i, "one iteration per tick");
+        assert_eq!(
+            read_u32(&mut rt, "b", "out").await,
+            i,
+            "one iteration per tick"
+        );
     }
 }
 
@@ -1965,14 +2075,14 @@ async fn a_value_injected_between_ticks_is_not_overwritten_by_older_feedback() {
             Trace::new(),
         )
         .await;
-    inject(&mut rt, "a", "in", Val::U32(0));
-    inject(&mut rt, "a", "add", Val::U32(1));
+    inject(&mut rt, "a", "in", Val::U32(0)).await;
+    inject(&mut rt, "a", "add", Val::U32(1)).await;
     let _ = tokio::time::timeout(Duration::from_millis(300), rt.tick()).await;
-    assert_eq!(read_u32(&rt, "b", "out"), 1);
+    assert_eq!(read_u32(&mut rt, "b", "out").await, 1);
     // `a.in` is fed by feedback, so the host may seed it again.
-    inject(&mut rt, "a", "in", Val::U32(100));
+    inject(&mut rt, "a", "in", Val::U32(100)).await;
     let _ = tokio::time::timeout(Duration::from_millis(300), rt.tick()).await;
-    assert_eq!(read_u32(&rt, "b", "out"), 101);
+    assert_eq!(read_u32(&mut rt, "b", "out").await, 101);
 }
 
 #[tokio::test]
@@ -1991,14 +2101,14 @@ async fn step_limited_ticks_finish_an_iteration_before_the_next() {
         ..RuntimeConfig::default()
     };
     let mut rt = kit.load(graph, config, Trace::new()).await;
-    inject(&mut rt, "a", "in", Val::U32(0));
-    inject(&mut rt, "a", "add", Val::U32(1));
+    inject(&mut rt, "a", "in", Val::U32(0)).await;
+    inject(&mut rt, "a", "add", Val::U32(1)).await;
     for _ in 0..10 {
         let _ = rt.tick().await;
     }
-    let a = read_u32(&rt, "a", "out");
+    let a = read_u32(&mut rt, "a", "out").await;
     assert!(
-        read_u32(&rt, "c", "out") + 1 >= a,
+        read_u32(&mut rt, "c", "out").await + 1 >= a,
         "`c` keeps up with `a`: a={a}"
     );
 }
@@ -2020,10 +2130,10 @@ async fn step_limited_self_loop(kit: &Kit) -> RuntimeGraph<Trace> {
         ..RuntimeConfig::default()
     };
     let mut rt = kit.load(graph, config, Trace::new()).await;
-    inject(&mut rt, "a", "in", Val::U32(0));
-    inject(&mut rt, "a", "add", Val::U32(1));
+    inject(&mut rt, "a", "in", Val::U32(0)).await;
+    inject(&mut rt, "a", "add", Val::U32(1)).await;
     assert!(matches!(rt.tick().await, TickResult::StepLimitReached));
-    assert_eq!(rt.snapshot().unwrap().feedback.len(), 1, "buffered");
+    assert_eq!(rt.snapshot().await.unwrap().feedback.len(), 1, "buffered");
     rt
 }
 
@@ -2032,7 +2142,7 @@ async fn cancel_forgets_buffered_feedback() {
     let kit = Kit::new(&[RELAY]);
     let mut rt = step_limited_self_loop(&kit).await;
     rt.cancel(&id("a")).unwrap();
-    assert!(rt.snapshot().unwrap().feedback.is_empty());
+    assert!(rt.snapshot().await.unwrap().feedback.is_empty());
     for _ in 0..5 {
         let _ = rt.tick().await;
     }
@@ -2044,7 +2154,7 @@ async fn shutdown_forgets_buffered_feedback() {
     let kit = Kit::new(&[RELAY]);
     let mut rt = step_limited_self_loop(&kit).await;
     rt.shutdown();
-    assert!(rt.snapshot().unwrap().feedback.is_empty());
+    assert!(rt.snapshot().await.unwrap().feedback.is_empty());
     for _ in 0..5 {
         let _ = rt.tick().await;
     }
@@ -2056,9 +2166,9 @@ async fn an_injected_value_outlives_feedback_buffered_before_it() {
     let kit = Kit::new(&[RELAY]);
     let mut rt = step_limited_self_loop(&kit).await;
     // The buffered `a.out = 1` is older than this write.
-    inject(&mut rt, "a", "in", Val::U32(100));
+    inject(&mut rt, "a", "in", Val::U32(100)).await;
     let _ = rt.tick().await;
-    assert_eq!(read_u32(&rt, "a", "out"), 101);
+    assert_eq!(read_u32(&mut rt, "a", "out").await, 101);
 }
 
 #[tokio::test]
@@ -2071,8 +2181,8 @@ async fn cancel_forgets_feedback_buffered_for_the_island() {
             Trace::new(),
         )
         .await;
-    inject(&mut rt, "a", "in", Val::U32(0));
-    inject(&mut rt, "a", "add", Val::U32(1));
+    inject(&mut rt, "a", "in", Val::U32(0)).await;
+    inject(&mut rt, "a", "add", Val::U32(1)).await;
     let _ = tokio::time::timeout(Duration::from_millis(500), rt.tick()).await;
     rt.cancel(&id("a")).unwrap();
     rt.cancel(&id("cons")).unwrap();
@@ -2091,7 +2201,7 @@ async fn a_spinning_guest_yields_so_a_timeout_fires() {
         .add_node("busy", kit.get(BUSY_LOOP))
         .build();
     let mut rt = kit.load(graph, RuntimeConfig::default(), Perf).await;
-    inject(&mut rt, "busy", "action", Val::Enum("spin".into()));
+    inject(&mut rt, "busy", "action", Val::Enum("spin".into())).await;
     // The tick runs on a task of its own: if the guest never yielded, that
     // task would never return, and the watchdog below fails the test
     // instead of hanging it.
@@ -2140,9 +2250,9 @@ async fn a_trap_faults_only_its_island() {
     let mut rt = kit
         .load(graph, RuntimeConfig::default(), Trace::new())
         .await;
-    inject(&mut rt, "busy", "action", Val::Enum("trap".into()));
-    inject(&mut rt, "e", "in", Val::Float64(1.5));
-    inject(&mut rt, "prod", "burst-size", Val::U32(3));
+    inject(&mut rt, "busy", "action", Val::Enum("trap".into())).await;
+    inject(&mut rt, "e", "in", Val::Float64(1.5)).await;
+    inject(&mut rt, "prod", "burst-size", Val::U32(3)).await;
     settle(&mut rt).await;
 
     let busy = rt.node_state(&id("busy")).unwrap();
@@ -2151,8 +2261,8 @@ async fn a_trap_faults_only_its_island() {
         busy.fault_cause(),
         Some(NodeFault::WasmTrap { .. })
     ));
-    assert_eq!(read_f64(&rt, "e", "out"), 1.5);
-    assert_eq!(read_u32(&rt, "cons", "total"), 3);
+    assert_eq!(read_f64(&mut rt, "e", "out").await, 1.5);
+    assert_eq!(read_u32(&mut rt, "cons", "total").await, 3);
     assert_eq!(phase(&rt, "cons"), NodePhase::Idle);
 }
 
@@ -2180,8 +2290,8 @@ async fn busy_loop_exhausts_its_run_budget_while_a_sibling_island_finishes() {
     let mut rt = kit
         .load(pipeline_and_busy(&kit), config, Trace::new())
         .await;
-    feed_pipeline(&mut rt, Some(100), None);
-    inject(&mut rt, "busy", "action", Val::Enum("spin".into()));
+    feed_pipeline(&mut rt, Some(100), None).await;
+    inject(&mut rt, "busy", "action", Val::Enum("spin".into())).await;
     settle(&mut rt).await;
 
     let busy = rt.node_state(&id("busy")).unwrap();
@@ -2190,8 +2300,11 @@ async fn busy_loop_exhausts_its_run_budget_while_a_sibling_island_finishes() {
         "{:?}",
         busy.fault_cause()
     );
-    assert_eq!(read_u32(&rt, "cons", "count"), 100);
-    assert_eq!(read_u32(&rt, "cons", "total"), (0..100).sum::<u32>());
+    assert_eq!(read_u32(&mut rt, "cons", "count").await, 100);
+    assert_eq!(
+        read_u32(&mut rt, "cons", "total").await,
+        (0..100).sum::<u32>()
+    );
     assert_eq!(
         phase(&rt, "cons"),
         NodePhase::Idle,
@@ -2233,7 +2346,7 @@ async fn fatal_aborts_the_tick() {
     let mut rt = kit
         .load(graph, RuntimeConfig::default(), Trace::new())
         .await;
-    inject(&mut rt, "busy", "action", Val::Enum("fatal".into()));
+    inject(&mut rt, "busy", "action", Val::Enum("fatal".into())).await;
     match rt.tick().await {
         TickResult::Aborted { node, fault } => {
             assert_eq!(node, id("busy"));
@@ -2260,15 +2373,16 @@ async fn a_faulted_island_restarts_on_new_input() {
     let mut rt = kit
         .load(graph, RuntimeConfig::default(), Trace::new())
         .await;
-    inject(&mut rt, "busy", "action", Val::Enum("trap".into()));
+    inject(&mut rt, "busy", "action", Val::Enum("trap".into())).await;
     settle(&mut rt).await;
     assert_eq!(phase(&rt, "busy"), NodePhase::Faulted);
 
     rt.inject(&id("busy"), &"action".into(), Val::Enum("finish".into()))
+        .await
         .unwrap();
     settle(&mut rt).await;
     assert_eq!(phase(&rt, "busy"), NodePhase::Idle);
-    assert_eq!(read_u32(&rt, "busy", "done"), 1);
+    assert_eq!(read_u32(&mut rt, "busy", "done").await, 1);
     let trace = rt.mode().trace();
     assert!(
         trace
@@ -2290,15 +2404,15 @@ async fn an_input_change_during_a_faulting_generation_reruns_after_the_fault() {
         ..RuntimeConfig::default()
     };
     let mut rt = kit.load(graph, config, Trace::new()).await;
-    inject(&mut rt, "busy", "action", Val::Enum("spin".into()));
+    inject(&mut rt, "busy", "action", Val::Enum("spin".into())).await;
     poll_tick_once(&mut rt).await;
     assert_eq!(phase(&rt, "busy"), NodePhase::Running);
 
     // Owed while the spinning generation runs; the fault must not drop it.
-    inject(&mut rt, "busy", "action", Val::Enum("finish".into()));
+    inject(&mut rt, "busy", "action", Val::Enum("finish".into())).await;
     settle(&mut rt).await;
     assert_eq!(phase(&rt, "busy"), NodePhase::Idle);
-    assert_eq!(read_u32(&rt, "busy", "done"), 1);
+    assert_eq!(read_u32(&mut rt, "busy", "done").await, 1);
     let trace = rt.mode().trace();
     assert!(trace.iter().any(|e| matches!(
         e,
@@ -2324,7 +2438,7 @@ async fn cancelling_a_faulted_island_marks_it_cancelled() {
     let mut rt = kit
         .load(graph, RuntimeConfig::default(), Trace::new())
         .await;
-    inject(&mut rt, "busy", "action", Val::Enum("trap".into()));
+    inject(&mut rt, "busy", "action", Val::Enum("trap".into())).await;
     settle(&mut rt).await;
     assert_eq!(phase(&rt, "busy"), NodePhase::Faulted);
 
@@ -2349,14 +2463,14 @@ async fn cancelling_again_forgets_work_owed_since() {
     let mut rt = kit
         .load(graph, RuntimeConfig::default(), Trace::new())
         .await;
-    inject(&mut rt, "e", "in", Val::Float64(1.0));
+    inject(&mut rt, "e", "in", Val::Float64(1.0)).await;
     settle(&mut rt).await;
     rt.cancel(&id("e")).unwrap();
-    inject(&mut rt, "e", "in", Val::Float64(2.0));
+    inject(&mut rt, "e", "in", Val::Float64(2.0)).await;
     rt.cancel(&id("e")).unwrap();
     assert!(matches!(rt.tick().await, TickResult::Idle));
     assert_eq!(phase(&rt, "e"), NodePhase::Cancelled);
-    assert_eq!(read_f64(&rt, "e", "out"), 1.0);
+    assert_eq!(read_f64(&mut rt, "e", "out").await, 1.0);
 }
 
 // ---- Cancellation and shutdown ----
@@ -2385,9 +2499,10 @@ async fn cancel_drops_an_endless_island_and_new_input_restarts_it() {
     assert!(matches!(rt.tick().await, TickResult::Idle));
 
     rt.inject(&id("prod"), &"burst-size".into(), Val::U32(4))
+        .await
         .unwrap();
     settle(&mut rt).await;
-    assert_eq!(read_u32(&rt, "cons", "total"), 6, "0+1+2+3");
+    assert_eq!(read_u32(&mut rt, "cons", "total").await, 6, "0+1+2+3");
     assert_eq!(phase(&rt, "cons"), NodePhase::Idle);
     let trace = rt.mode().trace();
     for node in ["prod", "cons"] {
@@ -2449,7 +2564,7 @@ async fn rerun_restarts_an_island_the_host_cannot_feed() {
     .await
     .expect("loads");
     settle(&mut rt).await;
-    assert_eq!(read_u32(&rt, "cons", "total-bytes"), 2);
+    assert_eq!(read_u32(&mut rt, "cons", "total-bytes").await, 2);
     rt.cancel(&id("mqtt")).unwrap();
 
     feed.lock()
@@ -2461,7 +2576,7 @@ async fn rerun_restarts_an_island_the_host_cannot_feed() {
     );
     rt.rerun(&id("mqtt")).unwrap();
     settle(&mut rt).await;
-    assert_eq!(read_u32(&rt, "cons", "total-bytes"), 4);
+    assert_eq!(read_u32(&mut rt, "cons", "total-bytes").await, 4);
 }
 
 #[tokio::test]
@@ -2471,12 +2586,16 @@ async fn clear_input_forgets_an_injected_value() {
     let mut rt = kit
         .load(graph, RuntimeConfig::default(), Trace::new())
         .await;
-    inject(&mut rt, "e", "in", Val::Float64(2.0));
+    inject(&mut rt, "e", "in", Val::Float64(2.0)).await;
     settle(&mut rt).await;
-    rt.clear_input(&id("e"), &"in".into()).unwrap();
+    rt.clear_input(&id("e"), &"in".into()).await.unwrap();
     settle(&mut rt).await;
-    assert_eq!(read_f64(&rt, "e", "out"), 0.0, "`in` reads as none again");
-    rt.clear_input(&id("e"), &"in".into()).unwrap();
+    assert_eq!(
+        read_f64(&mut rt, "e", "out").await,
+        0.0,
+        "`in` reads as none again"
+    );
+    rt.clear_input(&id("e"), &"in".into()).await.unwrap();
     assert!(
         matches!(rt.tick().await, TickResult::Idle),
         "clearing nothing is not a change"
@@ -2540,9 +2659,9 @@ async fn the_host_creates_the_data_of_every_island_store() {
     assert_eq!(built.lock().unwrap().len(), 2, "one Store per island");
     settle(&mut rt).await;
     rt.cancel(&id("a")).unwrap();
-    inject(&mut rt, "a", "in", Val::Float64(1.0));
+    inject(&mut rt, "a", "in", Val::Float64(1.0)).await;
     settle(&mut rt).await;
-    assert_eq!(read_f64(&rt, "a", "out"), 1.0);
+    assert_eq!(read_f64(&mut rt, "a", "out").await, 1.0);
     assert_eq!(
         built.lock().unwrap().last(),
         Some(&vec![id("a")]),
@@ -2562,7 +2681,7 @@ async fn cancel_frees_what_the_island_held_back() {
     let mut rt = kit
         .load(graph, RuntimeConfig::default(), Trace::new())
         .await;
-    inject(&mut rt, "busy", "action", Val::Enum("spin".into()));
+    inject(&mut rt, "busy", "action", Val::Enum("spin".into())).await;
     let tick = rt
         .tick_until(tokio::time::sleep(Duration::from_millis(200)))
         .await;
@@ -2593,18 +2712,18 @@ async fn cancel_releases_resources_to_waiting_islands() {
     let mut rt = kit
         .load(graph, RuntimeConfig::default(), Trace::new())
         .await;
-    inject(&mut rt, "busy", "action", Val::Enum("spin".into()));
-    inject(&mut rt, "e", "in", Val::Float64(4.0));
+    inject(&mut rt, "busy", "action", Val::Enum("spin".into())).await;
+    inject(&mut rt, "e", "in", Val::Float64(4.0)).await;
     let _ = rt
         .tick_until(tokio::time::sleep(Duration::from_millis(200)))
         .await;
-    let e_ran = read(&rt, "e", "out").is_some();
+    let e_ran = read(&mut rt, "e", "out").await.is_some();
     if phase(&rt, "busy") == NodePhase::Running {
         assert!(!e_ran, "`e` waits for the gpu");
         rt.cancel(&id("busy")).unwrap();
         let _ = rt.tick().await;
     }
-    assert_eq!(read_f64(&rt, "e", "out"), 4.0);
+    assert_eq!(read_f64(&mut rt, "e", "out").await, 4.0);
 }
 
 #[tokio::test]
@@ -2622,11 +2741,15 @@ async fn a_faulted_island_releases_its_resources() {
     let mut rt = kit
         .load(graph, RuntimeConfig::default(), Trace::new())
         .await;
-    inject(&mut rt, "busy", "action", Val::Enum("trap".into()));
-    inject(&mut rt, "e", "in", Val::Float64(2.0));
+    inject(&mut rt, "busy", "action", Val::Enum("trap".into())).await;
+    inject(&mut rt, "e", "in", Val::Float64(2.0)).await;
     settle(&mut rt).await;
     assert_eq!(phase(&rt, "busy"), NodePhase::Faulted);
-    assert_eq!(read_f64(&rt, "e", "out"), 2.0, "the trap freed the disk");
+    assert_eq!(
+        read_f64(&mut rt, "e", "out").await,
+        2.0,
+        "the trap freed the disk"
+    );
     let trace = rt.mode().trace();
     assert!(
         trace
@@ -2778,12 +2901,12 @@ async fn split_members_share_a_store_only_for_streams_the_host_cannot_move() {
         ]
     );
 
-    inject(&mut rt, "numbers", "burst-size", Val::U32(5));
-    inject(&mut rt, "readings", "burst-size", Val::U32(5));
+    inject(&mut rt, "numbers", "burst-size", Val::U32(5)).await;
+    inject(&mut rt, "readings", "burst-size", Val::U32(5)).await;
     settle(&mut rt).await;
     for consumer in ["sum", "total"] {
-        assert_eq!(read_u32(&rt, consumer, "count"), 5, "{consumer}");
-        assert_eq!(read_u32(&rt, consumer, "total"), 10, "{consumer}");
+        assert_eq!(read_u32(&mut rt, consumer, "count").await, 5, "{consumer}");
+        assert_eq!(read_u32(&mut rt, consumer, "total").await, 10, "{consumer}");
     }
     // The host saw the pumped items pass, and only those.
     let mut passed = 0;
@@ -2821,11 +2944,11 @@ async fn values_inject_as_wave_text_against_the_port_type() {
         rt.output_type(&id("e"), &"out".into()).unwrap(),
         wasmtime::component::Type::Float64
     ));
-    rt.inject_wave(&id("e"), &"in".into(), "2.5").unwrap();
+    rt.inject_wave(&id("e"), &"in".into(), "2.5").await.unwrap();
     settle(&mut rt).await;
-    assert_eq!(read_f64(&rt, "e", "out"), 2.5);
+    assert_eq!(read_f64(&mut rt, "e", "out").await, 2.5);
     assert!(matches!(
-        rt.inject_wave(&id("e"), &"in".into(), "\"no\""),
+        rt.inject_wave(&id("e"), &"in".into(), "\"no\"").await,
         Err(RuntimeError::ValueType { .. })
     ));
     assert!(matches!(
@@ -2878,20 +3001,20 @@ async fn dropping_a_graph_stops_its_generations() {
 async fn read_output_reports_bad_targets() {
     let kit = Kit::new(&[ECHO]);
     let graph = kit.builder("e").add_node("e", kit.get(ECHO)).build();
-    let rt = kit.load(graph, RuntimeConfig::default(), Perf).await;
+    let mut rt = kit.load(graph, RuntimeConfig::default(), Perf).await;
     assert!(matches!(
-        rt.read_output(&id("ghost"), &"out".into()),
+        rt.read_output(&id("ghost"), &"out".into()).await,
         Err(RuntimeError::UnknownNode { .. })
     ));
     assert!(matches!(
-        rt.read_output(&id("e"), &"in".into()),
+        rt.read_output(&id("e"), &"in".into()).await,
         Err(RuntimeError::NotAValuePort {
             direction: PortDirection::Output,
             ..
         })
     ));
     assert_eq!(
-        rt.read_output(&id("e"), &"out".into()).unwrap(),
+        rt.read_output(&id("e"), &"out".into()).await.unwrap(),
         None,
         "not run yet"
     );
@@ -2926,9 +3049,9 @@ async fn by_default_a_list_of_megabytes_leaves_a_node() {
         .connect("c", port("source", "blob"), port("sink", "blob"))
         .build();
     let mut rt = kit.load(graph, RuntimeConfig::default(), Perf).await;
-    inject(&mut rt, "source", "size", Val::U32(4 << 20));
+    inject(&mut rt, "source", "size", Val::U32(4 << 20)).await;
     settle(&mut rt).await;
-    assert_eq!(read_u32(&rt, "sink", "len"), 4 << 20);
+    assert_eq!(read_u32(&mut rt, "sink", "len").await, 4 << 20);
 }
 
 #[tokio::test]
@@ -2957,15 +3080,18 @@ async fn feedback_unwraps_an_option_into_an_optional_input() {
     let mut rt = kit
         .load(graph, RuntimeConfig::default(), Trace::new())
         .await;
-    inject(&mut rt, "m", "x", Val::U32(5));
+    inject(&mut rt, "m", "x", Val::U32(5)).await;
     settle(&mut rt).await;
     assert_eq!(phase(&rt, "m"), NodePhase::Idle, "some(5) latched as 5");
-    assert_eq!(rt.snapshot().unwrap().inputs[&id("m")][&"x".into()], "5");
-    rt.clear_input(&id("m"), &"x".into()).unwrap();
+    assert_eq!(
+        rt.snapshot().await.unwrap().inputs[&id("m")][&"x".into()],
+        "5"
+    );
+    rt.clear_input(&id("m"), &"x".into()).await.unwrap();
     settle(&mut rt).await;
     assert_eq!(phase(&rt, "m"), NodePhase::Idle);
     assert!(
-        !rt.snapshot().unwrap().inputs.contains_key(&id("m")),
+        !rt.snapshot().await.unwrap().inputs.contains_key(&id("m")),
         "none latched as no value"
     );
 }
@@ -3002,15 +3128,18 @@ async fn re_injecting_the_current_value_keeps_a_loop_going() {
         ..RuntimeConfig::default()
     };
     let mut rt = kit.load(graph, config, Trace::new()).await;
-    inject(&mut rt, "a", "in", Val::U32(0));
-    inject(&mut rt, "a", "add", Val::U32(1));
+    inject(&mut rt, "a", "in", Val::U32(0)).await;
+    inject(&mut rt, "a", "add", Val::U32(1)).await;
     assert!(matches!(rt.tick().await, TickResult::StepLimitReached));
     // Not a change: the feedback buffered for `a.in` stands.
-    inject(&mut rt, "a", "in", Val::U32(0));
+    inject(&mut rt, "a", "in", Val::U32(0)).await;
     for _ in 0..8 {
         let _ = rt.tick().await;
     }
-    assert!(read_u32(&rt, "b", "out") > 2, "the loop kept counting");
+    assert!(
+        read_u32(&mut rt, "b", "out").await > 2,
+        "the loop kept counting"
+    );
 }
 
 #[tokio::test]
@@ -3026,13 +3155,13 @@ async fn a_restored_replay_keeps_the_host_write_over_stale_feedback() {
             .build()
     };
     let mut rt = kit.load(graph(), small_slices(), Trace::new()).await;
-    inject(&mut rt, "cons", "take", Val::U32(500));
-    inject(&mut rt, "cons", "delay", Val::U32(4));
-    inject(&mut rt, "r", "in", Val::U32(1));
+    inject(&mut rt, "cons", "take", Val::U32(500)).await;
+    inject(&mut rt, "cons", "delay", Val::U32(4)).await;
+    inject(&mut rt, "r", "in", Val::U32(1)).await;
     poll_tick_once(&mut rt).await;
     // Newer than what the in-flight generation will feed back.
-    inject(&mut rt, "r", "in", Val::U32(100));
-    let snapshot = rt.snapshot().unwrap();
+    inject(&mut rt, "r", "in", Val::U32(100)).await;
+    let snapshot = rt.snapshot().await.unwrap();
     assert_eq!(
         snapshot
             .islands
@@ -3045,12 +3174,16 @@ async fn a_restored_replay_keeps_the_host_write_over_stale_feedback() {
 
     for graph_rt in [&mut rt] {
         settle(graph_rt).await;
-        assert_eq!(read_u32(graph_rt, "r", "out"), 100, "original");
+        assert_eq!(read_u32(graph_rt, "r", "out").await, 100, "original");
     }
     let mut fresh = kit.load(graph(), small_slices(), Trace::new()).await;
-    fresh.restore(&snapshot).unwrap();
+    fresh.restore(&snapshot).await.unwrap();
     settle(&mut fresh).await;
-    assert_eq!(read_u32(&fresh, "r", "out"), 100, "restored replay");
+    assert_eq!(
+        read_u32(&mut fresh, "r", "out").await,
+        100,
+        "restored replay"
+    );
 
     // A host write after the restore wins over the replay's feedback too.
     let mut again = kit.load(graph(), small_slices(), Trace::new()).await;
@@ -3058,10 +3191,10 @@ async fn a_restored_replay_keeps_the_host_write_over_stale_feedback() {
     for island in &mut clean.islands {
         island.stale_feedback.clear();
     }
-    again.restore(&clean).unwrap();
-    inject(&mut again, "r", "in", Val::U32(200));
+    again.restore(&clean).await.unwrap();
+    inject(&mut again, "r", "in", Val::U32(200)).await;
     settle(&mut again).await;
-    assert_eq!(read_u32(&again, "r", "out"), 200);
+    assert_eq!(read_u32(&mut again, "r", "out").await, 200);
 }
 
 #[tokio::test]
@@ -3080,27 +3213,27 @@ async fn interrupted_ticks_wait_for_every_feedback_source() {
             .connect_feedback("ct", port("cons", "count"), port("t", "add"))
             .build()
     };
-    let seed = |rt: &mut RuntimeGraph<Trace>| {
-        inject(rt, "t", "in", Val::U32(1));
-        inject(rt, "s1", "add", Val::U32(1));
-        inject(rt, "cons", "delay", Val::U32(300));
-    };
+    async fn seed(rt: &mut RuntimeGraph<Trace>) {
+        inject(rt, "t", "in", Val::U32(1)).await;
+        inject(rt, "s1", "add", Val::U32(1)).await;
+        inject(rt, "cons", "delay", Val::U32(300)).await;
+    }
     let mut full = kit.load(graph(), small_slices(), Trace::new()).await;
-    seed(&mut full);
+    seed(&mut full).await;
     let mut expected = Vec::new();
     for _ in 0..4 {
         let _ = full.tick().await;
-        expected.push(read_u32(&full, "t", "out"));
+        expected.push(read_u32(&mut full, "t", "out").await);
     }
 
     let mut cut = kit.load(graph(), small_slices(), Trace::new()).await;
-    seed(&mut cut);
+    seed(&mut cut).await;
     let mut seen: Vec<u32> = Vec::new();
     for _ in 0..40 {
         let _ = cut
             .tick_until(tokio::time::sleep(Duration::from_millis(20)))
             .await;
-        if let Some(Val::U32(out)) = read(&cut, "t", "out")
+        if let Some(Val::U32(out)) = read(&mut cut, "t", "out").await
             && seen.last() != Some(&out)
         {
             seen.push(out);
@@ -3138,9 +3271,9 @@ async fn load_claimants(kit: &Kit, a: f64, b: f64) -> RuntimeGraph<Trace> {
             Trace::new(),
         )
         .await;
-    inject(&mut rt, "a", "in", Val::Float64(1.0));
-    inject(&mut rt, "b", "in", Val::Float64(2.0));
-    inject(&mut rt, "free", "in", Val::Float64(3.0));
+    inject(&mut rt, "a", "in", Val::Float64(1.0)).await;
+    inject(&mut rt, "b", "in", Val::Float64(2.0)).await;
+    inject(&mut rt, "free", "in", Val::Float64(3.0)).await;
     rt
 }
 
@@ -3169,9 +3302,9 @@ async fn resource_claims_exclude_each_other() {
     let kit = Kit::new(&[ECHO]);
     let mut rt = load_claimants(&kit, 0.6, 0.6).await;
     settle(&mut rt).await;
-    assert_eq!(read_f64(&rt, "a", "out"), 1.0);
-    assert_eq!(read_f64(&rt, "b", "out"), 2.0);
-    assert_eq!(read_f64(&rt, "free", "out"), 3.0);
+    assert_eq!(read_f64(&mut rt, "a", "out").await, 1.0);
+    assert_eq!(read_f64(&mut rt, "b", "out").await, 2.0);
+    assert_eq!(read_f64(&mut rt, "free", "out").await, 3.0);
     let (ia, ib) = (
         rt.compiled().island_of(&id("a")).unwrap(),
         rt.compiled().island_of(&id("b")).unwrap(),
@@ -3328,9 +3461,9 @@ async fn prepared_components_load_on_their_engine() {
         rt.config().engine.as_ref().unwrap(),
         &engine
     ));
-    inject(&mut rt, "e", "in", Val::Float64(1.0));
+    inject(&mut rt, "e", "in", Val::Float64(1.0)).await;
     settle(&mut rt).await;
-    assert_eq!(read_f64(&rt, "e", "out"), 1.0);
+    assert_eq!(read_f64(&mut rt, "e", "out").await, 1.0);
 
     let other = RuntimeConfig {
         engine: Some(RuntimeConfig::default().new_engine().unwrap()),
@@ -3465,22 +3598,26 @@ async fn restore_continues_a_feedback_loop_from_the_snapshot() {
     let mut rt = kit
         .load(counter_loop(&kit), RuntimeConfig::default(), Trace::new())
         .await;
-    inject(&mut rt, "a", "in", Val::U32(0));
-    inject(&mut rt, "a", "add", Val::U32(1));
+    inject(&mut rt, "a", "in", Val::U32(0)).await;
+    inject(&mut rt, "a", "add", Val::U32(1)).await;
     for _ in 0..3 {
         assert!(matches!(rt.tick().await, TickResult::Progress));
     }
-    assert_eq!(read_u32(&rt, "b", "out"), 3);
-    let snapshot = rt.snapshot().unwrap();
+    assert_eq!(read_u32(&mut rt, "b", "out").await, 3);
+    let snapshot = rt.snapshot().await.unwrap();
 
     let mut fresh = kit
         .load(counter_loop(&kit), RuntimeConfig::default(), Trace::new())
         .await;
-    fresh.restore(&snapshot).expect("same graph");
-    assert_eq!(read_u32(&fresh, "b", "out"), 3, "latched outputs come back");
+    fresh.restore(&snapshot).await.expect("same graph");
+    assert_eq!(
+        read_u32(&mut fresh, "b", "out").await,
+        3,
+        "latched outputs come back"
+    );
     assert!(matches!(fresh.tick().await, TickResult::Progress));
     assert_eq!(
-        read_u32(&fresh, "b", "out"),
+        read_u32(&mut fresh, "b", "out").await,
         4,
         "the loop continues where it stopped"
     );
@@ -3488,7 +3625,7 @@ async fn restore_continues_a_feedback_loop_from_the_snapshot() {
     assert_eq!(runs_of(&trace, "a"), 1);
     assert_eq!(runs_of(&trace, "b"), 1);
     assert_eq!(
-        fresh.snapshot().unwrap().outputs[&id("b")][&"out".into()],
+        fresh.snapshot().await.unwrap().outputs[&id("b")][&"out".into()],
         "4"
     );
 }
@@ -3505,10 +3642,10 @@ async fn restore_onto_an_untouched_graph_runs_only_queued_islands() {
     let mut rt = kit
         .load(graph(), RuntimeConfig::default(), Trace::new())
         .await;
-    inject(&mut rt, "a", "in", Val::Float64(1.0));
+    inject(&mut rt, "a", "in", Val::Float64(1.0)).await;
     settle(&mut rt).await;
-    inject(&mut rt, "b", "in", Val::Float64(2.0));
-    let snapshot = rt.snapshot().unwrap();
+    inject(&mut rt, "b", "in", Val::Float64(2.0)).await;
+    let snapshot = rt.snapshot().await.unwrap();
     assert!(snapshot.quiescent);
     assert_eq!(
         snapshot.islands,
@@ -3524,13 +3661,13 @@ async fn restore_onto_an_untouched_graph_runs_only_queued_islands() {
     let mut fresh = kit
         .load(graph(), RuntimeConfig::default(), Trace::new())
         .await;
-    fresh.restore(&snapshot).unwrap();
+    fresh.restore(&snapshot).await.unwrap();
     settle(&mut fresh).await;
     let trace = fresh.mode().trace();
     assert_eq!(runs_of(&trace, "a"), 0, "a had no work outstanding");
     assert_eq!(runs_of(&trace, "b"), 1);
-    assert_eq!(read_f64(&fresh, "a", "out"), 1.0);
-    assert_eq!(read_f64(&fresh, "b", "out"), 2.0);
+    assert_eq!(read_f64(&mut fresh, "a", "out").await, 1.0);
+    assert_eq!(read_f64(&mut fresh, "b", "out").await, 2.0);
 }
 
 /// Polls one tick exactly once, leaving a long generation in flight.
@@ -3551,12 +3688,12 @@ async fn a_mid_flight_snapshot_replays_the_streaming_generation() {
     let kit = Kit::new(&[STREAM_PRODUCER, STREAM_CONSUMER]);
     let mut rt = kit.load(pipeline(&kit), small_slices(), Trace::new()).await;
     // Endless producer; the consumer stops after 5000 items.
-    inject(&mut rt, "cons", "take", Val::U32(5000));
-    inject(&mut rt, "cons", "delay", Val::U32(4));
+    inject(&mut rt, "cons", "take", Val::U32(5000)).await;
+    inject(&mut rt, "cons", "delay", Val::U32(4)).await;
     poll_tick_once(&mut rt).await;
     assert_eq!(phase(&rt, "cons"), NodePhase::Running);
 
-    let snapshot = rt.snapshot().unwrap();
+    let snapshot = rt.snapshot().await.unwrap();
     assert!(!snapshot.quiescent);
     assert_eq!(snapshot.phases[&id("cons")], NodePhase::Running);
     let [island] = snapshot.islands.as_slice() else {
@@ -3565,19 +3702,20 @@ async fn a_mid_flight_snapshot_replays_the_streaming_generation() {
     let started = island.running.as_ref().expect("in flight");
     assert_eq!(started[&id("cons")][&"take".into()], "5000");
 
-    let err = rt.restore(&snapshot).unwrap_err();
+    let err = rt.restore(&snapshot).await.unwrap_err();
     assert!(matches!(err, RuntimeError::NotQuiescent), "{err}");
 
     let mut fresh = kit.load(pipeline(&kit), small_slices(), Trace::new()).await;
     fresh
         .restore(&snapshot)
+        .await
         .expect("fresh graph has nothing in flight");
     settle(&mut fresh).await;
     settle(&mut rt).await;
     let expected = (0..5000).sum::<u32>();
-    for graph in [&rt, &fresh] {
-        assert_eq!(read_u32(graph, "cons", "count"), 5000);
-        assert_eq!(read_u32(graph, "cons", "total"), expected);
+    for graph in [&mut rt, &mut fresh] {
+        assert_eq!(read_u32(graph, "cons", "count").await, 5000);
+        assert_eq!(read_u32(graph, "cons", "total").await, expected);
     }
     assert_eq!(
         runs_of(&fresh.mode().trace(), "cons"),
@@ -3590,16 +3728,17 @@ async fn a_mid_flight_snapshot_replays_the_streaming_generation() {
 async fn restore_after_shutdown_replays_the_interrupted_generation() {
     let kit = Kit::new(&[STREAM_PRODUCER, STREAM_CONSUMER]);
     let mut rt = kit.load(pipeline(&kit), small_slices(), Trace::new()).await;
-    inject(&mut rt, "cons", "take", Val::U32(3000));
-    inject(&mut rt, "cons", "delay", Val::U32(4));
+    inject(&mut rt, "cons", "take", Val::U32(3000)).await;
+    inject(&mut rt, "cons", "delay", Val::U32(4)).await;
     poll_tick_once(&mut rt).await;
-    let snapshot = rt.snapshot().unwrap();
+    let snapshot = rt.snapshot().await.unwrap();
 
     rt.shutdown();
     rt.restore(&snapshot)
+        .await
         .expect("nothing in flight after shutdown");
     settle(&mut rt).await;
-    assert_eq!(read_u32(&rt, "cons", "count"), 3000);
+    assert_eq!(read_u32(&mut rt, "cons", "count").await, 3000);
     assert_eq!(
         phase(&rt, "cons"),
         NodePhase::Idle,
@@ -3611,17 +3750,18 @@ async fn restore_after_shutdown_replays_the_interrupted_generation() {
 async fn restore_works_right_after_cancel() {
     let kit = Kit::new(&[STREAM_PRODUCER, STREAM_CONSUMER]);
     let mut rt = kit.load(pipeline(&kit), small_slices(), Trace::new()).await;
-    inject(&mut rt, "cons", "take", Val::U32(3000));
-    inject(&mut rt, "cons", "delay", Val::U32(4));
+    inject(&mut rt, "cons", "take", Val::U32(3000)).await;
+    inject(&mut rt, "cons", "delay", Val::U32(4)).await;
     poll_tick_once(&mut rt).await;
-    let snapshot = rt.snapshot().unwrap();
+    let snapshot = rt.snapshot().await.unwrap();
     assert!(!snapshot.quiescent);
 
     rt.cancel(&id("cons")).unwrap();
     rt.restore(&snapshot)
+        .await
         .expect("a cancelled island has nothing in flight");
     settle(&mut rt).await;
-    assert_eq!(read_u32(&rt, "cons", "count"), 3000);
+    assert_eq!(read_u32(&mut rt, "cons", "count").await, 3000);
     assert_eq!(phase(&rt, "cons"), NodePhase::Idle);
 }
 
@@ -3632,9 +3772,9 @@ async fn restore_rejects_another_graph_and_bad_values() {
     let mut rt = kit
         .load(echo_graph(), RuntimeConfig::default(), Trace::new())
         .await;
-    inject(&mut rt, "n", "in", Val::Float64(1.5));
+    inject(&mut rt, "n", "in", Val::Float64(1.5)).await;
     settle(&mut rt).await;
-    let snapshot = rt.snapshot().unwrap();
+    let snapshot = rt.snapshot().await.unwrap();
 
     let other = kit
         .builder("c")
@@ -3643,7 +3783,7 @@ async fn restore_rejects_another_graph_and_bad_values() {
     let mut wrong = kit
         .load(other, RuntimeConfig::default(), Trace::new())
         .await;
-    let err = wrong.restore(&snapshot).unwrap_err();
+    let err = wrong.restore(&snapshot).await.unwrap_err();
     assert!(
         matches!(err, RuntimeError::SnapshotMismatch { .. }),
         "{err}"
@@ -3657,10 +3797,10 @@ async fn restore_rejects_another_graph_and_bad_values() {
     let mut fresh = kit
         .load(echo_graph(), RuntimeConfig::default(), Trace::new())
         .await;
-    inject(&mut fresh, "n", "in", Val::Float64(7.0));
+    inject(&mut fresh, "n", "in", Val::Float64(7.0)).await;
     settle(&mut fresh).await;
-    let before = fresh.snapshot().unwrap();
-    let err = fresh.restore(&bad).unwrap_err();
+    let before = fresh.snapshot().await.unwrap();
+    let err = fresh.restore(&bad).await.unwrap_err();
     assert!(matches!(err, RuntimeError::SnapshotValue { .. }), "{err}");
 
     let mut unknown = snapshot.clone();
@@ -3669,14 +3809,14 @@ async fn restore_rejects_another_graph_and_bad_values() {
         .get_mut(&id("n"))
         .unwrap()
         .insert("nope".into(), "1".into());
-    let err = fresh.restore(&unknown).unwrap_err();
+    let err = fresh.restore(&unknown).await.unwrap_err();
     assert!(matches!(err, RuntimeError::SnapshotValue { .. }), "{err}");
     assert_eq!(
-        fresh.snapshot().unwrap(),
+        fresh.snapshot().await.unwrap(),
         before,
         "a failed restore changes nothing"
     );
-    assert_eq!(read_f64(&fresh, "n", "out"), 7.0);
+    assert_eq!(read_f64(&mut fresh, "n", "out").await, 7.0);
 }
 
 #[tokio::test]
@@ -3693,14 +3833,14 @@ async fn restore_rejects_a_rewired_graph() {
     let mut rt = kit
         .load(wired("e1"), RuntimeConfig::default(), Trace::new())
         .await;
-    inject(&mut rt, "e1", "in", Val::Float64(4.0));
+    inject(&mut rt, "e1", "in", Val::Float64(4.0)).await;
     settle(&mut rt).await;
-    let snapshot = rt.snapshot().unwrap();
+    let snapshot = rt.snapshot().await.unwrap();
 
     let mut other = kit
         .load(wired("e3"), RuntimeConfig::default(), Trace::new())
         .await;
-    let err = other.restore(&snapshot).unwrap_err();
+    let err = other.restore(&snapshot).await.unwrap_err();
     assert!(
         matches!(err, RuntimeError::SnapshotMismatch { .. }),
         "same nodes, other wiring: {err}"
@@ -3711,10 +3851,10 @@ async fn restore_rejects_a_rewired_graph() {
 async fn restore_matches_islands_by_their_members_in_any_order() {
     let kit = Kit::new(&[STREAM_PRODUCER, STREAM_CONSUMER]);
     let mut rt = kit.load(pipeline(&kit), small_slices(), Trace::new()).await;
-    inject(&mut rt, "cons", "take", Val::U32(300));
-    inject(&mut rt, "cons", "delay", Val::U32(4));
+    inject(&mut rt, "cons", "take", Val::U32(300)).await;
+    inject(&mut rt, "cons", "delay", Val::U32(4)).await;
     poll_tick_once(&mut rt).await;
-    let mut snapshot = rt.snapshot().unwrap();
+    let mut snapshot = rt.snapshot().await.unwrap();
     assert_eq!(
         snapshot.islands[0].members,
         vec![id("cons"), id("prod")],
@@ -3723,9 +3863,12 @@ async fn restore_matches_islands_by_their_members_in_any_order() {
     snapshot.islands[0].members.reverse();
 
     let mut fresh = kit.load(pipeline(&kit), small_slices(), Trace::new()).await;
-    fresh.restore(&snapshot).expect("members match as a set");
+    fresh
+        .restore(&snapshot)
+        .await
+        .expect("members match as a set");
     settle(&mut fresh).await;
-    assert_eq!(read_u32(&fresh, "cons", "count"), 300);
+    assert_eq!(read_u32(&mut fresh, "cons", "count").await, 300);
 }
 
 #[tokio::test]
@@ -3734,14 +3877,14 @@ async fn restore_rejects_a_replay_missing_a_required_input() {
     let mut rt = kit
         .load(counter_loop(&kit), RuntimeConfig::default(), Trace::new())
         .await;
-    let mut snapshot = rt.snapshot().unwrap();
+    let mut snapshot = rt.snapshot().await.unwrap();
     snapshot.islands = vec![IslandSnapshot {
         members: vec![id("a")],
         running: Some([(id("a"), Default::default())].into_iter().collect()),
         queued: false,
         stale_feedback: Default::default(),
     }];
-    let err = rt.restore(&snapshot).unwrap_err();
+    let err = rt.restore(&snapshot).await.unwrap_err();
     assert!(
         matches!(err, RuntimeError::SnapshotValue { ref port, .. } if port.as_str() == "in"),
         "`a.in` is required: {err}"
@@ -3760,7 +3903,7 @@ async fn restore_rejects_a_replay_missing_a_required_input() {
         .into_iter()
         .collect(),
     );
-    let err = rt.restore(&snapshot).unwrap_err();
+    let err = rt.restore(&snapshot).await.unwrap_err();
     assert!(
         matches!(err, RuntimeError::SnapshotValue { ref port, .. } if port.as_str() == "out"),
         "`out` is not an input: {err}"
@@ -3773,14 +3916,14 @@ async fn restore_rejects_inconsistent_snapshots_and_changes_nothing() {
     let mut rt = kit
         .load(counter_loop(&kit), RuntimeConfig::default(), Trace::new())
         .await;
-    inject(&mut rt, "a", "in", Val::U32(1));
-    inject(&mut rt, "a", "add", Val::U32(1));
-    inject(&mut rt, "b", "add", Val::U32(1));
+    inject(&mut rt, "a", "in", Val::U32(1)).await;
+    inject(&mut rt, "a", "add", Val::U32(1)).await;
+    inject(&mut rt, "b", "add", Val::U32(1)).await;
     // A feedback loop never settles: a few iterations will do.
     for _ in 0..3 {
         let _ = rt.tick().await;
     }
-    let good = rt.snapshot().unwrap();
+    let good = rt.snapshot().await.unwrap();
     let running = |node: &str| -> Option<witgraph_runtime::PortValues> {
         Some(
             [(
@@ -3820,16 +3963,20 @@ async fn restore_rejects_inconsistent_snapshots_and_changes_nothing() {
     phases.phases.insert(id("ghost"), NodePhase::Idle);
     cases.push(("a phase for a node not in the graph", phases));
 
-    let before = rt.snapshot().unwrap();
+    let before = rt.snapshot().await.unwrap();
     for (what, snapshot) in cases {
-        let err = rt.restore(&snapshot).unwrap_err();
+        let err = rt.restore(&snapshot).await.unwrap_err();
         assert!(
             matches!(err, RuntimeError::SnapshotMismatch { .. }),
             "{what}: {err}"
         );
-        assert_eq!(rt.snapshot().unwrap(), before, "{what}: nothing changed");
+        assert_eq!(
+            rt.snapshot().await.unwrap(),
+            before,
+            "{what}: nothing changed"
+        );
     }
-    rt.restore(&good).expect("the good snapshot restores");
+    rt.restore(&good).await.expect("the good snapshot restores");
 }
 
 #[test]

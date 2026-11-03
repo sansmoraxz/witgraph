@@ -63,8 +63,8 @@ export async function edgesOnBoth(frames: number): Promise<number> {
       if (port === 'edges') seen[node].push(item as Frame);
     },
   } as never);
-  session.graph.inject('cpu-source', 'frames', frames);
-  session.graph.inject('gpu-source', 'frames', frames);
+  await session.graph.inject('cpu-source', 'frames', frames);
+  await session.graph.inject('gpu-source', 'frames', frames);
   await session.settle();
   session.dispose();
   if (seen.cpu.length !== frames || seen.gpu.length !== frames) return Infinity;

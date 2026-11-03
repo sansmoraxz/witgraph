@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::time::{Duration, Instant};
+use witgraph_runtime::RunningGraph;
 
 use test_components::{BLOB_RELAY, BLOB_SINK, BLOB_SOURCE, Guest};
 use witgraph_runtime::witgraph_ir::{Graph, PortRef};
@@ -66,16 +67,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
             ..RuntimeConfig::default()
         };
         let mut rt = RuntimeGraph::load(compiled, &wasm, config, Perf).await?;
-        rt.inject(&"source".into(), &"size".into(), Val::U32(size))?;
+        rt.inject(&"source".into(), &"size".into(), Val::U32(size))
+            .await?;
         let runs = if mib >= 8.0 { 3 } else { 7 };
         let mut times = Vec::new();
         // The first run warms up.
         for seed in 0..=runs {
-            rt.inject(&"source".into(), &"seed".into(), Val::U32(seed))?;
+            rt.inject(&"source".into(), &"seed".into(), Val::U32(seed))
+                .await?;
             let start = Instant::now();
             while !matches!(rt.tick().await, TickResult::Idle) {}
             let elapsed = start.elapsed();
-            match rt.read_output(&"sink".into(), &"len".into())? {
+            match rt.read_output(&"sink".into(), &"len".into()).await? {
                 Some(Val::U32(len)) if len == size => {}
                 other => {
                     let faults = rt.take_faults();

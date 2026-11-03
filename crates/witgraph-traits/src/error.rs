@@ -45,9 +45,9 @@ pub enum RuntimeError {
     /// [`clear_input`]) or Value or handle output (for [`read_output`]) of
     /// the node.
     ///
-    /// [`inject`]: crate::Scheduler::inject
-    /// [`clear_input`]: crate::Scheduler::clear_input
-    /// [`read_output`]: crate::Scheduler::read_output
+    /// [`inject`]: crate::RunningGraph::inject
+    /// [`clear_input`]: crate::RunningGraph::clear_input
+    /// [`read_output`]: crate::RunningGraph::read_output
     #[error("`{node}.{port}` is not a Value {direction} port")]
     #[diagnostic(code(witgraph::runtime::not_a_value_port))]
     NotAValuePort {
@@ -58,7 +58,7 @@ pub enum RuntimeError {
         /// Which kind of port was expected.
         direction: PortDirection,
     },
-    /// [`inject`](crate::Scheduler::inject) targeted an input that a
+    /// [`inject`](crate::RunningGraph::inject) targeted an input that a
     /// non-feedback connection writes. An input has one writer: inject
     /// only into unconnected inputs and inputs fed by feedback connections.
     #[error(

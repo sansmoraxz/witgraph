@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+use witgraph_runtime::RunningGraph;
 
 use test_components::{
     Guest, TENSOR_COPY_INVERT, TENSOR_EDGE, TENSOR_FUTURE_SINK, TENSOR_FUTURE_SOURCE,
@@ -298,8 +299,8 @@ async fn settle(rt: &mut RuntimeGraph<Perf, Plugins>) {
     panic!("graph did not settle");
 }
 
-fn u64_of(rt: &RuntimeGraph<Perf, Plugins>, node: &str, port: &str) -> u64 {
-    match rt.read_output(&node.into(), &port.into()).unwrap() {
+async fn u64_of(rt: &mut RuntimeGraph<Perf, Plugins>, node: &str, port: &str) -> u64 {
+    match rt.read_output(&node.into(), &port.into()).await.unwrap() {
         Some(Val::U64(v)) => v,
         other => panic!("{node}.{port}: {other:?}"),
     }
@@ -355,24 +356,29 @@ async fn tensors_pass_between_islands_as_handles() {
         .unwrap();
     settle(&mut rt).await;
 
-    let sum = u64_of(&rt, "direct", "sum");
-    assert_eq!(u64_of(&rt, "direct", "len"), SOURCE_BYTES as u64);
+    let sum = u64_of(&mut rt, "direct", "sum").await;
+    assert_eq!(u64_of(&mut rt, "direct", "len").await, SOURCE_BYTES as u64);
     let inverted = 255 * SOURCE_BYTES as u64 - sum;
     assert_eq!(
-        u64_of(&rt, "inv-sink", "sum"),
+        u64_of(&mut rt, "inv-sink", "sum").await,
         inverted,
         "inverted by the host"
     );
     assert_eq!(
-        u64_of(&rt, "copy-sink", "sum"),
+        u64_of(&mut rt, "copy-sink", "sum").await,
         inverted,
         "inverted by the guest"
     );
     assert!(
-        rt.read_output(&"src".into(), &"tensor".into()).is_err(),
+        rt.read_output(&"src".into(), &"tensor".into())
+            .await
+            .is_err(),
         "a handle is no Val"
     );
-    let source = rt.read_handle(&"src".into(), &"tensor".into()).unwrap();
+    let source = rt
+        .read_handle(&"src".into(), &"tensor".into())
+        .await
+        .unwrap();
     assert_eq!(source.map(|s| s.bytes()), Some(SOURCE_BYTES));
     assert_eq!(
         rt.shared_memory(),
@@ -382,9 +388,10 @@ async fn tensors_pass_between_islands_as_handles() {
 
     // A new source tensor replaces the old, which nothing holds any more.
     rt.inject(&"src".into(), &"seed".into(), Val::U32(7))
+        .await
         .unwrap();
     settle(&mut rt).await;
-    assert_ne!(u64_of(&rt, "direct", "sum"), sum);
+    assert_ne!(u64_of(&mut rt, "direct", "sum").await, sum);
     assert_eq!(
         rt.shared_memory(),
         3 * SOURCE_BYTES,
@@ -411,13 +418,15 @@ async fn a_node_keeps_its_own_reference() {
         .await
         .unwrap();
     settle(&mut rt).await;
-    assert_eq!(u64_of(&rt, "keep", "previous"), 0);
+    assert_eq!(u64_of(&mut rt, "keep", "previous").await, 0);
     let first = rt
         .read_handle(&"src".into(), &"tensor".into())
+        .await
         .unwrap()
         .unwrap();
 
     rt.inject(&"src".into(), &"seed".into(), Val::U32(1))
+        .await
         .unwrap();
     settle(&mut rt).await;
     assert_eq!(
@@ -427,6 +436,7 @@ async fn a_node_keeps_its_own_reference() {
     );
     let second = rt
         .read_handle(&"src".into(), &"tensor".into())
+        .await
         .unwrap()
         .unwrap();
     assert_ne!(first, second);
@@ -439,13 +449,14 @@ async fn a_node_keeps_its_own_reference() {
         .sum();
     drop(first);
     assert_eq!(
-        u64_of(&rt, "keep", "previous"),
+        u64_of(&mut rt, "keep", "previous").await,
         first_sum,
         "its clone of the first outlived the first's latch"
     );
     drop(second);
 
     rt.inject(&"src".into(), &"seed".into(), Val::U32(2))
+        .await
         .unwrap();
     settle(&mut rt).await;
     assert_eq!(
@@ -521,19 +532,20 @@ async fn a_restore_makes_the_tensors_anew() {
         .await
         .unwrap();
     rt.inject(&"src".into(), &"seed".into(), Val::U32(3))
+        .await
         .unwrap();
     settle(&mut rt).await;
-    let sum = u64_of(&rt, "inv-sink", "sum");
-    let snapshot = rt.snapshot().unwrap();
+    let sum = u64_of(&mut rt, "inv-sink", "sum").await;
+    let snapshot = rt.snapshot().await.unwrap();
     drop(rt);
 
     let mut restored = kit
         .load(fan_out(&kit), RuntimeConfig::default(), true)
         .await
         .unwrap();
-    restored.restore(&snapshot).unwrap();
+    restored.restore(&snapshot).await.unwrap();
     settle(&mut restored).await;
-    assert_eq!(u64_of(&restored, "inv-sink", "sum"), sum);
+    assert_eq!(u64_of(&mut restored, "inv-sink", "sum").await, sum);
     assert_eq!(restored.shared_memory(), 3 * SOURCE_BYTES);
 }
 
@@ -563,6 +575,7 @@ async fn edges_are_found_where_the_data_lives() {
     settle(&mut rt).await;
     let edges = rt
         .read_handle(&"edge".into(), &"edges".into())
+        .await
         .unwrap()
         .unwrap();
     let cpu = edges.downcast_ref::<Arc<Cpu>>().unwrap();
@@ -573,7 +586,7 @@ async fn edges_are_found_where_the_data_lives() {
         "{bright} of {}",
         cpu.data.len()
     );
-    assert_eq!(u64_of(&rt, "sink", "len"), SOURCE_BYTES as u64);
+    assert_eq!(u64_of(&mut rt, "sink", "len").await, SOURCE_BYTES as u64);
 }
 
 // Streams and futures of handles.
@@ -581,8 +594,8 @@ async fn edges_are_found_where_the_data_lives() {
 /// The bytes of a tensor the stream and future guests make.
 const FRAME: usize = 16 * 16 * 3;
 
-fn u32_of(rt: &RuntimeGraph<Perf, Plugins>, node: &str, port: &str) -> u32 {
-    match rt.read_output(&node.into(), &port.into()).unwrap() {
+async fn u32_of(rt: &mut RuntimeGraph<Perf, Plugins>, node: &str, port: &str) -> u32 {
+    match rt.read_output(&node.into(), &port.into()).await.unwrap() {
         Some(Val::U32(v)) => v,
         other => panic!("{node}.{port}: {other:?}"),
     }
@@ -646,20 +659,26 @@ async fn a_stream_of_tensors_flows_and_frees_them() {
         .await
         .unwrap();
     rt.inject(&"src".into(), &"frames".into(), Val::U32(20))
+        .await
         .unwrap();
     settle(&mut rt).await;
     no_faults(&mut rt);
-    assert_eq!(u32_of(&rt, "sink", "count"), 20);
+    assert_eq!(u32_of(&mut rt, "sink", "count").await, 20);
     let sum: u64 = (0..20).map(|i| 255 - i).sum();
-    assert_eq!(u64_of(&rt, "sink", "sum"), sum, "inverted by the host");
+    assert_eq!(
+        u64_of(&mut rt, "sink", "sum").await,
+        sum,
+        "inverted by the host"
+    );
     assert_eq!(rt.shared_memory(), 0, "every tensor is freed");
 
     // And again, in the same Store.
     rt.inject(&"src".into(), &"frames".into(), Val::U32(5))
+        .await
         .unwrap();
     settle(&mut rt).await;
     no_faults(&mut rt);
-    assert_eq!(u32_of(&rt, "sink", "count"), 5);
+    assert_eq!(u32_of(&mut rt, "sink", "count").await, 5);
     assert_eq!(rt.shared_memory(), 0);
 }
 
@@ -672,10 +691,11 @@ async fn a_reader_stopping_early_frees_whats_in_flight() {
         .unwrap();
     // Endless: only the reader letting go can stop it.
     rt.inject(&"sink".into(), &"take".into(), Val::U32(3))
+        .await
         .unwrap();
     settle(&mut rt).await;
     no_faults(&mut rt);
-    assert_eq!(u32_of(&rt, "sink", "count"), 3);
+    assert_eq!(u32_of(&mut rt, "sink", "count").await, 3);
     for _ in 0..50 {
         if rt.shared_memory() == 0 {
             break;
@@ -697,10 +717,11 @@ async fn backpressure_keeps_an_endless_stream_within_a_small_budget() {
     };
     let mut rt = kit.load(stream_chain(&kit), config, true).await.unwrap();
     rt.inject(&"sink".into(), &"take".into(), Val::U32(500))
+        .await
         .unwrap();
     settle(&mut rt).await;
     no_faults(&mut rt);
-    assert_eq!(u32_of(&rt, "sink", "count"), 500);
+    assert_eq!(u32_of(&mut rt, "sink", "count").await, 500);
 }
 
 #[tokio::test]
@@ -760,18 +781,20 @@ async fn a_future_of_a_tensor_moves_it_to_its_reader() {
         .await
         .unwrap();
     rt.inject(&"src".into(), &"seed".into(), Val::U32(42))
+        .await
         .unwrap();
     settle(&mut rt).await;
     no_faults(&mut rt);
-    assert_eq!(u32_of(&rt, "sink", "first"), 42);
+    assert_eq!(u32_of(&mut rt, "sink", "first").await, 42);
     assert_eq!(rt.shared_memory(), 0);
 
     // A reader that drops the future: the writer's tensor is its own again.
     rt.inject(&"sink".into(), &"ignore".into(), Val::Bool(true))
+        .await
         .unwrap();
     settle(&mut rt).await;
     no_faults(&mut rt);
-    assert_eq!(u32_of(&rt, "sink", "first"), 1000);
+    assert_eq!(u32_of(&mut rt, "sink", "first").await, 1000);
     assert_eq!(rt.shared_memory(), 0);
 }
 
@@ -813,6 +836,7 @@ async fn a_fault_mid_stream_frees_every_tensor() {
     };
     let mut rt = kit.load(stream_chain(&kit), config, true).await.unwrap();
     rt.inject(&"src".into(), &"frames".into(), Val::U32(5))
+        .await
         .unwrap();
     let _ = tokio::time::timeout(Duration::from_secs(10), rt.tick()).await;
     let faults = rt.take_faults();
@@ -828,19 +852,20 @@ async fn a_restore_runs_a_stream_of_tensors_again() {
         .await
         .unwrap();
     rt.inject(&"src".into(), &"frames".into(), Val::U32(3))
+        .await
         .unwrap();
     settle(&mut rt).await;
-    assert_eq!(u32_of(&rt, "sink", "count"), 3);
-    let snapshot = rt.snapshot().unwrap();
+    assert_eq!(u32_of(&mut rt, "sink", "count").await, 3);
+    let snapshot = rt.snapshot().await.unwrap();
 
     let mut restored = kit
         .load(stream_chain(&kit), RuntimeConfig::default(), true)
         .await
         .unwrap();
-    restored.restore(&snapshot).unwrap();
+    restored.restore(&snapshot).await.unwrap();
     settle(&mut restored).await;
     no_faults(&mut restored);
-    assert_eq!(u32_of(&restored, "sink", "count"), 3);
+    assert_eq!(u32_of(&mut restored, "sink", "count").await, 3);
     assert_eq!(restored.shared_memory(), 0);
 }
 
@@ -868,9 +893,10 @@ async fn a_stream_of_tensors_is_processed_where_they_live() {
         .await
         .unwrap();
     rt.inject(&"src".into(), &"frames".into(), Val::U32(4))
+        .await
         .unwrap();
     settle(&mut rt).await;
     no_faults(&mut rt);
-    assert_eq!(u32_of(&rt, "sink", "count"), 4);
+    assert_eq!(u32_of(&mut rt, "sink", "count").await, 4);
     assert_eq!(rt.shared_memory(), 0);
 }

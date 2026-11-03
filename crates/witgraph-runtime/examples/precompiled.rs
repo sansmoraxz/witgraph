@@ -8,6 +8,7 @@
 
 use std::error::Error;
 use std::time::Instant;
+use witgraph_runtime::RunningGraph;
 
 use test_components::ECHO;
 use witgraph_runtime::witgraph_ir::{ComponentContract, Graph};
@@ -52,9 +53,10 @@ async fn run(contract: &ComponentContract, path: &str) -> Result<(), Box<dyn Err
         NoCapabilities,
     )
     .await?;
-    rt.inject(&"echo".into(), &"in".into(), Val::Float64(1.5))?;
+    rt.inject(&"echo".into(), &"in".into(), Val::Float64(1.5))
+        .await?;
     while !matches!(rt.tick().await, TickResult::Idle) {}
-    let out = rt.read_output(&"echo".into(), &"out".into())?;
+    let out = rt.read_output(&"echo".into(), &"out".into()).await?;
     println!("echo says {out:?}");
     if out != Some(Val::Float64(1.5)) {
         return Err("the value did not come back".into());

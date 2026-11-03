@@ -1,8 +1,7 @@
 //! The JavaScript executor: nodes are functions of the embedding page.
 
 use std::borrow::Cow;
-use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use futures::FutureExt;
@@ -80,12 +79,6 @@ pub(crate) struct Shared {
     pub(crate) output_types: HashMap<PortRef, Type>,
     /// Every node's output ports.
     pub(crate) outputs: HashMap<NodeId, Vec<OutputPort>>,
-    /// Every Value and handle output's latest value: the scheduler's
-    /// latched outputs, then each value a `run` returns. What `readOutput` reports while a
-    /// tick holds the scheduler.
-    pub(crate) latest: RefCell<HashMap<PortRef, WebValue>>,
-    /// The outputs a `run` returned since `latest` was last made exact.
-    pub(crate) touched: RefCell<HashSet<PortRef>>,
 }
 
 /// The executor: runs nodes through the page's callbacks. An island keeps
@@ -231,15 +224,6 @@ impl NodeCaller<WebValue> for Members<'_> {
                 _ => WebValue::Handle(js),
             };
             outputs.push((port.name.clone(), value));
-        }
-        let mut latest = self.shared.latest.borrow_mut();
-        let mut touched = self.shared.touched.borrow_mut();
-        for (port, value) in &outputs {
-            if let WebValue::Data(_) | WebValue::Resource(_) = value {
-                let port = PortRef::new(node.clone(), port.as_str());
-                latest.insert(port.clone(), value.clone());
-                touched.insert(port);
-            }
         }
         Ok(outputs)
     }
