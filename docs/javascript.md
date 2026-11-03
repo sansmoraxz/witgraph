@@ -71,12 +71,11 @@ the TypeScript and let `init` fetch the module from beside the script.
 - **Warnings.** `session.warnings` lists what was wrong with the components
   but did not stop the load (a viewer hint naming an output the component
   does not have, say); each is also written to the console.
-- **Streams of handles.** A `stream<own<R>>` port has a `handle` too.
-  `onStreamItem` is given the object itself, which is its reader's, and may be
-  disposed as soon as the reader is done: to keep it, take your own reference,
-  through the resource's API, before returning. The loader disposes what no reader
-  takes. A `future<own<R>>` can't pass between nodes yet: a graph connecting one
-  fails to load, naming the port, as jco lowers it into the wrong table.
+- **Streams and futures of handles.** A `stream<own<R>>` or `future<own<R>>`
+  port has a `handle` too. `onStreamItem` and `onFutureValue` are given the
+  object itself, which is its reader's, and may be disposed as soon as the
+  reader is done: to keep it, take your own reference, through the resource's
+  API, before returning. The loader disposes what no reader takes.
   In Chromium such a stream costs about 14 ms a frame through jco, whatever the
   frame's size and however many nodes it passes (measured up to 10), so expect
   at most about 70 frames a second, less whatever the work itself takes.
@@ -130,17 +129,14 @@ goes the same way.
   group can re-run beside an endless stream here, and its next `run` may start
   while its last stream is still being written.
 - What a failed call is pinned on is the node whose call failed.
-- A future of a resource can't pass between nodes.
 - Nodes are async, so the browser needs JSPI.
 
 ## What the loader changes in jco's output
 
-jco's output needs four patches, applied by text when a composite is transpiled.
+jco's output needs three patches, applied by text when a composite is transpiled.
 Each is tested to still apply, so a jco update that moves one fails a test rather
 than a graph:
 
-- `countLoweredReturns`: its deadlock watchdog doesn't count the timer an async
-  import returns through, and traps a graph that is fine.
 - `ownedFromWriter`: it lifts a resource a guest wrote to a stream from the wrong
   table, once the host reads it.
 - `instanceHooks`: lets the loader dispose what an instance holds, stop its host

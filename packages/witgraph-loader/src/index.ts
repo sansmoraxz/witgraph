@@ -972,30 +972,10 @@ async function transpileComposite(bytes: Uint8Array): Promise<Transpiled> {
     else if (name.endsWith('.js')) source = new TextDecoder().decode(contents);
   }
   if (source === undefined) throw new Error('the composite transpiled to no JavaScript');
-  source = instanceHooks(ownedFromWriter(countLoweredReturns(fastListLift(source))));
+  source = instanceHooks(ownedFromWriter(fastListLift(source)));
   const url = `data:text/javascript;base64,${base64(new TextEncoder().encode(source))}`;
   const { instantiate } = await import(/* @vite-ignore */ url);
   return { instantiate, modules, imports };
-}
-
-/**
- * How jco returns from a host import a guest called async, one timer later.
- * Its deadlock watchdog does not count that timer as work: when the host's promise
- * settles at once and every other task is parked (a `run` the hub is waiting
- * on, say), the watchdog can fire first and trap a graph that is fine.
- */
-const LOWERED_RETURN = `      return new Promise((resolve, reject) => {
-        setTimeout(() => {
-          // NOTE: whether the import settled`;
-const LOWERED_RETURN_COUNTED = `      STORE_ASYNC_STATE.pendingHostOperations++;
-      return new Promise((resolve, reject) => {
-        setTimeout(() => {
-          STORE_ASYNC_STATE.pendingHostOperations--;
-          // NOTE: whether the import settled`;
-
-/** `source`, jco's output, with {@link LOWERED_RETURN} counted as work, if it has one. */
-export function countLoweredReturns(source: string): string {
-  return source.replace(LOWERED_RETURN, LOWERED_RETURN_COUNTED);
 }
 
 /**

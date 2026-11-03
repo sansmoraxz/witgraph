@@ -98,10 +98,6 @@ component model doesn't allow `stream<borrow<tensor>>` at all.
 Whatever is in flight is freed however the pipeline ends: when the stream runs
 out, a reader stops early, nothing reads it, the graph stops, or a node faults.
 
-On JavaScript hosts, a future of a handle can't pass between nodes yet: a graph
-connecting one fails to load (see
-[Differences from wasmtime](javascript.md#differences-from-wasmtime)).
-
 ## `run`
 
 `run` must be an `async func` that takes `inputs` and returns `outputs`. It can

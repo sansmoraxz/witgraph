@@ -15,7 +15,6 @@ import {
   type Capability,
   type ComponentSource,
   camelCase,
-  countLoweredReturns,
   type FutureItem,
   fastListLift,
   instanceHooks,
@@ -1267,10 +1266,8 @@ test('a composite is transpiled with multiMemory, which its speed depends on', (
   assert.equal(TRANSPILE_OPTIONS.multiMemory, true);
 });
 
-test('the return jco counts no work for is there to be counted', async () => {
-  // A graph with a host import a guest calls async: `tensor-sink`'s `read`.
-  const sink = await guestSource('tensor-sink');
-  const source = await guestSource('tensor-source');
+test('a guest suspended in an async host import, with its caller parked, finishes', async () => {
+  // `tensor-sink`'s `read` is a host import it calls async, under the hub's `run`.
   const session = await load(
     [
       ['s', 'tensor-source'],
@@ -1279,14 +1276,11 @@ test('the return jco counts no work for is there to be counted', async () => {
     [['t', 's.tensor', 'k.tensor']],
     tensorsFor(cpuTensors()),
   );
-  void sink;
-  void source;
   await session.graph.inject('s', 'width', 2);
   await session.graph.inject('s', 'height', 2);
   await session.settle();
   assert.deepEqual(session.graph.takeFaults(), []);
   assert.equal(await session.graph.readOutput('k', 'len'), 12n);
-  assert.equal(countLoweredReturns('nothing to replace'), 'nothing to replace');
   assert.equal(ownedFromWriter('nothing to replace'), 'nothing to replace');
   assert.equal(instanceHooks('nothing to replace'), 'nothing to replace');
 });
@@ -1734,18 +1728,50 @@ const streamChain = (
     { ...tensorsFor(tensors), ...options },
   );
 
-test('a future of a resource between nodes is refused by name', async () => {
-  await assert.rejects(
-    load(
-      [
-        ['src', 'tensor-future-source'],
-        ['sink', 'tensor-future-sink'],
-      ],
-      [['a', 'src.tensor', 'sink.tensor']],
-      tensorsFor(cpuTensors()),
-    ),
-    /`src.tensor`: a future of a resource cannot pass between nodes/,
+const futureChain = (tensors: ReturnType<typeof cpuTensors>) =>
+  load(
+    [
+      ['src', 'tensor-future-source'],
+      ['sink', 'tensor-future-sink'],
+    ],
+    [['a', 'src.tensor', 'sink.tensor']],
+    tensorsFor(tensors),
   );
+
+test('a future moves its tensor to its reader', async () => {
+  const tensors = cpuTensors();
+  const session = await futureChain(tensors);
+  await session.graph.inject('src', 'seed', 42);
+  await within(session.settle(), 20000);
+  assert.equal(await session.graph.readOutput('sink', 'first'), 42);
+  await allDisposed(tensors);
+});
+
+test('a future its reader drops frees its tensor', async () => {
+  const tensors = cpuTensors();
+  const session = await futureChain(tensors);
+  await session.graph.inject('sink', 'ignore', true);
+  await within(session.settle(), 20000);
+  assert.equal(await session.graph.readOutput('sink', 'first'), 1000);
+  await allDisposed(tensors);
+});
+
+test('a future read to watch it still reaches its reader, and frees its tensor', async () => {
+  const tensors = cpuTensors();
+  const watched: unknown[] = [];
+  const session = await load(
+    [
+      ['src', 'tensor-future-source'],
+      ['sink', 'tensor-future-sink'],
+    ],
+    [['a', 'src.tensor', 'sink.tensor']],
+    { ...tensorsFor(tensors), onFutureValue: ({ value }) => void watched.push(value) },
+  );
+  await session.graph.inject('src', 'seed', 9);
+  await within(session.settle(), 20000);
+  assert.equal(await session.graph.readOutput('sink', 'first'), 9);
+  assert.ok(watched[0] instanceof tensors.imports.Tensor);
+  await allDisposed(tensors);
 });
 
 test('a stream of tensors flows, and each is disposed once', async () => {

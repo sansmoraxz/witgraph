@@ -853,18 +853,6 @@ impl WebGraph {
         }
         let linked = link::compose_links(&compiled, &entries, &node_components)?;
 
-        // jco lowers a resource a future carries into the hub's table, not its
-        // reader's, and traps; moved directly, the reader never wakes.
-        for resolved in compiled.connections() {
-            if resolved.from.kind == PortKind::Future && resolved.from.handle.is_some() {
-                let port = &resolved.connection.from;
-                return Err(error(format!(
-                    "`{}.{}`: a future of a resource cannot pass between nodes on a JavaScript \
-                     host yet; use a stream",
-                    port.node, port.port
-                )));
-            }
-        }
         let (composite, capabilities) = compose(
             &compiled,
             &entries,

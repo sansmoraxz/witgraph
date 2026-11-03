@@ -223,8 +223,8 @@ importers:
   packages/witgraph-loader:
     dependencies:
       '@bytecodealliance/jco':
-        specifier: ^1.40.0
-        version: 1.40.0
+        specifier: ^1.41.0
+        version: 1.41.0
     devDependencies:
       '@bytecodealliance/preview3-shim':
         specifier: ^0.13.0
@@ -431,8 +431,15 @@ packages:
   '@bytecodealliance/jco-transpile@0.21.0':
     resolution: {integrity: sha512-uzPsODpWcGAfiO5Yt4HSRFTrTJCb0PxMt6joHEb7f7IAqFz8wT5W/O0f0PqPkz+EctLd9PKOGylzCJRPu2B/8w==}
 
+  '@bytecodealliance/jco-transpile@0.23.0':
+    resolution: {integrity: sha512-0Vd3W2EA+OMfcGxScTUClo48cHoviJ44HpcF9P0kkYm8tZMzJhT7LLQPzJPV34ynzghARyOf+jpGr83bbYyLhQ==}
+
   '@bytecodealliance/jco@1.40.0':
     resolution: {integrity: sha512-yC3hSK09KL8ER5YwT7DL/RZkJJKR2JuhSNxcWSpWlq7zol79G7hkAvmA172uWAJ02N/3FcetTHgA1doZXFJB3g==}
+    hasBin: true
+
+  '@bytecodealliance/jco@1.41.0':
+    resolution: {integrity: sha512-hsl9PEj5kOQLMsUhMqaho6yYooQ8SqULjPCuUuUSXu0D3huVQKFwmbUH0B9JTBpLPZPuJJNfnpKnZx6rV53VOA==}
     hasBin: true
 
   '@bytecodealliance/preview2-shim@0.31.0':
@@ -1804,12 +1811,36 @@ snapshots:
       binaryen: 132.0.0
       oxc-minify: 0.151.0
 
+  '@bytecodealliance/jco-transpile@0.23.0':
+    dependencies:
+      '@bytecodealliance/preview2-shim': 0.31.0
+      '@bytecodealliance/preview3-shim': 0.13.0
+      binaryen: 132.0.0
+      oxc-minify: 0.151.0
+
   '@bytecodealliance/jco@1.40.0':
     dependencies:
       '@bytecodealliance/componentize-js': 0.23.0
       '@bytecodealliance/componentize-js-0-19-3': '@bytecodealliance/componentize-js@0.19.3'
       '@bytecodealliance/jco-std': 0.10.0(@bytecodealliance/preview2-shim@0.31.0)
       '@bytecodealliance/jco-transpile': 0.21.0
+      '@bytecodealliance/preview2-shim': 0.31.0
+      binaryen: 132.0.0
+      commander: 14.0.3
+      componentize-qjs: 0.5.0
+      mkdirp: 3.0.1
+      regexpu-core: 6.4.0
+      rolldown: 1.2.15
+      typescript: 7.0.2
+      typescript-compiler-api: typescript@6.0.3
+      unenv: 2.0.0-rc.24
+
+  '@bytecodealliance/jco@1.41.0':
+    dependencies:
+      '@bytecodealliance/componentize-js': 0.23.0
+      '@bytecodealliance/componentize-js-0-19-3': '@bytecodealliance/componentize-js@0.19.3'
+      '@bytecodealliance/jco-std': 0.10.0(@bytecodealliance/preview2-shim@0.31.0)
+      '@bytecodealliance/jco-transpile': 0.23.0
       '@bytecodealliance/preview2-shim': 0.31.0
       binaryen: 132.0.0
       commander: 14.0.3

@@ -699,3 +699,28 @@ test('without a way to keep them, a preview describes a stream of handles', asyn
   assert.equal(view.latest, '<tensor>');
   assert.equal(tensors.live.size, 0, 'it holds on to none');
 });
+
+test('a future of a handle is kept and released like a stream item', async () => {
+  const tensors = cpuTensors();
+  registerViewer({
+    id: 'tensor',
+    mount: () => ({ update() {}, dispose() {} }),
+    keep: (item) => (item as { clone(): unknown }).clone(),
+  });
+  const controller = await loadController(
+    [
+      ['src', 'tensor-future-source'],
+      ['sink', 'tensor-future-sink'],
+    ],
+    [['a', 'src.tensor', 'sink.tensor']],
+    { capabilities: tensors.capabilities },
+  );
+  controller.setPreview('src', 'tensor');
+  controller.select('src');
+  await settled(controller);
+  const view = controller.observe('src', 'tensor');
+  assert.equal(view.count, 1);
+  assert.equal(view.pending, false);
+  assert.equal(typeof view.latest, 'string', 'its component names no viewer: described');
+  assert.equal(tensors.live.size, 0);
+});
