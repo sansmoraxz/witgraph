@@ -399,6 +399,33 @@ async fn tensors_pass_between_groups_as_handles() {
     drop(rt);
 }
 
+/// Compiling and `docs/graphs.md` allow a handle on a feedback connection: it
+/// arrives an iteration later, like a value, and has no text for a snapshot.
+#[tokio::test]
+async fn a_handle_crosses_a_feedback_connection() {
+    let kit = Kit::new();
+    let graph = kit
+        .builder()
+        .add_node("src", of(TENSOR_SOURCE))
+        .add_node("sink", of(TENSOR_SINK))
+        .connect_feedback(
+            "back",
+            PortRef::new("src", "tensor"),
+            PortRef::new("sink", "tensor"),
+        )
+        .build();
+    let mut rt = kit
+        .load(graph, RuntimeConfig::default(), true)
+        .await
+        .unwrap();
+    settle(&mut rt).await;
+    no_faults(&mut rt);
+    assert_eq!(u64_of(&mut rt, "sink", "len").await, SOURCE_BYTES as u64);
+    let snapshot = rt.snapshot().await.unwrap();
+    assert!(snapshot.feedback.is_empty(), "{:?}", snapshot.feedback);
+    drop(rt);
+}
+
 #[tokio::test]
 async fn a_handle_port_reads_the_object_the_hub_holds() {
     let kit = Kit::new();

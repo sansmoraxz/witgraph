@@ -38,7 +38,7 @@
 //! - A Value output is delivered as soon as its `run` returns. One reaching a
 //!   member of the same group over a non-feedback connection owes nothing: it is
 //!   part of the group's run.
-//! - Feedback connections (Value only) are latched once per tick, at quiescence:
+//! - Feedback connections (values and handles) are latched once per tick, at quiescence:
 //!   that is one iteration of a loop. A tick that ends early (`StepLimitReached`,
 //!   `Aborted`) latches nothing; a later tick finishes the iteration. A dropped or
 //!   interrupted tick latches, as it ends, the feedback into every node whose

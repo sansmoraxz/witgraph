@@ -2263,7 +2263,8 @@ impl<'a> Core<'a> {
                 PortKind::Stream | PortKind::Future => {}
             }
         }
-        for (conn, ty) in &self.feedback_ty {
+        // A handle in feedback is the host's, not text: it has no getter or setter.
+        for (conn, ty) in self.feedback_ty.iter().filter(|(_, ty)| self.is_value(ty)) {
             let held = self.feedback_slot(*conn);
             self.write_getter(module, &get_feedback(*conn), held, ty)?;
             self.write_setter(module, rt, types, &set_feedback(*conn), (held, ty), false)?;
