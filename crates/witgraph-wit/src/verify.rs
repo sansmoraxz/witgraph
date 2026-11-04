@@ -114,9 +114,15 @@ fn port_difference(expected: &[PortDef], found: &[PortDef]) -> Option<String> {
         .find_map(|name| match (expected.get(name), found.get(name)) {
             (Some(_), None) => Some(format!("port `{name}` is missing from the bytes")),
             (None, Some(_)) => Some(format!("port `{name}` is not in the contract")),
+            // wit-component merges semver-compatible imports, so a handle's
+            // version in the bytes may be another compatible one.
             (Some(e), Some(f))
-                if (e.kind, e.optional, &e.ty, &e.handle)
-                    != (f.kind, f.optional, &f.ty, &f.handle) =>
+                if (e.kind, e.optional, &e.ty) != (f.kind, f.optional, &f.ty)
+                    || !match (&e.handle, &f.handle) {
+                        (Some(e), Some(f)) => e.connects(f),
+                        (None, None) => true,
+                        _ => false,
+                    } =>
             {
                 Some(format!(
                     "port `{name}` is a {} in the contract but a {} in the bytes",
@@ -131,6 +137,33 @@ fn port_difference(expected: &[PortDef], found: &[PortDef]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn handle_at(version: &str) -> PortDef {
+        let mut port = PortDef::new("t", witgraph_ir::PortKind::Handle, witgraph_ir::Type::U32);
+        port.ty = None;
+        port.handle = Some(witgraph_ir::HandleType {
+            interface: format!("test:data/tensor@{version}"),
+            resource: "tensor".into(),
+        });
+        port
+    }
+
+    /// wit-component merges semver-compatible imports, moving a handle's version.
+    #[test]
+    fn a_handle_may_be_at_another_compatible_version() {
+        let (expected, merged) = ([handle_at("0.1.0")], [handle_at("0.1.3")]);
+        assert_eq!(port_difference(&expected, &merged), None);
+        let (expected, merged) = ([handle_at("1.0.0")], [handle_at("1.4.0")]);
+        assert_eq!(port_difference(&expected, &merged), None);
+    }
+
+    #[test]
+    fn a_handle_may_not_be_at_an_incompatible_version() {
+        let (expected, found) = ([handle_at("0.1.0")], [handle_at("0.2.0")]);
+        assert!(port_difference(&expected, &found).is_some());
+        let (expected, found) = ([handle_at("1.0.0")], [handle_at("2.0.0")]);
+        assert!(port_difference(&expected, &found).is_some());
+    }
 
     #[test]
     fn shapes_wit_cannot_represent_are_refused() {
