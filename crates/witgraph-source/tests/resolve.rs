@@ -491,3 +491,27 @@ async fn a_malformed_reference_fails_even_when_its_digest_is_cached() {
         "{err:?}"
     );
 }
+
+/// With no writer, opening a FIFO never returns: it is refused before that.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_fifo_is_not_a_component() {
+    let dir = scratch("fifo");
+    let made = std::process::Command::new("mkfifo")
+        .arg(dir.join("pipe"))
+        .status()
+        .unwrap();
+    assert!(made.success());
+    let source = ComponentSource::file(echo(), "pipe");
+    let fetched = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        Resolver::new().base(&dir).fetch(&source),
+    )
+    .await
+    .expect("does not wait for a writer");
+    assert!(
+        matches!(&fetched, Err(SourceError::Read { source, .. }) if source.to_string().contains("not a regular file")),
+        "{:?}",
+        fetched.err()
+    );
+}

@@ -3437,6 +3437,7 @@ dependencies = [
  "bytes",
  "futures",
  "hex",
+ "libc",
  "oci-client",
  "serde",
  "serde_json",

@@ -522,7 +522,8 @@ impl Resolver {
         match &source.location {
             Location::File(path) => {
                 let full = self.confined(path).await?;
-                let bytes = read(&full, self.max_bytes).await?;
+                let file = open(&full).await?;
+                let bytes = read_file(file, &full, self.max_bytes).await?;
                 check(bytes.ok_or_else(too_large)?)
             }
             Location::Oci(reference) => {
@@ -776,12 +777,39 @@ fn client(protocol: ClientProtocol) -> Client {
 /// The file at `path` and its digest, or `None` when it is over `limit`
 /// bytes.
 async fn read(path: &Path, limit: u64) -> Result<Option<(Vec<u8>, Digest)>, SourceError> {
+    read_file(open(path).await?, path, limit).await
+}
+
+/// `path`, which must be a regular file: without a writer, opening a FIFO would
+/// wait forever, and neither the size limit nor a digest would get to look at it.
+async fn open(path: &Path) -> Result<tokio::fs::File, SourceError> {
+    let failed = |source| SourceError::Read {
+        path: path.to_path_buf(),
+        source,
+    };
+    let mut options = tokio::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NONBLOCK);
+    let file = options.open(path).await.map_err(failed)?;
+    if !file.metadata().await.map_err(failed)?.is_file() {
+        return Err(failed(std::io::Error::other("not a regular file")));
+    }
+    Ok(file)
+}
+
+/// The rest of `file`, read from `path`, and its digest, or `None` when it is over
+/// `limit` bytes.
+async fn read_file(
+    mut file: tokio::fs::File,
+    path: &Path,
+    limit: u64,
+) -> Result<Option<(Vec<u8>, Digest)>, SourceError> {
     use tokio::io::AsyncReadExt;
     let failed = |source| SourceError::Read {
         path: path.to_path_buf(),
         source,
     };
-    let mut file = tokio::fs::File::open(path).await.map_err(failed)?;
     let mut out = Capped::new(limit);
     let mut chunk = vec![0; 64 << 10];
     loop {
