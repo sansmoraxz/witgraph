@@ -29,6 +29,8 @@ pub mod hub;
 pub use witgraph_traits::{error, executor, mode, node, plan, schedule};
 pub mod latches;
 pub(crate) mod lifecycle;
+#[cfg(test)]
+mod model_tests;
 pub(crate) mod resource;
 pub mod scheduler;
 pub mod snapshot;
