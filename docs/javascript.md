@@ -127,6 +127,9 @@ goes the same way.
 same as data: each diagnostic has a stable `code`, a `severity`, a `message`, perhaps
 some `help`, and a `location` with the `nodes` it touches, so you can mark them.
 
+A graph that compiles can still have warnings: `session.diagnostics` has them, in the
+same form.
+
 `GraphChecker` compiles graphs with nothing loaded, by the same rules, so you can ask
 about a graph before you make it:
 

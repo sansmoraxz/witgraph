@@ -327,6 +327,8 @@ export class Session {
    * reported to the console as the session loads.
    */
   readonly warnings: readonly string[];
+  /** What compiling warned of the graph: it runs, but look at these. */
+  readonly diagnostics: readonly Diagnostic[];
   #options: SessionOptions;
   #transpiled: Transpiled;
   #imports: ImportKind[];
@@ -366,6 +368,7 @@ export class Session {
     // The contracts the graph was loaded with: lowered once, by `WebGraph.load`.
     this.contracts = new Map(nodes.map((node) => [node, graph.contract(node) as Contract]));
     this.warnings = graph.warnings() as string[];
+    this.diagnostics = graph.diagnostics() as Diagnostic[];
     for (const warning of this.warnings) console.warn(`witgraph: ${warning}`);
   }
 

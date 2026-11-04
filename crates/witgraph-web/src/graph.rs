@@ -26,7 +26,7 @@ use witgraph_traits::{
     FaultReport, NodeState, OutputReader, PortVersion, RunningGraph, SnapshotError,
 };
 
-use crate::diagnostics::{compile_error, component_entry};
+use crate::diagnostics::{compile_error, component_entry, diagnostic_array};
 use crate::link::{self, Composed};
 use crate::live::{Live, LiveMode, LiveState};
 use crate::plane::{Callbacks, WebHub, WebPlane, stream_inputs};
@@ -544,7 +544,7 @@ impl WebGraph {
     ///   as `m<number>` for the host to implement.
     ///
     /// A graph that does not compile throws an `Error` listing every diagnostic, with
-    /// them as data in its `diagnostics` (see [`GraphChecker`]).
+    /// them as data in its `diagnostics` (see [`GraphChecker`](crate::GraphChecker)).
     pub fn load(
         graph: &str,
         components: Array,
@@ -1116,6 +1116,12 @@ impl WebGraph {
             .contract_for(&node.into())
             .ok_or_else(|| error(format!("unknown node `{node}`")))?;
         describe(&witgraph_wit::metadata::ComponentMeta::of(contract))
+    }
+
+    /// What compiling warned of the graph, which did not stop the load: as
+    /// [`GraphChecker`](crate::GraphChecker) says it.
+    pub fn diagnostics(&self) -> Result<Array, JsError> {
+        Ok(diagnostic_array(self.idle()?.compiled().warnings().iter()))
     }
 
     /// What was wrong with the components but did not stop the load, one

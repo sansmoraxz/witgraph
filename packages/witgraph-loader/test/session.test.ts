@@ -2307,3 +2307,12 @@ test('a failed load lists only its errors as why, and keeps its warnings as data
     ],
   );
 });
+
+test('a session says what compiling warned of its graph', async () => {
+  const session = await load([['fed', 'relay']], [['loop', 'fed.out', 'fed.in', true]]);
+  const [warning, ...rest] = session.diagnostics;
+  assert.deepEqual(rest, []);
+  assert.equal(warning.severity, 'warning');
+  assert.equal(warning.code, 'witgraph::ir::feedback_only_input');
+  assert.deepEqual(warning.location, { kind: 'port', nodes: ['fed'], port: 'in' });
+});

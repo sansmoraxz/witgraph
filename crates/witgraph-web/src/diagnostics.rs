@@ -79,7 +79,7 @@ pub(crate) fn diagnostic_object(diagnostic: &Diagnostic) -> JsValue {
     object.into()
 }
 
-fn diagnostic_array<'a>(diagnostics: impl Iterator<Item = &'a Diagnostic>) -> Array {
+pub(crate) fn diagnostic_array<'a>(diagnostics: impl Iterator<Item = &'a Diagnostic>) -> Array {
     diagnostics.map(diagnostic_object).collect()
 }
 
