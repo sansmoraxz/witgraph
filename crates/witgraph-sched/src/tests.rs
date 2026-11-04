@@ -10,8 +10,8 @@ use futures::FutureExt;
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
 use futures::executor::block_on;
 use witgraph_ir::{
-    CompiledGraph, ComponentContract, ComponentRef, Graph, HandleType, NodeId, NodeIdx, PortDef,
-    PortDirection, PortKind, PortName, PortRef, Type,
+    CompiledGraph, ComponentContract, ComponentRef, FeedbackIdx, Graph, HandleType, InputIdx,
+    NodeId, NodeIdx, PortDef, PortDirection, PortKind, PortName, PortRef, Type,
 };
 
 use crate::control::SchedulerCore;
@@ -791,4 +791,96 @@ fn nothing_starts_until_every_command_is_answered() {
     });
     assert!(poll_tick(&mut core).is_none());
     assert_eq!(plane.commands(), [Command::Run(n)]);
+}
+
+/// `s`, with a feedback connection from `s.out` into `s.in`, over a [`Scripted`]
+/// plane: past its first run, with the latch of its feedback asked.
+fn with_a_latch_asked() -> (SchedulerCore<Scripted>, Scripted, InputIdx, FeedbackIdx) {
+    let looped = ComponentContract {
+        id: ComponentRef {
+            content_hash: Some("cc".into()),
+            ..("test:nodes/looped@0.1.0".parse().unwrap())
+        },
+        inputs: vec![PortDef::new("in", PortKind::Value, Type::U32)],
+        outputs: vec![PortDef::new("out", PortKind::Value, Type::U32)],
+        capabilities: vec![],
+        docs: None,
+    };
+    let compiled = Graph::builder("t")
+        .add_component(&looped)
+        .add_node("s", looped.id.clone())
+        .connect_feedback("ss", PortRef::new("s", "out"), PortRef::new("s", "in"))
+        .build()
+        .compile(std::slice::from_ref(&looped))
+        .unwrap();
+    let plane = Scripted::default();
+    let mut core = SchedulerCore::new(compiled, Arc::new(Perf), 100, |_, _| plane.clone()).unwrap();
+    let s = index(&core, "s");
+    let input = core.ports().input(&"s".into(), &"in".into()).unwrap();
+    let connection = core.ports().feedback_index(&"ss".into()).unwrap();
+    let core_dyn: &mut SchedulerCore<dyn DataPlane> = &mut core;
+    core_dyn.host_set(input);
+    assert!(poll_tick(core_dyn).is_none());
+    assert_eq!(plane.commands(), [Command::Run(s)]);
+    plane.report(ControlKind::RunReturned {
+        node: s,
+        returned: Returned {
+            feedback_buffered: vec![connection],
+            ..Returned::default()
+        },
+    });
+    // The tick ends here: it asks to latch what is over.
+    assert!(poll_tick(core_dyn).is_none());
+    let asked = plane.commands();
+    assert!(
+        asked.contains(&Command::LatchFeedback(connection)),
+        "{asked:?}"
+    );
+    (core, plane, input, connection)
+}
+
+/// The lane serves the latch, then the clear: the clear has the last word, and the
+/// node must not start on a value the hub no longer holds.
+#[test]
+fn a_clear_wins_over_a_latch_asked_before_it() {
+    let (mut core, plane, input, connection) = with_a_latch_asked();
+    let core_dyn: &mut SchedulerCore<dyn DataPlane> = &mut core;
+    core_dyn.host_clear_started(input);
+    plane.report(ControlKind::Latched {
+        connection,
+        latched: crate::Latched::Changed,
+    });
+    plane.report(ControlKind::HostCleared {
+        input,
+        cleared: true,
+    });
+    core_dyn.drain();
+    assert!(!core_dyn.is_present(input));
+    let _ = poll_tick(core_dyn);
+    let s = core_dyn.ports().node(&"s".into()).unwrap();
+    let asked = plane.commands();
+    assert!(!asked.contains(&Command::Run(s)), "{asked:?}");
+}
+
+/// As above for a write: a latch that cleared the input has not the last word, and
+/// the node must not wait for a value the hub holds.
+#[test]
+fn a_write_wins_over_a_latch_asked_before_it() {
+    let (mut core, plane, input, connection) = with_a_latch_asked();
+    let s = index(&core, "s");
+    let core_dyn: &mut SchedulerCore<dyn DataPlane> = &mut core;
+    core_dyn.host_write_started(input);
+    plane.report(ControlKind::Latched {
+        connection,
+        latched: crate::Latched::Cleared,
+    });
+    plane.report(ControlKind::HostWrote {
+        input,
+        changed: true,
+    });
+    core_dyn.drain();
+    assert!(core_dyn.is_present(input));
+    let _ = poll_tick(core_dyn);
+    let asked = plane.commands();
+    assert!(asked.contains(&Command::Run(s)), "{asked:?}");
 }

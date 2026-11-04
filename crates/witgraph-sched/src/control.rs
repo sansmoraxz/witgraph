@@ -630,8 +630,16 @@ impl SchedulerCore<dyn DataPlane> {
                     }
                 }
             }
-            ControlKind::HostWrote { input, changed } => self.host_write_arrived(input, changed),
-            ControlKind::HostCleared { input, cleared } => self.host_write_arrived(input, cleared),
+            // Each has the last word on its input: a latch asked before it may have
+            // said otherwise since it started.
+            ControlKind::HostWrote { input, changed } => {
+                self.presence.insert(input);
+                self.host_write_arrived(input, changed)
+            }
+            ControlKind::HostCleared { input, cleared } => {
+                self.presence.remove(input);
+                self.host_write_arrived(input, cleared)
+            }
             ControlKind::Restored => {
                 self.outstanding = self.outstanding.saturating_sub(1);
                 self.dirty = true;
