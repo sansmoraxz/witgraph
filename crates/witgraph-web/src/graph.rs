@@ -15,8 +15,8 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::{JsFuture, future_to_promise};
 use witgraph_ir::wasm_wave::value::Type;
 use witgraph_ir::{
-    Capability, CompiledGraph, ComponentContract, ComponentRef, Graph, Idx, IndexVec, InputIdx,
-    NodeId, OutputIdx, PortDirection, PortKind, PortName, PortTable,
+    Capability, CompiledGraph, ComponentContract, ComponentRef, Graph, IndexVec, InputIdx, NodeId,
+    OutputIdx, PortDirection, PortKind, PortName, PortTable,
 };
 use witgraph_sched::{
     DataPlane, NodeFault, PortVersions, RuntimeError, SchedulerCore, Snapshot, TickResult,
@@ -29,7 +29,7 @@ use witgraph_traits::{
 use crate::link::{self, Composed};
 use crate::live::{Live, LiveMode, LiveState};
 use crate::plane::{Callbacks, WebHub, WebPlane, stream_inputs};
-use crate::value::{Data, check_type, from_js, parse_wave, set, set_field, with_key};
+use crate::value::{Data, camel, check_type, from_js, parse_wave, set, set_field, with_key};
 use witgraph_wit::hub::{self, CompositeImport, HubMember};
 
 /// Reads a graph's latched outputs, as jco represents them, also while it
@@ -536,7 +536,7 @@ impl WebGraph {
     ///   `rebuild()` makes a new instance of the composite, throwing or rejecting
     ///   if it cannot (with an error marked `witgraphFatal` when a start function
     ///   called `fatal`); `instance()` returns the live instance's exports,
-    ///   `{ control, ports }`; `readHandle(output)` has the hub lend it a handle
+    ///   `{ control, ports }`; `readHandle(name)` has the hub lend it a handle
     ///   output and returns the object; `abandon()` says the instance stopped, so
     ///   whatever it holds and still does belongs to nothing.
     /// - `mocked` names the nodes left out of the composite, which imports each
@@ -846,8 +846,8 @@ impl WebGraph {
     }
 
     /// The stream and future inputs a node's outputs feed: an array of
-    /// `{ port, kind, input }`, the output port, its kind, and the input's number
-    /// for `take-stream` and `give-stream`.
+    /// `{ port, kind, take, give }`, the output port, its kind, and the input's
+    /// `take-stream` and `give-stream`, as the hub's port functions are named.
     #[wasm_bindgen(js_name = streamEdges)]
     pub fn stream_edges(&self, node: &str) -> Array {
         self.stream_edges
@@ -866,7 +866,8 @@ impl WebGraph {
                         "stream"
                     }),
                 );
-                set(&object, "input", &JsValue::from(input.position() as u32));
+                set(&object, "take", &text(&camel(&hub::take_stream(*input))));
+                set(&object, "give", &text(&camel(&hub::give_stream(*input))));
                 JsValue::from(object)
             })
             .collect()

@@ -246,10 +246,6 @@ type ImportKind =
 
 /** A node, by its position in the graph's topological order, as the hub numbers it. */
 type NodeNumber = number & { readonly brand: 'node' };
-/** A stream or future input, as the hub numbers it. */
-type InputNumber = number & { readonly brand: 'input' };
-/** An output port, as the hub numbers it. */
-type OutputNumber = number & { readonly brand: 'output' };
 
 /** A live hub's exports, as jco names them. */
 interface HubInstance extends Disposable {
@@ -392,7 +388,7 @@ export class Session {
         run: (node: NodeNumber) => live().#run(node),
         rebuild: () => live().#instantiate(),
         instance: () => live().#instance,
-        readHandle: (output: OutputNumber) => live().#readHandle(output),
+        readHandle: (name: string) => live().#readHandle(name),
         abandon: () => live().#abandon(),
       },
       mocked.filter((node) => known.has(node)),
@@ -533,9 +529,9 @@ export class Session {
   }
 
   /** What the hub lends the host of a handle output. */
-  #readHandle(output: OutputNumber): unknown {
+  #readHandle(name: string): unknown {
     this.#lent = undefined;
-    this.#instance?.ports[`readHandle${output}`]();
+    this.#instance?.ports[name]();
     const lent = this.#lent;
     this.#lent = undefined;
     return lent;
@@ -651,13 +647,14 @@ export class Session {
     const edges = this.graph.streamEdges(node) as {
       port: string;
       kind: 'stream' | 'future';
-      input: InputNumber;
+      take: string;
+      give: string;
     }[];
     const live = () => !this.#disposed && this.#instance === instance;
-    for (const { port, kind, input } of edges) {
-      const value = instance.ports[`takeStream${input}`]();
+    for (const { port, kind, take, give: giveName } of edges) {
+      const value = instance.ports[take]();
       if (value === undefined) continue;
-      const give = instance.ports[`giveStream${input}`];
+      const give = instance.ports[giveName];
       if (kind === 'future') {
         const future = value as PromiseLike<unknown>;
         if (options.onFutureValue) {

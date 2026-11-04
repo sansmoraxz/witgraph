@@ -43,8 +43,8 @@ pub(crate) struct Callbacks {
     pub(crate) rebuild: Function,
     /// `instance() -> { control, ports }`: the live instance's exports.
     pub(crate) instance: Function,
-    /// `readHandle(output) -> object | undefined`: what the hub lends the host of
-    /// a handle output.
+    /// `readHandle(name) -> object | undefined`: what the hub lends the host of a
+    /// handle output, when its port function `name` is called.
     pub(crate) read_handle: Function,
     /// `abandon()`: the instance stopped, whatever was in flight in it: what it
     /// holds and what it still does belong to nothing now.
@@ -306,11 +306,11 @@ impl WebHub {
     }
 
     pub(crate) fn read_handle(&self, output: OutputIdx) -> Result<Option<JsValue>, ReadFailure> {
-        let number = JsValue::from(output.position() as u32);
+        let name = JsValue::from_str(&camel(&hub::read_handle(output)));
         let handle = self
             .callbacks
             .read_handle
-            .call1(&JsValue::NULL, &number)
+            .call1(&JsValue::NULL, &name)
             .map_err(|e| ReadFailure::Thrown(thrown(&e)))?;
         Ok((!handle.is_undefined()).then_some(handle))
     }
