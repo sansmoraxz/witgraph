@@ -3004,12 +3004,7 @@ mod tests {
                 export node: interface {{ use caps.{{a{LAST}}}; record outputs {{ out: a{LAST} }} run: async func() -> outputs; }}
             }}"
         );
-        let source = std::thread::Builder::new()
-            .stack_size(1 << 30)
-            .spawn(move || load_str("aliases.wit", &wit).expect("wit-parser accepts it"))
-            .unwrap()
-            .join()
-            .unwrap();
+        let source = load_str("aliases.wit", &wit).expect("wit-parser accepts it");
         let started = std::time::Instant::now();
         let lowered = lower(&source).expect("lowers");
         assert_eq!(lowered[0].types.len(), LAST + 1, "every alias is named");
@@ -3031,17 +3026,13 @@ mod tests {
                 export node: interface {{ use caps.{{a19999}}; record outputs {{ out: a19999 }} run: async func() -> outputs; }}
             }}"
         );
-        // wit-parser itself recurses along the chain: parse on a large
-        // stack, then lower on a small one.
-        let source = std::thread::Builder::new()
-            .stack_size(256 << 20)
-            .spawn(move || load_str("aliases.wit", &wit).expect("wit-parser accepts it"))
-            .unwrap()
-            .join()
-            .unwrap();
+        // A stack overflow aborts the process, so neither step may recurse along it.
         let lowered = std::thread::Builder::new()
             .stack_size(2 << 20)
-            .spawn(move || lower(&source).map(|l| l.len()))
+            .spawn(move || {
+                let source = load_str("aliases.wit", &wit).expect("wit-parser accepts it");
+                lower(&source).map(|l| l.len())
+            })
             .unwrap()
             .join()
             .expect("no stack overflow");

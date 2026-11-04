@@ -63,12 +63,12 @@ wasm-wave = { version = "0.263", default-features = false, features = ["std"] }
 opt-level = 1
 
 [patch.crates-io]
-wasm-encoder = { git = "https://github.com/sansmoraxz/wasm-tools", rev = "51eb0b097375efcb8a44137dd3342a773c25c85f" }
-wasm-metadata = { git = "https://github.com/sansmoraxz/wasm-tools", rev = "51eb0b097375efcb8a44137dd3342a773c25c85f" }
-wasm-wave = { git = "https://github.com/sansmoraxz/wasm-tools", rev = "51eb0b097375efcb8a44137dd3342a773c25c85f" }
-wasmparser = { git = "https://github.com/sansmoraxz/wasm-tools", rev = "51eb0b097375efcb8a44137dd3342a773c25c85f" }
-wasmprinter = { git = "https://github.com/sansmoraxz/wasm-tools", rev = "51eb0b097375efcb8a44137dd3342a773c25c85f" }
-wast = { git = "https://github.com/sansmoraxz/wasm-tools", rev = "51eb0b097375efcb8a44137dd3342a773c25c85f" }
-wat = { git = "https://github.com/sansmoraxz/wasm-tools", rev = "51eb0b097375efcb8a44137dd3342a773c25c85f" }
-wit-component = { git = "https://github.com/sansmoraxz/wasm-tools", rev = "51eb0b097375efcb8a44137dd3342a773c25c85f" }
-wit-parser = { git = "https://github.com/sansmoraxz/wasm-tools", rev = "51eb0b097375efcb8a44137dd3342a773c25c85f" }
+wasm-encoder = { git = "https://github.com/sansmoraxz/wasm-tools", rev = "774832120e5640db309c0d74070b35c5ee05255f" }
+wasm-metadata = { git = "https://github.com/sansmoraxz/wasm-tools", rev = "774832120e5640db309c0d74070b35c5ee05255f" }
+wasm-wave = { git = "https://github.com/sansmoraxz/wasm-tools", rev = "774832120e5640db309c0d74070b35c5ee05255f" }
+wasmparser = { git = "https://github.com/sansmoraxz/wasm-tools", rev = "774832120e5640db309c0d74070b35c5ee05255f" }
+wasmprinter = { git = "https://github.com/sansmoraxz/wasm-tools", rev = "774832120e5640db309c0d74070b35c5ee05255f" }
+wast = { git = "https://github.com/sansmoraxz/wasm-tools", rev = "774832120e5640db309c0d74070b35c5ee05255f" }
+wat = { git = "https://github.com/sansmoraxz/wasm-tools", rev = "774832120e5640db309c0d74070b35c5ee05255f" }
+wit-component = { git = "https://github.com/sansmoraxz/wasm-tools", rev = "774832120e5640db309c0d74070b35c5ee05255f" }
+wit-parser = { git = "https://github.com/sansmoraxz/wasm-tools", rev = "774832120e5640db309c0d74070b35c5ee05255f" }
