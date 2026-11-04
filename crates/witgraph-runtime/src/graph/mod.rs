@@ -10,7 +10,7 @@
 //! and writes one port at a time, only when it asks: through a [`Port`] when it
 //! knows the type, which typechecks once and calls with no conversion, or through
 //! [`Val`] when it does not. The scheduling model, with its invariants, is
-//! described in [`witgraph_sched::scheduler`].
+//! described in [`witgraph_sched::control`].
 //!
 //! Reads and writes wait for the guest to suspend when one is spinning, which is
 //! forever with no fuel budget. Bound them with [`until`](witgraph_traits::until)

@@ -3391,6 +3391,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "witgraph-host-plane"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "serde_json",
+ "witgraph-ir",
+ "witgraph-sched",
+ "witgraph-traits",
+]
+
+[[package]]
 name = "witgraph-ir"
 version = "0.1.0"
 dependencies = [

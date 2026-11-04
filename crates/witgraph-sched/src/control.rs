@@ -4,7 +4,70 @@
 //!
 //! [`SchedulerCore`] ends in its data plane, so that a typed wrapper keeps its
 //! own plane's type, while everything here is compiled once, for
-//! `dyn DataPlane`. See [`scheduler`](crate::scheduler) for the scheduling model.
+//! `dyn DataPlane`.
+//!
+//! # Scheduling model
+//!
+//! The unit of execution is the node. Each has a lifecycle (`Waiting`,
+//! `Scheduled`, `Running`, in the crate-private `lifecycle` module), and all of
+//! them share one instance of the graph: one fault domain. Nodes joined by
+//! stream or future connections form a *stream group*, since a stream can be read
+//! once: its producer and reader must always re-run together.
+//!
+//! The data plane keeps one latched value per Value input port (written by
+//! connections and `inject`) and one per Value output port (latched when the
+//! node's `run` returns). The scheduler keeps which inputs have a value, each
+//! output's version, and what is owed. Invariants:
+//!
+//! - A newly built instance owes every node a run. An external Value input that
+//!   changes (value equality decides) makes its node owe a run, whatever phase it
+//!   is in; any number of changes before the next start owe one run. Owing a
+//!   member of a stream group owes the whole group.
+//! - A node starts when it owes a run, it is not running, every required input
+//!   has a value, its resource claims fit, and nothing *upstream* of it can still
+//!   change its inputs (computed by `unsettled`). That keeps a node from running
+//!   on half-updated inputs, while a Value latched by a stream group that never
+//!   finishes still wakes everything downstream of it.
+//! - A stream group starts as one: when a member can start, and every member has
+//!   its required inputs, each of them is scheduled, and runs when what it reads
+//!   has settled. Its claims are held until it has drained.
+//! - A `run` in flight is never pre-empted: inputs that change while it runs are
+//!   owed, and the node re-runs after it returns. A node reads its inputs when it
+//!   starts.
+//! - A stream group whose `run`s have all returned is *draining*: its writers may
+//!   be going on. It cannot start again until no guest work is left in the whole
+//!   instance, so beside an endless stream it never re-runs.
+//! - A Value output is delivered as soon as its `run` returns. One reaching a
+//!   member of the same group over a non-feedback connection owes nothing: it is
+//!   part of the group's run.
+//! - Feedback connections (values and handles) are latched once per tick, at quiescence:
+//!   that is one iteration of a loop. A tick that ends early (`StepLimitReached`,
+//!   `Faulted`) latches nothing; a later tick finishes the iteration. A dropped or
+//!   interrupted tick latches, as it ends, the feedback into every node whose
+//!   iteration is over: it has settled, and so has every feedback source into it.
+//! - A host write that changes an input wins over older feedback: it drops
+//!   feedback buffered for that input, and what a `run` in flight at the source
+//!   would feed back into it is dropped too.
+//! - A fault (trap, fuel exhaustion, a limit, `fatal`) stops the whole instance
+//!   and faults every node, recording the culprit when it is known and the fault
+//!   for `take_faults`. Every value is gone but the inputs the host wrote. What
+//!   the host asked for since the instance started, and has not started since,
+//!   is still owed, so an input that changed while it happened rebuilds the
+//!   instance; otherwise a stopped graph waits for its next input change or
+//!   `rerun`. So a node that always traps cannot rebuild the graph forever. A new
+//!   instance owes every node a run, and resets feedback loops. A rebuild that
+//!   fails faults every node with
+//!   [`NodeFault::Restart`](crate::NodeFault::Restart).
+//! - Shutdown drops the instance and forgets owed work.
+//! - Commands to the data plane are served in order. A start pass needs proof
+//!   ([`Drained`](crate::control)) that every one is answered, so nothing starts
+//!   on inputs a latch is yet to write.
+//!
+//! What is in flight lives in the scheduler, not in the future returned by
+//! `tick`: dropping a tick (on a timeout, say) loses nothing, and the next tick
+//! resumes it. Every `&mut self` entry point first handles what the instance
+//! reported since the last tick, so a `run` that returned before a dropped tick
+//! or a shutdown still has its changes recorded.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::{Future, poll_fn};
@@ -158,7 +221,7 @@ pub struct SchedulerCore<P: ?Sized> {
     /// Whether anything changed since the last start pass that could let a node
     /// start.
     dirty: bool,
-    pub(crate) events_tx: UnboundedSender<ControlEvent>,
+    events_tx: UnboundedSender<ControlEvent>,
     events_rx: UnboundedReceiver<ControlEvent>,
     resources: ResourcePool,
     /// What holds the values and runs the nodes. Last, so that
@@ -813,7 +876,7 @@ impl SchedulerCore<dyn DataPlane> {
 
     /// Builds a new instance, if work is owed that could start. Every node owes
     /// a run in it: its values are gone with the last one.
-    pub(crate) fn rebuild_if_owed(&mut self) -> bool {
+    pub fn rebuild_if_owed(&mut self) -> bool {
         let wanted = self.owed.iter().any(|node| self.ready(node));
         if !wanted {
             return false;

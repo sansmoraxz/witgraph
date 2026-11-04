@@ -1,0 +1,21 @@
+[package]
+name = "witgraph-host-plane"
+description = "A data plane that keeps values in the host, over an executor of closures: the scheduler under test, with no engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+witgraph-ir = { workspace = true }
+witgraph-sched = { workspace = true }
+witgraph-traits = { workspace = true }
+futures = "0.3"
+
+[dev-dependencies]
+serde_json = { workspace = true }

@@ -9,13 +9,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use futures::executor::block_on;
-use witgraph_ir::{
-    ComponentContract, ComponentRef, Graph, NodeId, PortDef, PortDirection, PortKind, PortRef, Type,
-};
-use witgraph_sched::{
+use witgraph_host_plane::{
     BoxFuture, CallFuture, Canonical, Executor, MemberPlan, NodeFault, NodePhase, OptionPayload,
     Outcome, Perf, RunShape, RuntimeError, RuntimeMode, Scheduler, TickResult, Trace, TraceEvent,
     boxed,
+};
+use witgraph_ir::{
+    ComponentContract, ComponentRef, Graph, NodeId, PortDef, PortDirection, PortKind, PortRef, Type,
 };
 
 /// What a node computes: its inputs, by field, to its outputs, by name.

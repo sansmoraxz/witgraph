@@ -4,20 +4,21 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use crate::plan::{InputField, MemberPlan, OutputField, RunShape};
 use futures::channel::mpsc::UnboundedSender;
 use futures::stream::{FuturesUnordered, StreamExt};
 use witgraph_ir::{
     CompiledGraph, FeedbackIdx, Idx, IndexVec, InputIdx, NodeId, NodeIdx, OutputIdx, PortDirection,
     PortKind, PortName, PortSet, PortTable,
 };
-use witgraph_traits::plan::{InputField, MemberPlan, OutputField, RunShape};
 use witgraph_traits::{
-    BoxFuture, Command, ControlEvent, ControlKind, DataPlane, Executor, Latched, NodeFault,
-    OptionPayload, OptionPayloadFn, Outcome, PortValue, PortVersion, Returned, RuntimeError,
-    Serving, boxed,
+    BoxFuture, Command, ControlEvent, ControlKind, DataPlane, Latched, NodeFault, Outcome,
+    PortVersion, Returned, RuntimeError, Serving, boxed,
 };
 
-use crate::control::PortVersions;
+use crate::executor::{Executor, OptionPayload, OptionPayloadFn, PortValue};
+
+use witgraph_sched::PortVersions;
 
 /// The latched value of each port or connection of one kind that has one.
 pub(crate) type Latches<I, V> = IndexVec<I, Option<Arc<V>>>;

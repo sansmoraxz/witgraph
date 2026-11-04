@@ -3,7 +3,7 @@
 //! measured.
 //!
 //! ```text
-//! cargo run --release -p witgraph-sched --example tick_overhead [nodes] [ticks]
+//! cargo run --release -p witgraph-host-plane --example tick_overhead [nodes] [ticks]
 //! ```
 
 use std::collections::{HashMap, HashSet};
@@ -12,13 +12,13 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use futures::executor::block_on;
-use witgraph_ir::{
-    ComponentContract, ComponentRef, Graph, NodeId, PortDef, PortDirection, PortKind, PortRef, Type,
-};
-use witgraph_sched::plan::RunShape;
-use witgraph_sched::{
+use witgraph_host_plane::plan::RunShape;
+use witgraph_host_plane::{
     BoxFuture, CallFuture, Canonical, Executor, MemberPlan, OptionPayload, Outcome, Perf,
     Scheduler, boxed,
+};
+use witgraph_ir::{
+    ComponentContract, ComponentRef, Graph, NodeId, PortDef, PortDirection, PortKind, PortRef, Type,
 };
 
 /// Every node is `out = in + add + 1`.

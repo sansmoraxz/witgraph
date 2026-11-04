@@ -10,11 +10,11 @@ use witgraph_ir::{
 };
 pub use witgraph_traits::snapshot::*;
 
-use crate::control::SchedulerCore;
-use crate::error::RuntimeError;
-use crate::executor::{DataPlane, Executor};
+use witgraph_sched::SchedulerCore;
+use witgraph_traits::{DataPlane, RuntimeError, RuntimeMode};
+
+use crate::executor::Executor;
 use crate::latches::Latches;
-use crate::mode::RuntimeMode;
 use crate::scheduler::Scheduler;
 
 impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
