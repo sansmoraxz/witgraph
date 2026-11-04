@@ -15,6 +15,12 @@ impl Guest for BusyLoop {
                     x = core::hint::black_box(x.wrapping_add(1));
                 }
             }
+            Action::SpinAWhile => {
+                let mut x = 0u64;
+                while x < 1_000_000_000 {
+                    x = core::hint::black_box(x.wrapping_add(1));
+                }
+            }
             Action::Trap => core::arch::wasm32::unreachable(),
             Action::Fatal => host::fatal("busy-loop asked for it"),
         }

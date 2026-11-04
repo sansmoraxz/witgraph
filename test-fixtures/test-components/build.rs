@@ -2,8 +2,9 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::{env, fs};
 
-const GUESTS: [&str; 46] = [
+const GUESTS: [&str; 47] = [
     "echo",
+    "m0-import",
     "configurable",
     "relay",
     "stream-producer",

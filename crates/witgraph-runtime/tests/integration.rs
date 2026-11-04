@@ -4239,3 +4239,229 @@ async fn a_preview_reads_bytes_as_bytes_and_anything_else_as_a_val() {
         Some("1.5")
     );
 }
+
+/// Bugs not fixed yet. Each test states what should happen, and fails: run them
+/// with `--ignored known_bugs`, and drop the `ignore` with the fix.
+mod known_bugs {
+    use test_components::{TENSOR_SINK, TENSOR_SOURCE};
+    use witgraph_runtime::until;
+    use witgraph_wit::hub::{self, HubMember};
+
+    use super::*;
+
+    async fn read<M: RuntimeMode, H: Host>(
+        rt: &mut RuntimeGraph<M, H>,
+        node: &str,
+        port: &str,
+    ) -> Option<Val> {
+        rt.read_output(&id(node), &port.into()).await.unwrap()
+    }
+
+    /// A required input a host may write has to be fed by feedback alone.
+    fn busy_and_a_loop(kit: &Kit) -> Graph {
+        kit.builder("g")
+            .add_node("busy", kit.get(BUSY_LOOP))
+            .add_node("r", kit.get(RELAY))
+            .connect_feedback("rr", port("r", "out"), port("r", "in"))
+            .build()
+    }
+
+    /// Leaves a guest spinning, so what the host asks next waits in the lane.
+    async fn start_spinning<M: RuntimeMode, H: Host>(rt: &mut RuntimeGraph<M, H>) {
+        inject(rt, "busy", "action", Val::Enum("spin-a-while".into())).await;
+        let tick = rt
+            .tick_until(tokio::time::sleep(Duration::from_millis(50)))
+            .await;
+        assert!(matches!(tick, TickResult::Interrupted), "{tick:?}");
+    }
+
+    /// The write stays queued and reaches the hub, but the scheduler never hears
+    /// of it, and writing it again changes nothing.
+    #[tokio::test]
+    #[ignore = "known bug: giving up on a write leaves the hub and scheduler disagreeing"]
+    async fn an_inject_given_up_on_still_runs_its_node() {
+        let kit = Kit::new(&[BUSY_LOOP, RELAY]);
+        let mut rt = kit
+            .load(
+                busy_and_a_loop(&kit),
+                RuntimeConfig::default(),
+                Trace::new(),
+            )
+            .await;
+        start_spinning(&mut rt).await;
+        let given_up = until(
+            tokio::time::sleep(Duration::from_millis(50)),
+            rt.inject(&id("r"), &"in".into(), Val::U32(7)),
+        )
+        .await;
+        assert!(
+            matches!(given_up, Err(RuntimeError::PullStopped)),
+            "{given_up:?}"
+        );
+        settle(&mut rt).await;
+        inject(&mut rt, "r", "in", Val::U32(7)).await;
+        settle(&mut rt).await;
+        assert_eq!(read(&mut rt, "r", "out").await, Some(Val::U32(7)));
+    }
+
+    /// The hub clears the input, but the scheduler still has it present, so the
+    /// node starts on a required input with no value, and traps.
+    #[tokio::test]
+    #[ignore = "known bug: giving up on a clear leaves the input present to the scheduler"]
+    async fn a_clear_given_up_on_leaves_its_node_waiting() {
+        let kit = Kit::new(&[BUSY_LOOP, RELAY]);
+        let mut rt = kit
+            .load(
+                busy_and_a_loop(&kit),
+                RuntimeConfig::default(),
+                Trace::new(),
+            )
+            .await;
+        inject(&mut rt, "r", "in", Val::U32(7)).await;
+        settle(&mut rt).await;
+        start_spinning(&mut rt).await;
+        let given_up = until(
+            tokio::time::sleep(Duration::from_millis(50)),
+            rt.clear_input(&id("r"), &"in".into()),
+        )
+        .await;
+        assert!(
+            matches!(given_up, Err(RuntimeError::PullStopped)),
+            "{given_up:?}"
+        );
+        settle(&mut rt).await;
+        rt.rerun(&id("r")).unwrap();
+        settle(&mut rt).await;
+        let faults = rt.take_faults();
+        assert!(faults.is_empty(), "{faults:?}");
+    }
+
+    /// The instance is restarted, but the scheduler's state is never restored.
+    #[tokio::test]
+    #[ignore = "known bug: giving up on a restore leaves it half applied"]
+    async fn a_restore_given_up_on_leaves_a_graph_that_runs() {
+        let kit = Kit::new(&[RELAY]);
+        let graph = kit
+            .builder("g")
+            .add_node("x", kit.get(RELAY))
+            .add_node("y", kit.get(RELAY))
+            .connect_feedback("xx", port("x", "out"), port("x", "in"))
+            .connect("xy", port("x", "out"), port("y", "in"))
+            .build();
+        let mut rt = kit
+            .load(graph, RuntimeConfig::default(), Trace::new())
+            .await;
+        inject(&mut rt, "x", "in", Val::U32(5)).await;
+        settle(&mut rt).await;
+        let snapshot = rt.snapshot().await.unwrap();
+        let given_up = until(std::future::ready(()), rt.restore(&snapshot)).await;
+        assert!(
+            matches!(given_up, Err(RuntimeError::PullStopped)),
+            "{given_up:?}"
+        );
+        settle(&mut rt).await;
+        rt.mode().take_trace();
+        rt.rerun(&id("y")).unwrap();
+        settle(&mut rt).await;
+        let runs = rt
+            .mode()
+            .take_trace()
+            .iter()
+            .filter(|e| matches!(e, TraceEvent::RunStarted { node } if node.as_str() == "y"))
+            .count();
+        assert_eq!(runs, 1, "`y` was asked to run");
+    }
+
+    /// The write counts as nothing to the scheduler, yet is kept and written to
+    /// the next instance, whose node then never gets to run.
+    #[tokio::test]
+    #[ignore = "known bug: an equal host write is retained but not recorded"]
+    async fn an_equal_write_does_not_stick_a_required_input_after_a_fault() {
+        let kit = Kit::new(&[BUSY_LOOP, RELAY]);
+        let graph = kit
+            .builder("g")
+            .add_node("busy", kit.get(BUSY_LOOP))
+            .add_node("r", kit.get(RELAY))
+            .connect_feedback("br", port("busy", "done"), port("r", "in"))
+            .build();
+        let mut rt = kit
+            .load(graph, RuntimeConfig::default(), Trace::new())
+            .await;
+        settle(&mut rt).await;
+        assert_eq!(read(&mut rt, "r", "out").await, Some(Val::U32(1)));
+        inject(&mut rt, "r", "in", Val::U32(1)).await;
+        inject(&mut rt, "busy", "action", Val::Enum("trap".into())).await;
+        let _ = rt.tick().await;
+        assert_eq!(rt.take_faults().len(), 1);
+        inject(&mut rt, "busy", "action", Val::Enum("finish".into())).await;
+        settle(&mut rt).await;
+        inject(&mut rt, "r", "in", Val::U32(1)).await;
+        settle(&mut rt).await;
+        assert_eq!(read(&mut rt, "r", "out").await, Some(Val::U32(1)));
+    }
+
+    /// Compiling and `docs/graphs.md` allow it, and generating the hub fails with
+    /// `no function get-feedback-0`.
+    #[test]
+    #[ignore = "known bug: a handle feedback connection compiles but cannot be composed"]
+    fn a_handle_feedback_connection_composes() {
+        let (source, sink) = (contract(TENSOR_SOURCE), contract(TENSOR_SINK));
+        let compiled = Graph::builder("g")
+            .add_component(&source)
+            .add_component(&sink)
+            .add_node("a", source.id.clone())
+            .add_node("b", sink.id.clone())
+            .connect_feedback("ab", port("a", "tensor"), port("b", "tensor"))
+            .build()
+            .compile(&[source.clone(), sink.clone()])
+            .expect("a handle may cross a feedback edge");
+        let nodes = [id("a"), id("b")];
+        let members = [
+            HubMember {
+                node: &nodes[0],
+                bytes: TENSOR_SOURCE.wasm,
+                export: "node",
+                mocked: false,
+            },
+            HubMember {
+                node: &nodes[1],
+                bytes: TENSOR_SINK.wasm,
+                export: "node",
+                mocked: false,
+            },
+        ];
+        if let Err(e) = hub::compose_graph(&compiled, &members) {
+            panic!("generating the hub: {e}");
+        }
+    }
+
+    /// Restoring counts every input with no connection into it as written by the
+    /// host, so a loop's value survives the next fault instead of starting over.
+    #[tokio::test]
+    #[ignore = "known bug: a restore makes feedback values look written by the host"]
+    async fn a_new_instance_after_a_restore_resets_a_loop() {
+        let kit = Kit::new(&[BUSY_LOOP, RELAY]);
+        let graph = kit
+            .builder("g")
+            .add_node("busy", kit.get(BUSY_LOOP))
+            .add_node("r", kit.get(RELAY))
+            .connect("br", port("busy", "done"), port("r", "in"))
+            .connect_feedback("rr", port("r", "out"), port("r", "add"))
+            .build();
+        let mut rt = kit
+            .load(graph, RuntimeConfig::default(), Trace::new())
+            .await;
+        for _ in 0..4 {
+            let _ = rt.tick().await;
+        }
+        let snapshot = rt.snapshot().await.unwrap();
+        rt.restore(&snapshot).await.unwrap();
+        let _ = rt.tick().await;
+        inject(&mut rt, "busy", "action", Val::Enum("trap".into())).await;
+        let _ = rt.tick().await;
+        assert_eq!(rt.take_faults().len(), 1);
+        inject(&mut rt, "busy", "action", Val::Enum("finish".into())).await;
+        let _ = rt.tick().await;
+        assert_eq!(read(&mut rt, "r", "out").await, Some(Val::U32(1)));
+    }
+}

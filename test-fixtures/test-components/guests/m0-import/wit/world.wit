@@ -1,0 +1,16 @@
+package test:m0-import@0.1.0;
+
+/// A capability whose import is named like the import of a mocked node.
+world m0-import {
+    import m0: func() -> u32;
+
+    export node: interface {
+        record inputs {
+            x: option<u32>,
+        }
+        record outputs {
+            out: u32,
+        }
+        run: async func(inputs: inputs) -> outputs;
+    }
+}

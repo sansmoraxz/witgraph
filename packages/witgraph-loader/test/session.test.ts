@@ -57,6 +57,7 @@ const wasm = await readFile(new URL('../pkg/witgraph_web_bg.wasm', import.meta.u
 
 const ids: Record<string, string> = {
   echo: 'test:echo/echo@0.1.0',
+  'm0-import': 'test:m0-import/m0-import@0.1.0',
   relay: 'test:relay/relay@0.1.0',
   'stream-producer': 'test:stream-producer/stream-producer@0.1.0',
   'stream-consumer': 'test:stream-consumer/stream-consumer@0.1.0',
@@ -1938,4 +1939,68 @@ test('a snapshot leaves out feedback a host write dropped', async () => {
   assert.deepEqual(Object.keys(JSON.parse(await session.graph.snapshot()).feedback), ['nm']);
   await session.graph.inject('m', 'add', 100);
   assert.deepEqual(JSON.parse(await session.graph.snapshot()).feedback, {});
+});
+
+// Bugs not fixed yet: each test states what should happen, and fails. Drop the
+// `skip` with the fix.
+
+test('known bug: an equal host write does not stick a required input after a fault', {
+  skip: 'an equal host write is retained but not recorded',
+}, async () => {
+  const session = await load(
+    [
+      ['busy', 'busy-loop'],
+      ['r', 'relay'],
+    ],
+    [['br', 'busy.done', 'r.in', true]],
+  );
+  await session.tick();
+  await session.tick();
+  assert.equal(await session.graph.readOutput('r', 'out'), 1);
+  await session.graph.inject('r', 'in', 1);
+  await session.graph.inject('busy', 'action', 'trap');
+  await session.tick();
+  assert.equal(session.graph.takeFaults().length, 1);
+  await session.graph.inject('busy', 'action', 'finish');
+  await session.tick();
+  await session.tick();
+  await session.tick();
+  await session.graph.inject('r', 'in', 1);
+  await session.tick();
+  assert.equal(await session.graph.readOutput('r', 'out'), 1);
+});
+
+test('known bug: a new instance after a restore resets a loop', {
+  skip: 'a restore makes feedback values look written by the host',
+}, async () => {
+  const session = await load(
+    [
+      ['busy', 'busy-loop'],
+      ['r', 'relay'],
+    ],
+    [
+      ['br', 'busy.done', 'r.in'],
+      ['rr', 'r.out', 'r.add', true],
+    ],
+  );
+  for (let i = 0; i < 4; i++) await session.tick();
+  await session.graph.restore(await session.graph.snapshot());
+  await session.tick();
+  await session.graph.inject('busy', 'action', 'trap');
+  await session.tick();
+  assert.equal(session.graph.takeFaults().length, 1);
+  await session.graph.inject('busy', 'action', 'finish');
+  await session.tick();
+  assert.equal(await session.graph.readOutput('r', 'out'), 1);
+});
+
+test('known bug: a capability import named like a mocked node reaches the host', {
+  skip: 'imports() takes `m0` for a mock without checking the node is mocked',
+}, async () => {
+  const session = await load([['n', 'm0-import']], [], {
+    capabilities: () => (() => 41) as unknown as object,
+  });
+  await session.tick();
+  assert.deepEqual(session.graph.takeFaults(), []);
+  assert.equal(await session.graph.readOutput('n', 'out'), 41);
 });

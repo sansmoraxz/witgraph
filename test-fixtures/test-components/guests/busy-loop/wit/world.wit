@@ -10,6 +10,7 @@ world busy-loop {
             spin,
             trap,
             fatal,
+            spin-a-while,
         }
         record inputs {
             action: option<action>,

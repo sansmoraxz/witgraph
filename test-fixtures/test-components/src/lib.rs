@@ -27,6 +27,10 @@ macro_rules! guest {
 /// `in: option<f64>` → `out: f64`; absent input reads as 0.0.
 pub const ECHO: Guest = guest!("ECHO_WASM", "echo");
 
+/// `x: option<u32>` → `out: u32`, adding what a capability whose import is named
+/// `m0`, like the import of a mocked node, returns.
+pub const M0_IMPORT: Guest = guest!("M0_IMPORT_WASM", "m0-import");
+
 /// `rate: option<u32>`, `gain: option<f64>` → `result: f64`
 /// (`rate * gain`, defaults 1 and 1.0).
 /// Previews `result` as `series`.
@@ -74,9 +78,10 @@ pub const MQTT_NODE: Guest = guest!("MQTT_NODE_WASM", "mqtt-node");
 /// Counts messages and sums their lengths.
 pub const BYTES_CONSUMER: Guest = guest!("BYTES_CONSUMER_WASM", "bytes-consumer");
 
-/// `action: option<enum { finish, spin, trap, fatal }>` (default
+/// `action: option<enum { finish, spin, trap, fatal, spin-a-while }>` (default
 /// `finish`) → `done: u32`.
-/// Spins forever, traps, or calls `witgraph:runtime/host.fatal` on request.
+/// Spins forever or for a while, traps, or calls `witgraph:runtime/host.fatal` on
+/// request.
 pub const BUSY_LOOP: Guest = guest!("BUSY_LOOP_WASM", "busy-loop");
 
 /// `x: option<u32>` → `maybe: option<u32>`, passed straight through.
