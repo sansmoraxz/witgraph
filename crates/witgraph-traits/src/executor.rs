@@ -199,6 +199,22 @@ pub enum ControlKind {
     },
     /// No guest work was left when a [`Command::AwaitQuiet`] was served.
     Quiet(u64),
+    /// A write the scheduler was told of as it started reached the input.
+    HostWrote {
+        /// The input.
+        input: InputIdx,
+        /// Whether that changed its value.
+        changed: bool,
+    },
+    /// A clear the scheduler was told of as it started reached the input.
+    HostCleared {
+        /// The input.
+        input: InputIdx,
+        /// Whether it had a value.
+        cleared: bool,
+    },
+    /// What a restore writes into a new instance has been written.
+    Restored,
 }
 
 /// What is told of a new instance.

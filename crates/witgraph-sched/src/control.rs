@@ -110,6 +110,8 @@ pub struct SchedulerCore<P: ?Sized> {
     internal: PortSet<InputIdx>,
     /// The inputs the host wrote: all that survives the instance.
     host_written: PortSet<InputIdx>,
+    /// The inputs with a host write or clear on its way, whoever waits for it.
+    writing: PortSet<InputIdx>,
     /// Each output port's version.
     versions: PortVersions,
     /// The feedback connections with a value waiting for the end-of-iteration
@@ -293,6 +295,7 @@ impl<P: DataPlane> SchedulerCore<P> {
             presence: PortSet::new(ports.inputs().len()),
             internal,
             host_written: PortSet::new(ports.inputs().len()),
+            writing: PortSet::new(ports.inputs().len()),
             versions: PortVersions::new(ports.outputs().len()),
             pending: PortSet::new(ports.feedback().len()),
             stale: PortSet::new(ports.feedback().len()),
@@ -437,6 +440,31 @@ impl SchedulerCore<dyn DataPlane> {
         self.host_written.insert(input);
     }
 
+    /// A host write to `input` has started on its way to the instance, which will
+    /// report [`ControlKind::HostWrote`]. Whoever asked may give up on it, which
+    /// does not stop it. Nothing starts before it arrives.
+    pub fn host_write_started(&mut self, input: InputIdx) {
+        self.outstanding += 1;
+        self.writing.insert(input);
+        self.presence.insert(input);
+        self.host_written.insert(input);
+    }
+
+    /// As [`host_write_started`](Self::host_write_started), for a clear, reported
+    /// as [`ControlKind::HostCleared`].
+    pub fn host_clear_started(&mut self, input: InputIdx) {
+        self.outstanding += 1;
+        self.writing.insert(input);
+        self.presence.remove(input);
+        self.host_written.remove(input);
+    }
+
+    /// What a restore writes has started on its way to the new instance, which will
+    /// report [`ControlKind::Restored`]. Nothing starts before it arrives.
+    pub fn restore_writes_started(&mut self) {
+        self.outstanding += 1;
+    }
+
     fn note_host_write(&mut self, input: InputIdx) {
         for at in 0..self.feedback_into[input].len() {
             let conn = self.feedback_into[input][at];
@@ -520,6 +548,7 @@ impl SchedulerCore<dyn DataPlane> {
         self.drain();
         self.owed.clear();
         self.owed_by_host.clear();
+        self.writing.clear();
         if self.is_live() {
             self.stop(StopCause::Shutdown);
             for node in self.compiled.graph().nodes.iter().map(|n| n.id.clone()) {
@@ -601,6 +630,13 @@ impl SchedulerCore<dyn DataPlane> {
                     }
                 }
             }
+            ControlKind::HostWrote { input, changed } => self.host_write_arrived(input, changed),
+            ControlKind::HostCleared { input, cleared } => self.host_write_arrived(input, cleared),
+            ControlKind::Restored => {
+                self.outstanding = self.outstanding.saturating_sub(1);
+                self.dirty = true;
+                false
+            }
             ControlKind::Quiet(at) => {
                 self.quiet_asked = None;
                 if at == self.runs_started && self.running == 0 {
@@ -610,6 +646,19 @@ impl SchedulerCore<dyn DataPlane> {
                 false
             }
         }
+    }
+
+    /// A host write or clear reached its input: if that changed it, its node owes a
+    /// run, and the write wins over feedback computed before it.
+    fn host_write_arrived(&mut self, input: InputIdx, changed: bool) -> bool {
+        self.outstanding = self.outstanding.saturating_sub(1);
+        self.writing.remove(input);
+        self.dirty = true;
+        if changed {
+            self.owe_host(self.ports.inputs()[input].node);
+            self.note_host_write(input);
+        }
+        changed
     }
 
     fn ports_node_ids(&self) -> Vec<NodeId> {
@@ -898,6 +947,12 @@ impl SchedulerCore<dyn DataPlane> {
             return;
         }
         self.plane.stopped();
+        // The next instance gets what they wrote, and their nodes owe a run on it.
+        let unarrived: Vec<InputIdx> = self.writing.iter().collect();
+        for input in unarrived {
+            self.owed_by_host.insert(self.ports.inputs()[input].node);
+        }
+        self.writing.clear();
         self.running = 0;
         self.outstanding = 0;
         self.quiet_asked = None;

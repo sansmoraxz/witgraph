@@ -4279,7 +4279,6 @@ mod known_bugs {
     /// The write stays queued and reaches the hub, but the scheduler never hears
     /// of it, and writing it again changes nothing.
     #[tokio::test]
-    #[ignore = "known bug: giving up on a write leaves the hub and scheduler disagreeing"]
     async fn an_inject_given_up_on_still_runs_its_node() {
         let kit = Kit::new(&[BUSY_LOOP, RELAY]);
         let mut rt = kit
@@ -4308,7 +4307,6 @@ mod known_bugs {
     /// The hub clears the input, but the scheduler still has it present, so the
     /// node starts on a required input with no value, and traps.
     #[tokio::test]
-    #[ignore = "known bug: giving up on a clear leaves the input present to the scheduler"]
     async fn a_clear_given_up_on_leaves_its_node_waiting() {
         let kit = Kit::new(&[BUSY_LOOP, RELAY]);
         let mut rt = kit
@@ -4339,7 +4337,6 @@ mod known_bugs {
 
     /// The instance is restarted, but the scheduler's state is never restored.
     #[tokio::test]
-    #[ignore = "known bug: giving up on a restore leaves it half applied"]
     async fn a_restore_given_up_on_leaves_a_graph_that_runs() {
         let kit = Kit::new(&[RELAY]);
         let graph = kit

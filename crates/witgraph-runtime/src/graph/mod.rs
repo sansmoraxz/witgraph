@@ -33,8 +33,8 @@ use witgraph_ir::{
     PortKind, PortName, PortTable,
 };
 use witgraph_sched::{
-    DataPlane, FaultReport, Incarnation, NodeState, Perf, PortVersion, PortVersions, RuntimeError,
-    RuntimeMode, SchedulerCore, TickResult,
+    ControlKind, DataPlane, FaultReport, Incarnation, NodeState, Perf, PortVersion, PortVersions,
+    RuntimeError, RuntimeMode, SchedulerCore, TickResult,
 };
 use witgraph_traits::{OutputReader, PortValues, RunningGraph, Snapshot, SnapshotError};
 
@@ -471,28 +471,32 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
             retained[input] = Some(write.clone());
             same
         };
-        let changed = match self.client() {
-            Some(client) => {
-                let written = client
-                    .call(move |acc, hub| {
-                        Box::pin(async move { write.write(acc, hub, input).await })
-                    })
-                    .await;
-                match written {
-                    Ok(changed) => changed,
-                    // It is kept for the next instance.
-                    Err(RuntimeError::InstanceStopped) => true,
-                    Err(e) => return Err(e),
-                }
-            }
+        let Some(client) = self.client() else {
             // A typed value cannot be compared, so it counts as a change.
-            None => !same,
+            if same {
+                self.core().host_kept(input);
+            } else {
+                self.core().host_set(input);
+            }
+            return Ok(());
         };
-        if changed {
-            self.core().host_set(input);
-        } else {
-            self.core().host_kept(input);
+        self.core().host_write_started(input);
+        let report = client.reporter();
+        let written = client
+            .call(move |acc, hub| {
+                Box::pin(async move {
+                    let changed = write.write(acc, hub, input).await?;
+                    report(ControlKind::HostWrote { input, changed });
+                    Ok(())
+                })
+            })
+            .await;
+        // Stopped first, it is kept for the next instance.
+        match written {
+            Ok(()) | Err(RuntimeError::InstanceStopped) => {}
+            Err(e) => return Err(e),
         }
+        self.core().drain();
         Ok(())
     }
 
@@ -921,24 +925,28 @@ impl<M: RuntimeMode, H: Host> RunningGraph for RuntimeGraph<M, H> {
         self.core().drain();
         let (input, _) = self.host_input(node, port)?;
         let held = lock(&self.core.plane.retained)[input].take().is_some();
-        let cleared = match self.client() {
-            Some(client) => {
-                let cleared = client
-                    .call(move |acc, hub| {
-                        Box::pin(async move { hub.clear_input(acc, input).await })
-                    })
-                    .await;
-                match cleared {
-                    Ok(cleared) => cleared,
-                    Err(RuntimeError::InstanceStopped) => held,
-                    Err(e) => return Err(e),
-                }
+        let Some(client) = self.client() else {
+            if held {
+                self.core().host_cleared(input);
             }
-            None => held,
+            return Ok(());
         };
-        if cleared {
-            self.core().host_cleared(input);
+        self.core().host_clear_started(input);
+        let report = client.reporter();
+        let cleared = client
+            .call(move |acc, hub| {
+                Box::pin(async move {
+                    let cleared = hub.clear_input(acc, input).await?;
+                    report(ControlKind::HostCleared { input, cleared });
+                    Ok(())
+                })
+            })
+            .await;
+        match cleared {
+            Ok(()) | Err(RuntimeError::InstanceStopped) => {}
+            Err(e) => return Err(e),
         }
+        self.core().drain();
         Ok(())
     }
 
@@ -1117,7 +1125,9 @@ impl<M: RuntimeMode, H: Host> RunningGraph for RuntimeGraph<M, H> {
             feedback.push((index, val));
         }
 
-        // Nothing fails from here on, but building the instance.
+        // Nothing fails from here on, but building the instance. It is all in place
+        // before the first wait, so giving up on a restore leaves it to finish, with
+        // nothing starting until it has.
         let host_written = self.core().host_written_in(snapshot);
         {
             let mut retained = lock(&self.core.plane.retained);
@@ -1131,15 +1141,18 @@ impl<M: RuntimeMode, H: Host> RunningGraph for RuntimeGraph<M, H> {
         self.core().restart_for_restore();
         let presence: Vec<InputIdx> = inputs.iter().map(|(input, _)| *input).collect();
         let pending: Vec<FeedbackIdx> = feedback.iter().map(|(conn, _)| *conn).collect();
+        self.core().apply_restore(&presence, &pending, snapshot);
         if let Some(client) = self.client() {
-            let connected: Vec<(InputIdx, Val)> = inputs
+            let graphs: Vec<(InputIdx, Val)> = inputs
                 .into_iter()
                 .filter(|(input, _)| !host_written.contains(*input))
                 .collect();
+            self.core().restore_writes_started();
+            let report = client.reporter();
             let written = client
                 .call(move |acc, hub| {
                     Box::pin(async move {
-                        for (input, val) in connected {
+                        for (input, val) in graphs {
                             call_set(acc, hub.set_input(acc, input)?, val).await?;
                         }
                         for (output, val) in outputs {
@@ -1148,6 +1161,7 @@ impl<M: RuntimeMode, H: Host> RunningGraph for RuntimeGraph<M, H> {
                         for (connection, val) in feedback {
                             call_set(acc, hub.set_feedback(acc, connection)?, val).await?;
                         }
+                        report(ControlKind::Restored);
                         Ok(())
                     })
                 })
@@ -1156,8 +1170,8 @@ impl<M: RuntimeMode, H: Host> RunningGraph for RuntimeGraph<M, H> {
                 Ok(()) | Err(RuntimeError::InstanceStopped) => {}
                 Err(e) => return Err(e),
             }
+            self.core().drain();
         }
-        self.core().apply_restore(&presence, &pending, snapshot);
         Ok(())
     }
 

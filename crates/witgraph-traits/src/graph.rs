@@ -33,7 +33,8 @@ impl PortVersion {
 /// `pull` (any of a graph's reads and writes), unless `stop` completes first,
 /// which is [`RuntimeError::PullStopped`]. A pull waits for the guest to suspend
 /// when one is spinning, forever with no fuel budget, so give it a timer here if
-/// that could matter. Stopping a pull is safe.
+/// that could matter. Stopping a pull is safe: a read is forgotten, and a write
+/// still happens, as if it had been waited for.
 pub async fn until<T>(
     stop: impl Future<Output = ()>,
     pull: impl Future<Output = Result<T, RuntimeError>>,

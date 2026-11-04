@@ -378,6 +378,8 @@ pub(crate) async fn call_get<D: StoreData>(
 /// How to reach the live instance, while there is one.
 pub(crate) struct Client<D: StoreData> {
     requests: UnboundedSender<Request<D>>,
+    /// Where the instance reports.
+    events: UnboundedSender<ControlEvent>,
     /// The server, for a waiting pull to drive, and to know it has ended.
     server: SharedFuture<BoxFuture<Outcome>>,
     /// Which instance it is: what a typed port's cached function belongs to.
@@ -388,6 +390,7 @@ impl<D: StoreData> Clone for Client<D> {
     fn clone(&self) -> Self {
         Self {
             requests: self.requests.clone(),
+            events: self.events.clone(),
             server: self.server.clone(),
             incarnation: self.incarnation,
         }
@@ -397,6 +400,17 @@ impl<D: StoreData> Clone for Client<D> {
 impl<D: StoreData> Client<D> {
     pub(crate) fn incarnation(&self) -> witgraph_sched::Incarnation {
         self.incarnation
+    }
+
+    /// What tells the scheduler what a request did, for a request whose asker may
+    /// give up on it: the request still happens.
+    pub(crate) fn reporter(&self) -> impl Fn(ControlKind) + Send + 'static {
+        let (events, incarnation) = (self.events.clone(), self.incarnation);
+        move |kind| {
+            // The receiver lives as long as the scheduler; a send can only fail
+            // while it is being dropped.
+            let _ = events.unbounded_send(ControlEvent { incarnation, kind });
+        }
     }
 
     /// Runs `body` in the Store, in the lane's order, driving the server until
@@ -805,6 +819,7 @@ impl<H: Host> DataPlane for HubPlane<H> {
             }
         };
         let (requests_tx, requests) = mpsc::unbounded();
+        let events = serving.events.clone();
         let server: BoxFuture<Outcome> = boxed(serve_hub(ServerArgs {
             built,
             build,
@@ -817,6 +832,7 @@ impl<H: Host> DataPlane for HubPlane<H> {
         let server = server.shared();
         *lock(&self.client) = Some(Client {
             requests: requests_tx,
+            events,
             server: server.clone(),
             incarnation,
         });
