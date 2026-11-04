@@ -362,6 +362,9 @@ pub enum FieldErrorKind {
     /// An output field borrowing a handle: outputs hand theirs to the host.
     #[error("an output hands its handle to the host: use `own<R>`, not `borrow<R>`")]
     BorrowedOutput,
+    /// A stream or future of borrows: reading one takes the handle from the writer.
+    #[error("a stream or future moves its handles to the reader: use `own<R>`, not `borrow<R>`")]
+    BorrowedPayload,
     /// A handle to a resource not declared in a named interface the world
     /// imports, which no other node, or host, can name.
     #[error(
@@ -1235,6 +1238,9 @@ fn async_payload(
     };
     if let Some(wp::TypeDefKind::Handle(h)) = top_kind(resolve, payload) {
         // Owned in either direction: reading takes it from the writer.
+        if matches!(h, wp::Handle::Borrow(_)) {
+            return Err(FieldErrorKind::BorrowedPayload);
+        }
         let handle = lower_handle(resolve, world, h, PortDirection::Output)?;
         return Ok((None, Some(handle)));
     }
@@ -1982,6 +1988,18 @@ mod tests {
             capability_names(&contract),
             ["test:data/tensor@0.1.0"],
             "the resource's interface is still what the host provides"
+        );
+    }
+
+    #[test]
+    fn a_stream_of_borrows_is_refused_as_a_stream() {
+        let message = lower_err(&handle_world(
+            "record inputs { x: stream<borrow<tensor>> } record outputs { b: u32 }",
+            "",
+        ));
+        assert!(
+            message.contains("field `x`") && message.contains("a stream or future moves"),
+            "{message}"
         );
     }
 
