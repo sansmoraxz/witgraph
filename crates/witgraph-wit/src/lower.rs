@@ -93,8 +93,8 @@ use wasm_wave::value::resolve_wit_type;
 use wit_parser as wp;
 use wit_parser::{Resolve, TypeId, WorldItem, WorldKey};
 use witgraph_ir::{
-    Capability, ComponentContract, ComponentRef, HandleType, PackageRef, PortDef, PortDirection,
-    PortKind, Type,
+    Capability, Carried, ComponentContract, ComponentRef, HandleType, PackageRef, PortDef,
+    PortDirection, PortType, Type,
 };
 
 use crate::hash;
@@ -1218,43 +1218,37 @@ fn lower_field(
     field: &wp::Field,
     direction: PortDirection,
 ) -> Result<PortDef, FieldErrorKind> {
-    let mut handle = None;
-    let (kind, optional, ty) = match top_kind(resolve, &field.ty) {
+    let port_type = match top_kind(resolve, &field.ty) {
         Some(wp::TypeDefKind::Stream(payload)) => {
-            let (ty, carried) = async_payload(resolve, world, payload.as_ref())?;
-            handle = carried;
-            (PortKind::Stream, false, ty)
+            PortType::Stream(async_payload(resolve, world, payload.as_ref())?)
         }
         Some(wp::TypeDefKind::Future(payload)) => {
-            let (ty, carried) = async_payload(resolve, world, payload.as_ref())?;
-            handle = carried;
-            (PortKind::Future, false, ty)
+            PortType::Future(async_payload(resolve, world, payload.as_ref())?)
         }
-        Some(wp::TypeDefKind::Handle(h)) => {
-            handle = Some(lower_handle(resolve, world, h, direction)?);
-            (PortKind::Handle, false, None)
-        }
+        Some(wp::TypeDefKind::Handle(h)) => PortType::Handle {
+            handle: lower_handle(resolve, world, h, direction)?,
+            optional: false,
+        },
         Some(wp::TypeDefKind::Option(inner)) if direction == PortDirection::Input => {
             match top_kind(resolve, inner) {
-                Some(wp::TypeDefKind::Handle(h)) => {
-                    handle = Some(lower_handle(resolve, world, h, direction)?);
-                    (PortKind::Handle, true, None)
-                }
-                _ => (PortKind::Value, true, Some(payload_type(resolve, inner)?)),
+                Some(wp::TypeDefKind::Handle(h)) => PortType::Handle {
+                    handle: lower_handle(resolve, world, h, direction)?,
+                    optional: true,
+                },
+                _ => PortType::Value {
+                    ty: payload_type(resolve, inner)?,
+                    optional: true,
+                },
             }
         }
-        _ => (
-            PortKind::Value,
-            false,
-            Some(payload_type(resolve, &field.ty)?),
-        ),
+        _ => PortType::Value {
+            ty: payload_type(resolve, &field.ty)?,
+            optional: false,
+        },
     };
     Ok(PortDef {
         name: field.name.clone().into(),
-        kind,
-        ty,
-        handle,
-        optional,
+        port_type,
         docs: field.docs.contents.clone(),
         viewer: None,
     })
@@ -1266,9 +1260,9 @@ fn async_payload(
     resolve: &Resolve,
     world: &wp::World,
     payload: Option<&wp::Type>,
-) -> Result<(Option<Type>, Option<HandleType>), FieldErrorKind> {
+) -> Result<Carried, FieldErrorKind> {
     let Some(payload) = payload else {
-        return Ok((None, None));
+        return Ok(Carried::Nothing);
     };
     if let Some(wp::TypeDefKind::Handle(h)) = top_kind(resolve, payload) {
         // Owned in either direction: reading takes it from the writer.
@@ -1276,9 +1270,9 @@ fn async_payload(
             return Err(FieldErrorKind::BorrowedPayload);
         }
         let handle = lower_handle(resolve, world, h, PortDirection::Output)?;
-        return Ok((None, Some(handle)));
+        return Ok(Carried::Handle(handle));
     }
-    Ok((Some(payload_type(resolve, payload)?), None))
+    Ok(Carried::Data(payload_type(resolve, payload)?))
 }
 
 /// The resource a top-level handle field carries. An input borrows it (the
@@ -1572,7 +1566,7 @@ fn is_witgraph_runtime(resolve: &Resolve, interface: &wp::Interface) -> bool {
 mod tests {
     use super::*;
     use crate::load::load_str;
-    use witgraph_ir::NodeShape;
+    use witgraph_ir::{NodeShape, PortKind};
 
     fn lower_all(wit: &str) -> Result<Vec<Lowered>, crate::Error> {
         Ok(lower(&load_str("test.wit", wit)?)?)
@@ -1657,13 +1651,16 @@ mod tests {
         assert_eq!(contract.docs.as_deref(), Some("Lowers everything."));
         assert_eq!(contract.shape(), NodeShape::Reactive);
 
-        assert!(contract.inputs.iter().all(|p| p.kind == PortKind::Value));
+        assert!(contract.inputs.iter().all(|p| p.kind() == PortKind::Value));
         let rate = port(&contract.inputs, "rate");
-        assert!(rate.optional, "top-level option input is an optional Value");
-        assert_eq!(rate.ty, Some(Type::U32));
+        assert!(
+            rate.is_optional(),
+            "top-level option input is an optional Value"
+        );
+        assert_eq!(rate.ty(), Some(&Type::U32));
         assert_eq!(rate.docs.as_deref(), Some("Sampling rate."));
 
-        let ty = |name: &str| port(&contract.inputs, name).ty.clone().unwrap();
+        let ty = |name: &str| port(&contract.inputs, name).ty().cloned().unwrap();
         let expected_point = Type::record([("x", Type::F32), ("y", Type::F32)]).unwrap();
         assert_eq!(ty("pos"), expected_point);
         assert_eq!(ty("m"), Type::enum_ty(["fast", "slow"]).unwrap());
@@ -1677,8 +1674,8 @@ mod tests {
         assert_eq!(ty("res"), Type::result(Some(Type::U32), Some(Type::STRING)));
 
         let maybe = port(&contract.outputs, "maybe");
-        assert!(!maybe.optional, "outputs get no optional unwrapping");
-        assert_eq!(maybe.ty, Some(Type::option(Type::U64)));
+        assert!(!maybe.is_optional(), "outputs get no optional unwrapping");
+        assert_eq!(maybe.ty(), Some(&Type::option(Type::U64)));
 
         let point_decl = types
             .iter()
@@ -1718,24 +1715,24 @@ mod tests {
         assert_eq!(contract.shape(), NodeShape::Streaming);
         let samples = port(&contract.inputs, "samples");
         assert_eq!(
-            (samples.kind, &samples.ty),
-            (PortKind::Stream, &Some(Type::F64))
+            (samples.kind(), samples.ty()),
+            (PortKind::Stream, Some(&Type::F64))
         );
         let done = port(&contract.inputs, "done");
         assert_eq!(
-            (done.kind, &done.ty),
-            (PortKind::Future, &Some(Type::STRING))
+            (done.kind(), done.ty()),
+            (PortKind::Future, Some(&Type::STRING))
         );
         let tick = port(&contract.inputs, "tick");
         assert_eq!(
-            (tick.kind, &tick.ty),
+            (tick.kind(), &tick.ty()),
             (PortKind::Future, &None),
             "a bare future carries no payload"
         );
-        assert_eq!(port(&contract.inputs, "threshold").kind, PortKind::Value);
-        assert_eq!(port(&contract.outputs, "filtered").kind, PortKind::Stream);
-        assert_eq!(port(&contract.outputs, "total").kind, PortKind::Future);
-        assert_eq!(port(&contract.outputs, "latest").kind, PortKind::Value);
+        assert_eq!(port(&contract.inputs, "threshold").kind(), PortKind::Value);
+        assert_eq!(port(&contract.outputs, "filtered").kind(), PortKind::Stream);
+        assert_eq!(port(&contract.outputs, "total").kind(), PortKind::Future);
+        assert_eq!(port(&contract.outputs, "latest").kind(), PortKind::Value);
     }
 
     #[test]
@@ -1753,7 +1750,7 @@ mod tests {
             world w { export node; }
             "#,
         );
-        assert_eq!(port(&contract.inputs, "s").kind, PortKind::Stream);
+        assert_eq!(port(&contract.inputs, "s").kind(), PortKind::Stream);
     }
 
     #[test]
@@ -1769,7 +1766,7 @@ mod tests {
             "#,
         );
         let ticks = port(&contract.inputs, "ticks");
-        assert_eq!((ticks.kind, &ticks.ty), (PortKind::Stream, &None));
+        assert_eq!((ticks.kind(), &ticks.ty()), (PortKind::Stream, &None));
     }
 
     #[test]
@@ -1828,7 +1825,7 @@ mod tests {
             world w { export node; }
             "#,
         );
-        assert_eq!(port(&contract.inputs, "x").kind, PortKind::Value);
+        assert_eq!(port(&contract.inputs, "x").kind(), PortKind::Value);
     }
 
     #[test]
@@ -2002,17 +1999,17 @@ mod tests {
         };
         let a = port(&contract.inputs, "a");
         assert_eq!(
-            (a.kind, a.optional, &a.ty),
+            (a.kind(), a.is_optional(), &a.ty()),
             (PortKind::Handle, false, &None)
         );
-        assert_eq!(a.handle.as_ref(), Some(&tensor));
+        assert_eq!(a.handle_type(), Some(&tensor));
         let b = port(&contract.inputs, "b");
-        assert_eq!((b.kind, b.optional), (PortKind::Handle, true));
-        assert_eq!(b.handle.as_ref(), Some(&tensor));
-        assert_eq!(port(&contract.outputs, "c").handle.as_ref(), Some(&tensor));
+        assert_eq!((b.kind(), b.is_optional()), (PortKind::Handle, true));
+        assert_eq!(b.handle_type(), Some(&tensor));
+        assert_eq!(port(&contract.outputs, "c").handle_type(), Some(&tensor));
         assert_eq!(
             port(&contract.outputs, "d")
-                .handle
+                .handle_type()
                 .as_ref()
                 .map(|h| h.resource.as_str()),
             Some("blob")
@@ -2107,9 +2104,9 @@ mod tests {
             (&contract.outputs, "d", PortKind::Future, "tensor"),
         ] {
             let port = port(ports, name);
-            assert_eq!((port.kind, &port.ty), (kind, &None), "{name}");
+            assert_eq!((port.kind(), &port.ty()), (kind, &None), "{name}");
             assert_eq!(
-                port.handle.as_ref().map(|h| h.resource.as_str()),
+                port.handle_type().map(|h| h.resource.as_str()),
                 Some(resource),
                 "{name}"
             );
@@ -2122,10 +2119,10 @@ mod tests {
             "record inputs { a: stream<u32> } record outputs { b: future<u8>, c: stream }",
             "",
         ));
-        assert!(port(&data.inputs, "a").handle.is_none());
-        assert!(port(&data.outputs, "b").ty.is_some());
+        assert!(port(&data.inputs, "a").handle_type().is_none());
+        assert!(port(&data.outputs, "b").ty().is_some());
         let unit = port(&data.outputs, "c");
-        assert!(unit.ty.is_none() && unit.handle.is_none());
+        assert!(unit.ty().is_none() && unit.handle_type().is_none());
     }
 
     #[test]

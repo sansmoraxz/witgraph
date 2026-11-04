@@ -303,7 +303,7 @@ impl<P: DataPlane> SchedulerCore<P> {
                 let required: Vec<InputIdx> = contract
                     .into_iter()
                     .flat_map(|c| &c.inputs)
-                    .filter(|port| port.kind.is_latched() && !port.optional)
+                    .filter(|port| port.kind().is_latched() && !port.is_optional())
                     .filter_map(|port| ports.input(id, &port.name))
                     .filter(|input| !internal.contains(*input))
                     .collect();
@@ -1277,7 +1277,7 @@ impl SchedulerCore<dyn DataPlane> {
             let makes_handle = self
                 .compiled
                 .contract_for(id)
-                .is_some_and(|c| c.outputs.iter().any(|p| p.kind == PortKind::Handle));
+                .is_some_and(|c| c.outputs.iter().any(|p| p.kind() == PortKind::Handle));
             if makes_handle && entry.life.has_run() {
                 owed.insert(id.clone());
             }

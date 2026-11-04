@@ -1183,8 +1183,8 @@ fn value_type(
     };
     ports
         .iter()
-        .find(|p| p.name == entry.port.port && p.kind == PortKind::Value)
-        .and_then(|p| p.ty.clone())
+        .find(|p| p.name == entry.port.port && p.kind() == PortKind::Value)
+        .and_then(|p| p.ty().cloned())
 }
 
 /// Makes `compiled` one component: its hub, and each node with its links composed

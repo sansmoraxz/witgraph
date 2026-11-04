@@ -270,7 +270,7 @@ fn check_shared<H: Host>(host: &H, compiled: &CompiledGraph) -> Result<(), LoadE
             continue;
         };
         for port in contract.inputs.iter().chain(&contract.outputs) {
-            let Some(handle) = &port.handle else {
+            let Some(handle) = port.handle_type() else {
                 continue;
             };
             if !host.shares(&node.id, handle) {

@@ -686,9 +686,9 @@ fn stream_and_future_ports_carry_a_resource() {
         let ports = if inputs { c.inputs } else { c.outputs };
         let port = ports.into_iter().find(|p| p.name == port.into()).unwrap();
         (
-            port.kind,
-            port.ty.is_none(),
-            port.handle.unwrap().to_string(),
+            port.kind(),
+            port.ty().is_none(),
+            port.handle_type().unwrap().to_string(),
         )
     };
     let tensor = format!("{TENSOR}.tensor");

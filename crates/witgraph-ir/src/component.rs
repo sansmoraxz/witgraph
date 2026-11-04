@@ -149,7 +149,7 @@ impl ComponentContract {
             .inputs
             .iter()
             .chain(&self.outputs)
-            .any(|port| port.kind.is_async())
+            .any(|port| port.kind().is_async())
         {
             NodeShape::Streaming
         } else {
@@ -184,7 +184,6 @@ mod tests {
             assert_eq!(capability.link_name(), link, "{name}");
         }
     }
-    use crate::port::PortKind;
 
     fn contract(inputs: Vec<PortDef>, outputs: Vec<PortDef>) -> ComponentContract {
         ComponentContract {
@@ -207,21 +206,24 @@ mod tests {
     #[test]
     fn shape_from_ports() {
         let reactive = contract(
-            vec![PortDef::new("a", PortKind::Value, Type::F64)],
-            vec![PortDef::new("b", PortKind::Value, Type::U32)],
+            vec![PortDef::value("a", Type::F64)],
+            vec![PortDef::value("b", Type::U32)],
         );
         assert_eq!(reactive.shape(), NodeShape::Reactive);
 
         let streaming_in = contract(
             vec![
-                PortDef::new("a", PortKind::Value, Type::F64),
-                PortDef::new("b", PortKind::Stream, Type::U32),
+                PortDef::value("a", Type::F64),
+                PortDef::stream("b", crate::port::Carried::Data(Type::U32)),
             ],
             vec![],
         );
         assert_eq!(streaming_in.shape(), NodeShape::Streaming);
 
-        let streaming_out = contract(vec![], vec![PortDef::new("f", PortKind::Future, Type::U32)]);
+        let streaming_out = contract(
+            vec![],
+            vec![PortDef::future("f", crate::port::Carried::Data(Type::U32))],
+        );
         assert_eq!(
             streaming_out.shape(),
             NodeShape::Streaming,

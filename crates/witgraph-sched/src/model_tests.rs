@@ -19,8 +19,8 @@ use futures::FutureExt;
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
 use futures::channel::oneshot;
 use witgraph_ir::{
-    ComponentContract, ComponentRef, FeedbackIdx, Graph, InputIdx, NodeIdx, PortDef, PortKind,
-    PortRef, ResourceClaim, Type,
+    ComponentContract, ComponentRef, FeedbackIdx, Graph, InputIdx, NodeIdx, PortDef, PortRef,
+    ResourceClaim, Type,
 };
 
 use crate::control::SchedulerCore;
@@ -147,11 +147,11 @@ fn contract(world: &str, inputs: Vec<PortDef>, outputs: Vec<PortDef>) -> Compone
 }
 
 fn value(name: &str) -> PortDef {
-    PortDef::new(name, PortKind::Value, Type::U32)
+    PortDef::value(name, Type::U32)
 }
 
 fn stream(name: &str) -> PortDef {
-    PortDef::new(name, PortKind::Stream, Type::U32)
+    PortDef::stream(name, witgraph_ir::Carried::Data(Type::U32))
 }
 
 /// Every kind of thing a graph holds, in a few nodes:

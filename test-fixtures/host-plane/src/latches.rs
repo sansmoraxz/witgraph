@@ -322,8 +322,8 @@ pub(crate) fn plan_members(
                                 name: port.name.clone(),
                                 port: witgraph_ir::PortRef::new(node.clone(), port.name.clone()),
                                 index,
-                                kind: port.kind,
-                                optional: port.optional,
+                                kind: port.kind(),
+                                optional: port.is_optional(),
                             })
                         })
                         .collect::<Result<Vec<_>, RuntimeError>>()
@@ -338,7 +338,7 @@ pub(crate) fn plan_members(
                         port.name.clone(),
                         OutputField {
                             index,
-                            kind: port.kind,
+                            kind: port.kind(),
                         },
                     ))
                 })

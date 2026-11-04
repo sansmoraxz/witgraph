@@ -332,22 +332,6 @@ pub enum Diagnostic {
         /// The flagged output port.
         port: PortName,
     },
-    /// An input port marked optional whose kind is Stream or Future. Only
-    /// Value inputs can be optional: an unconnected value reads as `none`,
-    /// but there is no handle to hand a node for an unconnected stream or
-    /// future.
-    #[error(
-        "input port `{port}` on `{component}` is an optional {kind}; only value inputs may be optional"
-    )]
-    #[diagnostic(code(witgraph::ir::optional_async_input))]
-    OptionalAsyncInput {
-        /// The component declaring the flagged input.
-        component: ComponentRef,
-        /// The flagged input port.
-        port: PortName,
-        /// The port's kind (Stream or Future).
-        kind: PortKind,
-    },
     /// A Stream or Future output with more than one outgoing connection.
     /// Stream and future handles move to exactly one consumer; fan-out is
     /// the job of a dedicated tee node.
@@ -367,18 +351,6 @@ pub enum Diagnostic {
         kind: PortKind,
         /// Every connection reading from it.
         connections: Vec<ConnectionId>,
-    },
-    /// A Value port with no payload type. Only a bare `stream` or `future`
-    /// carries none; no component can declare such a Value port.
-    #[error("{direction} value port `{port}` on `{component}` has no payload type")]
-    #[diagnostic(code(witgraph::ir::untyped_value_port))]
-    UntypedValuePort {
-        /// The component declaring the port.
-        component: ComponentRef,
-        /// Which side of the contract the port is on.
-        direction: PortDirection,
-        /// The port.
-        port: PortName,
     },
     /// A stream group whose members' claims on one resource sum to more than
     /// all of it. A group holds its members' claims together from its first
@@ -505,9 +477,7 @@ impl Diagnostic {
                 Location::Component(component.clone())
             }
             Diagnostic::DuplicatePortName { component, .. }
-            | Diagnostic::OptionalOutput { component, .. }
-            | Diagnostic::OptionalAsyncInput { component, .. }
-            | Diagnostic::UntypedValuePort { component, .. } => {
+            | Diagnostic::OptionalOutput { component, .. } => {
                 Location::Component(component.clone())
             }
             Diagnostic::IllegalCycle { nodes } => Location::Cycle(nodes.clone()),

@@ -10,7 +10,7 @@ use futures::FutureExt;
 use futures::executor::block_on;
 use witgraph_ir::{
     CompiledGraph, ComponentContract, ComponentRef, Graph, HandleType, NodeId, PortDef,
-    PortDirection, PortKind, PortName, PortRef, Type,
+    PortDirection, PortName, PortRef, Type,
 };
 
 use witgraph_traits::{BoxFuture, NodeFault, NodePhase, Outcome, Perf, TickResult, boxed};
@@ -97,10 +97,10 @@ fn adder() -> ComponentContract {
             ..("test:nodes/adder@0.1.0".parse().unwrap())
         },
         inputs: vec![
-            PortDef::new("in", PortKind::Value, Type::U32).optional(),
-            PortDef::new("add", PortKind::Value, Type::U32).optional(),
+            PortDef::value("in", Type::U32).optional(),
+            PortDef::value("add", Type::U32).optional(),
         ],
-        outputs: vec![PortDef::new("out", PortKind::Value, Type::U32)],
+        outputs: vec![PortDef::value("out", Type::U32)],
         capabilities: vec![],
         docs: None,
     }
@@ -377,13 +377,13 @@ fn load_handles() -> Scheduler<Perf, Adders> {
     };
     let make = contract(
         "make",
-        vec![PortDef::new("add", PortKind::Value, Type::U32).optional()],
+        vec![PortDef::value("add", Type::U32).optional()],
         vec![PortDef::handle("t", tensor())],
     );
     let take = contract(
         "take",
         vec![PortDef::handle("t", tensor())],
-        vec![PortDef::new("out", PortKind::Value, Type::U32)],
+        vec![PortDef::value("out", Type::U32)],
     );
     let contracts = [make.clone(), take.clone()];
     let compiled = Graph::builder("t")

@@ -113,10 +113,10 @@ pub struct PortMeta {
 fn port_meta(port: &PortDef) -> PortMeta {
     PortMeta {
         name: port.name.to_string(),
-        kind: port.kind,
+        kind: port.kind(),
         type_display: port.type_display(),
-        handle: port.handle.clone(),
-        optional: port.optional,
+        handle: port.handle_type().cloned(),
+        optional: port.is_optional(),
         docs: port.docs.clone(),
         viewer: port.viewer.clone(),
     }

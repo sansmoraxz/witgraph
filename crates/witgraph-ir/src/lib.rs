@@ -37,6 +37,6 @@ pub use index::{
     FeedbackEntry, FeedbackIdx, Idx, IndexVec, InputIdx, NodeIdx, OutputIdx, PortEntry, PortSet,
     PortTable,
 };
-pub use port::{HandleType, NodeShape, PortDef, PortDirection, PortKind};
+pub use port::{Carried, HandleType, NodeShape, PortDef, PortDirection, PortKind, PortType};
 pub use wasm_wave;
 pub use wasm_wave::value::Type;

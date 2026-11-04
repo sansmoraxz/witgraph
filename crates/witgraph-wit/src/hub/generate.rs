@@ -186,16 +186,16 @@ fn world_text(
             let Some(input) = ports.input(node.node, &port) else {
                 continue;
             };
-            if def.kind == PortKind::Handle {
+            if def.kind() == PortKind::Handle {
                 continue;
             }
-            let payload = if def.optional {
+            let payload = if def.is_optional() {
                 payload_of(resolve, &ty).unwrap_or(ty)
             } else {
                 ty
             };
             let text = printer.ty(&payload)?;
-            if def.kind.is_async() {
+            if def.kind().is_async() {
                 let _ = writeln!(
                     port_funcs,
                     "  {}: func() -> option<{text}>;\n  {}: func(value: {text});",
@@ -526,8 +526,8 @@ impl<'a> Core<'a> {
                 let port = PortName::from(*name);
                 let def = contract.inputs.iter().find(|p| p.name == port);
                 let index = ports.input(member.node, &port);
-                let kind = def.map_or(PortKind::Value, |d| d.kind);
-                let optional = def.filter(|d| d.optional).and_then(|_| {
+                let kind = def.map_or(PortKind::Value, |d| d.kind());
+                let optional = def.filter(|d| d.is_optional()).and_then(|_| {
                     let payload = payload_of(resolve, ty)?;
                     let at = abi.payload_offset(Int::U8, &[None, Some(payload)]);
                     Some((payload, at))

@@ -304,7 +304,7 @@ impl PortTable {
                     inputs.push(PortEntry {
                         port: PortRef::new(node.clone(), port.name.clone()),
                         node: at,
-                        kind: port.kind,
+                        kind: port.kind(),
                     });
                 }
                 for port in &contract.outputs {
@@ -313,7 +313,7 @@ impl PortTable {
                     outputs.push(PortEntry {
                         port: PortRef::new(node.clone(), port.name.clone()),
                         node: at,
-                        kind: port.kind,
+                        kind: port.kind(),
                     });
                 }
             }

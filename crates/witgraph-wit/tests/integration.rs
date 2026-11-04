@@ -98,7 +98,7 @@ fn fixtures_lower_with_every_port_kind() {
             .chain(&c.outputs)
             .find(|p| p.name.as_str() == port)
             .unwrap_or_else(|| panic!("no port `{world}.{port}`"))
-            .kind
+            .kind()
     };
     assert_eq!(kind("sensor", "latest"), PortKind::Value);
     assert_eq!(kind("sensor", "samples"), PortKind::Stream);

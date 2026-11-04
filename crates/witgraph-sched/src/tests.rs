@@ -7,7 +7,7 @@ use futures::FutureExt;
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
 use witgraph_ir::{
     ComponentContract, ComponentRef, FeedbackIdx, Graph, InputIdx, NodeId, NodeIdx, PortDef,
-    PortKind, PortRef, Type,
+    PortRef, Type,
 };
 
 use crate::control::SchedulerCore;
@@ -25,10 +25,10 @@ fn adder() -> ComponentContract {
             ..("test:nodes/adder@0.1.0".parse().unwrap())
         },
         inputs: vec![
-            PortDef::new("in", PortKind::Value, Type::U32).optional(),
-            PortDef::new("add", PortKind::Value, Type::U32).optional(),
+            PortDef::value("in", Type::U32).optional(),
+            PortDef::value("add", Type::U32).optional(),
         ],
-        outputs: vec![PortDef::new("out", PortKind::Value, Type::U32)],
+        outputs: vec![PortDef::value("out", Type::U32)],
         capabilities: vec![],
         docs: None,
     }
@@ -106,11 +106,11 @@ fn stream_group(claims: bool) -> (SchedulerCore<Scripted>, Scripted) {
     let producer = contract(
         "producer",
         vec![],
-        vec![PortDef::new("s", PortKind::Stream, Type::U32)],
+        vec![PortDef::stream("s", witgraph_ir::Carried::Data(Type::U32))],
     );
     let reader = contract(
         "reader",
-        vec![PortDef::new("s", PortKind::Stream, Type::U32)],
+        vec![PortDef::stream("s", witgraph_ir::Carried::Data(Type::U32))],
         vec![],
     );
     let lone = contract("lone", vec![], vec![]);
@@ -295,8 +295,8 @@ fn with_a_latch_asked() -> (SchedulerCore<Scripted>, Scripted, InputIdx, Feedbac
             content_hash: Some("cc".into()),
             ..("test:nodes/looped@0.1.0".parse().unwrap())
         },
-        inputs: vec![PortDef::new("in", PortKind::Value, Type::U32)],
-        outputs: vec![PortDef::new("out", PortKind::Value, Type::U32)],
+        inputs: vec![PortDef::value("in", Type::U32)],
+        outputs: vec![PortDef::value("out", Type::U32)],
         capabilities: vec![],
         docs: None,
     };

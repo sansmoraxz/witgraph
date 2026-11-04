@@ -105,8 +105,8 @@ fn port_difference(expected: &[PortDef], found: &[PortDef]) -> Option<String> {
     };
     let (expected, found) = (by_name(expected), by_name(found));
     let describe = |p: &PortDef| {
-        let optional = if p.optional { "optional " } else { "" };
-        format!("{optional}{} of {}", p.kind, p.type_display())
+        let optional = if p.is_optional() { "optional " } else { "" };
+        format!("{optional}{} of {}", p.kind(), p.type_display())
     };
     let names: BTreeSet<&String> = expected.keys().chain(found.keys()).collect();
     names
@@ -117,8 +117,8 @@ fn port_difference(expected: &[PortDef], found: &[PortDef]) -> Option<String> {
             // wit-component merges semver-compatible imports, so a handle's
             // version in the bytes may be another compatible one.
             (Some(e), Some(f))
-                if (e.kind, e.optional, &e.ty) != (f.kind, f.optional, &f.ty)
-                    || !match (&e.handle, &f.handle) {
+                if (e.kind(), e.is_optional(), &e.ty()) != (f.kind(), f.is_optional(), &f.ty())
+                    || !match (&e.handle_type(), &f.handle_type()) {
                         (Some(e), Some(f)) => e.connects(f),
                         (None, None) => true,
                         _ => false,
@@ -139,13 +139,13 @@ mod tests {
     use super::*;
 
     fn handle_at(version: &str) -> PortDef {
-        let mut port = PortDef::new("t", witgraph_ir::PortKind::Handle, witgraph_ir::Type::U32);
-        port.ty = None;
-        port.handle = Some(witgraph_ir::HandleType {
-            interface: format!("test:data/tensor@{version}"),
-            resource: "tensor".into(),
-        });
-        port
+        PortDef::handle(
+            "t",
+            witgraph_ir::HandleType {
+                interface: format!("test:data/tensor@{version}"),
+                resource: "tensor".into(),
+            },
+        )
     }
 
     /// wit-component merges semver-compatible imports, moving a handle's version.

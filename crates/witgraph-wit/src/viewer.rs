@@ -255,11 +255,11 @@ mod tests {
     #[test]
     fn hints_name_outputs_of_the_contract() {
         use wasm_wave::value::Type;
-        use witgraph_ir::{PortDef, PortKind};
+        use witgraph_ir::PortDef;
         let mut contract = ComponentContract {
             id: "a:b/c@0.1.0".parse().unwrap(),
-            inputs: vec![PortDef::new("frames", PortKind::Value, Type::U32)],
-            outputs: vec![PortDef::new("frames", PortKind::Value, Type::U32)],
+            inputs: vec![PortDef::value("frames", Type::U32)],
+            outputs: vec![PortDef::value("frames", Type::U32)],
             capabilities: Vec::new(),
             docs: None,
         };

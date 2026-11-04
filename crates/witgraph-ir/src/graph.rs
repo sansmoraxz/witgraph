@@ -351,7 +351,7 @@ mod tests {
     use crate::Type;
     use crate::component::ComponentContract;
     use crate::id::PackageRef;
-    use crate::port::{PortDef, PortKind};
+    use crate::port::PortDef;
 
     #[test]
     fn serde_round_trip_preserves_ids() {
@@ -365,8 +365,8 @@ mod tests {
                 world: "echo".into(),
                 content_hash: Some("aa".into()),
             },
-            inputs: vec![PortDef::new("in", PortKind::Value, Type::STRING)],
-            outputs: vec![PortDef::new("out", PortKind::Value, Type::STRING)],
+            inputs: vec![PortDef::value("in", Type::STRING)],
+            outputs: vec![PortDef::value("out", Type::STRING)],
             capabilities: vec![],
             docs: None,
         };

@@ -135,10 +135,10 @@ fn same_but_docs(a: &ComponentContract, b: &ComponentContract) -> bool {
         x.len() == y.len()
             && x.iter().zip(y).all(|(p, q)| {
                 p.name == q.name
-                    && p.kind == q.kind
-                    && p.ty == q.ty
-                    && p.handle == q.handle
-                    && p.optional == q.optional
+                    && p.kind() == q.kind()
+                    && p.ty() == q.ty()
+                    && p.handle_type() == q.handle_type()
+                    && p.is_optional() == q.is_optional()
             })
     };
     a.id == b.id
@@ -773,37 +773,15 @@ fn check_duplicate_port_names(table: &[Option<&ComponentContract>], diagnostics:
 /// none.
 fn check_port_flags(table: &[Option<&ComponentContract>], diagnostics: &mut Diagnostics) {
     for contract in distinct(table) {
-        for output in contract.outputs.iter().filter(|output| output.optional) {
+        for output in contract
+            .outputs
+            .iter()
+            .filter(|output| output.is_optional())
+        {
             diagnostics.push(Diagnostic::OptionalOutput {
                 component: contract.id.clone(),
                 port: output.name.clone(),
             });
-        }
-        for input in contract
-            .inputs
-            .iter()
-            .filter(|input| input.optional && input.kind.is_async())
-        {
-            diagnostics.push(Diagnostic::OptionalAsyncInput {
-                component: contract.id.clone(),
-                port: input.name.clone(),
-                kind: input.kind,
-            });
-        }
-        for (direction, ports) in [
-            (PortDirection::Input, &contract.inputs),
-            (PortDirection::Output, &contract.outputs),
-        ] {
-            for port in ports
-                .iter()
-                .filter(|p| p.kind == PortKind::Value && p.ty.is_none())
-            {
-                diagnostics.push(Diagnostic::UntypedValuePort {
-                    component: contract.id.clone(),
-                    direction,
-                    port: port.name.clone(),
-                });
-            }
         }
     }
 }
@@ -947,11 +925,11 @@ fn check_connection_endpoints<'g>(
         }
         if let (Some((output, from)), Some((input, to))) = (from, to) {
             ports[index] = Some((output, input));
-            if !from.kind.compatible(to.kind) {
+            if !from.kind().compatible(to.kind()) {
                 diagnostics.push(Diagnostic::KindMismatch {
                     conn: conn.id.clone(),
-                    from: from.kind,
-                    to: to.kind,
+                    from: from.kind(),
+                    to: to.kind(),
                 });
             } else if !from.carries_into(to) {
                 diagnostics.push(Diagnostic::TypeMismatch {
@@ -994,7 +972,7 @@ fn check_required_inputs(
             continue;
         };
         for input in &contract.inputs {
-            if input.optional {
+            if input.is_optional() {
                 continue;
             }
             let port = PortRef {
@@ -1006,7 +984,7 @@ fn check_required_inputs(
                     diagnostics.push(Diagnostic::RequiredInputUnconnected { port });
                 }
                 // A Stream or Future feedback edge is an error of its own.
-                Some(conns) if !input.kind.is_async() && conns.iter().all(|c| c.feedback) => {
+                Some(conns) if !input.kind().is_async() && conns.iter().all(|c| c.feedback) => {
                     diagnostics.push(Diagnostic::FeedbackOnlyInput {
                         port,
                         conn: conns[0].id.clone(),
@@ -1060,7 +1038,7 @@ fn source_kind(
         .outputs
         .iter()
         .find(|output| output.name == from.port)
-        .map(|output| output.kind)
+        .map(|output| output.kind())
 }
 
 /// Feedback edges are unit-delay boundaries between generations; only a
@@ -1176,10 +1154,9 @@ fn check_group_start(
         .collect();
     let required = |to: &PortRef| {
         contracts.get(&to.node).is_some_and(|contract| {
-            contract
-                .inputs
-                .iter()
-                .any(|input| input.name == to.port && input.kind.is_latched() && !input.optional)
+            contract.inputs.iter().any(|input| {
+                input.name == to.port && input.kind().is_latched() && !input.is_optional()
+            })
         })
     };
     let edges = graph
@@ -1622,7 +1599,13 @@ mod tests {
     }
 
     fn port(name: &str, kind: PortKind) -> PortDef {
-        PortDef::new(name, kind, Type::F64)
+        let data = crate::port::Carried::Data(Type::F64);
+        match kind {
+            PortKind::Value => PortDef::value(name, Type::F64),
+            PortKind::Stream => PortDef::stream(name, data),
+            PortKind::Future => PortDef::future(name, data),
+            PortKind::Handle => panic!("a handle port names its resource: `PortDef::handle`"),
+        }
     }
 
     fn source() -> ComponentContract {
@@ -1946,7 +1929,7 @@ mod tests {
             .add_component(source())
             .add_component(contract(
                 "int-sink",
-                vec![PortDef::new("in", PortKind::Value, Type::U32)],
+                vec![PortDef::value("in", Type::U32)],
                 vec![],
                 &[],
             ))
@@ -1967,15 +1950,15 @@ mod tests {
     #[test]
     fn a_stream_of_handles_connects_only_to_a_stream_of_that_resource() {
         let carrying = |kind: PortKind, resource: &str| {
-            let mut port = PortDef::handle(
-                "t",
-                crate::HandleType {
-                    interface: "test:data/tensor@0.1.0".into(),
-                    resource: resource.into(),
-                },
-            );
-            port.kind = kind;
-            port
+            let handle = crate::HandleType {
+                interface: "test:data/tensor@0.1.0".into(),
+                resource: resource.into(),
+            };
+            match kind {
+                PortKind::Stream => PortDef::stream("t", crate::port::Carried::Handle(handle)),
+                PortKind::Future => PortDef::future("t", crate::port::Carried::Handle(handle)),
+                _ => PortDef::handle("t", handle),
+            }
         };
         let graph = |input: PortDef| {
             builder("t")
@@ -1997,7 +1980,7 @@ mod tests {
         assert!(!diags(graph(carrying(PortKind::Stream, "blob")).compile()).is_empty());
         assert!(!diags(graph(carrying(PortKind::Future, "tensor")).compile()).is_empty());
         assert!(!diags(graph(carrying(PortKind::Handle, "tensor")).compile()).is_empty());
-        let data = PortDef::new("t", PortKind::Stream, wasm_wave::value::Type::U32);
+        let data = PortDef::stream("t", crate::port::Carried::Data(wasm_wave::value::Type::U32));
         assert!(
             !diags(graph(data).compile()).is_empty(),
             "data, not handles"
@@ -2046,7 +2029,7 @@ mod tests {
             "another track is another resource"
         );
         assert_eq!(
-            diags(graph(PortDef::new("t", PortKind::Value, Type::U32)).compile()),
+            diags(graph(PortDef::value("t", Type::U32)).compile()),
             vec![Diagnostic::KindMismatch {
                 conn: "c1".into(),
                 from: PortKind::Handle,
@@ -2191,26 +2174,6 @@ mod tests {
         graph
             .compile()
             .expect("values are copied, so they fan out freely");
-    }
-
-    #[test]
-    fn optional_async_input_rejected() {
-        let graph = builder("t")
-            .add_component(contract(
-                "opt-stream",
-                vec![port("s", PortKind::Stream).optional()],
-                vec![],
-                &[],
-            ))
-            .build();
-        assert_eq!(
-            diags(graph.compile()),
-            vec![Diagnostic::OptionalAsyncInput {
-                component: cref("opt-stream"),
-                port: "s".into(),
-                kind: PortKind::Stream,
-            }]
-        );
     }
 
     #[test]
@@ -2739,18 +2702,18 @@ mod tests {
             .add_component(contract(
                 "maybe",
                 vec![],
-                vec![PortDef::new("m", PortKind::Value, Type::option(Type::U32))],
+                vec![PortDef::value("m", Type::option(Type::U32))],
                 &[],
             ))
             .add_component(contract(
                 "opt",
-                vec![PortDef::new("m", PortKind::Value, Type::U32).optional()],
+                vec![PortDef::value("m", Type::U32).optional()],
                 vec![],
                 &[],
             ))
             .add_component(contract(
                 "plain",
-                vec![PortDef::new("m", PortKind::Value, Type::U32)],
+                vec![PortDef::value("m", Type::U32)],
                 vec![],
                 &[],
             ))
@@ -2984,12 +2947,15 @@ mod tests {
             .add_component(contract(
                 "emitter",
                 vec![],
-                vec![PortDef::new("sig", PortKind::Value, Type::F64)],
+                vec![PortDef::value("sig", Type::F64)],
                 &[],
             ))
             .add_component(contract(
                 "consumer",
-                vec![PortDef::new("sig", PortKind::Stream, Type::U32)],
+                vec![PortDef::stream(
+                    "sig",
+                    crate::port::Carried::Data(Type::U32),
+                )],
                 vec![],
                 &[],
             ))
@@ -3355,28 +3321,6 @@ mod tests {
         graph
             .compile()
             .expect("value-connected nodes hold their claims apart");
-    }
-
-    #[test]
-    fn a_value_port_needs_a_payload_type() {
-        let untyped = contract(
-            "untyped",
-            vec![],
-            vec![PortDef::unit("out", PortKind::Value)],
-            &[],
-        );
-        let graph = builder("t")
-            .add_component(untyped)
-            .add_node("u", cref("untyped"))
-            .build();
-        assert_eq!(
-            diags(graph.compile()),
-            vec![Diagnostic::UntypedValuePort {
-                component: cref("untyped"),
-                direction: PortDirection::Output,
-                port: "out".into(),
-            }]
-        );
     }
 
     #[test]

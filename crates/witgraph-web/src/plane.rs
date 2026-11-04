@@ -366,13 +366,13 @@ pub(crate) fn stream_inputs(
     let mut edges: HashMap<NodeId, Vec<(String, PortKind, InputIdx)>> = HashMap::new();
     for resolved in compiled.connections() {
         let conn = resolved.connection;
-        if !resolved.from.kind.is_async() {
+        if !resolved.from.kind().is_async() {
             continue;
         }
         if let Some(input) = ports.input(&conn.to.node, &conn.to.port) {
             edges.entry(conn.from.node.clone()).or_default().push((
                 conn.from.port.to_string(),
-                resolved.from.kind,
+                resolved.from.kind(),
                 input,
             ));
         }

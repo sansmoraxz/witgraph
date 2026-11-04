@@ -15,7 +15,7 @@ use witgraph_host_plane::{
     boxed,
 };
 use witgraph_ir::{
-    ComponentContract, ComponentRef, Graph, NodeId, PortDef, PortDirection, PortKind, PortRef, Type,
+    ComponentContract, ComponentRef, Graph, NodeId, PortDef, PortDirection, PortRef, Type,
 };
 
 /// What a node computes: its inputs, by field, to its outputs, by name.
@@ -78,8 +78,8 @@ fn contract(world: &str) -> ComponentContract {
             content_hash: Some("aa".into()),
             ..format!("mock:nodes/{world}@0.1.0").parse().unwrap()
         },
-        inputs: vec![PortDef::new("in", PortKind::Value, Type::U32).optional()],
-        outputs: vec![PortDef::new("out", PortKind::Value, Type::U32)],
+        inputs: vec![PortDef::value("in", Type::U32).optional()],
+        outputs: vec![PortDef::value("out", Type::U32)],
         capabilities: vec![],
         docs: None,
     }

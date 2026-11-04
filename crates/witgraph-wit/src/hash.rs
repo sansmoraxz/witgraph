@@ -54,7 +54,7 @@ fn write_ports(out: &mut String, direction: PortDirection, ports: &[PortDef]) {
     let mut lines: Vec<String> = ports
         .iter()
         .map(|p| {
-            let payload = match (&p.ty, &p.handle) {
+            let payload = match (&p.ty(), &p.handle_type()) {
                 (Some(ty), _) => encode_type(ty),
                 // On its interface's compatibility track, as connections
                 // match handles.
@@ -68,8 +68,8 @@ fn write_ports(out: &mut String, direction: PortDirection, ports: &[PortDef]) {
             format!(
                 "{direction} {:?} {} {} {payload:?}\n",
                 p.name.as_str(),
-                p.kind,
-                p.optional,
+                p.kind(),
+                p.is_optional(),
             )
         })
         .collect();
@@ -397,12 +397,11 @@ pub fn content_hash(contract: &ComponentContract) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use witgraph_ir::PortKind;
 
     fn contract(port_name: &str) -> ComponentContract {
         ComponentContract {
             id: "demo:test/w@0.1.0".parse().unwrap(),
-            inputs: vec![PortDef::new(port_name, PortKind::Value, Type::F64)],
+            inputs: vec![PortDef::value(port_name, Type::F64)],
             outputs: vec![],
             capabilities: vec![],
             docs: None,
@@ -430,7 +429,7 @@ mod tests {
     fn kind_changes_identity() {
         let plain = contract("in");
         let mut streamed = contract("in");
-        streamed.inputs[0].kind = PortKind::Stream;
+        streamed.inputs[0] = PortDef::stream("in", witgraph_ir::Carried::Data(Type::F64));
         assert_ne!(content_hash(&plain), content_hash(&streamed));
     }
 
@@ -466,16 +465,19 @@ mod tests {
     #[test]
     fn unit_payload_hashes_differently_from_any_type() {
         let mut unit = contract("in");
-        unit.inputs = vec![PortDef::unit("in", PortKind::Stream)];
+        unit.inputs = vec![PortDef::stream("in", witgraph_ir::Carried::Nothing)];
         let mut typed = contract("in");
-        typed.inputs[0].kind = PortKind::Stream;
+        typed.inputs[0] = PortDef::stream("in", witgraph_ir::Carried::Data(Type::F64));
         assert_ne!(content_hash(&unit), content_hash(&typed));
     }
 
     #[test]
     fn canonical_encoding_is_pinned() {
         let mut c = contract("in");
-        c.outputs = vec![PortDef::new("out", PortKind::Stream, Type::U32)];
+        c.outputs = vec![PortDef::stream(
+            "out",
+            witgraph_ir::Carried::Data(Type::U32),
+        )];
         assert_eq!(
             canonical(&c),
             "witgraph-contract v3\nrun async\ninput \"in\" value false \"f64\"\noutput \"out\" stream false \"u32\"\n"
