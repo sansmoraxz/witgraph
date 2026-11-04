@@ -250,6 +250,94 @@ fn a_snapshot_leaves_out_feedback_a_host_write_dropped() {
     assert!(sched.snapshot().unwrap().feedback.is_empty());
 }
 
+/// `n`, whose `out` feeds back into its `add`.
+fn a_loop() -> Scheduler<Perf, Adders> {
+    let contract = adder();
+    let compiled = Graph::builder("t")
+        .add_component(&contract)
+        .add_node("n", contract.id.clone())
+        .connect_feedback("nn", PortRef::new("n", "out"), PortRef::new("n", "add"))
+        .build()
+        .compile(std::slice::from_ref(&contract))
+        .unwrap();
+    load_adders(compiled, None, &Arc::new(AtomicUsize::new(0)))
+}
+
+#[test]
+fn an_equal_host_write_makes_the_value_the_hosts() {
+    let mut sched = a_loop();
+    for _ in 0..2 {
+        let _ = block_on(sched.tick());
+    }
+    assert_eq!(out(&sched, "n"), Some(2));
+    assert!(sched.snapshot().unwrap().host_written.is_empty());
+    let n = NodeId::from("n");
+    // What the loop latched: changing nothing, it runs nothing.
+    sched.inject(&n, &"add".into(), 2).unwrap();
+    let written = sched.snapshot().unwrap().host_written;
+    assert_eq!(written[&n].len(), 1, "{written:?}");
+    sched.shutdown();
+    let add = sched.core.ports().input(&n, &"add".into()).unwrap();
+    assert!(
+        sched.core.is_present(add),
+        "the next instance is written it"
+    );
+}
+
+#[test]
+fn a_restored_loop_starts_over_with_the_next_instance() {
+    let mut sched = a_loop();
+    for _ in 0..3 {
+        let _ = block_on(sched.tick());
+    }
+    let looped = out(&sched, "n");
+    assert!(looped > Some(1), "{looped:?}");
+    let snapshot = sched.snapshot().unwrap();
+    assert!(snapshot.host_written.is_empty());
+    sched.restore(&snapshot).unwrap();
+    assert_eq!(
+        snapshot.inputs[&NodeId::from("n")].len(),
+        1,
+        "what it latched"
+    );
+    let _ = block_on(sched.tick());
+    sched.shutdown();
+    sched.rerun(&"n".into()).unwrap();
+    assert!(sched.tick().now_or_never().is_some());
+    assert_eq!(out(&sched, "n"), Some(1), "a loop starts over");
+}
+
+#[test]
+fn a_restore_keeps_what_the_host_wrote_for_the_next_instance() {
+    let mut sched = a_loop();
+    let _ = block_on(sched.tick());
+    sched.inject(&"n".into(), &"in".into(), 40).unwrap();
+    let _ = block_on(sched.tick());
+    let snapshot = sched.snapshot().unwrap();
+    sched.restore(&snapshot).unwrap();
+    let _ = block_on(sched.tick());
+    sched.shutdown();
+    sched.rerun(&"n".into()).unwrap();
+    assert!(sched.tick().now_or_never().is_some());
+    assert_eq!(out(&sched, "n"), Some(41));
+}
+
+#[test]
+fn a_snapshot_may_not_say_the_host_wrote_a_connected_input() {
+    let mut sched = load(None, &Arc::new(AtomicUsize::new(0)));
+    settle(&mut sched);
+    let mut snapshot = sched.snapshot().unwrap();
+    snapshot
+        .host_written
+        .entry("b".into())
+        .or_default()
+        .insert("in".into());
+    assert!(matches!(
+        sched.restore(&snapshot),
+        Err(crate::RuntimeError::SnapshotMismatch { .. })
+    ));
+}
+
 #[test]
 fn work_owed_during_a_failing_rebuild_survives_it() {
     let fail = Arc::new(AtomicUsize::new(0));

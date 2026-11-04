@@ -4030,6 +4030,7 @@ fn snapshot_round_trips_through_serde() {
         inputs: values("in", "1.5"),
         outputs: Default::default(),
         feedback: [("ba".into(), "3".to_string())].into_iter().collect(),
+        host_written: Default::default(),
         in_flight: [id("n")].into_iter().collect(),
         owed: [id("n")].into_iter().collect(),
     };
@@ -4437,7 +4438,6 @@ mod known_bugs {
     /// Restoring counts every input with no connection into it as written by the
     /// host, so a loop's value survives the next fault instead of starting over.
     #[tokio::test]
-    #[ignore = "known bug: a restore makes feedback values look written by the host"]
     async fn a_new_instance_after_a_restore_resets_a_loop() {
         let kit = Kit::new(&[BUSY_LOOP, RELAY]);
         let graph = kit

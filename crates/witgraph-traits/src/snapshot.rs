@@ -55,6 +55,9 @@ pub struct Snapshot {
     /// Feedback values waiting for the next latch, by connection, as the
     /// source port produced them.
     pub feedback: BTreeMap<ConnectionId, String>,
+    /// The inputs the host wrote, of those with a value: what outlives an
+    /// instance. Values latched from feedback are the graph's, and start over.
+    pub host_written: BTreeMap<NodeId, BTreeSet<PortName>>,
     /// The nodes with a `run` in flight.
     pub in_flight: BTreeSet<NodeId>,
     /// The nodes owing a run.

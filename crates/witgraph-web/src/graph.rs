@@ -461,11 +461,12 @@ impl RunningGraph for WebRuntime {
         }
 
         // Nothing fails from here on, but building the instance.
+        let host_written = self.core().host_written_in(snapshot);
         {
             let mut retained = self.hub.retained.borrow_mut();
             *retained = IndexVec::from_fn(ports.inputs().len(), |_| None);
             for (input, val) in &inputs {
-                if self.core.connected(*input).is_none() {
+                if host_written.contains(*input) {
                     retained[*input] = Some(val.clone());
                 }
             }
@@ -477,7 +478,7 @@ impl RunningGraph for WebRuntime {
         if self.hub.built().await.is_ok() {
             let wrote = || -> Result<(), String> {
                 for (input, val) in &inputs {
-                    if self.core.connected(*input).is_some() {
+                    if !host_written.contains(*input) {
                         self.hub.set_input(*input, val)?;
                     }
                 }

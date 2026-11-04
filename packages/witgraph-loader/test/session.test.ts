@@ -1968,9 +1968,7 @@ test('an equal host write does not stick a required input after a fault', async 
   assert.equal(await session.graph.readOutput('r', 'out'), 1);
 });
 
-test('known bug: a new instance after a restore resets a loop', {
-  skip: 'a restore makes feedback values look written by the host',
-}, async () => {
+test('a new instance after a restore resets a loop', async () => {
   const session = await load(
     [
       ['busy', 'busy-loop'],

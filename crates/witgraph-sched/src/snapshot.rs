@@ -84,6 +84,7 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
         }
 
         // Nothing fails from here on.
+        let host_written = self.core().host_written_in(snapshot);
         self.core().restart_for_restore();
         let presence: Vec<InputIdx> = inputs
             .iter_enumerated()
@@ -99,7 +100,7 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
             .plane
             .lock()
             .restore(inputs, outputs, feedback, |input| {
-                self.core.connected(input).is_none()
+                host_written.contains(input)
             });
         self.core().apply_restore(&presence, &pending, snapshot);
         Ok(())

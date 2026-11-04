@@ -17,7 +17,7 @@ use futures::future::Either;
 use futures::stream::StreamExt;
 use witgraph_ir::{
     CompiledGraph, ComponentRef, Connection, ConnectionId, FeedbackIdx, Idx, IndexVec, InputIdx,
-    Link, NodeId, NodeIdx, OutputIdx, PortKind, PortSet, PortTable, ResourceId,
+    Link, NodeId, NodeIdx, OutputIdx, PortKind, PortName, PortSet, PortTable, ResourceId,
 };
 use witgraph_traits::{
     Command, ControlEvent, ControlKind, DataPlane, FaultReport, Incarnation, Latched, NodeFault,
@@ -1162,6 +1162,14 @@ impl SchedulerCore<dyn DataPlane> {
                 owed.insert(id.clone());
             }
         }
+        let mut host_written: BTreeMap<NodeId, BTreeSet<PortName>> = BTreeMap::new();
+        for input in self.host_written.iter() {
+            let port = &self.ports.inputs()[input].port;
+            host_written
+                .entry(port.node.clone())
+                .or_default()
+                .insert(port.port.clone());
+        }
         Snapshot {
             nodes: self.components.clone(),
             connections: self.connections.clone(),
@@ -1171,6 +1179,7 @@ impl SchedulerCore<dyn DataPlane> {
             inputs: BTreeMap::new(),
             outputs: BTreeMap::new(),
             feedback: BTreeMap::new(),
+            host_written,
             in_flight,
             owed,
         }
@@ -1216,7 +1225,33 @@ impl SchedulerCore<dyn DataPlane> {
         {
             return Err(mismatch(format!("`{node}` is not a node of this graph")));
         }
+        for (node, ports) in &snapshot.host_written {
+            for port in ports {
+                let writable = self
+                    .ports
+                    .input(node, port)
+                    .is_some_and(|input| self.connected[input].is_none());
+                if !writable {
+                    return Err(mismatch(format!(
+                        "the host cannot have written `{node}.{port}`"
+                    )));
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// The inputs `snapshot` says the host wrote: what survives the next instance.
+    pub fn host_written_in(&self, snapshot: &Snapshot) -> PortSet<InputIdx> {
+        let mut written = PortSet::new(self.ports.inputs().len());
+        for (node, ports) in &snapshot.host_written {
+            for port in ports {
+                if let Some(input) = self.ports.input(node, port) {
+                    written.insert(input);
+                }
+            }
+        }
+        written
     }
 
     /// Replaces the instance with a new one, its nodes yet to run, for a restore
@@ -1249,11 +1284,12 @@ impl SchedulerCore<dyn DataPlane> {
         pending: &[FeedbackIdx],
         snapshot: &Snapshot,
     ) {
+        let host_written = self.host_written_in(snapshot);
         self.presence = PortSet::new(self.ports.inputs().len());
         self.host_written = PortSet::new(self.ports.inputs().len());
         for input in presence {
             self.presence.insert(*input);
-            if self.connected[*input].is_none() {
+            if host_written.contains(*input) {
                 self.host_written.insert(*input);
             }
         }

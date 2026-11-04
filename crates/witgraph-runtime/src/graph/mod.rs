@@ -1118,11 +1118,12 @@ impl<M: RuntimeMode, H: Host> RunningGraph for RuntimeGraph<M, H> {
         }
 
         // Nothing fails from here on, but building the instance.
+        let host_written = self.core().host_written_in(snapshot);
         {
             let mut retained = lock(&self.core.plane.retained);
             *retained = IndexVec::from_fn(ports.inputs().len(), |_| None);
             for (input, val) in &inputs {
-                if self.core.connected(*input).is_none() {
+                if host_written.contains(*input) {
                     retained[*input] = Some(Arc::new(ValWrite(val.clone())));
                 }
             }
@@ -1133,7 +1134,7 @@ impl<M: RuntimeMode, H: Host> RunningGraph for RuntimeGraph<M, H> {
         if let Some(client) = self.client() {
             let connected: Vec<(InputIdx, Val)> = inputs
                 .into_iter()
-                .filter(|(input, _)| self.core.connected(*input).is_some())
+                .filter(|(input, _)| !host_written.contains(*input))
                 .collect();
             let written = client
                 .call(move |acc, hub| {
