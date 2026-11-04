@@ -21,7 +21,14 @@ use crate::topo;
 /// A rejected graph, handed back for correction alongside everything wrong
 /// with it.
 #[derive(Debug, Clone, thiserror::Error, miette::Diagnostic)]
-#[error("graph compilation failed with {} error(s)", diagnostics.errors().count())]
+#[error(
+    "graph compilation failed with {} error(s):{}",
+    diagnostics.errors().count(),
+    diagnostics
+        .errors()
+        .map(|d| format!("\n  - {d}"))
+        .collect::<String>()
+)]
 #[diagnostic(code(witgraph::ir::compilation_failed))]
 pub struct CompilationFailure {
     /// The rejected graph, returned so the caller can correct and retry.
@@ -2999,6 +3006,21 @@ mod tests {
             }],
             "with the wrong kind, a payload-type diagnostic would be noise"
         );
+    }
+
+    #[test]
+    fn a_failure_says_what_is_wrong_when_it_is_printed() {
+        let graph = builder("t")
+            .add_component(stream_with_threshold())
+            .add_node("t", cref("dst"))
+            .build();
+        let Err(failure) = graph.compile() else {
+            panic!("nothing feeds its inputs");
+        };
+        let text = failure.to_string();
+        assert!(text.contains("2 error(s)"), "{text}");
+        assert!(text.contains("`t.st`"), "{text}");
+        assert!(text.contains("`t.threshold`"), "{text}");
     }
 
     #[test]

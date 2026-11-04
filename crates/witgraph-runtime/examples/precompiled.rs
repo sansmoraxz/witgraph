@@ -22,7 +22,7 @@ fn graph(contract: &ComponentContract) -> Result<CompiledGraph, Box<dyn Error>> 
         .add_node("echo", contract.id.clone())
         .build()
         .compile(std::slice::from_ref(contract))
-        .map_err(|e| format!("{e:?}").into())
+        .map_err(|e| e.to_string().into())
 }
 
 #[cfg(feature = "compile")]

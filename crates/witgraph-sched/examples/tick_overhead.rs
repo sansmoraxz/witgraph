@@ -104,7 +104,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let compiled = builder
         .build()
         .compile(std::slice::from_ref(&contract))
-        .map_err(|e| format!("{e:?}"))?;
+        .map_err(|e| e.to_string())?;
 
     let mut ports = HashSet::new();
     for i in 0..nodes {

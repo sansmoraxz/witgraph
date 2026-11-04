@@ -59,7 +59,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let compiled = graph
             .clone()
             .compile(&contracts)
-            .map_err(|e| format!("{e:?}"))?;
+            .map_err(|e| e.to_string())?;
         // Lifting a `list<u8>` costs about 48 bytes of hostcall fuel a
         // byte: the default (4 GiB) stops a list of ~85 MiB leaving a node.
         let config = RuntimeConfig {

@@ -34,7 +34,7 @@ fn chain(nodes: usize, contracts: &[ComponentContract]) -> Result<CompiledGraph,
     Ok(builder
         .build()
         .compile(contracts)
-        .map_err(|e| format!("{e:?}"))?)
+        .map_err(|e| e.to_string())?)
 }
 
 #[tokio::main]
