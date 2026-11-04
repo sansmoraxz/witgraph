@@ -4,7 +4,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use witgraph_runtime::RunningGraph;
+use witgraph_runtime::{OutputReader, RunningGraph};
 
 use test_components::{
     BLOB_SINK, BLOB_SOURCE, BUSY_LOOP, BYTES_CONSUMER, CALC, CONFIGURABLE, ECHO, EDGE_DETECT,
@@ -15,8 +15,8 @@ use test_components::{
 use wasmtime::StoreContextMut;
 use wasmtime::component::{ComponentType, Lift, Lower, Resource, ResourceType};
 use witgraph_ir::{
-    Capability, ComponentContract, ComponentRef, Graph, GraphBuilder, NodeId, PortDirection,
-    PortRef, ResourceClaim,
+    Capability, CompiledGraph, ComponentContract, ComponentRef, Graph, GraphBuilder, NodeId,
+    PortDirection, PortRef, ResourceClaim,
 };
 use witgraph_runtime::{
     CapabilityPlugin, Host, HostState, LoadError, NodeFault, NodePhase, PluginData, Plugins,
@@ -2332,6 +2332,137 @@ async fn a_prepared_graph_is_for_the_components_it_was_prepared_with() {
         loaded.is_ok(),
         "the graph it was prepared for: {:?}",
         loaded.err().map(|err| err.to_string())
+    );
+}
+
+#[tokio::test]
+async fn reads_of_a_settled_graph_use_up_no_budget() {
+    let kit = Kit::new(&[ECHO]);
+    let graph = kit.builder("g").add_node("e", kit.get(ECHO)).build();
+    let config = RuntimeConfig {
+        fuel_per_run: Some(witgraph_runtime::Fuel(100_000)),
+        ..RuntimeConfig::default()
+    };
+    let mut rt = kit.load(graph, config, Trace::new()).await;
+    inject(&mut rt, "e", "in", Val::Float64(4.0)).await;
+    settle(&mut rt).await;
+    let reader = rt.reader();
+    // Each read costs a few dozen fuel, so these come to more than the budget.
+    for _ in 0..10_000 {
+        let read = reader.read_output(&id("e"), &"out".into()).await.unwrap();
+        assert_eq!(read, Some(Val::Float64(4.0)));
+    }
+    assert!(rt.take_faults().is_empty());
+}
+
+/// Whether a loop of one `echo` loads and ticks once on `budget`: if it does,
+/// whether it faulted, and whether its `run` had returned.
+async fn tick_on_budget(
+    prepared: &PreparedGraph,
+    graph: &dyn Fn() -> CompiledGraph,
+    budget: u64,
+) -> Option<(bool, bool)> {
+    let config = RuntimeConfig {
+        fuel_per_run: Some(witgraph_runtime::Fuel(budget)),
+        ..RuntimeConfig::default()
+    };
+    let mut rt = RuntimeGraph::load_prepared(
+        graph(),
+        prepared,
+        config,
+        Trace::new(),
+        witgraph_runtime::NoCapabilities,
+    )
+    .await
+    .ok()?;
+    let _ = rt.tick().await;
+    let faulted = !rt.take_faults().is_empty();
+    let returned = rt
+        .mode()
+        .take_trace()
+        .iter()
+        .any(|event| matches!(event, TraceEvent::RunReturned { .. }));
+    Some((faulted, returned))
+}
+
+#[tokio::test]
+async fn a_latch_does_not_pay_for_the_run_before_it() {
+    let kit = Kit::new(&[ECHO]);
+    let graph = || {
+        kit.builder("g")
+            .add_node("e", kit.get(ECHO))
+            .connect_feedback("ee", PortRef::new("e", "out"), PortRef::new("e", "in"))
+            .build()
+            .compile(&kit.contracts)
+            .expect("compiles")
+    };
+    let engine = RuntimeConfig::default().new_engine().unwrap();
+    let prepared = PreparedGraph::new(&engine, &graph(), &kit.wasm).unwrap();
+    let (mut low, mut high) = (1u64, 5_000_000u64);
+    assert_eq!(
+        tick_on_budget(&prepared, &graph, high).await,
+        Some((false, true))
+    );
+    while high - low > 1 {
+        let mid = low.midpoint(high);
+        match tick_on_budget(&prepared, &graph, mid).await {
+            Some((false, _)) => high = mid,
+            _ => low = mid,
+        }
+    }
+    // The least budget that faults is one the `run` itself runs out of.
+    assert_ne!(
+        tick_on_budget(&prepared, &graph, low).await,
+        Some((true, true)),
+        "the `run` returned in budget, and the graph still faulted"
+    );
+}
+
+#[tokio::test]
+async fn reads_do_not_extend_the_budget_of_guests_at_work() {
+    let kit = Kit::new(&[ECHO, STREAM_PRODUCER, STREAM_CONSUMER]);
+    let config = RuntimeConfig {
+        fuel_per_run: Some(witgraph_runtime::Fuel(5_000_000)),
+        ..RuntimeConfig::default()
+    };
+    // The run never ends on its own, and yields to the host as it goes.
+    let graph = kit
+        .builder("g")
+        .add_node("e", kit.get(ECHO))
+        .add_node("prod", kit.get(STREAM_PRODUCER))
+        .add_node("cons", kit.get(STREAM_CONSUMER))
+        .connect("s", port("prod", "items"), port("cons", "items"))
+        .build();
+    let mut rt = kit.load(graph, config, Trace::new()).await;
+    let reader = rt.reader();
+    let answered = std::sync::atomic::AtomicUsize::new(0);
+    let polling = async {
+        loop {
+            // Through the hub: a read that fails before it would cost nothing.
+            reader
+                .read_output(&id("e"), &"out".into())
+                .await
+                .expect("`e.out` is a Value port");
+            answered.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tokio::task::yield_now().await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::select! {
+            _ = rt.tick() => {}
+            () = polling => {}
+        }
+    })
+    .await
+    .expect("fuel ends the endless run, whatever the host reads");
+    assert!(answered.into_inner() > 0, "reads were served while it ran");
+    assert!(
+        matches!(
+            rt.node_state(&id("prod")).unwrap().fault_cause(),
+            Some(NodeFault::FuelExhausted)
+        ),
+        "{:?}",
+        rt.node_state(&id("prod")).unwrap().fault_cause()
     );
 }
 

@@ -697,6 +697,12 @@ async fn serve_commands<D: StoreData>(
             if lane.is_none()
                 && let Some(job) = jobs.pop_front()
             {
+                // With no guest at work, all that burns fuel is the hub doing what
+                // the host asked, which no `run` should pay for. A guest at work
+                // keeps its budget, so a host polling it cannot extend it.
+                if runs.is_empty() && acc.poll_no_interesting_tasks(cx).is_ready() {
+                    acc.with(|mut access| access.as_context_mut().set_fuel(budget))?;
+                }
                 lane = Some(start_job(job));
             }
             if let Some(job) = &mut lane

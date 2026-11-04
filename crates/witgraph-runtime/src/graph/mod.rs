@@ -79,11 +79,13 @@ pub struct RuntimeConfig {
     pub yield_interval: Fuel,
     /// Fuel the graph may burn between two `run` starts before it faults
     /// with [`NodeFault::FuelExhausted`](crate::NodeFault::FuelExhausted):
-    /// the fuel is reset to this budget before every `run` call, and
+    /// the fuel is reset to this budget before every `run` call, before every
+    /// host read, write or feedback latch made while no guest is at work, and
     /// instantiating the graph (start functions included) gets a budget of the
     /// same size. The budget is shared by everything executing in the graph,
-    /// spawned tasks included, so an endless stream exhausts any finite budget
-    /// eventually. `None` means effectively unlimited, instantiation included.
+    /// spawned tasks and a host's calls made while a guest is at work included, so
+    /// an endless stream exhausts any finite budget eventually. `None` means
+    /// effectively unlimited, instantiation included.
     pub fuel_per_run: Option<Fuel>,
     /// Bytes of linear memory and tables (8 bytes per element) the graph may
     /// hold in total. Growing past it faults the graph
