@@ -317,9 +317,25 @@ test.describe('WIT Graph Editor Demo', () => {
     await expect(status).toHaveClass(/ready/);
   });
 
-  test('a graph that stops compiling marks the nodes it is about', async ({ page }) => {
+  test('a graph that stops compiling marks what it is about, in the theme', async ({ page }) => {
     const canvas = page.locator('witgraph-canvas');
-    await expect(canvas.locator('svg .node-group.has-diagnostic')).toHaveCount(0);
+    const inspector = page.locator('witgraph-inspector');
+    const themed = (variable: string) =>
+      page.evaluate((variable) => {
+        const probe = document.createElement('div');
+        probe.style.color = `var(${variable})`;
+        document.body.appendChild(probe);
+        const colour = getComputedStyle(probe).color;
+        probe.remove();
+        return colour;
+      }, variable);
+    const stroke = (selector: string) =>
+      canvas
+        .locator(selector)
+        .first()
+        .evaluate((el) => getComputedStyle(el).stroke);
+    const errors = canvas.locator('svg .node-group.has-error');
+    await expect(errors).toHaveCount(0);
 
     // `relay-a` feeds `relay-b`, so this closes a cycle, which is for the next edit to mend.
     await canvas.evaluate((el: WitgraphCanvas) =>
@@ -330,20 +346,51 @@ test.describe('WIT Graph Editor Demo', () => {
       ),
     );
     await expect(page.locator('#status')).toHaveClass(/error/);
-    const marked = canvas.locator('svg .node-group.has-diagnostic');
-    await expect(marked.first()).toBeAttached();
-    await expect(marked.first().locator('title.diagnostics')).toContainText('cycle');
+    await expect(errors).toHaveCount(2);
+    await expect(errors.first().locator('title.diagnostics')).toContainText('cycle');
+    expect(await stroke('svg .node-group.has-error .node-body')).toBe(await themed('--wg-error'));
 
-    // The inspector says the same of the node, and not `relay-a.in` being fed only by
-    // feedback, which is a warning that stops nothing. (A locator of two would fail.)
-    await marked.first().click();
-    await expect(page.locator('witgraph-inspector').locator('.fault-bg')).toContainText('cycle');
+    // The inspector says the same of the node. (A locator of two would fail.)
+    await errors.first().click();
+    await expect(inspector.locator('.fault-bg')).toContainText('cycle');
 
     await canvas.evaluate((el: WitgraphCanvas) =>
       el.controller?.setConnectionFeedback('back', true),
     );
     await expect(page.locator('#status')).toHaveClass(/ready/);
-    await expect(canvas.locator('svg .node-group.has-diagnostic')).toHaveCount(0);
+    await expect(errors).toHaveCount(0);
+  });
+
+  test('what compiling warns of is marked, and does not stop the graph', async ({ page }) => {
+    const canvas = page.locator('witgraph-canvas');
+    const inspector = page.locator('witgraph-inspector');
+    const warned = canvas.locator('[data-node-id="relay-a"].has-warning');
+    // `relay-a.in` is fed only by feedback, and has a value injected, as the warning asks.
+    await expect(warned).toHaveCount(0);
+
+    await canvas.evaluate((el: WitgraphCanvas) => el.controller?.clearInput('relay-a', 'in'));
+    await expect(warned).toHaveCount(1);
+    await expect(page.locator('#status')).toHaveClass(/ready/);
+    await expect(warned.locator('title.diagnostics')).toContainText('fed only by feedback');
+    await canvas.evaluate((el: WitgraphCanvas) => el.controller?.select('relay-a'));
+    await expect(inspector.locator('.warning-bg')).toContainText('fed only by feedback');
+    await expect(inspector.locator('.fault-bg')).toHaveCount(0);
+
+    // A connection that does nothing is marked on the connection itself.
+    await canvas.evaluate((el: WitgraphCanvas) =>
+      el.controller?.setConnectionFeedback('a-to-b', true),
+    );
+    const edge = canvas.locator('svg path.edge.has-warning').first();
+    await expect(edge).toBeAttached();
+    const colour = await page.evaluate(() => {
+      const probe = document.createElement('div');
+      probe.style.color = 'var(--wg-warning)';
+      document.body.appendChild(probe);
+      const themed = getComputedStyle(probe).color;
+      probe.remove();
+      return themed;
+    });
+    expect(await edge.evaluate((el) => getComputedStyle(el).stroke)).toBe(colour);
   });
 
   test('the inspector says why a connection cannot be feedback', async ({ page }) => {

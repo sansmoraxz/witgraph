@@ -30,8 +30,10 @@ const SVG_CSS = `
   .node-group.selected { filter: drop-shadow(0 0 8px color-mix(in srgb, var(--wg-primary) 50%, transparent)) drop-shadow(0 2px 4px rgba(0,0,0,0.3)); }
   .node-group.selected .node-body { stroke: var(--wg-primary); stroke-width: 2; }
   .node-body { fill: url(#node-gradient); stroke: var(--wg-surface-hover); stroke-width: 1; rx: var(--_node-radius); }
-  .node-group.has-diagnostic .node-body { stroke: var(--wg-error); stroke-width: 2; }
-  .edge.has-diagnostic { stroke: var(--wg-error); }
+  .node-group.has-warning .node-body { stroke: var(--wg-warning); stroke-width: 2; }
+  .node-group.has-error .node-body { stroke: var(--wg-error); stroke-width: 2; }
+  .edge.has-warning { stroke: var(--wg-warning); }
+  .edge.has-error { stroke: var(--wg-error); }
   .node-header { rx: var(--_node-radius); }
   .node-header.pending { fill: var(--wg-phase-pending); }
   .node-header.running { fill: var(--wg-phase-running); }
@@ -389,7 +391,9 @@ export class WitgraphCanvas extends HTMLElement {
 
   /** Marks what compiling had something to say of, and says it on hovering. */
   #markDiagnostics(element: SVGElement, diagnostics: readonly Diagnostic[]): void {
-    element.classList.toggle('has-diagnostic', diagnostics.length > 0);
+    const error = diagnostics.some(({ severity }) => severity === 'error');
+    element.classList.toggle('has-error', error);
+    element.classList.toggle('has-warning', !error && diagnostics.length > 0);
     let title = element.querySelector(':scope > title.diagnostics');
     if (diagnostics.length === 0) {
       title?.remove();

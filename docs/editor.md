@@ -30,7 +30,8 @@ Put them anywhere on your page. They all share one `EditorController`.
   by kind (value, stream or future), and the editor refuses connections the
   rules of a load don't allow (`controller.canConnect` tells you why).
 - **See what's wrong.** A graph that doesn't compile marks the nodes and connections
-  at fault, and the inspector says why. `controller.diagnosticsForNode` and
+  at fault in `--wg-error`, and what compiling warns of in `--wg-warning`, and the
+  inspector says why. `controller.diagnosticsForNode` and
   `controller.diagnosticsForConnection` give you the same as data.
 - **Feedback.** Right-click a connection and choose _Mark as Feedback_ to make
   it a feedback edge, which cycles need.

@@ -57,6 +57,7 @@ const EXTRA_CSS = `
   }
   select:focus, input:focus, textarea:focus { border-color: var(--wg-primary); outline: none; }
   input[type="checkbox"] { accent-color: var(--wg-primary); width: 14px; height: 14px; cursor: pointer; padding: 0; }
+  .warning-bg { background: color-mix(in srgb, var(--wg-warning) 8%, transparent); border-left: 2px solid var(--wg-warning); }
   .fault-bg { background: color-mix(in srgb, var(--wg-error) 8%, transparent); border-left: 2px solid var(--wg-error); }
   .bp-bg { background: color-mix(in srgb, var(--wg-warning) 8%, transparent); border-left: 2px solid var(--wg-warning); }
   .port-val { white-space: pre-wrap; word-break: break-all; }
@@ -207,8 +208,13 @@ export class WitgraphInspector extends HTMLElement {
 
   /** What compiling says of what is shown, if anything. */
   #appendDiagnostics(wrap: HTMLElement, diagnostics: readonly Diagnostic[]): void {
-    for (const { message, help } of diagnostics) {
-      const entry = this.#el('div', 'fault-bg rounded-md p-3');
+    // What stops the graph comes before what does not.
+    const worstFirst = [...diagnostics].sort(
+      (a, b) => Number(b.severity === 'error') - Number(a.severity === 'error'),
+    );
+    for (const { severity, message, help } of worstFirst) {
+      const look = severity === 'error' ? 'fault-bg' : 'warning-bg';
+      const entry = this.#el('div', `${look} rounded-md p-3`);
       entry.appendChild(
         this.#el(
           'div',

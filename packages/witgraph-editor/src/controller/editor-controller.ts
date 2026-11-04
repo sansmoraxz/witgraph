@@ -145,7 +145,7 @@ export class EditorController extends EventTarget {
     ports: Map<string, { inputs: PortVisual[]; outputs: PortVisual[] }>;
   } | null = null;
   #compileError: string | null = null;
-  /** The errors that stop the graph compiling. */
+  /** What compiling last said of the graph, errors and warnings alike. */
   #compileDiagnostics: Diagnostic[] = [];
   /** Compiles what the graph would be, by the rules a load goes by. */
   #checker: GraphChecker | null = null;
@@ -198,21 +198,30 @@ export class EditorController extends EventTarget {
   get compileError(): string | null {
     return this.#compileError;
   }
-  /** What stops the graph compiling. Warnings are not here: they stop nothing. */
+  /**
+   * What compiling says of the graph: errors, when it does not compile, and warnings,
+   * which stop nothing, either way. An input fed only by feedback is left out once it
+   * has a value injected, as that is what the warning asks for, and compiling cannot
+   * see it.
+   */
   get compileDiagnostics(): readonly Diagnostic[] {
-    return this.#compileDiagnostics;
+    return this.#compileDiagnostics.filter(({ code, location }) => {
+      if (code !== 'witgraph::ir::feedback_only_input') return true;
+      const node = this.#graphJson?.nodes.find((n) => n.id === location.nodes[0]);
+      return node?.attrs?.[`inject.${location.port}`] === undefined;
+    });
   }
-  /** What stops the graph compiling that is about a node, or a connection of it. */
+  /** What compiling says about a node, or a connection of it. */
   diagnosticsForNode(id: string): readonly Diagnostic[] {
-    return this.#compileDiagnostics.filter(({ location }) => {
+    return this.compileDiagnostics.filter(({ location }) => {
       if (location.nodes.includes(id)) return true;
       const edge = this.#edges.find((e) => e.id === location.connection);
       return edge?.fromNode === id || edge?.toNode === id;
     });
   }
-  /** What stops the graph compiling that is about a connection. */
+  /** What compiling says about a connection. */
   diagnosticsForConnection(id: string): readonly Diagnostic[] {
-    return this.#compileDiagnostics.filter(({ location }) => location.connection === id);
+    return this.compileDiagnostics.filter(({ location }) => location.connection === id);
   }
   get compiles(): boolean {
     return this.#compileError === null && this.#session !== null;
@@ -998,7 +1007,6 @@ export class EditorController extends EventTarget {
     this.#graphJson = graphJson;
     await this.#createSession(graphJson);
     this.#compileError = null;
-    this.#compileDiagnostics = [];
     this.#mode = 'idle';
     this.#dispatch('state-changed');
   }
@@ -1860,6 +1868,7 @@ export class EditorController extends EventTarget {
 
     session = await Session.load(sessionOptions);
     this.#session = session;
+    this.#compileDiagnostics = [...session.diagnostics];
     // Each once, though every edit loads the graph again.
     for (const message of session.warnings) {
       if (this.#warned.has(message)) continue;
@@ -2115,7 +2124,6 @@ export class EditorController extends EventTarget {
       try {
         await this.#reload();
         this.#compileError = null;
-        this.#compileDiagnostics = [];
         if (hadError) {
           this.#traceEvents.push({
             event: 'compile-ok',
@@ -2127,9 +2135,7 @@ export class EditorController extends EventTarget {
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         this.#compileError = msg;
-        this.#compileDiagnostics = (diagnosticsOf(err) ?? []).filter(
-          ({ severity }) => severity === 'error',
-        );
+        this.#compileDiagnostics = diagnosticsOf(err) ?? [];
         this.#pushError(`Graph reload failed: ${msg}`);
       }
     } finally {

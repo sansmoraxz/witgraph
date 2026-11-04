@@ -801,7 +801,7 @@ test('what compiling says of a graph is on what it is about', async () => {
   assert.equal(controller.compiles, true);
 });
 
-test('only what stops a graph compiling is marked', async () => {
+test('a warning is said of a graph that compiles, and is not why one does not', async () => {
   const controller = await loadController(
     [
       ['a', 'relay'],
@@ -812,17 +812,27 @@ test('only what stops a graph compiling is marked', async () => {
       ['loop', 'a.out', 'a.in', true],
     ],
   );
-  // `a.in` is fed only by feedback, which is legal and says so with a warning.
+  const codes = () => controller.compileDiagnostics.map((d) => d.code);
   assert.equal(controller.compiles, true);
-  assert.deepEqual(controller.compileDiagnostics, []);
+  assert.deepEqual(codes(), ['witgraph::ir::feedback_only_input']);
+  const [warning] = controller.diagnosticsForNode('a');
+  assert.equal(warning.severity, 'warning');
+  assert.deepEqual(controller.diagnosticsForNode('b'), []);
 
   controller.addConnection('ba', { node: 'b', port: 'out' }, { node: 'a', port: 'add' });
-  await until(() => controller.compileDiagnostics.length > 0);
-  assert.deepEqual(
-    controller.compileDiagnostics.map((d) => d.code),
-    ['witgraph::ir::illegal_cycle'],
-  );
+  await until(() => controller.compileError !== null);
+  assert.deepEqual(codes(), ['witgraph::ir::feedback_only_input', 'witgraph::ir::illegal_cycle']);
   assert.doesNotMatch(controller.compileError ?? '', /fed only by feedback/);
+
+  controller.removeConnection('ba');
+  await until(() => controller.compiles);
+  assert.deepEqual(codes(), ['witgraph::ir::feedback_only_input'], 'the warning stays');
+
+  // Injecting a value is what the warning asks for.
+  await controller.injectValue('a', 'in', '1');
+  assert.deepEqual(codes(), []);
+  await controller.clearInput('a', 'in');
+  assert.deepEqual(codes(), ['witgraph::ir::feedback_only_input']);
 });
 
 test('what can feed an input is worked out once per graph', async () => {
