@@ -84,6 +84,19 @@ function release(seen: Observation): void {
 /** The most edits undo goes back over. */
 const MAX_UNDO = 50;
 
+/** Whether a connection may be, and if not, why, in the compiler's words. */
+export interface ConnectionCheck {
+  ok: boolean;
+  reason?: string;
+}
+
+/** What compiling said of connections, while the graph is as `graph` says. */
+interface ConnectionChecks {
+  graph: string;
+  outputs: Map<string, readonly CompatibleOutput[]>;
+  feedback: Map<string, ConnectionCheck>;
+}
+
 /** An output that can feed an input, as `compatibleOutputsForInput` lists them. */
 export interface CompatibleOutput {
   node: string;
@@ -137,10 +150,10 @@ export class EditorController extends EventTarget {
   /** Compiles what the graph would be, by the rules a load goes by. */
   #checker: GraphChecker | null = null;
   /**
-   * What can feed each input, for as long as the graph stays as `graph` says. Finding
-   * out compiles once per output, and the inspector asks on every state change.
+   * What compiling said of connections, for as long as the graph stays as `graph` says.
+   * Asking compiles, and the inspector asks of every port on every state change.
    */
-  #compatible: { graph: string; outputs: Map<string, readonly CompatibleOutput[]> } | null = null;
+  #checked: ConnectionChecks | null = null;
   #tickRate = 0;
   #componentContracts = new Map<number, Contract>();
 
@@ -700,10 +713,30 @@ export class EditorController extends EventTarget {
     return result;
   }
 
-  canBeFeedback(fromNode: string, fromPort: string): boolean {
-    const node = this.#nodes.get(fromNode);
-    const port = node?.outputs.find((p) => p.name === fromPort);
-    return port?.kind === 'value' || port?.kind === 'handle';
+  /**
+   * Whether this connection can be feedback, and if not, why: by the rules a load goes
+   * by, whether it exists yet or not.
+   */
+  canBeFeedback(
+    fromNode: string,
+    fromPort: string,
+    toNode: string,
+    toPort: string,
+  ): ConnectionCheck {
+    const { feedback } = this.#currentChecks();
+    const key = [fromNode, fromPort, toNode, toPort].join('\u0000');
+    let check = feedback.get(key);
+    if (!check) {
+      const reason = this.#connectionErrors(
+        { node: fromNode, port: fromPort },
+        { node: toNode, port: toPort },
+        true,
+        true,
+      ).find(({ code }) => code === 'witgraph::ir::async_feedback')?.message;
+      check = reason === undefined ? { ok: true } : { ok: false, reason };
+      feedback.set(key, check);
+    }
+    return check;
   }
 
   /** What compiles graphs against the loaded components, once one has loaded. */
@@ -720,26 +753,28 @@ export class EditorController extends EventTarget {
   }
 
   /**
-   * Why the graph could not have this connection, by the rules a load goes by: only
-   * what is wrong with the connection itself. A cycle is not, as marking a connection
+   * What is wrong with this connection by the rules a load goes by, were the graph to
+   * have it: only with the connection itself. A cycle is not, as marking a connection
    * of it feedback is the next edit, and the graph says so until then.
    */
-  #connectionProblem(
+  #connectionErrors(
     from: GraphJsonPortRef,
     to: GraphJsonPortRef,
     feedback: boolean,
     replacing: boolean,
-  ): string | undefined {
+  ): Diagnostic[] {
     const graph = this.#graphJson;
     const checker = this.#graphChecker();
-    if (!graph || !checker) return undefined;
-    let id = 'new';
-    for (let at = 2; graph.connections.some((c) => c.id === id); at++) id = `new-${at}`;
+    if (!graph || !checker) return [];
     const samePort = (a: GraphJsonPortRef, node?: string, port?: string) =>
       a.node === node && a.port === port;
     const others = graph.connections.filter(
       (c) => !(replacing && samePort(c.to, to.node, to.port)),
     );
+    // Its id is in what is said of it, so it says what it connects.
+    const name = `${from.node}.${from.port} -> ${to.node}.${to.port}`;
+    let id = name;
+    for (let at = 2; others.some((c) => c.id === id); at++) id = `${name} (${at})`;
     const candidate = {
       ...graph,
       connections: [...others, { id, from, to, ...(feedback ? { feedback: true } : {}) }],
@@ -749,15 +784,34 @@ export class EditorController extends EventTarget {
       said = checker.check(JSON.stringify(candidate)) as Diagnostic[];
     } catch {
       // Nothing to say of this connection: the next load says what is wrong.
-      return undefined;
+      return [];
     }
-    return said.find(({ severity, location }) => {
+    return said.filter(({ severity, location }) => {
       if (severity !== 'error') return false;
       if (location.connection === id) return true;
       if (location.kind !== 'port') return false;
       const [node] = location.nodes;
       return samePort(from, node, location.port) || samePort(to, node, location.port);
-    })?.message;
+    });
+  }
+
+  /** The first thing wrong with this connection, by `#connectionErrors`. */
+  #connectionProblem(
+    from: GraphJsonPortRef,
+    to: GraphJsonPortRef,
+    feedback: boolean,
+    replacing: boolean,
+  ): string | undefined {
+    return this.#connectionErrors(from, to, feedback, replacing)[0]?.message;
+  }
+
+  /** What was said of connections already, of the graph as it is now. */
+  #currentChecks(): ConnectionChecks {
+    const graph = `${JSON.stringify(this.#graphJson)}\u0000${[...this.#nodes.keys()].join()}`;
+    if (this.#checked?.graph !== graph) {
+      this.#checked = { graph, outputs: new Map(), feedback: new Map() };
+    }
+    return this.#checked;
   }
 
   /**
@@ -770,7 +824,7 @@ export class EditorController extends EventTarget {
     toNode: string,
     toPort: string,
     feedback = false,
-  ): { ok: boolean; reason?: string } {
+  ): ConnectionCheck {
     const reason = this.#connectionProblem(
       { node: fromNode, port: fromPort },
       { node: toNode, port: toPort },
@@ -781,13 +835,12 @@ export class EditorController extends EventTarget {
   }
 
   compatibleOutputsForInput(nodeId: string, portName: string): readonly CompatibleOutput[] {
-    const graph = `${JSON.stringify(this.#graphJson)}\u0000${[...this.#nodes.keys()].join()}`;
-    if (this.#compatible?.graph !== graph) this.#compatible = { graph, outputs: new Map() };
+    const { outputs: known } = this.#currentChecks();
     const key = `${nodeId}\u0000${portName}`;
-    let outputs = this.#compatible.outputs.get(key);
+    let outputs = known.get(key);
     if (!outputs) {
       outputs = this.#findCompatibleOutputs(nodeId, portName);
-      this.#compatible.outputs.set(key, outputs);
+      known.set(key, outputs);
     }
     return outputs;
   }
@@ -820,7 +873,7 @@ export class EditorController extends EventTarget {
     const problem = this.#connectionProblem(
       { node: fromNode, port: fromPort },
       { node: nodeId, port: portName },
-      feedback && this.canBeFeedback(fromNode, fromPort),
+      feedback && this.canBeFeedback(fromNode, fromPort, nodeId, portName).ok,
       true,
     );
     if (problem !== undefined) {
@@ -847,8 +900,11 @@ export class EditorController extends EventTarget {
     if (this.#locked()) return;
     const edge = this.#edges.find((e) => e.id === connId);
     if (!edge) return;
-    if (feedback && !this.canBeFeedback(edge.fromNode, edge.fromPort)) {
-      this.#pushError('Feedback is only valid on Value ports');
+    const check = feedback
+      ? this.canBeFeedback(edge.fromNode, edge.fromPort, edge.toNode, edge.toPort)
+      : { ok: true };
+    if (!check.ok) {
+      this.#pushError(`Cannot make it feedback: ${check.reason}`);
       return;
     }
     edge.feedback = feedback;
@@ -951,7 +1007,7 @@ export class EditorController extends EventTarget {
   #forgetChecker(): void {
     this.#checker?.free();
     this.#checker = null;
-    this.#compatible = null;
+    this.#checked = null;
   }
 
   dispose(): void {
@@ -1591,9 +1647,12 @@ export class EditorController extends EventTarget {
   addConnection(id: string, from: GraphJsonPortRef, to: GraphJsonPortRef, feedback = false): void {
     if (this.#locked()) return;
     if (!this.#graphJson) throw new Error('no graph loaded');
-    if (feedback && !this.canBeFeedback(from.node, from.port)) {
+    const asFeedback = feedback
+      ? this.canBeFeedback(from.node, from.port, to.node, to.port)
+      : { ok: true };
+    if (!asFeedback.ok) {
       feedback = false;
-      this.#pushError('Feedback downgraded: only Value ports support feedback');
+      this.#pushError(`Feedback downgraded: ${asFeedback.reason}`);
     }
     const check = this.canConnect(from.node, from.port, to.node, to.port, feedback);
     if (!check.ok) {

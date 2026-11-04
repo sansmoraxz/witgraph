@@ -1,5 +1,9 @@
 export type { Diagnostic } from 'witgraph-loader';
-export { EditorController } from './controller/editor-controller.ts';
+export {
+  type CompatibleOutput,
+  type ConnectionCheck,
+  EditorController,
+} from './controller/editor-controller.ts';
 export type {
   BreakpointState,
   CapabilityInfo,

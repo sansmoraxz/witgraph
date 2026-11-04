@@ -346,6 +346,17 @@ test.describe('WIT Graph Editor Demo', () => {
     await expect(canvas.locator('svg .node-group.has-diagnostic')).toHaveCount(0);
   });
 
+  test('the inspector says why a connection cannot be feedback', async ({ page }) => {
+    const inspector = page.locator('witgraph-inspector');
+    const canvas = page.locator('witgraph-canvas');
+    await canvas.evaluate((el: WitgraphCanvas) => el.controller?.selectEdge('stream'));
+    await expect(inspector).toContainText('carries a stream port');
+    await expect(inspector.locator('.toggle-track')).toHaveCount(0);
+
+    await canvas.evaluate((el: WitgraphCanvas) => el.controller?.selectEdge('a-to-b'));
+    await expect(inspector.locator('.toggle-track')).toHaveCount(1);
+  });
+
   test('the inspector describes the selected node by its component', async ({ page }) => {
     await page.locator('witgraph-canvas').locator('[data-node-id="relay-a"]').click();
     await expect(page.locator('witgraph-inspector').locator('.node-docs')).toContainText(

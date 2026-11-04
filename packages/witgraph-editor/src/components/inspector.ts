@@ -859,9 +859,14 @@ export class WitgraphInspector extends HTMLElement {
     row.appendChild(select);
     wrap.appendChild(row);
 
-    // Feedback checkbox (only when the port kind supports it)
+    // Feedback checkbox (only when the connection, or one it could be, can have it)
     let fbCheck: HTMLInputElement | null = null;
-    const canFeedback = port.kind === 'value';
+    const asFeedback = (fromNode: string, fromPort: string) =>
+      this.#controller?.canBeFeedback(fromNode, fromPort, node.id, port.name);
+    const connected = conn ? asFeedback(conn.fromNode, conn.fromPort) : undefined;
+    const canFeedback = conn
+      ? connected?.ok
+      : compatible.some((output) => asFeedback(output.node, output.port)?.ok);
     if (canFeedback) {
       const fbRow = this.#el('div', 'flex items-center gap-1 mt-1');
       fbCheck = document.createElement('input');
@@ -880,14 +885,8 @@ export class WitgraphInspector extends HTMLElement {
       fbLabel.textContent = 'Feedback (unit delay)';
       fbRow.append(fbCheck, fbLabel);
       wrap.appendChild(fbRow);
-    } else if (conn) {
-      wrap.appendChild(
-        this.#el(
-          'div',
-          'text-2xs text-wg-text-dim mt-1 italic',
-          `${port.kind} ports cannot be feedback`,
-        ),
-      );
+    } else if (connected?.reason) {
+      wrap.appendChild(this.#el('div', 'text-2xs text-wg-text-dim mt-1 italic', connected.reason));
     }
 
     select.dataset.structural = '';
@@ -999,11 +998,14 @@ export class WitgraphInspector extends HTMLElement {
     wrap.appendChild(flow);
 
     // Feedback toggle (Value ports only)
-    const srcNode = this.#controller?.nodes.get(edge.fromNode);
-    const srcPort = srcNode?.outputs.find((p) => p.name === edge.fromPort);
-    const isValue = srcPort?.kind === 'value';
+    const asFeedback = this.#controller?.canBeFeedback(
+      edge.fromNode,
+      edge.fromPort,
+      edge.toNode,
+      edge.toPort,
+    );
 
-    if (isValue) {
+    if (asFeedback?.ok) {
       const fbRow = this.#el('div', 'flex items-center gap-3 p-2 bg-wg-surface rounded-md');
       const track = this.#el('div', `toggle-track ${edge.feedback ? 'on' : ''}`);
       track.appendChild(this.#el('div', 'toggle-knob'));
@@ -1024,7 +1026,7 @@ export class WitgraphInspector extends HTMLElement {
         this.#el(
           'div',
           'text-xs text-wg-text-dim italic p-2 bg-wg-surface rounded-md',
-          `${srcPort?.kind ?? 'unknown'} ports cannot be feedback`,
+          asFeedback?.reason ?? '',
         ),
       );
     }

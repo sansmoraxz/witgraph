@@ -58,6 +58,7 @@ const ids: Record<string, string> = {
   'future-writer': 'test:future-writer/future-writer@0.1.0',
   'future-reader': 'test:future-reader/future-reader@0.1.0',
   'tensor-source': 'test:tensor-source/tensor-source@0.1.0',
+  'tensor-invert': 'test:tensor-invert/tensor-invert@0.1.0',
   'tensor-stream-source': 'test:tensor-stream-source/tensor-stream-source@0.1.0',
   'tensor-stream-invert': 'test:tensor-stream-invert/tensor-stream-invert@0.1.0',
   'tensor-stream-sink': 'test:tensor-stream-sink/tensor-stream-sink@0.1.0',
@@ -660,7 +661,9 @@ test('a stream of handles connects only to a stream of that resource', async () 
     ['inv'],
     '`src` fits by type, but it feeds `inv`, and a stream has one reader',
   );
-  assert.equal(controller.canBeFeedback('src', 'tensors'), false);
+  const asFeedback = controller.canBeFeedback('src', 'tensors', 'inv', 'tensors');
+  assert.equal(asFeedback.ok, false);
+  assert.match(asFeedback.reason ?? '', /carries a stream port/);
 });
 
 test('a preview keeps a reference to a stream of handles, one at a time', async () => {
@@ -878,4 +881,37 @@ test('feedback on what cannot have it is downgraded, not refused', async () => {
   const connection = controller.connectionForInput('c', 'items');
   assert.equal(connection?.fromNode, 'q');
   assert.equal(connection?.feedback, false);
+});
+
+test('feedback goes by the rules a load goes by: a handle can have it, a stream cannot', async () => {
+  const tensors = cpuTensors();
+  const controller = await loadController(
+    [
+      ['source', 'tensor-source'],
+      ['invert', 'tensor-invert'],
+      ['nums', 'stream-producer'],
+      ['take', 'stream-consumer'],
+    ],
+    [
+      ['handle', 'source.tensor', 'invert.tensor'],
+      ['stream', 'nums.items', 'take.items'],
+    ],
+    { capabilities: tensors.capabilities },
+  );
+  assert.deepEqual(controller.canBeFeedback('source', 'tensor', 'invert', 'tensor'), { ok: true });
+
+  const errors: string[] = [];
+  controller.addEventListener('trace-event', () => {
+    for (const { event, message } of controller.traceEvents)
+      if (event === 'error' && message) errors.push(message);
+  });
+  controller.setConnectionFeedback('stream', true);
+  assert.equal(controller.connectionForInput('take', 'items')?.feedback, false);
+  assert.ok(
+    errors.some((e) => /carries a stream port; .* values or handles/.test(e)),
+    `the compiler's reason, not a copy of it: ${errors}`,
+  );
+
+  controller.setConnectionFeedback('handle', true);
+  assert.equal(controller.connectionForInput('invert', 'tensor')?.feedback, true);
 });
