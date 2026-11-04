@@ -32,6 +32,8 @@ pub use control::{
     DEFAULT_MAX_STEPS_PER_TICK, PortVersions, SchedulerCore, check_max_steps_per_tick,
     check_resources,
 };
-pub use hub::{HubPorts, PortSlot, latched_output, not_a_value_output};
+pub use hub::{
+    HubPorts, PortSlot, ReturnedNumbers, decode_returned, latched_output, not_a_value_output,
+};
 pub use witgraph_ir;
 pub use witgraph_traits::*;

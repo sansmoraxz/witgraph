@@ -30,7 +30,7 @@ use crate::link::{self, Composed};
 use crate::live::{Live, LiveMode, LiveState};
 use crate::plane::{Callbacks, WebHub, WebPlane, stream_inputs};
 use crate::value::{Data, check_type, from_js, parse_wave, set, set_field, with_key};
-use witgraph_wit::hub::{self, HubMember};
+use witgraph_wit::hub::{self, CompositeImport, HubMember};
 
 /// Reads a graph's latched outputs, as jco represents them, also while it
 /// ticks.
@@ -792,21 +792,23 @@ impl WebGraph {
             .iter()
             .map(|name| -> Result<JsValue, JsError> {
                 let object = Object::new();
-                let number = |prefix: &str, suffix: &str| {
-                    name.strip_prefix(prefix)
-                        .and_then(|rest| rest.strip_suffix(suffix))
-                        .and_then(|at| at.parse::<usize>().ok())
-                        .and_then(|at| order.get(at))
-                };
-                if let Some(node) = number("node-", "-host") {
-                    set(&object, "kind", &text("host"));
-                    set(&object, "node", &text(node.as_str()));
-                    return Ok(object.into());
-                }
-                if let Some(node) = number("m", "").filter(|node| self.mocked.contains(node)) {
-                    set(&object, "kind", &text("mock"));
-                    set(&object, "node", &text(node.as_str()));
-                    return Ok(object.into());
+                match CompositeImport::parse(name) {
+                    CompositeImport::Host(at) => {
+                        if let Some(node) = order.get(at) {
+                            set(&object, "kind", &text("host"));
+                            set(&object, "node", &text(node.as_str()));
+                            return Ok(object.into());
+                        }
+                    }
+                    // A capability can have such a name too.
+                    CompositeImport::Member(at) => {
+                        if let Some(node) = order.get(at).filter(|n| self.mocked.contains(n)) {
+                            set(&object, "kind", &text("mock"));
+                            set(&object, "node", &text(node.as_str()));
+                            return Ok(object.into());
+                        }
+                    }
+                    CompositeImport::Other(_) => {}
                 }
                 if unversioned(name) == unversioned(hub::LEND_INTERFACE) {
                     set(&object, "kind", &text("lend"));

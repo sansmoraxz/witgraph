@@ -33,6 +33,39 @@ pub const PORTS_INTERFACE: &str = "witgraph:hub/ports@0.1.0";
 /// The interface a hub imports to show the host a handle.
 pub const LEND_INTERFACE: &str = "witgraph:hub/lend@0.1.0";
 
+/// A function of [`CONTROL_INTERFACE`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlFunc {
+    /// `run: async func(member: u32) -> returned`.
+    Run,
+    /// `clear-input: func(input: u32) -> bool`.
+    ClearInput,
+    /// `latch-feedback: func(connection: u32) -> latched`.
+    LatchFeedback,
+    /// `drop-feedback: func(connection: u32)`.
+    DropFeedback,
+}
+
+impl ControlFunc {
+    /// Every one of them.
+    pub const ALL: [ControlFunc; 4] = [
+        ControlFunc::Run,
+        ControlFunc::ClearInput,
+        ControlFunc::LatchFeedback,
+        ControlFunc::DropFeedback,
+    ];
+
+    /// Its name in WIT.
+    pub const fn name(self) -> &'static str {
+        match self {
+            ControlFunc::Run => "run",
+            ControlFunc::ClearInput => "clear-input",
+            ControlFunc::LatchFeedback => "latch-feedback",
+            ControlFunc::DropFeedback => "drop-feedback",
+        }
+    }
+}
+
 /// The name of the function reading an output: `() -> option<T>`.
 pub fn get_output(output: OutputIdx) -> String {
     format!("get-output-{}", output.position())
@@ -102,4 +135,61 @@ pub fn member_import(node: usize) -> String {
 /// [`PortTable`](witgraph_ir::PortTable).
 pub fn host_import(node: usize) -> String {
     format!("node-{node}-host")
+}
+
+/// What a composite's import is, by its name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompositeImport<'a> {
+    /// A member's `node` interface ([`member_import`]), when it is mocked.
+    Member(usize),
+    /// A node's `witgraph:runtime/host` ([`host_import`]).
+    Host(usize),
+    /// Anything else: [`LEND_INTERFACE`], or a capability.
+    Other(&'a str),
+}
+
+impl<'a> CompositeImport<'a> {
+    /// The inverse of [`member_import`] and [`host_import`]. A capability may be
+    /// named like a member (`m0`): only the caller knows which nodes are mocked.
+    pub fn parse(name: &'a str) -> Self {
+        let number = |text: &str| text.parse::<usize>().ok();
+        let host = name
+            .strip_prefix("node-")
+            .and_then(|rest| rest.strip_suffix("-host"))
+            .and_then(number);
+        if let Some(node) = host {
+            return Self::Host(node);
+        }
+        match name.strip_prefix('m').and_then(number) {
+            Some(node) => Self::Member(node),
+            None => Self::Other(name),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_import_name_parses_back() {
+        assert_eq!(
+            CompositeImport::parse(&member_import(3)),
+            CompositeImport::Member(3)
+        );
+        assert_eq!(
+            CompositeImport::parse(&host_import(7)),
+            CompositeImport::Host(7)
+        );
+        for other in [
+            LEND_INTERFACE,
+            "mqtt",
+            "node-x-host",
+            "m",
+            "m1x",
+            "test:a/b@1.0.0",
+        ] {
+            assert_eq!(CompositeImport::parse(other), CompositeImport::Other(other));
+        }
+    }
 }

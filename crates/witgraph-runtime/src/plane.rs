@@ -29,9 +29,9 @@ use wasmtime::{AsContextMut, Engine, Store};
 use witgraph_ir::{FeedbackIdx, Idx, IndexVec, InputIdx, NodeId, NodeIdx, OutputIdx, PortTable};
 use witgraph_sched::{
     BoxFuture, Command, ControlEvent, ControlKind, DataPlane, HubPorts, Latched, NodeFault,
-    Outcome, PortSlot, Returned, RuntimeError, Serving, boxed,
+    Outcome, PortSlot, Returned, ReturnedNumbers, RuntimeError, Serving, boxed, decode_returned,
 };
-use witgraph_wit::hub;
+use witgraph_wit::hub::{self, ControlFunc};
 
 use crate::engine::{self, Host, HostState, StoreData, StoreSettings, classify};
 use crate::graph::PortTypes;
@@ -67,30 +67,19 @@ enum RawLatched {
     Cleared,
 }
 
-/// Numbers from a hub as numbers of `len` ports. The one place they are trusted:
-/// nothing else sees a raw one.
-fn decode<I: Idx>(raw: Vec<u32>, len: usize) -> wasmtime::Result<Vec<I>> {
-    raw.into_iter()
-        .map(|at| {
-            let at = at as usize;
-            if at >= len {
-                wasmtime::bail!("the hub named port {at} of {len}");
-            }
-            Ok(I::at(at))
-        })
-        .collect()
-}
-
 impl RawReturned {
     fn decode(self, ports: &PortTable) -> wasmtime::Result<Returned> {
-        let inputs = ports.inputs().len();
-        Ok(Returned {
-            outputs_changed: decode(self.outputs_changed, ports.outputs().len())?,
-            inputs_changed: decode(self.inputs_changed, inputs)?,
-            inputs_recorded: decode(self.inputs_recorded, inputs)?,
-            inputs_cleared: decode(self.inputs_cleared, inputs)?,
-            feedback_buffered: decode(self.feedback_buffered, ports.feedback().len())?,
-        })
+        decode_returned(
+            ports,
+            ReturnedNumbers {
+                outputs_changed: &self.outputs_changed,
+                inputs_changed: &self.inputs_changed,
+                inputs_recorded: &self.inputs_recorded,
+                inputs_cleared: &self.inputs_cleared,
+                feedback_buffered: &self.feedback_buffered,
+            },
+        )
+        .map_err(|message| wasmtime::format_err!("{message}"))
     }
 }
 
@@ -118,17 +107,17 @@ impl HubExports {
         };
         let control = interface(hub::CONTROL_INTERFACE)?;
         let port_funcs = interface(hub::PORTS_INTERFACE)?;
-        let of_control = |name: &str| {
+        let of_control = |func: ControlFunc| {
             component
-                .get_export_index(Some(&control), name)
-                .ok_or_else(|| wasmtime::format_err!("the hub's control has no `{name}`"))
+                .get_export_index(Some(&control), func.name())
+                .ok_or_else(|| wasmtime::format_err!("the hub's control has no `{}`", func.name()))
         };
         let of_ports = |name: String| component.get_export_index(Some(&port_funcs), &name);
         Ok(Self {
-            run: of_control("run")?,
-            clear_input: of_control("clear-input")?,
-            latch_feedback: of_control("latch-feedback")?,
-            drop_feedback: of_control("drop-feedback")?,
+            run: of_control(ControlFunc::Run)?,
+            clear_input: of_control(ControlFunc::ClearInput)?,
+            latch_feedback: of_control(ControlFunc::LatchFeedback)?,
+            drop_feedback: of_control(ControlFunc::DropFeedback)?,
             get_output: IndexVec::from_fn(ports.outputs().len(), |at| {
                 of_ports(hub::get_output(at))
             }),

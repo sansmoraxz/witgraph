@@ -25,9 +25,10 @@ use witgraph_ir::{
 };
 use witgraph_sched::{
     BoxFuture, Command, ControlEvent, ControlKind, DataPlane, HubPorts, Incarnation, Latched,
-    NodeFault, Outcome, PortSlot, Returned, RuntimeError, Serving, boxed,
+    NodeFault, Outcome, PortSlot, Returned, ReturnedNumbers, RuntimeError, Serving, boxed,
+    decode_returned,
 };
-use witgraph_wit::hub;
+use witgraph_wit::hub::{self, ControlFunc};
 
 use crate::value::{Data, camel, describe, parse_wave};
 
@@ -123,36 +124,33 @@ pub(crate) enum ReadFailure {
     Decode(String),
 }
 
-/// A list of port numbers of a `returned`.
-fn numbers<I: Idx>(returned: &JsValue, field: &str, len: usize) -> Result<Vec<I>, String> {
+/// A list of port numbers of a `returned`, as numbers.
+fn numbers(returned: &JsValue, field: &str) -> Result<Vec<u32>, String> {
     let list =
         Reflect::get(returned, &JsValue::from_str(field)).map_err(|_| format!("no `{field}`"))?;
-    let list = Array::from(&list);
-    list.iter()
+    Array::from(&list)
+        .iter()
         .map(|at| {
-            let at = at
-                .as_f64()
-                .ok_or_else(|| format!("`{field}` holds a non-number"))?
-                as usize;
-            if at >= len {
-                return Err(format!("the hub named port {at} of {len}"));
-            }
-            Ok(I::at(at))
+            at.as_f64()
+                .filter(|at| at.fract() == 0.0 && (0.0..=f64::from(u32::MAX)).contains(at))
+                .map(|at| at as u32)
+                .ok_or_else(|| format!("`{field}` holds what is no port number"))
         })
         .collect()
 }
 
-/// What the hub's `run` returned, as the scheduler needs it. The one place the
-/// numbers are trusted.
-fn decode_returned(returned: &JsValue, ports: &PortTable) -> Result<Returned, String> {
-    let inputs = ports.inputs().len();
-    Ok(Returned {
-        outputs_changed: numbers(returned, "outputsChanged", ports.outputs().len())?,
-        inputs_changed: numbers(returned, "inputsChanged", inputs)?,
-        inputs_recorded: numbers(returned, "inputsRecorded", inputs)?,
-        inputs_cleared: numbers(returned, "inputsCleared", inputs)?,
-        feedback_buffered: numbers(returned, "feedbackBuffered", ports.feedback().len())?,
-    })
+/// What the hub's `run` returned, as the scheduler needs it.
+fn returned_of(returned: &JsValue, ports: &PortTable) -> Result<Returned, String> {
+    decode_returned(
+        ports,
+        ReturnedNumbers {
+            outputs_changed: &numbers(returned, "outputsChanged")?,
+            inputs_changed: &numbers(returned, "inputsChanged")?,
+            inputs_recorded: &numbers(returned, "inputsRecorded")?,
+            inputs_cleared: &numbers(returned, "inputsCleared")?,
+            feedback_buffered: &numbers(returned, "feedbackBuffered")?,
+        },
+    )
 }
 
 /// A graph's hub, on this host.
@@ -302,7 +300,9 @@ impl WebHub {
 
     pub(crate) fn clear_input(&self, input: InputIdx) -> Result<bool, String> {
         let number = JsValue::from(input.position() as u32);
-        Ok(self.call("control", "clear-input", &[number])?.is_truthy())
+        Ok(self
+            .call("control", ControlFunc::ClearInput.name(), &[number])?
+            .is_truthy())
     }
 
     pub(crate) fn read_handle(&self, output: OutputIdx) -> Result<Option<JsValue>, ReadFailure> {
@@ -431,7 +431,7 @@ async fn serve(
                 let (node, result): CallDone = done;
                 let id = hub.ports.node_id(node).clone();
                 let returned = result.map_err(|error| fault_of(&error, Some(id), false))?;
-                let returned = decode_returned(&returned, &hub.ports).map_err(trap)?;
+                let returned = returned_of(&returned, &hub.ports).map_err(trap)?;
                 send(ControlKind::RunReturned { node, returned });
             }
             error = traps.select_next_some() => {
@@ -452,7 +452,7 @@ async fn serve(
                 Some(Command::LatchFeedback(connection)) => {
                     let number = JsValue::from(connection.position() as u32);
                     let latched = hub
-                        .call("control", "latch-feedback", &[number])
+                        .call("control", ControlFunc::LatchFeedback.name(), &[number])
                         .map_err(trap)?;
                     let latched = match latched.as_string().as_deref() {
                         Some("unchanged") => Latched::Unchanged,
@@ -468,7 +468,7 @@ async fn serve(
                 }
                 Some(Command::DropFeedback(connection)) => {
                     let number = JsValue::from(connection.position() as u32);
-                    hub.call("control", "drop-feedback", &[number]).map_err(trap)?;
+                    hub.call("control", ControlFunc::DropFeedback.name(), &[number]).map_err(trap)?;
                 }
                 Some(Command::AwaitQuiet(at)) => send(ControlKind::Quiet(at)),
                 None => closed = true,

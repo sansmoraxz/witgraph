@@ -24,9 +24,9 @@ use super::module::{
 };
 use super::text::{Printer, Resources};
 use super::{
-    CONTROL_INTERFACE, HubError, HubMember, LEND_INTERFACE, PORTS_INTERFACE, get_feedback,
-    get_input, get_output, give_stream, lend_handle, read_handle, set_feedback, set_input,
-    set_output, take_stream,
+    CONTROL_INTERFACE, ControlFunc, HubError, HubMember, LEND_INTERFACE, PORTS_INTERFACE,
+    get_feedback, get_input, get_output, give_stream, lend_handle, read_handle, set_feedback,
+    set_input, set_output, take_stream,
 };
 
 /// The fixed part of a hub's world.
@@ -44,7 +44,6 @@ interface control {
     clear-input: func(input: u32) -> bool;
     latch-feedback: func(connection: u32) -> latched;
     drop-feedback: func(connection: u32);
-    deliver-output: func(member: u32) -> returned;
 }
 ";
 
@@ -844,7 +843,7 @@ impl<'a> Core<'a> {
                 }
             }
         }
-        let run = self.func_of(&self.control, "run")?;
+        let run = self.func_of(&self.control, ControlFunc::Run.name())?;
         let (from, name, sig) =
             run.task_return_import(self.resolve, Some(&self.control), Mangling::Legacy);
         let task_return = module.import(&from, &name, &sig_of(&sig));
@@ -1949,7 +1948,7 @@ impl<'a> Core<'a> {
         completes: &[FuncIdx<Helper>],
     ) -> Result<(), HubError> {
         let mangling = ManglingAndAbi::Legacy(LiftLowerAbi::AsyncCallback);
-        let run = self.func_of(&self.control, "run")?;
+        let run = self.func_of(&self.control, ControlFunc::Run.name())?;
         let export = |kind| {
             self.resolve.wasm_export_name(
                 mangling,
@@ -2090,7 +2089,10 @@ impl<'a> Core<'a> {
             .op(I::I32Add)
             .call(rt.slot_clear);
         module.define(f, b);
-        module.export(&export(self.func_of(&self.control, "clear-input")?), f);
+        module.export(
+            &export(self.func_of(&self.control, ControlFunc::ClearInput.name())?),
+            f,
+        );
 
         // drop-feedback(connection)
         let sig = Sig::i32s(1, 0);
@@ -2104,7 +2106,10 @@ impl<'a> Core<'a> {
             .call(rt.slot_clear)
             .op(I::Drop);
         module.define(f, b);
-        module.export(&export(self.func_of(&self.control, "drop-feedback")?), f);
+        module.export(
+            &export(self.func_of(&self.control, ControlFunc::DropFeedback.name())?),
+            f,
+        );
 
         // latch-feedback(connection) -> latched: 0 unchanged, 1 changed, 2 cleared.
         let sig = Sig::i32s(1, 1);
@@ -2174,49 +2179,10 @@ impl<'a> Core<'a> {
         }
         b.int_const(0);
         module.define(f, b);
-        module.export(&export(self.func_of(&self.control, "latch-feedback")?), f);
-
-        // deliver-output(member) -> returned: every output set by hand.
-        let sig = Sig::i32s(1, 1);
-        let f: FuncIdx<Helper> = module.declare(&sig);
-        let (mut b, params) = Body::new(&sig);
-        let counts = ListCounts::new(&mut b);
-        for (at, member) in self.members.iter().enumerate() {
-            b.get(params[0])
-                .int_const(at as u32)
-                .op(I::I32Eq)
-                .when(|b| {
-                    for (index, field) in &member.outputs {
-                        let Some(index) = index else { continue };
-                        if field.kind.is_async() {
-                            continue;
-                        }
-                        let held = self.output_slot(*index);
-                        let (block, value) = (b.int(), b.int());
-                        b.load32(held).set(block);
-                        b.load32(Place::Fixed(held).offset(Offset(4))).set(value);
-                        b.get(block).when(|b| {
-                            self.emit_push(b, &counts, List::Outputs, index.position() as u32);
-                            for edge in self.edges.get(index).into_iter().flatten() {
-                                self.emit_edge(b, rt, &counts, *edge, block, value);
-                            }
-                        });
-                    }
-                });
-        }
-        let area = self.return_area;
-        for list in 0..5u32 {
-            let at = Place::Fixed(area).offset(Offset(list * 8));
-            b.store32(at, |b| {
-                b.int_const(self.lists[list as usize].0);
-            });
-            b.store32(at.offset(Offset(4)), |b| {
-                b.get(counts.0[list as usize]);
-            });
-        }
-        b.int_const(area.0);
-        module.define(f, b);
-        module.export(&export(self.func_of(&self.control, "deliver-output")?), f);
+        module.export(
+            &export(self.func_of(&self.control, ControlFunc::LatchFeedback.name())?),
+            f,
+        );
         Ok(())
     }
 
@@ -2472,5 +2438,18 @@ struct ListCounts([Local; 5]);
 impl ListCounts {
     fn new(b: &mut Body) -> Self {
         Self([b.int(), b.int(), b.int(), b.int(), b.int()])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_control_interface_declares_every_function() {
+        for func in ControlFunc::ALL {
+            let declared = format!("{}: ", func.name());
+            assert!(CONTROL_WIT.contains(&declared), "{declared}");
+        }
     }
 }

@@ -10,7 +10,7 @@ use witgraph_ir::{
     PortTable,
 };
 use witgraph_traits::{
-    BoxFuture, DataPlane, MaybeSend, PortValues, RuntimeError, Snapshot, SnapshotError,
+    BoxFuture, DataPlane, MaybeSend, PortValues, Returned, RuntimeError, Snapshot, SnapshotError,
 };
 
 use crate::control::SchedulerCore;
@@ -96,6 +96,46 @@ pub trait HubPorts: DataPlane {
 
     /// The value at `slot`.
     fn read(&self, slot: PortSlot) -> BoxFuture<Result<Option<Self::Value>, String>>;
+}
+
+/// A `returned`, as the hub numbers things: not to be trusted yet.
+#[derive(Debug, Clone, Copy)]
+pub struct ReturnedNumbers<'a> {
+    /// `outputs-changed`.
+    pub outputs_changed: &'a [u32],
+    /// `inputs-changed`.
+    pub inputs_changed: &'a [u32],
+    /// `inputs-recorded`.
+    pub inputs_recorded: &'a [u32],
+    /// `inputs-cleared`.
+    pub inputs_cleared: &'a [u32],
+    /// `feedback-buffered`.
+    pub feedback_buffered: &'a [u32],
+}
+
+/// What a hub's `run` returned, as the scheduler needs it: the one place its
+/// numbers are trusted, on any host, and nothing past here sees a raw one.
+pub fn decode_returned(ports: &PortTable, raw: ReturnedNumbers<'_>) -> Result<Returned, String> {
+    fn decoded<I: witgraph_ir::Idx>(numbers: &[u32], len: usize) -> Result<Vec<I>, String> {
+        numbers
+            .iter()
+            .map(|at| {
+                let at = *at as usize;
+                if at >= len {
+                    return Err(format!("the hub named port {at} of {len}"));
+                }
+                Ok(I::at(at))
+            })
+            .collect()
+    }
+    let inputs = ports.inputs().len();
+    Ok(Returned {
+        outputs_changed: decoded(raw.outputs_changed, ports.outputs().len())?,
+        inputs_changed: decoded(raw.inputs_changed, inputs)?,
+        inputs_recorded: decoded(raw.inputs_recorded, inputs)?,
+        inputs_cleared: decoded(raw.inputs_cleared, inputs)?,
+        feedback_buffered: decoded(raw.feedback_buffered, ports.feedback().len())?,
+    })
 }
 
 /// That `node` exists and `port` is an output of it of a latched kind, and which.
