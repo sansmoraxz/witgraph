@@ -294,6 +294,8 @@ impl Body {
         step: impl FnOnce(&mut Body, Local),
     ) -> &mut Self {
         let i = self.int();
+        // A local holds its value from the last time round an enclosing loop.
+        self.int_const(0).set(i);
         self.op(Instruction::Block(wasm_encoder::BlockType::Empty));
         self.op(Instruction::Loop(wasm_encoder::BlockType::Empty));
         self.get(i)
