@@ -28,7 +28,10 @@ Put them anywhere on your page. They all share one `EditorController`.
 - **Add** a node by dragging a component from the catalog.
 - **Connect** ports by dragging from an output to an input. Ports are coloured
   by kind (value, stream or future), and the editor refuses connections the
-  contracts don't allow (`controller.canConnect` tells you why).
+  rules of a load don't allow (`controller.canConnect` tells you why).
+- **See what's wrong.** A graph that doesn't compile marks the nodes and connections
+  at fault, and the inspector says why. `controller.diagnosticsForNode` and
+  `controller.diagnosticsForConnection` give you the same as data.
 - **Feedback.** Right-click a connection and choose _Mark as Feedback_ to make
   it a feedback edge, which cycles need.
 - **Rename and label** nodes, and set their attributes, in the inspector.

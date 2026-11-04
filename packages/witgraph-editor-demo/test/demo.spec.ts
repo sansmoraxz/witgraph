@@ -317,6 +317,35 @@ test.describe('WIT Graph Editor Demo', () => {
     await expect(status).toHaveClass(/ready/);
   });
 
+  test('a graph that stops compiling marks the nodes it is about', async ({ page }) => {
+    const canvas = page.locator('witgraph-canvas');
+    await expect(canvas.locator('svg .node-group.has-diagnostic')).toHaveCount(0);
+
+    // `relay-a` feeds `relay-b`, so this closes a cycle, which is for the next edit to mend.
+    await canvas.evaluate((el: WitgraphCanvas) =>
+      el.controller?.addConnection(
+        'back',
+        { node: 'relay-b', port: 'out' },
+        { node: 'relay-a', port: 'add' },
+      ),
+    );
+    await expect(page.locator('#status')).toHaveClass(/error/);
+    const marked = canvas.locator('svg .node-group.has-diagnostic');
+    await expect(marked.first()).toBeAttached();
+    await expect(marked.first().locator('title.diagnostics')).toContainText('cycle');
+
+    // The inspector says the same of the node, and not `relay-a.in` being fed only by
+    // feedback, which is a warning that stops nothing. (A locator of two would fail.)
+    await marked.first().click();
+    await expect(page.locator('witgraph-inspector').locator('.fault-bg')).toContainText('cycle');
+
+    await canvas.evaluate((el: WitgraphCanvas) =>
+      el.controller?.setConnectionFeedback('back', true),
+    );
+    await expect(page.locator('#status')).toHaveClass(/ready/);
+    await expect(canvas.locator('svg .node-group.has-diagnostic')).toHaveCount(0);
+  });
+
   test('the inspector describes the selected node by its component', async ({ page }) => {
     await page.locator('witgraph-canvas').locator('[data-node-id="relay-a"]').click();
     await expect(page.locator('witgraph-inspector').locator('.node-docs')).toContainText(

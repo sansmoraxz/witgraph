@@ -1,4 +1,5 @@
 import { createElement, History, Trash2 } from 'lucide';
+import type { Diagnostic } from 'witgraph-loader';
 import type { EditorController } from '../controller/editor-controller.ts';
 import type { NodeVisual, PortVisual } from '../controller/types.ts';
 import { defaultViewer, describeHandle } from '../controller/visual.ts';
@@ -202,6 +203,22 @@ export class WitgraphInspector extends HTMLElement {
     if (handle) return describeHandle(value, handle.resource);
     if (weight(value) > MAX_WAVE_BYTES) return `${summarize(value)} (too large to show as WAVE)`;
     return this.#controller?.outputWave(node, port) ?? '…';
+  }
+
+  /** What compiling says of what is shown, if anything. */
+  #appendDiagnostics(wrap: HTMLElement, diagnostics: readonly Diagnostic[]): void {
+    for (const { message, help } of diagnostics) {
+      const entry = this.#el('div', 'fault-bg rounded-md p-3');
+      entry.appendChild(
+        this.#el(
+          'div',
+          'font-mono text-xs whitespace-pre-wrap wrap-anywhere text-wg-text',
+          message,
+        ),
+      );
+      if (help) entry.appendChild(this.#el('div', 'text-wg-text-dim text-xs mt-1', help));
+      wrap.appendChild(entry);
+    }
   }
 
   #el(tag: string, cls: string, text?: string): HTMLElement {
@@ -569,6 +586,9 @@ export class WitgraphInspector extends HTMLElement {
         );
       wrap.appendChild(fault);
     }
+
+    // What compiling says of it
+    this.#appendDiagnostics(wrap, this.#controller?.diagnosticsForNode(node.id) ?? []);
 
     // Ports
     if (node.inputs.length > 0)
@@ -942,6 +962,7 @@ export class WitgraphInspector extends HTMLElement {
     feedback: boolean;
   }): HTMLDivElement {
     const wrap = this.#el('div', 'inspector-root p-3 flex flex-col gap-3') as HTMLDivElement;
+    this.#appendDiagnostics(wrap, this.#controller?.diagnosticsForConnection(edge.id) ?? []);
 
     const edgeHeader = this.#el(
       'div',

@@ -630,26 +630,35 @@ test('a stream of handles connects only to a stream of that resource', async () 
   const port = controller.nodes.get('src')?.outputs.find((p) => p.name === 'tensors');
   assert.equal(port?.kind, 'stream');
   assert.equal(port?.typeDisplay, 'tensor');
-  assert.equal(controller.canConnect('src', 'tensors', 'sink', 'tensors').ok, true);
+  assert.match(
+    controller.canConnect('src', 'tensors', 'sink', 'tensors').reason ?? '',
+    /already|duplicat|one reader|fan|writer/i,
+    'the types fit, but a stream has one reader and `sink` has a writer',
+  );
+  assert.doesNotMatch(
+    controller.canConnect('src', 'tensors', 'sink', 'tensors').reason ?? '',
+    /mixes/,
+  );
   assert.match(
     controller.canConnect('one', 'tensor', 'sink', 'tensors').reason ?? '',
-    /kind mismatch/,
+    /mixes port kinds/,
     'a handle port is not a stream',
   );
   assert.match(
     controller.canConnect('fut', 'tensor', 'sink', 'tensors').reason ?? '',
-    /kind mismatch/,
+    /mixes port kinds/,
     'nor is a future',
   );
   assert.match(
     controller.canConnect('nums', 'items', 'sink', 'tensors').reason ?? '',
-    /resource mismatch/,
+    /mixes payload types/,
     'a stream of numbers is not a stream of tensors',
   );
   assert.equal(controller.canConnect('src', 'tensors', 'take', 'items').ok, false);
   assert.deepEqual(
     controller.compatibleOutputsForInput('sink', 'tensors').map((o) => o.node),
-    ['src', 'inv'],
+    ['inv'],
+    '`src` fits by type, but it feeds `inv`, and a stream has one reader',
   );
   assert.equal(controller.canBeFeedback('src', 'tensors'), false);
 });
@@ -723,4 +732,150 @@ test('a future of a handle is kept and released like a stream item', async () =>
   assert.equal(view.pending, false);
   assert.equal(typeof view.latest, 'string', 'its component names no viewer: described');
   assert.equal(tensors.live.size, 0);
+});
+
+/** Waits for what an edit reloads: `ready` says when it has. */
+async function until(ready: () => boolean): Promise<void> {
+  for (let at = 0; at < 500 && !ready(); at++) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.ok(ready(), 'the edit took too long');
+}
+
+test('a connection is refused by the rules a load goes by', async () => {
+  const controller = await loadController(
+    [
+      ['e', 'echo'],
+      ['f', 'echo'],
+      ['r', 'relay'],
+      ['s', 'relay'],
+    ],
+    [
+      ['ef', 'e.out', 'f.in'],
+      ['rs', 'r.out', 's.in'],
+      ['rr', 'r.out', 'r.in', true],
+    ],
+  );
+  const refusal = (from: string, out: string, to: string, input: string) =>
+    controller.canConnect(from, out, to, input).reason ?? '';
+  assert.deepEqual(controller.canConnect('f', 'out', 'e', 'in'), { ok: true });
+  assert.match(refusal('e', 'out', 'r', 'add'), /mixes payload types/, 'f64 into u32');
+  assert.match(refusal('e', 'out', 'f', 'in'), /duplicates the endpoints of `ef`/);
+  assert.match(refusal('f', 'out', 'f', 'in'), /writer/, 'an input has one writer');
+  assert.match(refusal('e', 'nope', 'f', 'in'), /nope/);
+  assert.match(refusal('nope', 'out', 'f', 'in'), /nope/);
+  assert.deepEqual(
+    controller.compatibleOutputsForInput('f', 'in').map((o) => o.node),
+    ['e', 'f'],
+    'connecting here replaces what is there, and the types decide the rest',
+  );
+});
+
+test('what compiling says of a graph is on what it is about', async () => {
+  const controller = await loadController(
+    [
+      ['a', 'echo'],
+      ['b', 'echo'],
+      ['c', 'echo'],
+    ],
+    [['ab', 'a.out', 'b.in']],
+  );
+  assert.deepEqual(controller.compileDiagnostics, []);
+
+  // A cycle is for the next edit to mend, so it is not refused.
+  assert.equal(controller.canConnect('b', 'out', 'a', 'in').ok, true);
+  controller.addConnection('ba', { node: 'b', port: 'out' }, { node: 'a', port: 'in' });
+  await until(() => controller.compileDiagnostics.length > 0);
+  const [cycle] = controller.compileDiagnostics;
+  assert.equal(cycle.code, 'witgraph::ir::illegal_cycle');
+  assert.equal(controller.compiles, false);
+  assert.deepEqual(controller.diagnosticsForNode('a'), [cycle]);
+  assert.deepEqual(controller.diagnosticsForNode('b'), [cycle]);
+  assert.deepEqual(controller.diagnosticsForNode('c'), []);
+
+  controller.setConnectionFeedback('ba', true);
+  await until(() => controller.compileDiagnostics.length === 0);
+  assert.equal(controller.compiles, true);
+});
+
+test('only what stops a graph compiling is marked', async () => {
+  const controller = await loadController(
+    [
+      ['a', 'relay'],
+      ['b', 'relay'],
+    ],
+    [
+      ['ab', 'a.out', 'b.in'],
+      ['loop', 'a.out', 'a.in', true],
+    ],
+  );
+  // `a.in` is fed only by feedback, which is legal and says so with a warning.
+  assert.equal(controller.compiles, true);
+  assert.deepEqual(controller.compileDiagnostics, []);
+
+  controller.addConnection('ba', { node: 'b', port: 'out' }, { node: 'a', port: 'add' });
+  await until(() => controller.compileDiagnostics.length > 0);
+  assert.deepEqual(
+    controller.compileDiagnostics.map((d) => d.code),
+    ['witgraph::ir::illegal_cycle'],
+  );
+  assert.doesNotMatch(controller.compileError ?? '', /fed only by feedback/);
+});
+
+test('what can feed an input is worked out once per graph', async () => {
+  const controller = await loadController(
+    [
+      ['a', 'relay'],
+      ['b', 'relay'],
+    ],
+    [
+      ['ab', 'a.out', 'b.in'],
+      ['loop', 'a.out', 'a.in', true],
+    ],
+  );
+  const feeds = () => controller.compatibleOutputsForInput('b', 'add');
+  const before = feeds();
+  assert.equal(feeds(), before, 'nothing changed, so nothing is compiled');
+  assert.deepEqual(
+    before.map((o) => o.label),
+    ['a.out', 'b.out'],
+  );
+
+  controller.setNodeLabel('a', 'First');
+  assert.deepEqual(
+    feeds().map((o) => o.label),
+    ['First.out', 'b.out'],
+    'a change of the graph is seen at once',
+  );
+});
+
+test('a refused connection costs an input nothing', async () => {
+  const controller = await loadController(
+    [
+      ['a', 'relay'],
+      ['b', 'relay'],
+      ['e', 'echo'],
+    ],
+    [
+      ['ab', 'a.out', 'b.in'],
+      ['loop', 'a.out', 'a.in', true],
+    ],
+  );
+  controller.connectInput('b', 'in', 'e', 'out');
+  assert.equal(controller.connectionForInput('b', 'in')?.id, 'ab');
+});
+
+test('feedback on what cannot have it is downgraded, not refused', async () => {
+  const controller = await loadController(
+    [
+      ['p', 'stream-producer'],
+      ['q', 'stream-producer'],
+      ['c', 'stream-consumer'],
+    ],
+    [['pc', 'p.items', 'c.items']],
+  );
+  controller.connectInput('c', 'items', 'q', 'items', true);
+  const connection = controller.connectionForInput('c', 'items');
+  assert.equal(connection?.fromNode, 'q');
+  assert.equal(connection?.feedback, false);
 });

@@ -1,6 +1,9 @@
 import {
   type Contract,
+  type Diagnostic,
   describeComponent,
+  diagnosticsOf,
+  GraphChecker,
   type PortValues,
   Session,
   type SessionOptions,
@@ -66,18 +69,6 @@ interface Observation {
   bytes: number;
 }
 
-/**
- * Whether two handle ports carry one resource (as compiling checks it
- * exactly: on one semver track), or neither is a handle.
- */
-function sameResource(a: PortVisual, b: PortVisual): boolean {
-  if (!a.handle || !b.handle) return !a.handle && !b.handle;
-  const base = (id: string) => id.split('@')[0];
-  return (
-    a.handle.resource === b.handle.resource && base(a.handle.interface) === base(b.handle.interface)
-  );
-}
-
 /** Disposes what a viewer kept of an output's latest item. */
 function release(seen: Observation): void {
   if (!seen.kept) return;
@@ -92,6 +83,14 @@ function release(seen: Observation): void {
 
 /** The most edits undo goes back over. */
 const MAX_UNDO = 50;
+
+/** An output that can feed an input, as `compatibleOutputsForInput` lists them. */
+export interface CompatibleOutput {
+  node: string;
+  port: string;
+  label: string;
+  self: boolean;
+}
 
 export class EditorController extends EventTarget {
   #session: Session | null = null;
@@ -133,6 +132,15 @@ export class EditorController extends EventTarget {
     ports: Map<string, { inputs: PortVisual[]; outputs: PortVisual[] }>;
   } | null = null;
   #compileError: string | null = null;
+  /** The errors that stop the graph compiling. */
+  #compileDiagnostics: Diagnostic[] = [];
+  /** Compiles what the graph would be, by the rules a load goes by. */
+  #checker: GraphChecker | null = null;
+  /**
+   * What can feed each input, for as long as the graph stays as `graph` says. Finding
+   * out compiles once per output, and the inspector asks on every state change.
+   */
+  #compatible: { graph: string; outputs: Map<string, readonly CompatibleOutput[]> } | null = null;
   #tickRate = 0;
   #componentContracts = new Map<number, Contract>();
 
@@ -176,6 +184,22 @@ export class EditorController extends EventTarget {
   }
   get compileError(): string | null {
     return this.#compileError;
+  }
+  /** What stops the graph compiling. Warnings are not here: they stop nothing. */
+  get compileDiagnostics(): readonly Diagnostic[] {
+    return this.#compileDiagnostics;
+  }
+  /** What stops the graph compiling that is about a node, or a connection of it. */
+  diagnosticsForNode(id: string): readonly Diagnostic[] {
+    return this.#compileDiagnostics.filter(({ location }) => {
+      if (location.nodes.includes(id)) return true;
+      const edge = this.#edges.find((e) => e.id === location.connection);
+      return edge?.fromNode === id || edge?.toNode === id;
+    });
+  }
+  /** What stops the graph compiling that is about a connection. */
+  diagnosticsForConnection(id: string): readonly Diagnostic[] {
+    return this.#compileDiagnostics.filter(({ location }) => location.connection === id);
   }
   get compiles(): boolean {
     return this.#compileError === null && this.#session !== null;
@@ -682,50 +706,103 @@ export class EditorController extends EventTarget {
     return port?.kind === 'value' || port?.kind === 'handle';
   }
 
+  /** What compiles graphs against the loaded components, once one has loaded. */
+  #graphChecker(): GraphChecker | null {
+    if (this.#checker) return this.#checker;
+    if (!this.#originalOptions) return null;
+    try {
+      this.#checker = new GraphChecker(this.#originalOptions.components);
+    } catch {
+      // The module has yet to load, or a load will say what is wrong with them.
+      return null;
+    }
+    return this.#checker;
+  }
+
+  /**
+   * Why the graph could not have this connection, by the rules a load goes by: only
+   * what is wrong with the connection itself. A cycle is not, as marking a connection
+   * of it feedback is the next edit, and the graph says so until then.
+   */
+  #connectionProblem(
+    from: GraphJsonPortRef,
+    to: GraphJsonPortRef,
+    feedback: boolean,
+    replacing: boolean,
+  ): string | undefined {
+    const graph = this.#graphJson;
+    const checker = this.#graphChecker();
+    if (!graph || !checker) return undefined;
+    let id = 'new';
+    for (let at = 2; graph.connections.some((c) => c.id === id); at++) id = `new-${at}`;
+    const samePort = (a: GraphJsonPortRef, node?: string, port?: string) =>
+      a.node === node && a.port === port;
+    const others = graph.connections.filter(
+      (c) => !(replacing && samePort(c.to, to.node, to.port)),
+    );
+    const candidate = {
+      ...graph,
+      connections: [...others, { id, from, to, ...(feedback ? { feedback: true } : {}) }],
+    };
+    let said: Diagnostic[];
+    try {
+      said = checker.check(JSON.stringify(candidate)) as Diagnostic[];
+    } catch {
+      // Nothing to say of this connection: the next load says what is wrong.
+      return undefined;
+    }
+    return said.find(({ severity, location }) => {
+      if (severity !== 'error') return false;
+      if (location.connection === id) return true;
+      if (location.kind !== 'port') return false;
+      const [node] = location.nodes;
+      return samePort(from, node, location.port) || samePort(to, node, location.port);
+    })?.message;
+  }
+
+  /**
+   * Whether the graph can have this connection, and if not, why: by the rules a load
+   * goes by, so what passes here does not fail for itself there.
+   */
   canConnect(
     fromNode: string,
     fromPort: string,
     toNode: string,
     toPort: string,
+    feedback = false,
   ): { ok: boolean; reason?: string } {
-    const srcNode = this.#nodes.get(fromNode);
-    const tgtNode = this.#nodes.get(toNode);
-    if (!srcNode) return { ok: false, reason: `unknown node '${fromNode}'` };
-    if (!tgtNode) return { ok: false, reason: `unknown node '${toNode}'` };
-    const srcPort = srcNode.outputs.find((p) => p.name === fromPort);
-    const tgtPort = tgtNode.inputs.find((p) => p.name === toPort);
-    if (!srcPort) return { ok: false, reason: `'${fromNode}' has no output '${fromPort}'` };
-    if (!tgtPort) return { ok: false, reason: `'${toNode}' has no input '${toPort}'` };
-    if (srcPort.kind !== tgtPort.kind)
-      return { ok: false, reason: `kind mismatch: ${srcPort.kind} -> ${tgtPort.kind}` };
-    if (!sameResource(srcPort, tgtPort))
-      return {
-        ok: false,
-        reason: `resource mismatch: ${srcPort.typeDisplay} -> ${tgtPort.typeDisplay}`,
-      };
-    const duplicate = this.#edges.some(
-      (e) =>
-        e.fromNode === fromNode &&
-        e.fromPort === fromPort &&
-        e.toNode === toNode &&
-        e.toPort === toPort,
+    const reason = this.#connectionProblem(
+      { node: fromNode, port: fromPort },
+      { node: toNode, port: toPort },
+      feedback,
+      false,
     );
-    if (duplicate) return { ok: false, reason: 'connection already exists' };
-    return { ok: true };
+    return reason === undefined ? { ok: true } : { ok: false, reason };
   }
 
-  compatibleOutputsForInput(
-    nodeId: string,
-    portName: string,
-  ): readonly { node: string; port: string; label: string; self: boolean }[] {
+  compatibleOutputsForInput(nodeId: string, portName: string): readonly CompatibleOutput[] {
+    const graph = `${JSON.stringify(this.#graphJson)}\u0000${[...this.#nodes.keys()].join()}`;
+    if (this.#compatible?.graph !== graph) this.#compatible = { graph, outputs: new Map() };
+    const key = `${nodeId}\u0000${portName}`;
+    let outputs = this.#compatible.outputs.get(key);
+    if (!outputs) {
+      outputs = this.#findCompatibleOutputs(nodeId, portName);
+      this.#compatible.outputs.set(key, outputs);
+    }
+    return outputs;
+  }
+
+  #findCompatibleOutputs(nodeId: string, portName: string): CompatibleOutput[] {
     const tgtNode = this.#nodes.get(nodeId);
     const tgtPort = tgtNode?.inputs.find((p) => p.name === portName);
     if (!tgtPort) return [];
-    const result: { node: string; port: string; label: string; self: boolean }[] = [];
+    const to = { node: nodeId, port: portName };
+    const result: CompatibleOutput[] = [];
     for (const [id, n] of this.#nodes) {
       for (const p of n.outputs) {
-        if (p.kind !== tgtPort.kind || !sameResource(p, tgtPort)) continue;
         if (id === nodeId && tgtPort.kind !== 'value' && tgtPort.kind !== 'handle') continue;
+        // Connecting one here replaces what is connected now (`connectInput`).
+        if (this.#connectionProblem({ node: id, port: p.name }, to, false, true)) continue;
         result.push({ node: id, port: p.name, label: `${n.label}.${p.name}`, self: id === nodeId });
       }
     }
@@ -739,6 +816,17 @@ export class EditorController extends EventTarget {
     fromPort: string,
     feedback = false,
   ): void {
+    // Refused, it must not cost the input what it has.
+    const problem = this.#connectionProblem(
+      { node: fromNode, port: fromPort },
+      { node: nodeId, port: portName },
+      feedback && this.canBeFeedback(fromNode, fromPort),
+      true,
+    );
+    if (problem !== undefined) {
+      this.#pushError(`Cannot connect: ${problem}`);
+      return;
+    }
     const existing = this.connectionForInput(nodeId, portName);
     if (existing) this.removeConnection(existing.id);
     const id = `c-${fromNode}-${fromPort}-${nodeId}-${portName}`;
@@ -846,17 +934,28 @@ export class EditorController extends EventTarget {
 
   async load(options: EditorLoadOptions): Promise<void> {
     this.#originalOptions = options;
+    this.#forgetChecker();
     const graphJson: GraphJson =
       typeof options.graph === 'string'
         ? (JSON.parse(options.graph) as GraphJson)
         : structuredClone(options.graph);
     this.#graphJson = graphJson;
     await this.#createSession(graphJson);
+    this.#compileError = null;
+    this.#compileDiagnostics = [];
     this.#mode = 'idle';
     this.#dispatch('state-changed');
   }
 
+  /** Lets the checker go, and what it said: it knows the components of one load. */
+  #forgetChecker(): void {
+    this.#checker?.free();
+    this.#checker = null;
+    this.#compatible = null;
+  }
+
   dispose(): void {
+    this.#forgetChecker();
     this.#session?.dispose();
     this.#session = null;
     this.#streamGroups = [];
@@ -882,6 +981,7 @@ export class EditorController extends EventTarget {
     this.#capabilityInfo.clear();
     this.#savedSnapshots = [];
     this.#compileError = null;
+    this.#compileDiagnostics = [];
     this.#lastRunDurationMs = null;
     this.#lastRunTicks = 0;
     this.#componentContracts.clear();
@@ -1491,14 +1591,14 @@ export class EditorController extends EventTarget {
   addConnection(id: string, from: GraphJsonPortRef, to: GraphJsonPortRef, feedback = false): void {
     if (this.#locked()) return;
     if (!this.#graphJson) throw new Error('no graph loaded');
-    const check = this.canConnect(from.node, from.port, to.node, to.port);
-    if (!check.ok) {
-      this.#pushError(`Cannot connect: ${check.reason}`);
-      return;
-    }
     if (feedback && !this.canBeFeedback(from.node, from.port)) {
       feedback = false;
       this.#pushError('Feedback downgraded: only Value ports support feedback');
+    }
+    const check = this.canConnect(from.node, from.port, to.node, to.port, feedback);
+    if (!check.ok) {
+      this.#pushError(`Cannot connect: ${check.reason}`);
+      return;
     }
     const conn: GraphJsonConnection = {
       id,
@@ -1956,6 +2056,7 @@ export class EditorController extends EventTarget {
       try {
         await this.#reload();
         this.#compileError = null;
+        this.#compileDiagnostics = [];
         if (hadError) {
           this.#traceEvents.push({
             event: 'compile-ok',
@@ -1967,6 +2068,9 @@ export class EditorController extends EventTarget {
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         this.#compileError = msg;
+        this.#compileDiagnostics = (diagnosticsOf(err) ?? []).filter(
+          ({ severity }) => severity === 'error',
+        );
         this.#pushError(`Graph reload failed: ${msg}`);
       }
     } finally {

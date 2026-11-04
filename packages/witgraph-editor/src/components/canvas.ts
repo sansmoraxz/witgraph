@@ -1,3 +1,4 @@
+import type { Diagnostic } from 'witgraph-loader';
 import type { EditorController } from '../controller/editor-controller.ts';
 import type { EdgeVisual, NodePreview, NodeVisual } from '../controller/types.ts';
 import { makeDraggable } from '../util/drag.ts';
@@ -29,6 +30,8 @@ const SVG_CSS = `
   .node-group.selected { filter: drop-shadow(0 0 8px color-mix(in srgb, var(--wg-primary) 50%, transparent)) drop-shadow(0 2px 4px rgba(0,0,0,0.3)); }
   .node-group.selected .node-body { stroke: var(--wg-primary); stroke-width: 2; }
   .node-body { fill: url(#node-gradient); stroke: var(--wg-surface-hover); stroke-width: 1; rx: var(--_node-radius); }
+  .node-group.has-diagnostic .node-body { stroke: var(--wg-error); stroke-width: 2; }
+  .edge.has-diagnostic { stroke: var(--wg-error); }
   .node-header { rx: var(--_node-radius); }
   .node-header.pending { fill: var(--wg-phase-pending); }
   .node-header.running { fill: var(--wg-phase-running); }
@@ -336,6 +339,7 @@ export class WitgraphCanvas extends HTMLElement {
         this.#updateNodeGroup(g, node);
       }
       g.classList.toggle('selected', id === selectedNodeId);
+      this.#markDiagnostics(g, this.#controller?.diagnosticsForNode(id) ?? []);
     }
     this.#updatePreviews();
 
@@ -376,7 +380,27 @@ export class WitgraphCanvas extends HTMLElement {
         entry.hit.setAttribute('d', d);
       }
       entry.visible.classList.toggle('selected', edge.id === selectedEdgeId);
+      this.#markDiagnostics(
+        entry.visible,
+        this.#controller?.diagnosticsForConnection(edge.id) ?? [],
+      );
     }
+  }
+
+  /** Marks what compiling had something to say of, and says it on hovering. */
+  #markDiagnostics(element: SVGElement, diagnostics: readonly Diagnostic[]): void {
+    element.classList.toggle('has-diagnostic', diagnostics.length > 0);
+    let title = element.querySelector(':scope > title.diagnostics');
+    if (diagnostics.length === 0) {
+      title?.remove();
+      return;
+    }
+    if (!title) {
+      title = document.createElementNS(SVG_NS, 'title');
+      title.classList.add('diagnostics');
+      element.prepend(title);
+    }
+    title.textContent = diagnostics.map((d) => d.message).join('\n');
   }
 
   /** Removes a node's group, its drag handlers and its viewer. */
