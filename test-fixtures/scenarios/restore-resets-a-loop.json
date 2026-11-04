@@ -1,0 +1,105 @@
+{
+  "description": "A loop's value in a snapshot is the graph's: it goes with the next instance, and what the host wrote stays.",
+  "nodes": [
+    {
+      "id": "busy",
+      "guest": "busy-loop"
+    },
+    {
+      "id": "r",
+      "guest": "relay"
+    }
+  ],
+  "connections": [
+    {
+      "id": "br",
+      "from": "busy.done",
+      "to": "r.in"
+    },
+    {
+      "id": "rr",
+      "from": "r.out",
+      "to": "r.add",
+      "feedback": true
+    }
+  ],
+  "steps": [
+    {
+      "do": "tick"
+    },
+    {
+      "do": "tick"
+    },
+    {
+      "do": "tick"
+    },
+    {
+      "do": "tick"
+    },
+    {
+      "do": "output",
+      "at": "r.out",
+      "expect": "4"
+    },
+    {
+      "do": "snapshot",
+      "expect": {
+        "host_written": {},
+        "quiescent": true,
+        "inputs": {
+          "r": {
+            "add": "4",
+            "in": "1"
+          }
+        },
+        "outputs": {
+          "busy": {
+            "done": "1"
+          },
+          "r": {
+            "out": "4"
+          }
+        },
+        "feedback": {},
+        "owed": ["r"],
+        "in_flight": []
+      }
+    },
+    {
+      "do": "restore"
+    },
+    {
+      "do": "tick"
+    },
+    {
+      "do": "output",
+      "at": "r.out",
+      "expect": "5"
+    },
+    {
+      "do": "inject",
+      "at": "busy.action",
+      "wave": "trap"
+    },
+    {
+      "do": "tick"
+    },
+    {
+      "do": "faults",
+      "expect": ["trap"]
+    },
+    {
+      "do": "inject",
+      "at": "busy.action",
+      "wave": "finish"
+    },
+    {
+      "do": "tick"
+    },
+    {
+      "do": "output",
+      "at": "r.out",
+      "expect": "1"
+    }
+  ]
+}

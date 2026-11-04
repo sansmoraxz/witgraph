@@ -1,0 +1,102 @@
+{
+  "description": "A required input fed only by feedback waits for the host, and for it again once cleared.",
+  "nodes": [
+    {
+      "id": "r",
+      "guest": "relay"
+    }
+  ],
+  "connections": [
+    {
+      "id": "rr",
+      "from": "r.out",
+      "to": "r.in",
+      "feedback": true
+    }
+  ],
+  "steps": [
+    {
+      "do": "settle"
+    },
+    {
+      "do": "runs",
+      "expect": {
+        "r": 0
+      }
+    },
+    {
+      "do": "phase",
+      "node": "r",
+      "expect": "pending"
+    },
+    {
+      "do": "output",
+      "at": "r.out",
+      "expect": null
+    },
+    {
+      "do": "inject",
+      "at": "r.in",
+      "wave": "7"
+    },
+    {
+      "do": "settle"
+    },
+    {
+      "do": "output",
+      "at": "r.out",
+      "expect": "7"
+    },
+    {
+      "do": "runs",
+      "expect": {
+        "r": 1
+      }
+    },
+    {
+      "do": "clear",
+      "at": "r.in"
+    },
+    {
+      "do": "settle"
+    },
+    {
+      "do": "runs",
+      "expect": {
+        "r": 0
+      }
+    },
+    {
+      "do": "rerun",
+      "node": "r"
+    },
+    {
+      "do": "settle"
+    },
+    {
+      "do": "runs",
+      "expect": {
+        "r": 0
+      }
+    },
+    {
+      "do": "inject",
+      "at": "r.in",
+      "wave": "8"
+    },
+    {
+      "do": "settle"
+    },
+    {
+      "do": "output",
+      "at": "r.out",
+      "expect": "8"
+    },
+    {
+      "do": "runs",
+      "expect": {
+        "r": 1
+      }
+    }
+  ]
+}

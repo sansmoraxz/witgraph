@@ -1,0 +1,81 @@
+{
+  "description": "Shutting down forgets what was owed, an equal write leaves it stopped, and a new value rebuilds it.",
+  "nodes": [
+    {
+      "id": "e",
+      "guest": "echo"
+    }
+  ],
+  "connections": [],
+  "steps": [
+    {
+      "do": "inject",
+      "at": "e.in",
+      "wave": "4"
+    },
+    {
+      "do": "settle"
+    },
+    {
+      "do": "runs",
+      "expect": {
+        "e": 1
+      }
+    },
+    {
+      "do": "shutdown"
+    },
+    {
+      "do": "settle"
+    },
+    {
+      "do": "runs",
+      "expect": {
+        "e": 0
+      }
+    },
+    {
+      "do": "output",
+      "at": "e.out",
+      "expect": null
+    },
+    {
+      "do": "inject",
+      "at": "e.in",
+      "wave": "4"
+    },
+    {
+      "do": "settle"
+    },
+    {
+      "do": "runs",
+      "expect": {
+        "e": 0
+      }
+    },
+    {
+      "do": "output",
+      "at": "e.out",
+      "expect": null
+    },
+    {
+      "do": "inject",
+      "at": "e.in",
+      "wave": "5"
+    },
+    {
+      "do": "settle"
+    },
+    {
+      "do": "runs",
+      "expect": {
+        "e": 1
+      }
+    },
+    {
+      "do": "output",
+      "at": "e.out",
+      "expect": "5"
+    }
+  ]
+}

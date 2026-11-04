@@ -1,0 +1,38 @@
+{
+  "description": "A guest calling `fatal` aborts the tick, and is named.",
+  "nodes": [
+    {
+      "id": "busy",
+      "guest": "busy-loop"
+    }
+  ],
+  "connections": [],
+  "steps": [
+    {
+      "do": "settle"
+    },
+    {
+      "do": "inject",
+      "at": "busy.action",
+      "wave": "fatal"
+    },
+    {
+      "do": "tick",
+      "expect": "aborted"
+    },
+    {
+      "do": "faults",
+      "expect": [
+        {
+          "kind": "fatal",
+          "culprit": "busy"
+        }
+      ]
+    },
+    {
+      "do": "phase",
+      "node": "busy",
+      "expect": "faulted"
+    }
+  ]
+}

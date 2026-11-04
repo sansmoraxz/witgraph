@@ -1,0 +1,69 @@
+{
+  "description": "A write of the value feedback latched makes it the host's, so its node runs after a fault.",
+  "nodes": [
+    {
+      "id": "busy",
+      "guest": "busy-loop"
+    },
+    {
+      "id": "r",
+      "guest": "relay"
+    }
+  ],
+  "connections": [
+    {
+      "id": "br",
+      "from": "busy.done",
+      "to": "r.in",
+      "feedback": true
+    }
+  ],
+  "steps": [
+    {
+      "do": "settle"
+    },
+    {
+      "do": "output",
+      "at": "r.out",
+      "expect": "1"
+    },
+    {
+      "do": "inject",
+      "at": "r.in",
+      "wave": "1"
+    },
+    {
+      "do": "inject",
+      "at": "busy.action",
+      "wave": "trap"
+    },
+    {
+      "do": "tick"
+    },
+    {
+      "do": "faults",
+      "expect": ["trap"]
+    },
+    {
+      "do": "inject",
+      "at": "busy.action",
+      "wave": "finish"
+    },
+    {
+      "do": "settle"
+    },
+    {
+      "do": "inject",
+      "at": "r.in",
+      "wave": "1"
+    },
+    {
+      "do": "settle"
+    },
+    {
+      "do": "output",
+      "at": "r.out",
+      "expect": "1"
+    }
+  ]
+}

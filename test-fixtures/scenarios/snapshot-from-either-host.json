@@ -1,0 +1,164 @@
+{
+  "description": "One snapshot, as JSON, restores on either host: the format and the content hashes are the same on both.",
+  "nodes": [
+    {
+      "id": "h",
+      "guest": "echo"
+    },
+    {
+      "id": "e",
+      "guest": "echo"
+    }
+  ],
+  "connections": [
+    {
+      "id": "ee",
+      "from": "e.out",
+      "to": "e.in",
+      "feedback": true
+    }
+  ],
+  "steps": [
+    {
+      "do": "settle"
+    },
+    {
+      "do": "restore",
+      "snapshot": {
+        "connections": [
+          {
+            "feedback": true,
+            "from": {
+              "node": "e",
+              "port": "out"
+            },
+            "id": "ee",
+            "to": {
+              "node": "e",
+              "port": "in"
+            }
+          }
+        ],
+        "feedback": {
+          "ee": "7"
+        },
+        "host_written": {
+          "h": ["in"]
+        },
+        "in_flight": [],
+        "inputs": {
+          "e": {
+            "in": "0"
+          },
+          "h": {
+            "in": "2.5"
+          }
+        },
+        "nodes": {
+          "e": {
+            "content_hash": "26645bcda0d2e2cc6d87d9514b928ddc95b3d9207dd37e37fad2cef8db92efa5",
+            "package": {
+              "name": "echo",
+              "namespace": "test",
+              "version": "0.1.0"
+            },
+            "world": "echo"
+          },
+          "h": {
+            "content_hash": "26645bcda0d2e2cc6d87d9514b928ddc95b3d9207dd37e37fad2cef8db92efa5",
+            "package": {
+              "name": "echo",
+              "namespace": "test",
+              "version": "0.1.0"
+            },
+            "world": "echo"
+          }
+        },
+        "outputs": {
+          "e": {
+            "out": "0"
+          },
+          "h": {
+            "out": "2.5"
+          }
+        },
+        "owed": [],
+        "phases": {
+          "e": "idle",
+          "h": "idle"
+        },
+        "quiescent": true
+      }
+    },
+    {
+      "do": "output",
+      "at": "h.out",
+      "expect": "2.5"
+    },
+    {
+      "do": "output",
+      "at": "e.out",
+      "expect": "0"
+    },
+    {
+      "do": "snapshot",
+      "expect": {
+        "nodes": {
+          "e": {
+            "content_hash": "26645bcda0d2e2cc6d87d9514b928ddc95b3d9207dd37e37fad2cef8db92efa5",
+            "package": {
+              "name": "echo",
+              "namespace": "test",
+              "version": "0.1.0"
+            },
+            "world": "echo"
+          },
+          "h": {
+            "content_hash": "26645bcda0d2e2cc6d87d9514b928ddc95b3d9207dd37e37fad2cef8db92efa5",
+            "package": {
+              "name": "echo",
+              "namespace": "test",
+              "version": "0.1.0"
+            },
+            "world": "echo"
+          }
+        },
+        "host_written": {
+          "h": ["in"]
+        },
+        "feedback": {
+          "ee": "7"
+        },
+        "inputs": {
+          "e": {
+            "in": "0"
+          },
+          "h": {
+            "in": "2.5"
+          }
+        }
+      }
+    },
+    {
+      "do": "tick"
+    },
+    {
+      "do": "output",
+      "at": "e.out",
+      "expect": "0"
+    },
+    {
+      "do": "tick"
+    },
+    {
+      "do": "output",
+      "at": "e.out",
+      "expect": "7"
+    },
+    {
+      "do": "output",
+      "at": "h.out",
+      "expect": "2.5"
+    }
+  ]
+}

@@ -1,0 +1,80 @@
+{
+  "description": "A fault stops the whole graph, and only what the host wrote survives it.",
+  "nodes": [
+    {
+      "id": "busy",
+      "guest": "busy-loop"
+    },
+    {
+      "id": "e",
+      "guest": "echo"
+    }
+  ],
+  "connections": [],
+  "steps": [
+    {
+      "do": "inject",
+      "at": "e.in",
+      "wave": "4"
+    },
+    {
+      "do": "settle"
+    },
+    {
+      "do": "output",
+      "at": "e.out",
+      "expect": "4"
+    },
+    {
+      "do": "runs",
+      "expect": {
+        "busy": 1,
+        "e": 1
+      }
+    },
+    {
+      "do": "inject",
+      "at": "busy.action",
+      "wave": "trap"
+    },
+    {
+      "do": "tick"
+    },
+    {
+      "do": "faults",
+      "expect": ["trap"]
+    },
+    {
+      "do": "output",
+      "at": "e.out",
+      "expect": null
+    },
+    {
+      "do": "phase",
+      "node": "e",
+      "expect": "faulted"
+    },
+    {
+      "do": "inject",
+      "at": "busy.action",
+      "wave": "finish"
+    },
+    {
+      "do": "settle"
+    },
+    {
+      "do": "output",
+      "at": "e.out",
+      "expect": "4"
+    },
+    {
+      "do": "phase",
+      "node": "e",
+      "expect": "idle"
+    },
+    {
+      "do": "faults",
+      "expect": []
+    }
+  ]
+}

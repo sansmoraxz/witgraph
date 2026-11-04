@@ -1,0 +1,55 @@
+{
+  "description": "A snapshot with a port the graph lacks changes nothing.",
+  "nodes": [
+    {
+      "id": "e",
+      "guest": "echo"
+    }
+  ],
+  "connections": [],
+  "steps": [
+    {
+      "do": "inject",
+      "at": "e.in",
+      "wave": "4"
+    },
+    {
+      "do": "settle"
+    },
+    {
+      "do": "snapshot",
+      "expect": {
+        "host_written": {
+          "e": ["in"]
+        }
+      }
+    },
+    {
+      "do": "restore",
+      "patch": {
+        "host_written": {
+          "e": ["nope"]
+        }
+      },
+      "error": "the host cannot have written `e.nope`"
+    },
+    {
+      "do": "output",
+      "at": "e.out",
+      "expect": "4"
+    },
+    {
+      "do": "inject",
+      "at": "e.in",
+      "wave": "5"
+    },
+    {
+      "do": "settle"
+    },
+    {
+      "do": "output",
+      "at": "e.out",
+      "expect": "5"
+    }
+  ]
+}

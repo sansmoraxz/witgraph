@@ -1,0 +1,62 @@
+{
+  "description": "A feedback loop advances one iteration per tick.",
+  "nodes": [
+    {
+      "id": "busy",
+      "guest": "busy-loop"
+    },
+    {
+      "id": "r",
+      "guest": "relay"
+    }
+  ],
+  "connections": [
+    {
+      "id": "br",
+      "from": "busy.done",
+      "to": "r.in"
+    },
+    {
+      "id": "rr",
+      "from": "r.out",
+      "to": "r.add",
+      "feedback": true
+    }
+  ],
+  "steps": [
+    {
+      "do": "tick",
+      "expect": "progress"
+    },
+    {
+      "do": "output",
+      "at": "r.out",
+      "expect": "1"
+    },
+    {
+      "do": "tick",
+      "expect": "progress"
+    },
+    {
+      "do": "output",
+      "at": "r.out",
+      "expect": "2"
+    },
+    {
+      "do": "tick",
+      "expect": "progress"
+    },
+    {
+      "do": "output",
+      "at": "r.out",
+      "expect": "3"
+    },
+    {
+      "do": "runs",
+      "expect": {
+        "busy": 1,
+        "r": 3
+      }
+    }
+  ]
+}

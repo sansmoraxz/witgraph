@@ -1,0 +1,81 @@
+{
+  "description": "What the host wrote is in a snapshot as such, and a restore keeps it for the next instance.",
+  "nodes": [
+    {
+      "id": "busy",
+      "guest": "busy-loop"
+    },
+    {
+      "id": "e",
+      "guest": "echo"
+    }
+  ],
+  "connections": [],
+  "steps": [
+    {
+      "do": "inject",
+      "at": "e.in",
+      "wave": "4"
+    },
+    {
+      "do": "settle"
+    },
+    {
+      "do": "snapshot",
+      "expect": {
+        "host_written": {
+          "e": ["in"]
+        },
+        "inputs": {
+          "e": {
+            "in": "4"
+          }
+        },
+        "outputs": {
+          "busy": {
+            "done": "1"
+          },
+          "e": {
+            "out": "4"
+          }
+        }
+      }
+    },
+    {
+      "do": "restore"
+    },
+    {
+      "do": "settle"
+    },
+    {
+      "do": "output",
+      "at": "e.out",
+      "expect": "4"
+    },
+    {
+      "do": "inject",
+      "at": "busy.action",
+      "wave": "trap"
+    },
+    {
+      "do": "tick"
+    },
+    {
+      "do": "faults",
+      "expect": ["trap"]
+    },
+    {
+      "do": "inject",
+      "at": "busy.action",
+      "wave": "finish"
+    },
+    {
+      "do": "settle"
+    },
+    {
+      "do": "output",
+      "at": "e.out",
+      "expect": "4"
+    }
+  ]
+}

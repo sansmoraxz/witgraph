@@ -1,0 +1,82 @@
+{
+  "description": "Values flow down a chain, and an equal value runs nothing.",
+  "nodes": [
+    {
+      "id": "a",
+      "guest": "echo"
+    },
+    {
+      "id": "b",
+      "guest": "echo"
+    }
+  ],
+  "connections": [
+    {
+      "id": "ab",
+      "from": "a.out",
+      "to": "b.in"
+    }
+  ],
+  "steps": [
+    {
+      "do": "settle"
+    },
+    {
+      "do": "output",
+      "at": "a.out",
+      "expect": "0"
+    },
+    {
+      "do": "output",
+      "at": "b.out",
+      "expect": "0"
+    },
+    {
+      "do": "runs",
+      "expect": {
+        "a": 1,
+        "b": 1
+      }
+    },
+    {
+      "do": "inject",
+      "at": "a.in",
+      "wave": "4"
+    },
+    {
+      "do": "settle"
+    },
+    {
+      "do": "output",
+      "at": "b.out",
+      "expect": "4"
+    },
+    {
+      "do": "runs",
+      "expect": {
+        "a": 1,
+        "b": 1
+      }
+    },
+    {
+      "do": "inject",
+      "at": "a.in",
+      "wave": "4"
+    },
+    {
+      "do": "settle"
+    },
+    {
+      "do": "runs",
+      "expect": {
+        "a": 0,
+        "b": 0
+      }
+    },
+    {
+      "do": "phase",
+      "node": "a",
+      "expect": "idle"
+    }
+  ]
+}

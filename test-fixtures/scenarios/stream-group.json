@@ -1,0 +1,62 @@
+{
+  "description": "Nodes joined by a stream run as one, and re-run together.",
+  "nodes": [
+    {
+      "id": "prod",
+      "guest": "stream-producer"
+    },
+    {
+      "id": "cons",
+      "guest": "stream-consumer"
+    }
+  ],
+  "connections": [
+    {
+      "id": "s",
+      "from": "prod.items",
+      "to": "cons.items"
+    }
+  ],
+  "steps": [
+    {
+      "do": "inject",
+      "at": "prod.burst-size",
+      "wave": "3"
+    },
+    {
+      "do": "settle"
+    },
+    {
+      "do": "output",
+      "at": "cons.count",
+      "expect": "3"
+    },
+    {
+      "do": "runs",
+      "expect": {
+        "prod": 1,
+        "cons": 1
+      }
+    },
+    {
+      "do": "inject",
+      "at": "prod.burst-size",
+      "wave": "5"
+    },
+    {
+      "do": "settle"
+    },
+    {
+      "do": "output",
+      "at": "cons.count",
+      "expect": "5"
+    },
+    {
+      "do": "runs",
+      "expect": {
+        "prod": 1,
+        "cons": 1
+      }
+    }
+  ]
+}

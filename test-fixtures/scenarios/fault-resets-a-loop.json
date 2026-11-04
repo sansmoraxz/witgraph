@@ -1,0 +1,67 @@
+{
+  "description": "A new instance starts a feedback loop over.",
+  "nodes": [
+    {
+      "id": "busy",
+      "guest": "busy-loop"
+    },
+    {
+      "id": "r",
+      "guest": "relay"
+    }
+  ],
+  "connections": [
+    {
+      "id": "br",
+      "from": "busy.done",
+      "to": "r.in"
+    },
+    {
+      "id": "rr",
+      "from": "r.out",
+      "to": "r.add",
+      "feedback": true
+    }
+  ],
+  "steps": [
+    {
+      "do": "tick"
+    },
+    {
+      "do": "tick"
+    },
+    {
+      "do": "tick"
+    },
+    {
+      "do": "output",
+      "at": "r.out",
+      "expect": "3"
+    },
+    {
+      "do": "inject",
+      "at": "busy.action",
+      "wave": "trap"
+    },
+    {
+      "do": "tick"
+    },
+    {
+      "do": "faults",
+      "expect": ["trap"]
+    },
+    {
+      "do": "inject",
+      "at": "busy.action",
+      "wave": "finish"
+    },
+    {
+      "do": "tick"
+    },
+    {
+      "do": "output",
+      "at": "r.out",
+      "expect": "1"
+    }
+  ]
+}

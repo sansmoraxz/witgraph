@@ -1,0 +1,76 @@
+{
+  "description": "A write the graph cannot take is an error, and changes nothing.",
+  "nodes": [
+    {
+      "id": "a",
+      "guest": "echo"
+    },
+    {
+      "id": "b",
+      "guest": "echo"
+    }
+  ],
+  "connections": [
+    {
+      "id": "ab",
+      "from": "a.out",
+      "to": "b.in"
+    }
+  ],
+  "steps": [
+    {
+      "do": "settle"
+    },
+    {
+      "do": "runs",
+      "expect": {
+        "a": 1,
+        "b": 1
+      }
+    },
+    {
+      "do": "inject",
+      "at": "b.in",
+      "wave": "1",
+      "error": "connection"
+    },
+    {
+      "do": "inject",
+      "at": "nope.in",
+      "wave": "1",
+      "error": "nope"
+    },
+    {
+      "do": "inject",
+      "at": "a.nope",
+      "wave": "1",
+      "error": "nope"
+    },
+    {
+      "do": "inject",
+      "at": "a.in",
+      "wave": "\"text\"",
+      "error": "a"
+    },
+    {
+      "do": "clear",
+      "at": "b.in",
+      "error": "connection"
+    },
+    {
+      "do": "settle"
+    },
+    {
+      "do": "runs",
+      "expect": {
+        "a": 0,
+        "b": 0
+      }
+    },
+    {
+      "do": "output",
+      "at": "b.out",
+      "expect": "0"
+    }
+  ]
+}
