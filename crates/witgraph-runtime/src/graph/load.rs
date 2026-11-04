@@ -77,16 +77,18 @@ struct Parts {
 type LinkKey = (String, ComponentRef, String);
 
 /// What tells `compiled` from any other graph: its nodes, what they run, and how
-/// they are wired. Anything here changes the composite.
+/// they are wired. Anything here changes the composite. A contract's hash leaves
+/// out its name and version, so components with the same ports are told apart by
+/// those.
 fn fingerprint(compiled: &CompiledGraph) -> String {
     use std::fmt::Write;
     let mut text = String::new();
     for node in compiled.topological_order() {
-        let hash = compiled
+        let (component, hash) = compiled
             .contract_for(node)
-            .map(witgraph_wit::hash::content_hash)
+            .map(|c| (c.id.to_string(), witgraph_wit::hash::content_hash(c)))
             .unwrap_or_default();
-        let _ = writeln!(text, "node {node} {hash}");
+        let _ = writeln!(text, "node {node} {component} {hash}");
         for (import, provider, export) in link_keys(compiled, node) {
             let _ = writeln!(text, "link {node} {import} {provider} {export}");
         }

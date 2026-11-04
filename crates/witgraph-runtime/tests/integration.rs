@@ -2290,6 +2290,52 @@ async fn an_endless_group_exhausts_a_finite_budget() {
 }
 
 #[tokio::test]
+async fn a_prepared_graph_is_for_the_components_it_was_prepared_with() {
+    let kit = Kit::new(&[ECHO]);
+    let prepared_for = kit
+        .builder("g")
+        .add_node("n", kit.get(ECHO))
+        .build()
+        .compile(&kit.contracts)
+        .expect("compiles");
+    let engine = RuntimeConfig::default().new_engine().unwrap();
+    let prepared = PreparedGraph::new(&engine, &prepared_for, &kit.wasm).unwrap();
+    // The same ports, so the same contract hash, in another component.
+    let mut other = contract(ECHO);
+    other.id = "test:echo/echo@0.2.0".parse().unwrap();
+    let another = Graph::builder("g")
+        .add_component(&other)
+        .add_node("n", other.id.clone())
+        .build()
+        .compile(std::slice::from_ref(&other))
+        .expect("compiles");
+    let err = RuntimeGraph::load_prepared(
+        another,
+        &prepared,
+        RuntimeConfig::default(),
+        Perf,
+        witgraph_runtime::NoCapabilities,
+    )
+    .await
+    .err()
+    .expect("prepared for 0.1.0");
+    assert!(matches!(err, LoadError::GraphMismatch { .. }), "{err}");
+    let loaded = RuntimeGraph::load_prepared(
+        prepared_for,
+        &prepared,
+        RuntimeConfig::default(),
+        Perf,
+        witgraph_runtime::NoCapabilities,
+    )
+    .await;
+    assert!(
+        loaded.is_ok(),
+        "the graph it was prepared for: {:?}",
+        loaded.err().map(|err| err.to_string())
+    );
+}
+
+#[tokio::test]
 async fn fatal_aborts_the_tick() {
     let kit = Kit::new(&[BUSY_LOOP]);
     let graph = kit
