@@ -1018,7 +1018,7 @@ impl WebGraph {
                     set(&object, "node", &text(node.as_str()));
                     return Ok(object.into());
                 }
-                if let Some(node) = number("m", "") {
+                if let Some(node) = number("m", "").filter(|node| self.mocked.contains(node)) {
                     set(&object, "kind", &text("mock"));
                     set(&object, "node", &text(node.as_str()));
                     return Ok(object.into());

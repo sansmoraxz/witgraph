@@ -1994,12 +1994,16 @@ test('known bug: a new instance after a restore resets a loop', {
   assert.equal(await session.graph.readOutput('r', 'out'), 1);
 });
 
-test('known bug: a capability import named like a mocked node reaches the host', {
-  skip: 'imports() takes `m0` for a mock without checking the node is mocked',
-}, async () => {
+test('a capability import named like a mocked node reaches the host', async () => {
+  const asked: string[] = [];
   const session = await load([['n', 'm0-import']], [], {
-    capabilities: () => (() => 41) as unknown as object,
+    capabilities: (capability) => {
+      asked.push(capability.interface);
+      // jco takes a bare function as the default export of its import.
+      return { default: () => 41 };
+    },
   });
+  assert.deepEqual(asked, ['func:m0']);
   await session.tick();
   assert.deepEqual(session.graph.takeFaults(), []);
   assert.equal(await session.graph.readOutput('n', 'out'), 41);
