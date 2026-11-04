@@ -1941,9 +1941,6 @@ test('a snapshot leaves out feedback a host write dropped', async () => {
   assert.deepEqual(JSON.parse(await session.graph.snapshot()).feedback, {});
 });
 
-// Bugs not fixed yet: each test states what should happen, and fails. Drop the
-// `skip` with the fix.
-
 test('an equal host write does not stick a required input after a fault', async () => {
   const session = await load(
     [
@@ -2003,4 +2000,53 @@ test('a capability import named like a mocked node reaches the host', async () =
   await session.tick();
   assert.deepEqual(session.graph.takeFaults(), []);
   assert.equal(await session.graph.readOutput('n', 'out'), 41);
+});
+
+test('a hub setter throwing during a restore is a fault, with the restore in place', async () => {
+  const graph = {
+    metadata: { name: 'test' },
+    components: [componentRef(ids.echo)],
+    nodes: [{ id: 'e', component: componentRef(ids.echo) }],
+    connections: [],
+  };
+  const bytes = new Uint8Array(await readFile(new URL('echo.wasm', guests)));
+  let rebuilds = 0;
+  const ports = {
+    getInput0: () => undefined,
+    getOutput0: () => 1.5,
+    setInput0: () => true,
+    setOutput0: () => {
+      throw new Error('out of memory');
+    },
+  };
+  const web = WebGraph.load(
+    JSON.stringify(graph),
+    [{ id: ids.echo, bytes }],
+    {
+      run: () => ({
+        outputsChanged: [],
+        inputsChanged: [],
+        inputsRecorded: [],
+        inputsCleared: [],
+        feedbackBuffered: [],
+      }),
+      rebuild: () => void rebuilds++,
+      instance: () => ({ ports, control: {} }),
+      readHandle: () => undefined,
+    },
+    [],
+  );
+  try {
+    const snapshot = await web.snapshot();
+    assert.deepEqual(JSON.parse(snapshot).outputs, { e: { out: '1.5' } });
+    await web.restore(snapshot);
+    assert.equal(rebuilds, 1);
+    assert.equal(web.nodeState('e').phase, 'pending');
+    await web.tick();
+    const faults = web.takeFaults() as { fault: { kind: string; message: string } }[];
+    assert.equal(faults.length, 1);
+    assert.match(faults[0].fault.message, /out of memory/);
+  } finally {
+    web.free();
+  }
 });

@@ -460,7 +460,7 @@ impl RunningGraph for WebRuntime {
             feedback.push((index, val));
         }
 
-        // Nothing fails from here on, but building the instance.
+        // Nothing fails from here on: what goes wrong in the instance is a fault.
         let host_written = self.core().host_written_in(snapshot);
         {
             let mut retained = self.hub.retained.borrow_mut();
@@ -490,7 +490,9 @@ impl RunningGraph for WebRuntime {
                 }
                 Ok(())
             };
-            wrote().map_err(|message| RuntimeError::SnapshotMismatch { message })?;
+            if let Err(message) = wrote() {
+                self.hub.report_trap(JsValue::from_str(&message));
+            }
         }
         self.core().apply_restore(&presence, &pending, snapshot);
         Ok(())
