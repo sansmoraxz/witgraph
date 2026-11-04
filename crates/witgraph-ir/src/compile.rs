@@ -251,6 +251,9 @@ impl RequiredCapability {
     }
 }
 
+/// What identifies a link among a node's: its import, provider and export.
+pub type LinkKey = (String, ComponentRef, String);
+
 /// A graph that compiled successfully.
 ///
 /// Sealed — no public constructor, private fields, not deserializable. The
@@ -505,6 +508,17 @@ impl CompiledGraph {
                 items,
             })
             .collect()
+    }
+
+    /// The links of `node`, as what identifies each among them, sorted: two nodes
+    /// of one component with equal keys run one composition.
+    pub fn link_keys(&self, node: &NodeId) -> Vec<LinkKey> {
+        let mut keys: Vec<LinkKey> = self
+            .links_of(node)
+            .map(|l| (l.import.clone(), l.provider.clone(), l.export.clone()))
+            .collect();
+        keys.sort();
+        keys
     }
 
     /// The links satisfying imports of `node`, in declaration order.

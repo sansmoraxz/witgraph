@@ -17,7 +17,7 @@ use std::borrow::Cow;
 
 use wac_graph::types::Package;
 use wac_graph::{CompositionGraph, EncodeOptions, NodeId};
-use witgraph_ir::{Capability, ComponentContract, ComponentRef};
+use witgraph_ir::{Capability, ComponentContract, ComponentRef, LinkKey};
 
 use crate::lower::Lowered;
 use crate::lower_component;
@@ -38,6 +38,72 @@ pub struct LinkedProvider<'a> {
     pub bytes: &'a [u8],
     /// The provider's export that satisfies the import.
     pub export: &'a str,
+}
+
+/// Why no bytes could be found for a link's provider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderError {
+    /// None of the components given fits it.
+    Missing,
+    /// Several do, sorted.
+    Ambiguous(Vec<ComponentRef>),
+}
+
+/// The bytes of the component a link names as its provider, among `components`. A
+/// provider has no contract for a content hash to name, so a pinned ref takes only
+/// the component with that very ref. An unpinned one takes the component with its
+/// own ref, else the one pinned component of its world.
+pub fn find_provider<'a, 'i>(
+    components: impl IntoIterator<Item = (&'i ComponentRef, &'a [u8])>,
+    provider: &ComponentRef,
+) -> Result<&'a [u8], ProviderError> {
+    let mut fits = Vec::new();
+    for (id, bytes) in components {
+        if id == provider {
+            return Ok(bytes);
+        }
+        if id.matches(provider) {
+            fits.push((id, bytes));
+        }
+    }
+    if provider.content_hash.is_some() {
+        return Err(ProviderError::Missing);
+    }
+    match fits.as_slice() {
+        [] => Err(ProviderError::Missing),
+        [(_, bytes)] => Ok(bytes),
+        several => {
+            let mut candidates: Vec<ComponentRef> =
+                several.iter().map(|(id, _)| (*id).clone()).collect();
+            candidates.sort();
+            Err(ProviderError::Ambiguous(candidates))
+        }
+    }
+}
+
+/// A node's links with their providers' bytes, which `bytes` finds. A link whose
+/// import the node's bytes never use is left with none, so its provider need not
+/// be there.
+pub fn linked_providers<'a, E>(
+    lowered: &Lowered,
+    links: &'a [LinkKey],
+    mut bytes: impl FnMut(&ComponentRef) -> Result<&'a [u8], E>,
+) -> Result<Vec<LinkedProvider<'a>>, E> {
+    links
+        .iter()
+        .map(|(import, provider, export)| {
+            let found = match imported_as(lowered, import) {
+                Some(_) => bytes(provider)?,
+                None => &[][..],
+            };
+            Ok(LinkedProvider {
+                import,
+                provider,
+                bytes: found,
+                export,
+            })
+        })
+        .collect()
 }
 
 /// Not the provider's bytes, only how many there are.
@@ -281,4 +347,71 @@ pub fn link_node<'a>(
         capabilities: as_declared(contract, lowered, &composed_view.contract.capabilities),
         components: 1 + composed.providers,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn id(text: &str) -> ComponentRef {
+        text.parse().unwrap()
+    }
+
+    fn pinned(text: &str, hash: &str) -> ComponentRef {
+        ComponentRef {
+            content_hash: Some(hash.into()),
+            ..id(text)
+        }
+    }
+
+    #[test]
+    fn a_provider_is_found_by_its_own_ref_first() {
+        let (plain, hashed) = (id("a:b/c@1.0.0"), pinned("a:b/c@1.0.0", "aa"));
+        let components = [(&hashed, &b"pinned"[..]), (&plain, &b"plain"[..])];
+        assert_eq!(find_provider(components, &plain), Ok(&b"plain"[..]));
+        assert_eq!(find_provider(components, &hashed), Ok(&b"pinned"[..]));
+    }
+
+    #[test]
+    fn an_unpinned_provider_takes_the_one_pinned_component_of_its_world() {
+        let (wanted, hashed) = (id("a:b/c@1.0.0"), pinned("a:b/c@1.0.0", "aa"));
+        assert_eq!(
+            find_provider([(&hashed, &b"pinned"[..])], &wanted),
+            Ok(&b"pinned"[..])
+        );
+    }
+
+    #[test]
+    fn a_pinned_provider_takes_nothing_else() {
+        let wanted = pinned("a:b/c@1.0.0", "bb");
+        let (plain, other) = (id("a:b/c@1.0.0"), pinned("a:b/c@1.0.0", "aa"));
+        let components = [(&plain, &b"plain"[..]), (&other, &b"other"[..])];
+        assert_eq!(
+            find_provider(components, &wanted),
+            Err(ProviderError::Missing)
+        );
+    }
+
+    #[test]
+    fn another_version_is_no_provider() {
+        let (wanted, other) = (id("a:b/c@1.0.0"), id("a:b/c@1.0.1"));
+        assert_eq!(
+            find_provider([(&other, &b"x"[..])], &wanted),
+            Err(ProviderError::Missing)
+        );
+    }
+
+    #[test]
+    fn several_pinned_components_are_ambiguous() {
+        let wanted = id("a:b/c@1.0.0");
+        let (first, second) = (pinned("a:b/c@1.0.0", "aa"), pinned("a:b/c@1.0.0", "bb"));
+        let components = [(&second, &b"2"[..]), (&first, &b"1"[..])];
+        assert_eq!(
+            find_provider(components, &wanted),
+            Err(ProviderError::Ambiguous(vec![
+                first.clone(),
+                second.clone()
+            ]))
+        );
+    }
 }

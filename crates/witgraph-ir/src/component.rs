@@ -92,6 +92,22 @@ impl Capability {
             items: BTreeMap::new(),
         }
     }
+
+    /// Adds to `capabilities` those of `more` with a name it does not hold yet:
+    /// nodes importing one name share one import.
+    pub fn add_unique<'a>(
+        capabilities: &mut Vec<Capability>,
+        more: impl IntoIterator<Item = &'a Capability>,
+    ) {
+        for capability in more {
+            if !capabilities
+                .iter()
+                .any(|c| c.link_name() == capability.link_name())
+            {
+                capabilities.push(capability.clone());
+            }
+        }
+    }
 }
 
 /// The public contract of a WIT-defined component.

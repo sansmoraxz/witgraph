@@ -1215,14 +1215,7 @@ fn compose(
             }
         };
         if !is_mocked {
-            for capability in imports {
-                if !capabilities
-                    .iter()
-                    .any(|c| c.link_name() == capability.link_name())
-                {
-                    capabilities.push(capability.clone());
-                }
-            }
+            Capability::add_unique(&mut capabilities, imports);
         }
         members.push(HubMember {
             node: &node.id,

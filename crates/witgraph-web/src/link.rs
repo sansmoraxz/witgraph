@@ -8,9 +8,8 @@
 
 use std::collections::HashMap;
 
-use wasm_bindgen::JsError;
-use witgraph_ir::{Capability, CompiledGraph, ComponentRef, Link, NodeId};
-use witgraph_wit::compose::{LinkedProvider, imported_as, link_node};
+use witgraph_ir::{Capability, CompiledGraph, ComponentRef, LinkKey, NodeId};
+use witgraph_wit::compose::{ProviderError, find_provider, link_node, linked_providers};
 use witgraph_wit::lower::Lowered;
 
 use crate::graph::error;
@@ -35,33 +34,23 @@ pub struct Linked {
     pub of_node: HashMap<NodeId, usize>,
 }
 
-/// What identifies a link among a node's: its import, provider and export.
-type LinkKey = (String, ComponentRef, String);
-
 /// The bytes of the component a link names as its provider, among the
-/// `components` entries `load` was given. A provider has no contract for a
-/// content hash to name, so a pinned ref takes only the entry with that
-/// very ref. An unpinned one takes the entry with its own ref, else the one
-/// pinned entry of its world.
+/// `components` entries `load` was given.
 fn provider_bytes<'e>(
     entries: &'e [(ComponentRef, Vec<u8>)],
     provider: &ComponentRef,
 ) -> Result<&'e [u8], String> {
-    if let Some((_, bytes)) = entries.iter().find(|(id, _)| id == provider) {
-        return Ok(bytes);
-    }
-    let missing = || format!("no component `{provider:#}` for the provider of a link");
-    if provider.content_hash.is_some() {
-        return Err(missing());
-    }
-    let mut pinned = entries.iter().filter(|(id, _)| id.matches(provider));
-    match (pinned.next(), pinned.next()) {
-        (None, _) => Err(missing()),
-        (Some((_, bytes)), None) => Ok(bytes),
-        (Some((first, _)), Some((second, _))) => Err(format!(
-            "the provider `{provider}` of a link is ambiguous: `{first:#}` and `{second:#}` both fit"
-        )),
-    }
+    let components = entries.iter().map(|(id, bytes)| (id, bytes.as_slice()));
+    find_provider(components, provider).map_err(|e| match e {
+        ProviderError::Missing => format!("no component `{provider:#}` for the provider of a link"),
+        ProviderError::Ambiguous(candidates) => {
+            let candidates: Vec<String> = candidates.iter().map(|c| format!("`{c:#}`")).collect();
+            format!(
+                "the provider `{provider}` of a link is ambiguous: {} all fit",
+                candidates.join(", ")
+            )
+        }
+    })
 }
 
 /// Composes each node's links into its component. `entries` are the
@@ -81,28 +70,14 @@ pub fn compose_links(
     let mut done: HashMap<(&ComponentRef, Vec<LinkKey>), Option<usize>> = HashMap::new();
     let mut lowered: HashMap<&ComponentRef, Lowered> = HashMap::new();
     for node in &compiled.graph().nodes {
-        let mut links: Vec<&Link> = compiled
-            .graph()
-            .links
-            .iter()
-            .filter(|link| link.node == node.id)
-            .collect();
+        let links = compiled.link_keys(&node.id);
         if links.is_empty() {
             continue;
         }
         let contract = compiled
             .contract_for(&node.id)
             .ok_or_else(|| error(format!("unknown node `{}`", node.id)))?;
-        links.sort_by(|a, b| {
-            (&a.import, &a.provider, &a.export).cmp(&(&b.import, &b.provider, &b.export))
-        });
-        let key = (
-            &contract.id,
-            links
-                .iter()
-                .map(|l| (l.import.clone(), l.provider.clone(), l.export.clone()))
-                .collect::<Vec<_>>(),
-        );
+        let key = (&contract.id, links);
         if let Some(&index) = done.get(&key) {
             if let Some(index) = index {
                 linked.of_node.insert(node.id.clone(), index);
@@ -119,24 +94,10 @@ pub fn compose_links(
             lowered.insert(&contract.id, view);
         }
         let view = &lowered[&contract.id];
-        // A link whose import the bytes never use is left out, so its
-        // provider need not be there.
-        let providers = links
-            .iter()
-            .map(|link| {
-                let bytes = match imported_as(view, &link.import) {
-                    Some(_) => provider_bytes(entries, &link.provider)
-                        .map_err(|e| error(format!("component `{}`: {e}", contract.id)))?,
-                    None => &[][..],
-                };
-                Ok(LinkedProvider {
-                    import: &link.import,
-                    provider: &link.provider,
-                    bytes,
-                    export: &link.export,
-                })
-            })
-            .collect::<Result<Vec<_>, JsError>>()?;
+        let providers = linked_providers(view, &key.1, |provider| {
+            provider_bytes(entries, provider)
+                .map_err(|e| error(format!("component `{}`: {e}", contract.id)))
+        })?;
         let result = link_node(contract, bytes, view, &providers)
             .map_err(|e| error(format!("component `{}`: {e}", contract.id)))?;
         let index = match result.bytes {

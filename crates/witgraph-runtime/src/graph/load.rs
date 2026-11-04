@@ -18,9 +18,11 @@ use wasmtime::component::Component;
 use witgraph_ir::ComponentContract;
 #[cfg(feature = "compile")]
 use witgraph_ir::PackageRef;
-use witgraph_ir::{Capability, CompiledGraph, ComponentRef, IndexVec, NodeId, PortKind, PortTable};
+use witgraph_ir::{Capability, CompiledGraph, IndexVec, NodeId, PortKind, PortTable};
 #[cfg(feature = "compile")]
-use witgraph_wit::compose::{LinkedProvider, imported_as, link_node};
+use witgraph_ir::{ComponentRef, LinkKey};
+#[cfg(feature = "compile")]
+use witgraph_wit::compose::{ProviderError, find_provider, link_node, linked_providers};
 #[cfg(feature = "compile")]
 use witgraph_wit::hub::{self, HubMember};
 #[cfg(feature = "compile")]
@@ -73,9 +75,6 @@ struct Parts {
     source: Option<String>,
 }
 
-/// What identifies a link among a node's: its import, provider and export.
-type LinkKey = (String, ComponentRef, String);
-
 /// What tells `compiled` from any other graph: its nodes, what they run, and how
 /// they are wired. Anything here changes the composite. A contract's hash leaves
 /// out its name and version, so components with the same ports are told apart by
@@ -89,7 +88,7 @@ fn fingerprint(compiled: &CompiledGraph) -> String {
             .map(|c| (c.id.to_string(), witgraph_wit::hash::content_hash(c)))
             .unwrap_or_default();
         let _ = writeln!(text, "node {node} {component} {hash}");
-        for (import, provider, export) in link_keys(compiled, node) {
+        for (import, provider, export) in compiled.link_keys(node) {
             let _ = writeln!(text, "link {node} {import} {provider} {export}");
         }
     }
@@ -171,7 +170,7 @@ impl PreparedGraph {
         let mut of_node = Vec::with_capacity(compiled.graph().nodes.len());
         for node in &compiled.graph().nodes {
             let contract = contract_of(compiled, &node.id)?;
-            let key = (&contract.id, link_keys(compiled, &node.id));
+            let key = (&contract.id, compiled.link_keys(&node.id));
             if let Some(&at) = index_of.get(&key) {
                 of_node.push((&node.id, at));
                 continue;
@@ -185,24 +184,7 @@ impl PreparedGraph {
                     entry.insert((bytes, verify(contract, bytes)?))
                 }
             };
-            // A link whose import the bytes never use is left out, so its
-            // provider need not be there.
-            let links = key
-                .1
-                .iter()
-                .map(|(import, provider, export)| {
-                    let bytes = match imported_as(lowered, import) {
-                        Some(_) => index.provider(provider)?,
-                        None => &[][..],
-                    };
-                    Ok(LinkedProvider {
-                        import,
-                        provider,
-                        bytes,
-                        export,
-                    })
-                })
-                .collect::<Result<Vec<_>, LoadError>>()?;
+            let links = linked_providers(lowered, &key.1, |provider| index.provider(provider))?;
             let linked =
                 link_node(contract, bytes, lowered, &links).map_err(|e| LoadError::BadLink {
                     component: Box::new(contract.id.clone()),
@@ -431,16 +413,11 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
             message,
         };
         let ports = Arc::new(PortTable::new(&compiled));
-        // Nodes importing one name share one import.
         let mut capabilities: Vec<Capability> = Vec::new();
-        for capability in prepared.parts.capabilities.iter().flat_map(|(_, c)| c) {
-            if !capabilities
-                .iter()
-                .any(|c| c.link_name() == capability.link_name())
-            {
-                capabilities.push(capability.clone());
-            }
-        }
+        Capability::add_unique(
+            &mut capabilities,
+            prepared.parts.capabilities.iter().flat_map(|(_, c)| c),
+        );
         let linker = engine::graph_linker(&engine, &ports, &capabilities, &host)
             .map_err(|e| instantiation(format!("{:#}", e.context("linker"))))?;
         let pre = linker
@@ -510,16 +487,6 @@ fn port_types<D: engine::StoreData>(
         hub.getter_type(store, exports.output_getter(output))
     });
     PortTypes { inputs, outputs }
-}
-
-/// The links of `node`, sorted.
-fn link_keys(compiled: &CompiledGraph, node: &NodeId) -> Vec<LinkKey> {
-    let mut keys: Vec<LinkKey> = compiled
-        .links_of(node)
-        .map(|l| (l.import.clone(), l.provider.clone(), l.export.clone()))
-        .collect();
-    keys.sort();
-    keys
 }
 
 /// The load error for a capability the host cannot provide to `node`.
@@ -698,35 +665,19 @@ impl<'w, 'a> WasmIndex<'w, 'a> {
         })
     }
 
-    /// The bytes of a link's provider. A provider has no contract for a
-    /// hash to name, so a pinned ref takes only its own key. An unpinned
-    /// one takes its own key, else the one pinned key of its world:
-    /// several are [`LoadError::AmbiguousProvider`], none
-    /// [`LoadError::MissingWasm`].
+    /// The bytes of a link's provider ([`find_provider`]): several that fit are
+    /// [`LoadError::AmbiguousProvider`], none [`LoadError::MissingWasm`].
     fn provider(&self, provider: &ComponentRef) -> Result<&'a [u8], LoadError> {
-        let missing = || LoadError::MissingWasm {
-            component: Box::new(provider.clone()),
-        };
-        if let Some(bytes) = self.get(provider) {
-            return Ok(bytes);
-        }
-        if provider.content_hash.is_some() {
-            return Err(missing());
-        }
-        // Its own key is not there, so every key of its world is pinned.
-        match self.world(provider) {
-            [] => Err(missing()),
-            [(_, bytes)] => Ok(bytes),
-            pinned => {
-                let mut candidates: Vec<ComponentRef> =
-                    pinned.iter().map(|(key, _)| (*key).clone()).collect();
-                candidates.sort();
-                Err(LoadError::AmbiguousProvider {
-                    provider: Box::new(provider.clone()),
-                    candidates,
-                })
-            }
-        }
+        let components = self.wasm.iter().map(|(id, bytes)| (id, *bytes));
+        find_provider(components, provider).map_err(|e| match e {
+            ProviderError::Missing => LoadError::MissingWasm {
+                component: Box::new(provider.clone()),
+            },
+            ProviderError::Ambiguous(candidates) => LoadError::AmbiguousProvider {
+                provider: Box::new(provider.clone()),
+                candidates,
+            },
+        })
     }
 }
 

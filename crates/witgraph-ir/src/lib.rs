@@ -21,7 +21,7 @@ pub mod wave;
 
 pub use compile::{
     CompilationFailure, CompiledConnection, CompiledGraph, CompiledNode, ContractIndex,
-    ContractSource, RequiredCapability, Resolution, resolve_contract,
+    ContractSource, LinkKey, RequiredCapability, Resolution, resolve_contract,
 };
 pub use component::{Capability, ComponentContract};
 pub use diagnostics::{Diagnostic, Diagnostics, Location, Severity};
