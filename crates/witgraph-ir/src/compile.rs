@@ -1115,12 +1115,92 @@ fn claims_of<'g>(
     claims
 }
 
+/// A vertex per stream group, then one per node in none, and the nodes of each.
+fn units<'g>(
+    graph: &'g Graph,
+    groups: &'g StreamGroups,
+) -> (HashMap<&'g NodeId, usize>, Vec<Vec<&'g NodeId>>) {
+    let mut units: Vec<Vec<&NodeId>> = groups.groups.iter().map(|g| g.iter().collect()).collect();
+    let mut vertex: HashMap<&NodeId, usize> = HashMap::new();
+    for (at, members) in units.iter().enumerate() {
+        vertex.extend(members.iter().map(|m| (*m, at)));
+    }
+    for node in graph.nodes.iter().map(|n| &n.id) {
+        if !groups.in_group.contains_key(node) && !vertex.contains_key(node) {
+            vertex.insert(node, units.len());
+            units.push(vec![node]);
+        }
+    }
+    (vertex, units)
+}
+
+/// A stream group starts only once every member's required inputs have values,
+/// and what a connection writes has a value only once its writer has run. So
+/// groups, and the nodes between them, that wait on each other this way never
+/// start, and at run time all that shows is ticks going idle. An input a feedback
+/// connection also writes might get its value from that instead, and one written
+/// inside its group doesn't hold the group up.
+fn check_group_start(
+    graph: &Graph,
+    contracts: &HashMap<&NodeId, &ComponentContract>,
+    groups: &StreamGroups,
+    diagnostics: &mut Diagnostics,
+) {
+    let (vertex, units) = units(graph, groups);
+    let fed_back: BTreeSet<&PortRef> = graph
+        .connections
+        .iter()
+        .filter(|conn| conn.feedback)
+        .map(|conn| &conn.to)
+        .collect();
+    let required = |to: &PortRef| {
+        contracts.get(&to.node).is_some_and(|contract| {
+            contract
+                .inputs
+                .iter()
+                .any(|input| input.name == to.port && input.kind.is_latched() && !input.optional)
+        })
+    };
+    let edges = graph
+        .connections
+        .iter()
+        .filter(|conn| !conn.feedback && !fed_back.contains(&conn.to) && required(&conn.to))
+        .filter_map(|conn| Some((*vertex.get(&conn.from.node)?, *vertex.get(&conn.to.node)?)))
+        .filter(|(from, to)| from != to);
+    for cycle in topo::cyclic_groups(units.len(), edges) {
+        let mut nodes: Vec<NodeId> = cycle
+            .iter()
+            .filter_map(|at| units.get(*at))
+            .flatten()
+            .map(|node| (*node).clone())
+            .collect();
+        nodes.sort();
+        diagnostics.push(Diagnostic::GroupWaitsOnItself { nodes });
+    }
+}
+
+/// Every node with a path of connections to `node`, feedback aside.
+fn upstream_of<'g>(graph: &'g Graph, node: &'g NodeId) -> HashSet<&'g NodeId> {
+    let mut upstream: HashSet<&NodeId> = HashSet::new();
+    let mut waiting = vec![node];
+    while let Some(next) = waiting.pop() {
+        for conn in graph.connections.iter().filter(|conn| !conn.feedback) {
+            if conn.to.node == *next && upstream.insert(&conn.from.node) {
+                waiting.push(&conn.from.node);
+            }
+        }
+    }
+    upstream
+}
+
 /// A stream group holds its members' claims together from when the first
 /// starts until it has drained (see [`ResourceClaim`](crate::ResourceClaim)),
 /// as its producer's writer outlives `run`. So a group whose claims on one
 /// resource sum to more than all of it could never start, and groups on a
 /// cycle, each waiting for a node of the next, must all fit at once: one holding
-/// what the next needs would wait for it forever.
+/// what the next needs would wait for it forever. Likewise what a member waits
+/// for and another member does not: that one can start the group first, and what
+/// the first waits for must then fit beside the group's claims.
 fn check_group_claims(graph: &Graph, groups: &StreamGroups, diagnostics: &mut Diagnostics) {
     // Tolerates float rounding in sums of fractions such as 0.1 + 0.2.
     const EPSILON: f64 = 1e-9;
@@ -1140,30 +1220,16 @@ fn check_group_claims(graph: &Graph, groups: &StreamGroups, diagnostics: &mut Di
             });
         }
     }
-    // A vertex per group, then one per node in none, joined by what must return
-    // before what.
-    let vertex: HashMap<&NodeId, usize> = groups
-        .groups
-        .iter()
-        .enumerate()
-        .flat_map(|(at, members)| members.iter().map(move |m| (m, at)))
-        .chain(
-            graph
-                .nodes
-                .iter()
-                .map(|n| &n.id)
-                .filter(|n| !groups.in_group.contains_key(n))
-                .enumerate()
-                .map(|(at, n)| (n, groups.groups.len() + at)),
-        )
-        .collect();
+    // Joined by what must return before what.
+    let (vertex, units) = units(graph, groups);
+    let mut reported: Vec<(Vec<NodeId>, &ResourceId)> = Vec::new();
     let edges = graph
         .connections
         .iter()
         .filter(|conn| !conn.feedback)
         .filter_map(|conn| Some((*vertex.get(&conn.from.node)?, *vertex.get(&conn.to.node)?)))
         .filter(|(from, to)| from != to);
-    for cycle in topo::cyclic_groups(vertex.len(), edges) {
+    for cycle in topo::cyclic_groups(units.len(), edges) {
         let on_it: Vec<&Vec<NodeId>> = cycle
             .iter()
             .filter_map(|at| groups.groups.get(*at))
@@ -1177,10 +1243,60 @@ fn check_group_claims(graph: &Graph, groups: &StreamGroups, diagnostics: &mut Di
             members().filter_map(|m| nodes.get(m).map(|n| &n.id)),
         );
         for (resource, _) in claims.into_iter().filter(|(_, sum)| *sum > 1.0 + EPSILON) {
+            let nodes: Vec<NodeId> = members().cloned().collect();
+            let mut sorted = nodes.clone();
+            sorted.sort();
+            reported.push((sorted, resource));
             diagnostics.push(Diagnostic::ClaimsCanDeadlock {
-                nodes: members().cloned().collect(),
+                nodes,
                 resource: resource.clone(),
             });
+        }
+    }
+    for (at, members) in groups.groups.iter().enumerate() {
+        let upstream: Vec<HashSet<&NodeId>> =
+            members.iter().map(|m| upstream_of(graph, m)).collect();
+        let mut claims_of_group: Option<BTreeMap<&ResourceId, f64>> = None;
+        for (_, nodes_of) in units.iter().enumerate().filter(|(unit, _)| *unit != at) {
+            let above = |set: &HashSet<&NodeId>| nodes_of.iter().any(|n| set.contains(*n));
+            // Above no member, it holds nothing up. Above every one, the group
+            // cannot start before it has run.
+            if !upstream.iter().any(above) || upstream.iter().all(above) {
+                continue;
+            }
+            let of_group = claims_of_group.get_or_insert_with(|| {
+                claims_of(
+                    &nodes,
+                    members.iter().filter_map(|m| nodes.get(m).map(|n| &n.id)),
+                )
+            });
+            let of_other = claims_of(
+                &nodes,
+                nodes_of.iter().filter_map(|m| nodes.get(*m).map(|n| &n.id)),
+            );
+            for (resource, claim) in of_other {
+                let Some(held) = of_group.get(resource) else {
+                    continue;
+                };
+                if *held > 1.0 + EPSILON || held + claim <= 1.0 + EPSILON {
+                    continue;
+                }
+                let nodes: Vec<NodeId> = members
+                    .iter()
+                    .chain(nodes_of.iter().copied())
+                    .cloned()
+                    .collect();
+                let mut sorted = nodes.clone();
+                sorted.sort();
+                if reported.iter().any(|r| r.0 == sorted && *r.1 == *resource) {
+                    continue;
+                }
+                reported.push((sorted, resource));
+                diagnostics.push(Diagnostic::ClaimsCanDeadlock {
+                    nodes,
+                    resource: resource.clone(),
+                });
+            }
         }
     }
 }
@@ -1306,6 +1422,7 @@ impl Graph {
             check_useless_feedback(&self, &resolved, &mut diagnostics);
         }
         if let Some(groups) = &groups {
+            check_group_start(&self, &node_contracts, groups, &mut diagnostics);
             check_group_claims(&self, groups, &mut diagnostics);
         }
 
@@ -2231,13 +2348,184 @@ mod tests {
         )
     }
 
+    /// `inputs { st: stream, threshold: option<value> }`.
+    fn stream_with_optional_threshold() -> ComponentContract {
+        contract(
+            "dst",
+            vec![
+                port("st", PortKind::Stream),
+                port("threshold", PortKind::Value).optional(),
+            ],
+            vec![],
+            &[],
+        )
+    }
+
+    /// `s -> t` over a stream, and `s.status -> r.in`, `r.out -> t.threshold`.
+    fn group_and_a_value_path_back(dst: ComponentContract, pass: ComponentContract) -> TestGraph {
+        builder("t")
+            .add_component(stream_and_status())
+            .add_component(dst)
+            .add_component(pass)
+            .add_node("s", cref("src"))
+            .add_node("t", cref("dst"))
+            .add_node("r", cref("pass"))
+            .connect("st", PortRef::new("s", "st"), PortRef::new("t", "st"))
+            .connect("out", PortRef::new("s", "status"), PortRef::new("r", "in"))
+            .connect(
+                "back",
+                PortRef::new("r", "out"),
+                PortRef::new("t", "threshold"),
+            )
+            .build()
+    }
+
+    #[test]
+    fn a_group_cannot_wait_for_its_own_output_to_start() {
+        let graph = group_and_a_value_path_back(stream_with_threshold(), pass_through());
+        assert_eq!(
+            diags(graph.compile()),
+            vec![Diagnostic::GroupWaitsOnItself {
+                nodes: vec!["r".into(), "s".into(), "t".into()],
+            }]
+        );
+    }
+
+    #[test]
+    fn an_optional_input_on_the_path_back_lets_a_group_start() {
+        let pass = contract(
+            "pass",
+            vec![port("in", PortKind::Value).optional()],
+            vec![port("out", PortKind::Value)],
+            &[],
+        );
+        let graph = group_and_a_value_path_back(stream_with_threshold(), pass);
+        let compiled = graph.compile().expect("`r` runs without `s`");
+        assert!(compiled.warnings().is_empty(), "{:?}", compiled.warnings());
+    }
+
+    #[test]
+    fn a_required_input_written_inside_its_group_holds_nothing_up() {
+        let graph = builder("t")
+            .add_component(stream_and_status())
+            .add_component(stream_with_threshold())
+            .add_node("s", cref("src"))
+            .add_node("t", cref("dst"))
+            .connect("st", PortRef::new("s", "st"), PortRef::new("t", "st"))
+            .connect(
+                "status",
+                PortRef::new("s", "status"),
+                PortRef::new("t", "threshold"),
+            )
+            .build();
+        let compiled = graph.compile().expect("written while the group runs");
+        assert!(compiled.warnings().is_empty(), "{:?}", compiled.warnings());
+    }
+
+    /// `{a, b}` over a stream, with `u`, both claiming 0.6: `a` first, and `wire`
+    /// the connections of `u`.
+    fn group_and_a_claiming_node(
+        u_first: bool,
+        wire: impl FnOnce(TestBuilder) -> TestBuilder,
+    ) -> TestGraph {
+        let claim = || ResourceClaim::new(0.6).unwrap();
+        let mut graph = builder("t")
+            .add_component(contract(
+                "head",
+                vec![port("in", PortKind::Value).optional()],
+                vec![port("st", PortKind::Stream), port("out", PortKind::Value)],
+                &[],
+            ))
+            .add_component(contract(
+                "tail",
+                vec![
+                    port("st", PortKind::Stream),
+                    port("in", PortKind::Value).optional(),
+                ],
+                vec![],
+                &[],
+            ))
+            .add_component(contract(
+                "solo",
+                vec![port("in", PortKind::Value).optional()],
+                vec![port("out", PortKind::Value)],
+                &[],
+            ));
+        if u_first {
+            graph = graph.add_node("u", cref("solo"));
+        }
+        graph = graph
+            .add_node("a", cref("head"))
+            .add_node("b", cref("tail"));
+        if !u_first {
+            graph = graph.add_node("u", cref("solo"));
+        }
+        wire(graph.connect("ab", PortRef::new("a", "st"), PortRef::new("b", "st")))
+            .set_resource("a", "gpu", claim())
+            .unwrap()
+            .set_resource("u", "gpu", claim())
+            .unwrap()
+            .build()
+    }
+
+    fn u_feeds_b(graph: TestBuilder) -> TestBuilder {
+        graph.connect("ub", PortRef::new("u", "out"), PortRef::new("b", "in"))
+    }
+
+    #[test]
+    fn what_one_member_waits_for_must_fit_beside_the_group() {
+        // Whether it stalls would depend on which node was added first.
+        for u_first in [false, true] {
+            assert_eq!(
+                diags(group_and_a_claiming_node(u_first, u_feeds_b).compile()),
+                vec![Diagnostic::ClaimsCanDeadlock {
+                    nodes: vec!["a".into(), "b".into(), "u".into()],
+                    resource: "gpu".into(),
+                }],
+                "`u` added first: {u_first}"
+            );
+        }
+    }
+
+    #[test]
+    fn what_sits_between_members_must_fit_beside_the_group() {
+        let graph = group_and_a_claiming_node(false, |graph| {
+            u_feeds_b(graph).connect("au", PortRef::new("a", "out"), PortRef::new("u", "in"))
+        });
+        assert_eq!(
+            diags(graph.compile()),
+            vec![Diagnostic::ClaimsCanDeadlock {
+                nodes: vec!["a".into(), "b".into(), "u".into()],
+                resource: "gpu".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn what_every_member_waits_for_runs_before_the_group_holds_anything() {
+        let graph = group_and_a_claiming_node(false, |graph| {
+            graph.connect("ua", PortRef::new("u", "out"), PortRef::new("a", "in"))
+        });
+        graph.compile().expect("`u` has returned before `a` starts");
+    }
+
+    #[test]
+    fn what_a_group_does_not_wait_for_needs_no_room_beside_it() {
+        let graph = group_and_a_claiming_node(false, |graph| graph);
+        graph.compile().expect("`u` waits its turn");
+        let feedback = group_and_a_claiming_node(false, |graph| {
+            graph.connect_feedback("ub", PortRef::new("u", "out"), PortRef::new("b", "in"))
+        });
+        feedback.compile().expect("feedback waits for nothing");
+    }
+
     /// A value path out of a group and back no longer joins anything: each
     /// node runs when what it reads has settled.
     #[test]
     fn a_value_path_out_of_a_group_and_back_joins_nothing() {
         let graph = builder("t")
             .add_component(stream_and_status())
-            .add_component(stream_with_threshold())
+            .add_component(stream_with_optional_threshold())
             .add_component(pass_through())
             .add_node("s", cref("src"))
             .add_node("t", cref("dst"))
@@ -2270,7 +2558,10 @@ mod tests {
             ))
             .add_component(contract(
                 "tail",
-                vec![port("st", PortKind::Stream), port("in", PortKind::Value)],
+                vec![
+                    port("st", PortKind::Stream),
+                    port("in", PortKind::Value).optional(),
+                ],
                 vec![port("out", PortKind::Value)],
                 &[],
             ))

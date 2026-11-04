@@ -399,22 +399,38 @@ pub enum Diagnostic {
         /// The overclaimed resource.
         resource: ResourceId,
     },
-    /// Stream groups that each wait on a node of the next, on a cycle, whose
-    /// claims on one resource do not fit together. One holding the resource
-    /// would wait for one that cannot get it.
+    /// Stream groups and what they wait on whose claims on one resource do not
+    /// fit together: groups that each wait on a node of the next, on a cycle, or
+    /// a group and what only some of its members wait on. One holding the
+    /// resource would wait for one that cannot get it.
     #[error(
-        "nodes {} are in stream groups waiting on each other, which claim more than all of resource `{resource}` between them",
+        "nodes {} are in stream groups waiting on what claims more than the rest of resource `{resource}`",
         join_nodes(nodes)
     )]
     #[diagnostic(
         code(witgraph::ir::claims_can_deadlock),
-        help("lower the claims, or mark a connection between the groups `feedback`")
+        help("lower the claims, or mark a connection between them `feedback`")
     )]
     ClaimsCanDeadlock {
-        /// The groups' members.
+        /// The groups' members, and what they wait on.
         nodes: Vec<NodeId>,
         /// The resource.
         resource: ResourceId,
+    },
+    /// Stream groups, and the nodes between them, that wait on each other to
+    /// start: a group starts only once every member's required inputs have
+    /// values, and these are written only after it has run.
+    #[error(
+        "nodes {} can never start: a stream group among them needs a required input that is only written after it has run",
+        join_nodes(nodes)
+    )]
+    #[diagnostic(
+        code(witgraph::ir::group_waits_on_itself),
+        help("make an input on the path optional, or mark a connection on it `feedback`")
+    )]
+    GroupWaitsOnItself {
+        /// The nodes waiting on each other, sorted.
+        nodes: Vec<NodeId>,
     },
     /// A cycle in which no edge is marked as a feedback boundary. `nodes`
     /// holds the members of the offending strongly connected component,
@@ -496,7 +512,8 @@ impl Diagnostic {
             }
             Diagnostic::IllegalCycle { nodes } => Location::Cycle(nodes.clone()),
             Diagnostic::GroupOverclaims { nodes, .. }
-            | Diagnostic::ClaimsCanDeadlock { nodes, .. } => Location::Group(nodes.clone()),
+            | Diagnostic::ClaimsCanDeadlock { nodes, .. }
+            | Diagnostic::GroupWaitsOnItself { nodes } => Location::Group(nodes.clone()),
         }
     }
 }

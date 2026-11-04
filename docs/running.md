@@ -247,6 +247,9 @@ together: a _stream group_. If any member owes a run, they all do, and the group
 starts as soon as one member can. Each member still runs when what it reads has
 settled. Other nodes run on their own: they re-run only if an input changed.
 
+A group starts only once every member's required inputs have values, so compiling
+rejects one with a required input that is only written after the group has run.
+
 When a group's runs have all returned its writers may still be going, so it can't
 start again until no guest work is left anywhere in the graph. Beside an endless
 stream, then, a stream group never re-runs: stop the graph to restart it.
@@ -276,8 +279,9 @@ memory, so a graph holds at most 4 GiB of them, and that memory never shrinks.
 Nodes can also claim a fraction of a named resource. A node holds its claims while
 it runs, and a stream group holds its members' from when it starts until it has
 drained. The scheduler won't start what doesn't fit. Compiling rejects a group
-claiming more than all of a resource, and groups that wait on each other whose
-claims can't fit together, since they would deadlock.
+claiming more than all of a resource, groups that wait on each other whose claims
+can't fit together, and a group whose claims leave no room for a node only some of
+its members wait on, since they would deadlock.
 
 ## Snapshots
 
