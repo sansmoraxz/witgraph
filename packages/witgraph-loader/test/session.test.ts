@@ -1882,3 +1882,60 @@ test('imports sharing an instance type are decoded, not a crash', async () => {
     /exactly one node world in the component, found 0/,
   );
 });
+
+/** A tick stopped while `h` is held, so what else it asked for stays queued. */
+async function interruptedTick(session: Session): Promise<void> {
+  let stop!: () => void;
+  const ticked = session.tick(new Promise<void>((resolve) => (stop = resolve)));
+  // Long enough for what isn't held to return.
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  stop();
+  assert.equal((await ticked).result, 'interrupted');
+}
+
+test('a host write wins over a latch an interrupted tick queued', async () => {
+  const held = gate();
+  const session = await load(
+    [
+      ['h', 'echo'],
+      ['e', 'echo'],
+    ],
+    [['ee', 'e.out', 'e.in', true]],
+    {
+      beforeRun: async (node) => {
+        if (node === 'h') await held.promise;
+      },
+    },
+  );
+  await session.graph.inject('e', 'in', 1);
+  await interruptedTick(session);
+  assert.equal(await session.graph.readOutput('e', 'out'), 1);
+  await session.graph.inject('e', 'in', 100);
+  held.open();
+  await session.tick();
+  assert.equal(await session.graph.readOutput('e', 'out'), 100);
+});
+
+test('a snapshot leaves out feedback a host write dropped', async () => {
+  const held = gate();
+  const session = await load(
+    [
+      ['h', 'busy-loop'],
+      ['m', 'relay'],
+      ['n', 'busy-loop'],
+    ],
+    [
+      ['hm', 'h.done', 'm.in'],
+      ['nm', 'n.done', 'm.add', true],
+    ],
+    {
+      beforeRun: async (node) => {
+        if (node === 'h') await held.promise;
+      },
+    },
+  );
+  await interruptedTick(session);
+  assert.deepEqual(Object.keys(JSON.parse(await session.graph.snapshot()).feedback), ['nm']);
+  await session.graph.inject('m', 'add', 100);
+  assert.deepEqual(JSON.parse(await session.graph.snapshot()).feedback, {});
+});

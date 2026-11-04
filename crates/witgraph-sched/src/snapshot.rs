@@ -23,7 +23,8 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
     /// flight or owed. See [`Snapshot`] for what is and is not captured.
     ///
     /// Fails, naming it, on a value the executor cannot write as WAVE text.
-    pub fn snapshot(&self) -> Result<Snapshot, SnapshotError> {
+    pub fn snapshot(&mut self) -> Result<Snapshot, SnapshotError> {
+        self.core().serve_queued();
         let core: &SchedulerCore<dyn DataPlane> = &self.core;
         let mut snapshot = core.snapshot_base();
         let latches = self.core.plane.lock();

@@ -216,7 +216,7 @@ impl WebRuntime {
         input: InputIdx,
         data: Rc<Data>,
     ) -> Result<(), RuntimeError> {
-        self.core().drain();
+        self.core().serve_queued();
         let same = self.hub.retained.borrow()[input]
             .as_ref()
             .is_some_and(|old| old.equals(&data));
@@ -311,7 +311,7 @@ impl RunningGraph for WebRuntime {
     }
 
     async fn clear_input(&mut self, node: &NodeId, port: &PortName) -> Result<(), RuntimeError> {
-        self.core().drain();
+        self.core().serve_queued();
         let (input, _) = self.host_input(node, port)?;
         let held = self.hub.retained.borrow_mut()[input].take().is_some();
         let cleared = if self.hub.live.get() {
@@ -381,7 +381,7 @@ impl RunningGraph for WebRuntime {
     }
 
     async fn snapshot(&mut self) -> Result<Snapshot, SnapshotError> {
-        self.core().drain();
+        self.core().serve_queued();
         let core: &SchedulerCore<dyn DataPlane> = &self.core;
         let mut snapshot = core.snapshot_base();
         let ports = self.core.ports().clone();

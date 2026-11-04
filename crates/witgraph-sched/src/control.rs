@@ -531,6 +531,19 @@ impl SchedulerCore<dyn DataPlane> {
         any
     }
 
+    /// Serves the commands already sent, then handles what that reported. A host
+    /// that writes and reads its values directly, not through its server, calls
+    /// this first, so that it acts after what an interrupted tick left queued, as
+    /// on a host that queues them. An instance this stops has its fault in
+    /// [`take_faults`](Self::take_faults).
+    pub fn serve_queued(&mut self) {
+        if let Some(outcome) = self.poll_server_once() {
+            self.drain();
+            let _ = self.stopped(outcome);
+        }
+        self.drain();
+    }
+
     fn drained(&self) -> Option<Drained> {
         (self.outstanding == 0).then_some(Drained(()))
     }

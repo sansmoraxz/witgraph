@@ -155,7 +155,7 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
 
     /// Writes a value already in the port's checked, canonical form.
     fn inject_checked(&mut self, input: InputIdx, val: Canonical<X::Value>) {
-        self.core().drain();
+        self.core().serve_queued();
         let changed = self
             .core
             .plane
@@ -198,7 +198,7 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
     /// nothing; otherwise the node re-runs, and the clear wins over feedback
     /// for this input computed before it.
     pub fn clear_input(&mut self, node: &NodeId, port: &PortName) -> Result<(), RuntimeError> {
-        self.core().drain();
+        self.core().serve_queued();
         let (input, _) = self.host_input(node, port)?;
         let cleared = self.core.plane.lock().host_clear(input);
         if cleared {

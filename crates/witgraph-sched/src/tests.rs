@@ -10,8 +10,8 @@ use futures::FutureExt;
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
 use futures::executor::block_on;
 use witgraph_ir::{
-    ComponentContract, ComponentRef, Graph, HandleType, NodeId, NodeIdx, PortDef, PortDirection,
-    PortKind, PortName, PortRef, Type,
+    CompiledGraph, ComponentContract, ComponentRef, Graph, HandleType, NodeId, NodeIdx, PortDef,
+    PortDirection, PortKind, PortName, PortRef, Type,
 };
 
 use crate::control::SchedulerCore;
@@ -120,21 +120,28 @@ fn load(held: Option<&str>, fail_rebuilds: &Arc<AtomicUsize>) -> Scheduler<Perf,
         .build()
         .compile(std::slice::from_ref(&contract))
         .unwrap();
+    load_adders(compiled, held, fail_rebuilds)
+}
+
+/// Loads a graph of [`adder`]s.
+fn load_adders(
+    compiled: CompiledGraph,
+    held: Option<&str>,
+    fail_rebuilds: &Arc<AtomicUsize>,
+) -> Scheduler<Perf, Adders> {
     let mut ports = HashSet::new();
-    for node in ["a", "b"] {
-        for input in ["in", "add"] {
-            ports.insert((PortRef::new(node, input), PortDirection::Input));
-        }
-        ports.insert((PortRef::new(node, "out"), PortDirection::Output));
-    }
+    let mut shapes: HashMap<NodeId, RunShape> = HashMap::new();
     let shape = RunShape {
         inputs: Some(vec!["in".into(), "add".into()]),
         has_result: true,
     };
-    let shapes: HashMap<NodeId, RunShape> = ["a", "b"]
-        .into_iter()
-        .map(|node| (NodeId::from(node), shape.clone()))
-        .collect();
+    for node in compiled.topological_order() {
+        for input in ["in", "add"] {
+            ports.insert((PortRef::new(node.clone(), input), PortDirection::Input));
+        }
+        ports.insert((PortRef::new(node.clone(), "out"), PortDirection::Output));
+        shapes.insert(node.clone(), shape.clone());
+    }
     let executor = Adders {
         held: held.map(NodeId::from),
         fail_rebuilds: fail_rebuilds.clone(),
@@ -185,6 +192,62 @@ fn what_a_dropped_tick_left_behind_is_handled_first() {
     assert!(sched.take_faults().is_empty());
     assert_eq!(sched.node_state(&a).unwrap().phase(), NodePhase::Idle);
     assert!(sched.output_version(&a, &"out".into()).unwrap().get() > 0);
+}
+
+/// `h`, whose call never returns, beside `n`, whose `out` feeds back into its
+/// `add`, after a tick interrupted with the latch of `n`'s feedback queued.
+fn interrupted_with_a_latch_queued() -> Scheduler<Perf, Adders> {
+    let contract = adder();
+    let compiled = Graph::builder("t")
+        .add_component(&contract)
+        .add_node("h", contract.id.clone())
+        .add_node("n", contract.id.clone())
+        .connect_feedback("nn", PortRef::new("n", "out"), PortRef::new("n", "add"))
+        .build()
+        .compile(std::slice::from_ref(&contract))
+        .unwrap();
+    let mut sched = load_adders(compiled, Some("h"), &Arc::new(AtomicUsize::new(0)));
+    let tick = block_on(sched.tick_until(std::future::ready(())));
+    assert!(matches!(tick, TickResult::Interrupted), "{tick:?}");
+    assert_eq!(out(&sched, "n"), Some(1));
+    sched
+}
+
+#[test]
+fn a_host_write_wins_over_a_latch_an_interrupted_tick_queued() {
+    let mut sched = interrupted_with_a_latch_queued();
+    sched.inject(&"n".into(), &"add".into(), 100).unwrap();
+    assert!(sched.tick().now_or_never().is_none());
+    assert_eq!(out(&sched, "n"), Some(101));
+}
+
+#[test]
+fn a_host_clear_wins_over_a_latch_an_interrupted_tick_queued() {
+    let mut sched = interrupted_with_a_latch_queued();
+    sched.clear_input(&"n".into(), &"add".into()).unwrap();
+    assert!(sched.tick().now_or_never().is_none());
+    assert_eq!(out(&sched, "n"), Some(1));
+}
+
+#[test]
+fn a_snapshot_leaves_out_feedback_a_host_write_dropped() {
+    let contract = adder();
+    // `m` waits for `h`, so `n`'s feedback into it stays buffered.
+    let compiled = Graph::builder("t")
+        .add_component(&contract)
+        .add_node("h", contract.id.clone())
+        .add_node("m", contract.id.clone())
+        .add_node("n", contract.id.clone())
+        .connect("hm", PortRef::new("h", "out"), PortRef::new("m", "in"))
+        .connect_feedback("nm", PortRef::new("n", "out"), PortRef::new("m", "add"))
+        .build()
+        .compile(std::slice::from_ref(&contract))
+        .unwrap();
+    let mut sched = load_adders(compiled, Some("h"), &Arc::new(AtomicUsize::new(0)));
+    assert!(sched.tick().now_or_never().is_none());
+    assert_eq!(sched.snapshot().unwrap().feedback.len(), 1, "buffered");
+    sched.inject(&"m".into(), &"add".into(), 100).unwrap();
+    assert!(sched.snapshot().unwrap().feedback.is_empty());
 }
 
 #[test]
