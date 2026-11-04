@@ -7,11 +7,8 @@ rt.inject(&"scale".into(), &"factor".into(), Val::U32(10)).await?;
 for _ in 0..100 {
     match rt.tick_until(tokio::time::sleep(Duration::from_secs(1))).await {
         TickResult::Idle => break,
-        TickResult::Aborted { fault, .. } => return Err(fault.into()),
+        TickResult::Faulted(report) => return Err(report.fault.into()),
         _ => {}
-    }
-    for report in rt.take_faults() {
-        eprintln!("the graph faulted: {}", report.fault);
     }
 }
 let scaled = rt.read_output(&"scale".into(), &"out".into()).await?;
@@ -167,8 +164,8 @@ nothing more can run, then advances each feedback loop by one iteration.
 an endless stream can't block you. Dropping a tick is safe: the next one picks
 up where it left off.
 
-A tick returns `Progress`, `Idle`, `Interrupted`, `StepLimitReached` or
-`Aborted` (a node called `fatal`).
+A tick returns `Progress`, `Idle`, `Interrupted`, `StepLimitReached` or `Faulted`,
+which holds the fault that stopped the graph.
 
 ## Inputs and outputs
 

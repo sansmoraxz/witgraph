@@ -291,7 +291,7 @@ async fn settle(rt: &mut RuntimeGraph<Perf, Plugins>) {
             .expect("tick hung");
         match result {
             TickResult::Idle => return,
-            TickResult::Progress => {}
+            TickResult::Progress | TickResult::Faulted(_) => {}
             other => panic!("unexpected tick result: {other:?}"),
         }
     }

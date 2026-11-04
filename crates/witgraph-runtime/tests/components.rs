@@ -144,7 +144,7 @@ async fn a_named_node_interface_loads_and_runs() {
     let tick = tokio::time::timeout(Duration::from_secs(30), rt.tick())
         .await
         .unwrap();
-    assert!(matches!(tick, TickResult::Progress), "{tick:?}");
+    assert!(matches!(tick, TickResult::Faulted(_)), "{tick:?}");
     assert!(
         matches!(
             rt.node_state(&"n".into()).unwrap().fault_cause(),
@@ -908,7 +908,7 @@ async fn growing_memory_past_the_group_limit_faults() {
     let tick = tokio::time::timeout(Duration::from_secs(20), rt.tick())
         .await
         .expect("the tick ends");
-    assert!(matches!(tick, TickResult::Progress), "{tick:?}");
+    assert!(matches!(tick, TickResult::Faulted(_)), "{tick:?}");
     let state = rt.node_state(&"n".into()).unwrap();
     assert_eq!(state.phase(), NodePhase::Faulted);
     assert!(
@@ -1115,8 +1115,9 @@ async fn fatal_from_a_start_function_during_a_rebuild_aborts_the_tick() {
         .await
         .unwrap();
     assert!(
-        matches!(&tick, TickResult::Aborted { node, fault: NodeFault::Fatal { message } }
-            if node.as_str() == "n" && message == "boom"),
+        matches!(&tick, TickResult::Faulted(report)
+            if report.culprit.as_ref().is_some_and(|node| node.as_str() == "n")
+                && matches!(&report.fault, NodeFault::Fatal { message } if message == "boom")),
         "{tick:?}: {:?}",
         rt.take_faults()
     );

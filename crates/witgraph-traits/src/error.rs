@@ -134,8 +134,7 @@ pub enum NodeFault {
     #[error("fuel exhausted")]
     #[diagnostic(code(witgraph::runtime::fuel_exhausted))]
     FuelExhausted,
-    /// A node called `witgraph:runtime/host.fatal`. The tick that saw it
-    /// returned [`TickResult::Aborted`](crate::TickResult::Aborted).
+    /// A node called `witgraph:runtime/host.fatal`.
     #[error("fatal: {message}")]
     #[diagnostic(code(witgraph::runtime::fatal))]
     Fatal {

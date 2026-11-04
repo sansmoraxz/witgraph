@@ -78,7 +78,7 @@ fn tick_name(result: &TickResult) -> &'static str {
         TickResult::Idle => "idle",
         TickResult::Interrupted => "interrupted",
         TickResult::StepLimitReached => "step-limit",
-        TickResult::Aborted { .. } => "aborted",
+        TickResult::Faulted(_) => "faulted",
     }
 }
 

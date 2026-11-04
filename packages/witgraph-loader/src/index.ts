@@ -180,7 +180,7 @@ export type Wasm = BufferSource | URL | WebAssembly.Module;
 /** The result of a tick. */
 export type TickResult =
   | { result: 'progress' | 'idle' | 'interrupted' | 'step-limit' }
-  | { result: 'aborted'; node: string; message: string };
+  | { result: 'faulted'; node?: string; fault: { kind: string; message: string } };
 
 /**
  * `kebab-case` as jco names record fields and flags: `lowerCamelCase`, with
@@ -501,7 +501,10 @@ export class Session {
     for (let ticks = 1; ticks <= limit; ticks++) {
       const tick = await this.tick();
       if (tick.result === 'idle') return ticks;
-      if (tick.result === 'aborted') throw new Error(`\`${tick.node}\`: ${tick.message}`);
+      if (tick.result === 'faulted') {
+        const at = tick.node ? `\`${tick.node}\`: ` : '';
+        throw new Error(`${at}${tick.fault.message}`);
+      }
     }
     throw new Error(`the graph did not settle in ${limit} ticks`);
   }

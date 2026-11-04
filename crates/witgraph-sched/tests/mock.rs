@@ -159,7 +159,7 @@ fn settle<M: RuntimeMode>(sched: &mut Scheduler<M, Closures>) -> usize {
     for ticks in 1..=20 {
         match block_on(sched.tick()) {
             TickResult::Idle => return ticks,
-            TickResult::Progress => {}
+            TickResult::Progress | TickResult::Faulted(_) => {}
             other => panic!("unexpected {other:?}"),
         }
     }

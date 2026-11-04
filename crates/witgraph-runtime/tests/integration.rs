@@ -19,9 +19,9 @@ use witgraph_ir::{
     PortDirection, PortRef, ResourceClaim,
 };
 use witgraph_runtime::{
-    CapabilityPlugin, Host, HostState, LoadError, NodeFault, NodePhase, PluginData, Plugins,
-    PreparedGraph, RuntimeConfig, RuntimeError, RuntimeGraph, RuntimeMode, Snapshot, TickResult,
-    Trace, TraceEvent, Val,
+    CapabilityPlugin, FaultReport, Host, HostState, LoadError, NodeFault, NodePhase, PluginData,
+    Plugins, PreparedGraph, RuntimeConfig, RuntimeError, RuntimeGraph, RuntimeMode, Snapshot,
+    TickResult, Trace, TraceEvent, Val,
 };
 
 // ---- Fixtures ----
@@ -183,7 +183,7 @@ async fn settle<M: RuntimeMode, H: Host>(rt: &mut RuntimeGraph<M, H>) -> usize {
             .expect("tick hung");
         match result {
             TickResult::Idle => return n,
-            TickResult::Progress => {}
+            TickResult::Progress | TickResult::Faulted(_) => {}
             other => panic!("unexpected tick result: {other:?}"),
         }
     }
@@ -1093,14 +1093,14 @@ async fn without_an_accelerator_edge_detection_faults_saying_why() {
         .await
         .expect("tick")
     {
-        TickResult::Aborted { node, fault } => {
-            assert_eq!(node, id("edges"));
+        TickResult::Faulted(FaultReport { culprit, fault }) => {
+            assert_eq!(culprit, Some(id("edges")));
             assert!(
                 matches!(&fault, NodeFault::Fatal { message } if message.contains("no accelerator here")),
                 "{fault:?}"
             );
         }
-        other => panic!("expected Aborted, got {other:?}"),
+        other => panic!("expected a fault, got {other:?}"),
     }
 }
 
@@ -2278,7 +2278,7 @@ async fn an_endless_group_exhausts_a_finite_budget() {
     let tick = tokio::time::timeout(Duration::from_secs(30), rt.tick())
         .await
         .expect("fuel ends the endless run");
-    assert!(matches!(tick, TickResult::Progress), "{tick:?}");
+    assert!(matches!(tick, TickResult::Faulted(_)), "{tick:?}");
     for node in ["prod", "cons"] {
         let state = rt.node_state(&id(node)).unwrap();
         assert!(
@@ -2466,6 +2466,43 @@ async fn reads_do_not_extend_the_budget_of_guests_at_work() {
     );
 }
 
+/// A fault says so where the host is looking: the tick returns it, and nothing runs
+/// again until the next one.
+#[tokio::test]
+async fn a_tick_returns_the_fault_that_ended_it() {
+    let kit = Kit::new(&[BUSY_LOOP, ECHO]);
+    let graph = kit
+        .builder("g")
+        .add_node("busy", kit.get(BUSY_LOOP))
+        .add_node("e", kit.get(ECHO))
+        .build();
+    let mut rt = kit
+        .load(graph, RuntimeConfig::default(), Trace::new())
+        .await;
+    settle(&mut rt).await;
+    inject(&mut rt, "busy", "action", Val::Enum("trap".into())).await;
+    let TickResult::Faulted(report) = rt.tick().await else {
+        panic!("a trap ends the tick");
+    };
+    assert!(
+        matches!(report.fault, NodeFault::WasmTrap { .. }),
+        "{report:?}"
+    );
+    assert_eq!(report.culprit, Some(id("busy")));
+    assert_eq!(phase(&rt, "e"), NodePhase::Faulted);
+    let taken = rt.take_faults();
+    assert!(
+        matches!(
+            taken.as_slice(),
+            [FaultReport {
+                fault: NodeFault::WasmTrap { .. },
+                ..
+            }]
+        ),
+        "{taken:?}"
+    );
+}
+
 #[tokio::test]
 async fn fatal_aborts_the_tick() {
     let kit = Kit::new(&[BUSY_LOOP]);
@@ -2478,13 +2515,13 @@ async fn fatal_aborts_the_tick() {
         .await;
     inject(&mut rt, "busy", "action", Val::Enum("fatal".into())).await;
     match rt.tick().await {
-        TickResult::Aborted { node, fault } => {
-            assert_eq!(node, id("busy"));
+        TickResult::Faulted(FaultReport { culprit, fault }) => {
+            assert_eq!(culprit, Some(id("busy")));
             assert!(
                 matches!(fault, NodeFault::Fatal { ref message } if message.contains("asked for it"))
             );
         }
-        other => panic!("expected Aborted, got {other:?}"),
+        other => panic!("expected a fault, got {other:?}"),
     }
     assert_eq!(phase(&rt, "busy"), NodePhase::Faulted);
     assert!(

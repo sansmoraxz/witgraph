@@ -6,12 +6,10 @@ use crate::error::NodeFault;
 
 /// The outcome of one `tick`.
 #[derive(Debug, Clone)]
-#[must_use = "a tick can end in an abort or a step limit"]
+#[must_use = "a tick can end in a fault or a step limit"]
 pub enum TickResult {
-    /// Work happened: a node ran, the graph faulted, or a feedback edge
-    /// latched a new value. Tick again to continue. Faults
-    /// other than `fatal` do not end a tick: see
-    /// `take_faults`.
+    /// Work happened: a node ran, or a feedback edge latched a new value. Tick
+    /// again to continue.
     Progress,
     /// Nothing ran, and nothing can make progress: the graph is stopped, or
     /// every node is idle or owes a run it cannot start (a required input has
@@ -26,14 +24,10 @@ pub enum TickResult {
     /// The tick started `max_steps_per_tick` runs before reaching quiescence.
     /// What is in flight resumes on the next tick.
     StepLimitReached,
-    /// A node called `fatal`. The tick stopped at once, and the graph is
-    /// faulted.
-    Aborted {
-        /// The node that called `fatal`.
-        node: NodeId,
-        /// The fatal fault.
-        fault: NodeFault,
-    },
+    /// The graph faulted, which stopped all of it, and the tick with it. What the
+    /// host asked for since runs on a new instance, from the next tick.
+    /// `take_faults` reports the same fault, for as long as nobody has taken it.
+    Faulted(FaultReport),
 }
 
 /// A fault, as `take_faults` reports it: it stopped the whole graph.

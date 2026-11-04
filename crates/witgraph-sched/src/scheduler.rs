@@ -40,7 +40,7 @@
 //!   part of the group's run.
 //! - Feedback connections (values and handles) are latched once per tick, at quiescence:
 //!   that is one iteration of a loop. A tick that ends early (`StepLimitReached`,
-//!   `Aborted`) latches nothing; a later tick finishes the iteration. A dropped or
+//!   `Faulted`) latches nothing; a later tick finishes the iteration. A dropped or
 //!   interrupted tick latches, as it ends, the feedback into every node whose
 //!   iteration is over: it has settled, and so has every feedback source into it.
 //! - A host write that changes an input wins over older feedback: it drops
@@ -335,10 +335,9 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
         core.node_state(node)
     }
 
-    /// Takes the fault reported since the last call, if there is one. A tick
-    /// ends early only for `fatal` ([`TickResult::Aborted`]); every other fault
-    /// (a trap, exhausted fuel, a limit, a failed rebuild) is reported here, and
-    /// in [`node_state`](Self::node_state) while the graph stays stopped.
+    /// Takes the fault reported since the last call, if there is one: a tick that
+    /// saw it returned it too ([`TickResult::Faulted`]). It is also in
+    /// [`node_state`](Self::node_state) while the graph stays stopped.
     pub fn take_faults(&mut self) -> Vec<FaultReport> {
         self.core().take_faults()
     }
@@ -357,9 +356,8 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
     /// return, and keeps starting nodes whose inputs changed, until nothing is
     /// in flight and nothing can start. Then each feedback connection's latest
     /// value is written to its target (one loop iteration). A tick that returns
-    /// [`TickResult::StepLimitReached`] or [`TickResult::Aborted`] latches
-    /// nothing; a later tick finishes the iteration. Faults other than `fatal`
-    /// do not end the tick: see [`take_faults`](Self::take_faults).
+    /// [`TickResult::StepLimitReached`] or [`TickResult::Faulted`] latches
+    /// nothing; a later tick finishes the iteration.
     ///
     /// Work that never finishes (an endless stream, say) keeps the tick running:
     /// drive such a graph with [`tick_until`](Self::tick_until). Dropping the

@@ -373,7 +373,7 @@ fn a_failed_rebuild_is_not_retried_until_something_new_is_owed() {
     fail.store(1, Ordering::SeqCst);
     sched.shutdown();
     sched.inject(&a, &"add".into(), 1).unwrap();
-    assert!(matches!(block_on(sched.tick()), TickResult::Progress));
+    assert!(matches!(block_on(sched.tick()), TickResult::Faulted(_)));
     assert!(matches!(
         sched.node_state(&a).unwrap().fault_cause(),
         Some(NodeFault::Restart { message }) if message.contains("no data")

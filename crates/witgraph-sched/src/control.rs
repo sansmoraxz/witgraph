@@ -20,9 +20,9 @@ use witgraph_ir::{
     Link, NodeId, NodeIdx, OutputIdx, PortKind, PortName, PortSet, PortTable, ResourceId,
 };
 use witgraph_traits::{
-    Command, ControlEvent, ControlKind, DataPlane, FaultReport, Incarnation, Latched, NodeFault,
-    NodePhase, NodeState, Outcome, PortVersion, Returned, RuntimeError, RuntimeMode, Serving,
-    Snapshot, TickResult,
+    Command, ControlEvent, ControlKind, DataPlane, FaultReport, Incarnation, Latched, NodePhase,
+    NodeState, Outcome, PortVersion, Returned, RuntimeError, RuntimeMode, Serving, Snapshot,
+    TickResult,
 };
 
 use crate::lifecycle::{GraphState, Group, GroupLife, Instance, Node, NodeLife, StopCause};
@@ -516,8 +516,8 @@ impl SchedulerCore<dyn DataPlane> {
         ))
     }
 
-    /// Takes the fault reported since the last call, if there is one. A tick
-    /// ends early only for `fatal` ([`TickResult::Aborted`]).
+    /// Takes the fault reported since the last call, if there is one: the one a
+    /// tick returned ([`TickResult::Faulted`]), or one no tick has seen yet.
     pub fn take_faults(&mut self) -> Vec<FaultReport> {
         self.drain();
         let polled = self.poll_server_once();
@@ -1016,15 +1016,9 @@ impl SchedulerCore<dyn DataPlane> {
             }
             self.mode.on_node_fault(node, &fault);
         }
-        let abort = matches!(fault, NodeFault::Fatal { .. }).then(|| TickResult::Aborted {
-            node: culprit
-                .clone()
-                .or_else(|| ids.first().cloned())
-                .unwrap_or_else(|| NodeId::from("?")),
-            fault: fault.clone(),
-        });
-        self.fault = Some(FaultReport { culprit, fault });
-        abort
+        let report = FaultReport { culprit, fault };
+        self.fault = Some(report.clone());
+        Some(TickResult::Faulted(report))
     }
 
     /// Waits for the next report, or the server ending.
@@ -1097,8 +1091,8 @@ impl SchedulerCore<dyn DataPlane> {
         if let Some(outcome) = self.poll_server_once() {
             self.drain();
             progressed = true;
-            if let Some(abort) = self.stopped(outcome) {
-                return abort;
+            if let Some(faulted) = self.stopped(outcome) {
+                return faulted;
             }
         }
         loop {
@@ -1126,8 +1120,8 @@ impl SchedulerCore<dyn DataPlane> {
                 Wake::Stopped(outcome) => {
                     self.drain();
                     progressed = true;
-                    if let Some(abort) = self.stopped(outcome) {
-                        return abort;
+                    if let Some(faulted) = self.stopped(outcome) {
+                        return faulted;
                     }
                 }
             }
@@ -1139,8 +1133,8 @@ impl SchedulerCore<dyn DataPlane> {
                 Wake::Event(event) => progressed |= self.handle_event(event),
                 Wake::Stopped(outcome) => {
                     progressed = true;
-                    if let Some(abort) = self.stopped(outcome) {
-                        return abort;
+                    if let Some(faulted) = self.stopped(outcome) {
+                        return faulted;
                     }
                 }
             }

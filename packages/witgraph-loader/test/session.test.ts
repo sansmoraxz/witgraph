@@ -557,7 +557,7 @@ test('a mock replaces a node, and the hooks see every run', async () => {
 test('a trap names its frames only in a scheduler built with `addr2line`', async () => {
   const session = await load([['busy', 'busy-loop']]);
   await session.graph.inject('busy', 'action', 'trap');
-  await session.settle();
+  assert.equal((await session.tick()).result, 'faulted');
   const [{ fault }] = session.graph.takeFaults();
   const [trap, ...frames] = fault.message.split('\n');
   assert.match(trap, /`unreachable`/);
@@ -580,7 +580,9 @@ test('a trap stops the whole graph, and fatal aborts the tick', async () => {
   ]);
   await session.graph.inject('e', 'in', 1);
   await session.graph.inject('busy', 'action', 'trap');
-  assert.deepEqual(await session.tick(), { result: 'progress' });
+  const faulted = await session.tick();
+  assert.equal(faulted.result, 'faulted');
+  assert.equal((faulted as { node?: string }).node, 'busy');
   const [fault] = session.graph.takeFaults();
   assert.equal(fault.culprit, 'busy');
   assert.equal(fault.fault.kind, 'trap');
@@ -590,7 +592,7 @@ test('a trap stops the whole graph, and fatal aborts the tick', async () => {
 
   await session.graph.inject('busy', 'action', 'fatal');
   const tick = await session.tick();
-  assert.equal(tick.result, 'aborted');
+  assert.equal(tick.result, 'faulted');
   assert.equal((tick as any).node, 'busy');
   assert.equal(session.graph.nodeState('busy').fault.kind, 'fatal');
 
@@ -917,7 +919,7 @@ test('a value JavaScript fails to convert is an error, not a wedged graph', asyn
   }
   await session.graph.inject('n', 'xs', [1]);
   await session.graph.inject('m', 'xs', [1]);
-  assert.deepEqual(await within(session.tick()), { result: 'progress' });
+  assert.equal((await within(session.tick())).result, 'faulted');
   const [fault] = session.graph.takeFaults();
   assert.equal(fault.culprit, 'm');
   assert.match(fault.fault.message, /returned a bad `xs`/);
@@ -994,7 +996,7 @@ test('a failed run abandons its siblings still in flight', async () => {
   await session.graph.inject('m', 'burst-size', 2);
   const ticked = session.tick();
   await paused.promise;
-  assert.deepEqual(await within(ticked), { result: 'progress' });
+  assert.equal((await within(ticked)).result, 'faulted');
   const [fault] = session.graph.takeFaults();
   assert.equal(fault.culprit, 'p1');
   held.open();
@@ -1038,7 +1040,11 @@ test('a fatal start function during a rebuild aborts the tick, naming its node',
   session.graph.shutdown();
   session.graph.rerun('n');
   const tick = await session.tick();
-  assert.deepEqual(tick, { result: 'aborted', node: 'n', message: 'fatal: boom' });
+  assert.deepEqual(tick, {
+    result: 'faulted',
+    node: 'n',
+    fault: { kind: 'fatal', message: 'fatal: boom' },
+  });
   assert.equal(session.graph.nodeState('n').fault.kind, 'fatal');
   assert.equal(session.graph.nodeState('n').culprit, 'n');
 });
@@ -1062,7 +1068,7 @@ test('a failed rebuild says what it lacked', async () => {
   provide = false;
   session.graph.shutdown();
   session.graph.rerun('cons');
-  assert.deepEqual(await session.tick(), { result: 'progress' });
+  assert.equal((await session.tick()).result, 'faulted');
   const [fault] = session.graph.takeFaults();
   assert.equal(fault.fault.kind, 'restart');
   assert.match(fault.fault.message, /imports `test:mqtt\/source@0.1.0`, which nothing provides/);
@@ -1153,7 +1159,7 @@ test('mocks are own properties, called as methods, with an empty result as no ou
     mocks: { none: () => undefined },
   });
   await empty.graph.inject('none', 'in', 2);
-  await empty.settle();
+  assert.equal((await empty.tick()).result, 'faulted');
   assert.deepEqual(
     empty.graph.takeFaults().map((f: any) => f.culprit),
     ['none'],
@@ -2093,6 +2099,7 @@ test('a hub setter throwing during an inject is a fault, as on wasmtime', async 
     assert.equal(faults.length, 1);
     assert.equal(faults[0].fault.kind, 'trap');
     assert.match(faults[0].fault.message, /out of memory/);
+    await web.tick();
     assert.equal(writes, 2, 'the new instance is written what the host wrote');
   } finally {
     web.free();

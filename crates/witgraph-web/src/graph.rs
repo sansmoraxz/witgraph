@@ -692,7 +692,7 @@ impl WebGraph {
 
     /// Runs one iteration of the graph (see `SchedulerCore::tick`). Resolves to
     /// `{ result }`, one of `progress`, `idle`, `interrupted`,
-    /// `step-limit`, or `aborted` with `node` and `message`. When `stop` (a
+    /// `step-limit`, or `faulted` with `fault` and, when it is known, `node`. When `stop` (a
     /// promise) settles first, the tick ends early with `interrupted`, as
     /// it does when the graph is freed.
     ///
@@ -742,10 +742,12 @@ impl WebGraph {
                 TickResult::Idle => "idle",
                 TickResult::Interrupted => "interrupted",
                 TickResult::StepLimitReached => "step-limit",
-                TickResult::Aborted { node, fault } => {
-                    set(&object, "node", &text(node.as_str()));
-                    set(&object, "message", &text(&fault.to_string()));
-                    "aborted"
+                TickResult::Faulted(report) => {
+                    if let Some(culprit) = &report.culprit {
+                        set(&object, "node", &text(culprit.as_str()));
+                    }
+                    set(&object, "fault", &fault_object(&report.fault));
+                    "faulted"
                 }
             };
             set(&object, "result", &text(name));

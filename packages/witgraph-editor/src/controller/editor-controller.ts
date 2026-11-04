@@ -1025,11 +1025,11 @@ export class EditorController extends EventTarget {
       timer = setTimeout(resolve, sliceMs);
     });
     this.#ticking = true;
-    let result: Awaited<ReturnType<Session['tick']>>['result'];
+    let tick: Awaited<ReturnType<Session['tick']>>;
     try {
       // Paused at a breakpoint, a tick ends only when resumed or stopped.
       const stop = Promise.race([stopped, slice.then(() => this.#paused())]);
-      result = (await session.tick(stop)).result;
+      tick = await session.tick(stop);
     } finally {
       this.#ticking = false;
       this.#stopResolve = null;
@@ -1041,8 +1041,9 @@ export class EditorController extends EventTarget {
     this.#pollState();
     await this.#pullObserved(stop);
     if (stop) return 'stopped';
-    if (result === 'aborted') return 'aborted';
-    return result === 'idle' ? 'idle' : 'progress';
+    // Only `fatal` ends a run: past any other fault, ticking rebuilds what is owed.
+    if (tick.result === 'faulted') return tick.fault.kind === 'fatal' ? 'aborted' : 'progress';
+    return tick.result === 'idle' ? 'idle' : 'progress';
   }
 
   /** Resolves once no node is held at a breakpoint. */
