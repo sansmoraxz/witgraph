@@ -422,10 +422,10 @@ pub enum Diagnostic {
     },
     /// A feedback connection carries a Stream or Future port. A feedback
     /// edge is a unit-delay boundary between generations, which only a
-    /// Value can cross: a stream or future handle belongs to the run that
-    /// created it.
+    /// Value or a handle can cross: a stream or future belongs to the run
+    /// that created it.
     #[error(
-        "feedback connection `{conn}` carries a {kind} port; feedback connections must carry values"
+        "feedback connection `{conn}` carries a {kind} port; feedback connections must carry values or handles"
     )]
     #[diagnostic(code(witgraph::ir::async_feedback))]
     AsyncFeedback {
