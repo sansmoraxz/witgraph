@@ -9,7 +9,7 @@ use std::sync::Arc;
 use futures::FutureExt;
 use futures::channel::oneshot;
 use futures::future::{Either, Shared as SharedFuture};
-use js_sys::{Array, ArrayBuffer, Function, Object, Promise, Reflect, Uint8Array};
+use js_sys::{Array, Function, Object, Promise, Reflect, Uint8Array};
 use sha2::{Digest, Sha256};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::{JsFuture, future_to_promise};
@@ -26,6 +26,7 @@ use witgraph_traits::{
     FaultReport, NodeState, OutputReader, PortVersion, RunningGraph, SnapshotError,
 };
 
+use crate::diagnostics::{compile_error, component_entry};
 use crate::link::{self, Composed};
 use crate::live::{Live, LiveMode, LiveState};
 use crate::plane::{Callbacks, WebHub, WebPlane, stream_inputs};
@@ -316,7 +317,7 @@ pub(crate) fn error(message: impl std::fmt::Display) -> JsError {
     JsError::new(&message.to_string())
 }
 
-fn text(value: &str) -> JsValue {
+pub(crate) fn text(value: &str) -> JsValue {
     JsValue::from_str(value)
 }
 
@@ -353,8 +354,8 @@ fn json(value: &impl serde::Serialize) -> Result<JsValue, JsError> {
 /// A component's contract, and what was wrong with it but did not stop it
 /// lowering (see [`witgraph_wit::lower::Lowered::warnings`]).
 #[derive(Clone)]
-struct Lowered {
-    contract: ComponentContract,
+pub(crate) struct Lowered {
+    pub(crate) contract: ComponentContract,
     /// The name it exports its `node` interface under.
     export: String,
     warnings: Vec<String>,
@@ -363,7 +364,7 @@ struct Lowered {
 /// The contract of component `id` with encoded `bytes` (whose SHA-256 is
 /// `digest`) and, if given, the WIT source it was built from: as a load
 /// made it before, else lowered now.
-fn contract(
+pub(crate) fn contract(
     id: &str,
     bytes: &[u8],
     digest: [u8; 32],
@@ -542,13 +543,14 @@ impl WebGraph {
     /// - `mocked` names the nodes left out of the composite, which imports each
     ///   as `m<number>` for the host to implement.
     ///
-    /// A graph that does not compile throws with every diagnostic.
+    /// A graph that does not compile throws an `Error` listing every diagnostic, with
+    /// them as data in its `diagnostics` (see [`GraphChecker`]).
     pub fn load(
         graph: &str,
         components: Array,
         callbacks: JsValue,
         mocked: Vec<String>,
-    ) -> Result<WebGraph, JsError> {
+    ) -> Result<WebGraph, JsValue> {
         let graph: Graph = serde_json::from_str(graph).map_err(error)?;
         let required = |name: &str, key: &str| -> Result<Function, JsError> {
             function(&callbacks, key)?
@@ -572,21 +574,7 @@ impl WebGraph {
         let mut exports = Vec::new();
         let mut entries: Vec<(ComponentRef, Vec<u8>)> = Vec::new();
         for (index, entry) in components.iter().enumerate() {
-            let id = Reflect::get(&entry, &text("id"))
-                .ok()
-                .and_then(|id| id.as_string())
-                .ok_or_else(|| error("a component needs an `id`"))?;
-            // `isView` sees through no proxy: what passes copies out
-            // without calling back into JavaScript.
-            let bytes = Reflect::get(&entry, &text("bytes"))
-                .ok()
-                .filter(ArrayBuffer::is_view)
-                .and_then(|bytes| bytes.dyn_into::<Uint8Array>().ok())
-                .ok_or_else(|| error(format!("component `{id}` needs `bytes`")))?
-                .to_vec();
-            let wit = Reflect::get(&entry, &text("wit"))
-                .ok()
-                .and_then(|wit| wit.as_string());
+            let (id, bytes, wit) = component_entry(&entry).map_err(JsValue::from)?;
             let digest: [u8; 32] = Sha256::digest(&bytes).into();
             let component: ComponentRef = id.parse().map_err(error)?;
             // A provider is not a node: it has no `node` export, so no
@@ -608,17 +596,9 @@ impl WebGraph {
             }
             entries.push((component, bytes));
         }
-        let compiled = graph.compile(&contracts).map_err(|failure| {
-            let diagnostics: Vec<String> = failure
-                .diagnostics
-                .iter()
-                .map(ToString::to_string)
-                .collect();
-            error(format!(
-                "the graph does not compile:\n{}",
-                diagnostics.join("\n")
-            ))
-        })?;
+        let compiled = graph
+            .compile(&contracts)
+            .map_err(|failure| compile_error(&failure))?;
         // Among entries with one contract, compilation binds the first.
         let mut first_of: HashMap<&ComponentRef, usize> = HashMap::new();
         for (index, contract) in contracts.iter().enumerate() {

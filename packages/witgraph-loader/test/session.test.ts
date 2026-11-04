@@ -14,8 +14,12 @@ import {
   type Capability,
   type ComponentSource,
   camelCase,
+  type Diagnostic,
   describeComponent,
+  diagnosticsOf,
   type FutureItem,
+  GraphChecker,
+  init,
   jsName,
   Session,
   type SessionOptions,
@@ -2197,4 +2201,109 @@ test('a latch the hub does not answer with a `latched` is a fault', async () => 
   } finally {
     web.free();
   }
+});
+
+/** A graph of the guests in `nodes`, as its JSON has it. */
+function jsonGraph(
+  nodes: [string, string][],
+  connections: [id: string, from: string, to: string, feedback?: boolean][],
+) {
+  const used = [...new Set(nodes.map(([, guest]) => guest))];
+  const port = (text: string) => {
+    const [node, name] = text.split('.');
+    return { node, port: name };
+  };
+  return {
+    metadata: { name: 'test' },
+    components: used.map((guest) => componentRef(ids[guest])),
+    nodes: nodes.map(([id, guest]) => ({ id, component: componentRef(ids[guest]) })),
+    connections: connections.map(([id, from, to, feedback]) => ({
+      id,
+      from: port(from),
+      to: port(to),
+      ...(feedback ? { feedback: true } : {}),
+    })),
+  };
+}
+
+test('a graph that does not compile throws what is wrong, as data', async () => {
+  const error: unknown = await load([['r', 'relay']]).then(
+    () => assert.fail('`r.in` is required'),
+    (thrown) => thrown,
+  );
+  assert.match((error as Error).message, /`r\.in` is unconnected/);
+  const [diagnostic, ...rest] = diagnosticsOf(error) ?? [];
+  assert.deepEqual(rest, []);
+  assert.equal(diagnostic.code, 'witgraph::ir::required_input_unconnected');
+  assert.equal(diagnostic.severity, 'error');
+  assert.deepEqual(diagnostic.location, { kind: 'port', nodes: ['r'], port: 'in' });
+  assert.equal(diagnosticsOf(new Error('anything else')), undefined);
+});
+
+test('a checker compiles a graph with nothing loaded, by the rules a load goes by', async () => {
+  await init(wasm);
+  const components = await Promise.all(['echo', 'relay'].map(guestSource));
+  const checker = new GraphChecker(components);
+  const check = (graph: unknown) => checker.check(JSON.stringify(graph)) as unknown as Diagnostic[];
+  try {
+    assert.deepEqual(check(jsonGraph([['e', 'echo']], [])), []);
+
+    const [mismatch] = check(
+      jsonGraph(
+        [
+          ['e', 'echo'],
+          ['r', 'relay'],
+        ],
+        [['er', 'e.out', 'r.in']],
+      ),
+    );
+    assert.equal(mismatch.code, 'witgraph::ir::type_mismatch');
+    assert.deepEqual(mismatch.location, { kind: 'connection', nodes: [], connection: 'er' });
+
+    const [warning] = check(jsonGraph([['r', 'relay']], [['rr', 'r.out', 'r.in', true]]));
+    assert.equal(warning.severity, 'warning');
+    assert.equal(warning.code, 'witgraph::ir::feedback_only_input');
+
+    const [cycle] = check(
+      jsonGraph(
+        [
+          ['a', 'echo'],
+          ['b', 'echo'],
+        ],
+        [
+          ['ab', 'a.out', 'b.in'],
+          ['ba', 'b.out', 'a.in'],
+        ],
+      ),
+    );
+    assert.equal(cycle.location.kind, 'cycle');
+    assert.deepEqual(cycle.location.nodes, ['a', 'b']);
+
+    assert.throws(() => checker.check('not json'));
+  } finally {
+    checker.free();
+  }
+});
+
+test('a failed load lists only its errors as why, and keeps its warnings as data', async () => {
+  const error: unknown = await load(
+    [
+      ['fed', 'relay'],
+      ['bare', 'relay'],
+    ],
+    [['loop', 'fed.out', 'fed.in', true]],
+  ).then(
+    () => assert.fail('`bare.in` is required'),
+    (thrown) => thrown,
+  );
+  const { message } = error as Error;
+  assert.match(message, /`bare\.in` is unconnected/);
+  assert.doesNotMatch(message, /fed only by feedback/, 'it is legal, so it is not why');
+  assert.deepEqual(
+    (diagnosticsOf(error) ?? []).map(({ severity, location }) => [severity, location.nodes[0]]),
+    [
+      ['warning', 'fed'],
+      ['error', 'bare'],
+    ],
+  );
 });

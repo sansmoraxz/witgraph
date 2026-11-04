@@ -13,6 +13,7 @@ import { $init, generate } from '@bytecodealliance/jco-transpile/component';
 
 import initModule, {
   describeComponent as describeRaw,
+  GraphChecker,
   jsName as jsNameRaw,
   WebGraph,
 } from '../pkg/witgraph_web.js';
@@ -868,4 +869,42 @@ function base64(bytes: Uint8Array): string {
   return btoa(binary);
 }
 
-export { WebGraph };
+/**
+ * Something wrong with a graph, or worth a warning, as compiling says it. A failed
+ * `Session.load` throws an error with these in its `diagnostics`, and a
+ * {@link GraphChecker} returns them.
+ */
+export interface Diagnostic {
+  /** Stable: what to tell diagnostics apart by, as `message` may change. */
+  code?: string;
+  severity: 'error' | 'warning';
+  message: string;
+  /** What to do about it, when there is something to say. */
+  help?: string;
+  location: {
+    kind:
+      | 'graph'
+      | 'component'
+      | 'node'
+      | 'nodes'
+      | 'port'
+      | 'connection'
+      | 'link'
+      | 'cycle'
+      | 'group';
+    /** The nodes it touches: empty when it points at something else. */
+    nodes: string[];
+    port?: string;
+    connection?: string;
+    link?: string;
+    component?: string;
+  };
+}
+
+/** The diagnostics of what a failed `Session.load` threw, if it failed compiling. */
+export function diagnosticsOf(error: unknown): Diagnostic[] | undefined {
+  const diagnostics = (error as { diagnostics?: unknown } | null | undefined)?.diagnostics;
+  return Array.isArray(diagnostics) ? (diagnostics as Diagnostic[]) : undefined;
+}
+
+export { GraphChecker, WebGraph };

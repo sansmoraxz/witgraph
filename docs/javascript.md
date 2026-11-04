@@ -121,6 +121,21 @@ stops, its next call of a host import fails, and every object it still holds is
 disposed once. An instance the scheduler lets go of (on a fault, shutdown or restore)
 goes the same way.
 
+## When a graph does not compile
+
+`Session.load` throws an error listing what is wrong. `diagnosticsOf(error)` gets the
+same as data: each diagnostic has a stable `code`, a `severity`, a `message`, perhaps
+some `help`, and a `location` with the `nodes` it touches, so you can mark them.
+
+`GraphChecker` compiles graphs with nothing loaded, by the same rules, so you can ask
+about a graph before you make it:
+
+```ts
+await init(wasm);
+const checker = new GraphChecker(components);
+const diagnostics = checker.check(JSON.stringify(graph));
+```
+
 ## Differences from wasmtime
 
 - No fuel or memory limits, so a node that spins blocks the thread.
