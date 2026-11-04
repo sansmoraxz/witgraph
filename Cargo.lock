@@ -1570,8 +1570,7 @@ dependencies = [
 [[package]]
 name = "oci-client"
 version = "0.18.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ddc7848d781053285280fcd35aab24c9c0a677e26db4aa4209bd5db57467de0f"
+source = "git+https://github.com/sansmoraxz/rust-oci-client?rev=85dd6bff99f0d25a2fe752244195c312c9ec47c0#85dd6bff99f0d25a2fe752244195c312c9ec47c0"
 dependencies = [
  "base64 0.22.1",
  "bytes",
