@@ -1944,9 +1944,7 @@ test('a snapshot leaves out feedback a host write dropped', async () => {
 // Bugs not fixed yet: each test states what should happen, and fails. Drop the
 // `skip` with the fix.
 
-test('known bug: an equal host write does not stick a required input after a fault', {
-  skip: 'an equal host write is retained but not recorded',
-}, async () => {
+test('an equal host write does not stick a required input after a fault', async () => {
   const session = await load(
     [
       ['busy', 'busy-loop'],

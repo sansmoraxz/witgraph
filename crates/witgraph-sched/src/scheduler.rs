@@ -163,6 +163,8 @@ impl<M: RuntimeMode, X: Executor> Scheduler<M, X> {
             .host_set(input, Arc::new(val.into_inner()));
         if changed {
             self.core().host_set(input);
+        } else {
+            self.core().host_kept(input);
         }
     }
 

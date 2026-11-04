@@ -490,6 +490,8 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
         };
         if changed {
             self.core().host_set(input);
+        } else {
+            self.core().host_kept(input);
         }
         Ok(())
     }

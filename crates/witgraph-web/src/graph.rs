@@ -230,6 +230,8 @@ impl WebRuntime {
         };
         if changed {
             self.core().host_set(input);
+        } else {
+            self.core().host_kept(input);
         }
         Ok(())
     }

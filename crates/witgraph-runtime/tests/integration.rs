@@ -4375,7 +4375,6 @@ mod known_bugs {
     /// The write counts as nothing to the scheduler, yet is kept and written to
     /// the next instance, whose node then never gets to run.
     #[tokio::test]
-    #[ignore = "known bug: an equal host write is retained but not recorded"]
     async fn an_equal_write_does_not_stick_a_required_input_after_a_fault() {
         let kit = Kit::new(&[BUSY_LOOP, RELAY]);
         let graph = kit

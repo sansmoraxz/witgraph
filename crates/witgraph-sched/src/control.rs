@@ -430,6 +430,13 @@ impl SchedulerCore<dyn DataPlane> {
         self.note_host_write(input);
     }
 
+    /// Records a host write of the value an input already holds: nothing runs for
+    /// it, but the value is the host's now, and outlives the instance.
+    pub fn host_kept(&mut self, input: InputIdx) {
+        self.presence.insert(input);
+        self.host_written.insert(input);
+    }
+
     fn note_host_write(&mut self, input: InputIdx) {
         for at in 0..self.feedback_into[input].len() {
             let conn = self.feedback_into[input][at];
