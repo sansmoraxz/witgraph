@@ -515,3 +515,46 @@ async fn a_fifo_is_not_a_component() {
         fetched.err()
     );
 }
+
+/// A link swapped in between the check and the open: whichever way each fetch
+/// lands, what is outside the base is never read.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_link_swapped_in_after_the_check_is_not_followed() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let dir = scratch("swap");
+    let base = dir.join("base");
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::write(dir.join("secret"), b"secret").unwrap();
+    std::fs::write(base.join("real"), b"real").unwrap();
+    std::os::unix::fs::symlink("../secret", base.join("link")).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let swapper = {
+        let (stop, base) = (stop.clone(), base.clone());
+        std::thread::spawn(move || {
+            let (c, held) = (base.join("c.wasm"), base.join("held"));
+            std::fs::hard_link(base.join("real"), &c).unwrap();
+            while !stop.load(Ordering::Relaxed) {
+                std::fs::rename(&c, &held).unwrap();
+                std::fs::rename(base.join("link"), &c).unwrap();
+                std::fs::rename(&c, base.join("link")).unwrap();
+                std::fs::rename(&held, &c).unwrap();
+            }
+        })
+    };
+    let resolver = Resolver::new().base(&base);
+    let source = ComponentSource::file(echo(), "c.wasm");
+    let (mut read, mut refused) = (0, 0);
+    for _ in 0..2_000 {
+        match resolver.fetch(&source).await {
+            Ok(resolved) => {
+                assert_eq!(&*resolved.bytes, b"real", "read from outside the base");
+                read += 1;
+            }
+            Err(_) => refused += 1,
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    swapper.join().unwrap();
+    assert!(read + refused == 2_000);
+}

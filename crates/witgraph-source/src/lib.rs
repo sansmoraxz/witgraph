@@ -441,8 +441,9 @@ impl Resolver {
     /// lead out of it. By default they may not
     /// ([`SourceError::OutsideBase`]), so a source list from elsewhere
     /// cannot read files beside the project; a confined file is read by
-    /// the path its links resolved to when it was checked, so a link
-    /// changed after the check is not followed.
+    /// the path its links resolved to when it was checked, and refused if what
+    /// was opened is not what that path holds, so a link swapped in after the
+    /// check is not followed.
     pub fn allow_paths_outside_base(mut self) -> Self {
         self.any_path = true;
         self
@@ -523,6 +524,9 @@ impl Resolver {
             Location::File(path) => {
                 let full = self.confined(path).await?;
                 let file = open(&full).await?;
+                if !self.any_path {
+                    self.still_confined(path, &full, &file).await?;
+                }
                 let bytes = read_file(file, &full, self.max_bytes).await?;
                 check(bytes.ok_or_else(too_large)?)
             }
@@ -586,6 +590,39 @@ impl Resolver {
             return Err(outside());
         }
         Ok(file)
+    }
+
+    /// That `file`, opened from `full`, is what [`confined`](Self::confined) found:
+    /// a link swapped in between that check and the open led it elsewhere. Asked of
+    /// the file already open, so what is swapped afterwards changes nothing.
+    async fn still_confined(
+        &self,
+        path: &Path,
+        full: &Path,
+        file: &tokio::fs::File,
+    ) -> Result<(), SourceError> {
+        let failed = |source| SourceError::Read {
+            path: full.to_path_buf(),
+            source,
+        };
+        let outside = || SourceError::OutsideBase {
+            path: path.to_path_buf(),
+        };
+        if self.confined(path).await? != full {
+            return Err(outside());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let opened = file.metadata().await.map_err(failed)?;
+            let there = tokio::fs::symlink_metadata(full).await.map_err(failed)?;
+            if (opened.dev(), opened.ino()) != (there.dev(), there.ino()) {
+                return Err(outside());
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = (file, failed);
+        Ok(())
     }
 
     /// The cache file for `digest`.
