@@ -717,6 +717,31 @@ pub(crate) fn dealias(resolve: &Resolve, mut id: TypeId) -> TypeId {
     id
 }
 
+/// [`dealias`], remembering the end of every alias it passes, so finding it from
+/// every alias on a chain takes time linear in the chain.
+fn dealias_remembering(
+    resolve: &Resolve,
+    id: TypeId,
+    defining: &mut HashMap<TypeId, TypeId>,
+) -> TypeId {
+    let mut walked = Vec::new();
+    let mut at = id;
+    let end = loop {
+        if let Some(end) = defining.get(&at) {
+            break *end;
+        }
+        walked.push(at);
+        match resolve.types[at].kind {
+            wp::TypeDefKind::Type(wp::Type::Id(next)) => at = next,
+            _ => break at,
+        }
+    };
+    for alias in walked {
+        defining.insert(alias, end);
+    }
+    end
+}
+
 /// The id of a named interface, if it has one.
 fn interface_id(resolve: &Resolve, interface: wp::InterfaceId) -> Option<String> {
     resolve.id_of(interface)
@@ -1129,6 +1154,10 @@ fn named_types(
 ) -> Vec<NamedType> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
+    // Every alias on a chain is a named type, so what each one means is found
+    // once for the chain, not by walking the rest of it from each.
+    let mut defining: HashMap<TypeId, TypeId> = HashMap::new();
+    let mut resolved: HashMap<TypeId, Option<Type>> = HashMap::new();
     // A pre-order walk with an explicit stack (an alias chain may be far
     // longer than types nest), members pushed in reverse so they come off
     // in declaration order.
@@ -1149,13 +1178,18 @@ fn named_types(
         if let Some(name) = &def.name
             && !well_known.contains(&id)
             && !reexport
-            && let Ok(resolved) = resolve_wit_type(resolve, id)
+            && let at = dealias_remembering(resolve, id, &mut defining)
+            && let Some(resolved) = resolved
+                .entry(at)
+                .or_insert_with(|| resolve_wit_type(resolve, at).ok())
+                .clone()
         {
             // An alias's own doc comment, else the one of what it aliases.
-            let docs = def.docs.contents.clone().or_else(|| {
-                let defining = defining_id(resolve, ty).unwrap_or(id);
-                resolve.types[defining].docs.contents.clone()
-            });
+            let docs = def
+                .docs
+                .contents
+                .clone()
+                .or_else(|| resolve.types[at].docs.contents.clone());
             let owner = match def.owner {
                 wp::TypeOwner::Interface(interface) => interface_id(resolve, interface),
                 wp::TypeOwner::World(_) | wp::TypeOwner::None => None,
@@ -2951,6 +2985,36 @@ mod tests {
             .expect("no stack overflow");
         let message = format!("{:#}", lowered.unwrap_err());
         assert!(message.contains("levels deep"), "{message}");
+    }
+
+    /// Each alias is a named type, and walking the rest of the chain from each took
+    /// about 7 minutes on this many, for a few megabytes of WIT.
+    #[test]
+    fn lowering_an_alias_chain_takes_time_linear_in_it() {
+        const LAST: usize = 199_999;
+        let mut aliases = String::from("type a0 = u32;");
+        for i in 1..LAST + 1 {
+            aliases.push_str(&format!(" type a{i} = a{};", i - 1));
+        }
+        let wit = format!(
+            "package demo:test@0.1.0;
+            interface caps {{ {aliases} get: func(x: a{LAST}) -> a{LAST}; }}
+            world w {{
+                import caps;
+                export node: interface {{ use caps.{{a{LAST}}}; record outputs {{ out: a{LAST} }} run: async func() -> outputs; }}
+            }}"
+        );
+        let source = std::thread::Builder::new()
+            .stack_size(1 << 30)
+            .spawn(move || load_str("aliases.wit", &wit).expect("wit-parser accepts it"))
+            .unwrap()
+            .join()
+            .unwrap();
+        let started = std::time::Instant::now();
+        let lowered = lower(&source).expect("lowers");
+        assert_eq!(lowered[0].types.len(), LAST + 1, "every alias is named");
+        let took = started.elapsed();
+        assert!(took.as_secs() < 60, "took {took:?}");
     }
 
     #[test]
