@@ -24,12 +24,12 @@ use witgraph_ir::{
     FeedbackIdx, Idx, IndexVec, InputIdx, NodeId, NodeIdx, OutputIdx, PortKind, PortTable,
 };
 use witgraph_sched::{
-    BoxFuture, Command, ControlEvent, ControlKind, DataPlane, Latched, NodeFault, Outcome,
-    Returned, RuntimeError, Serving, boxed,
+    BoxFuture, Command, ControlEvent, ControlKind, DataPlane, HubPorts, Incarnation, Latched,
+    NodeFault, Outcome, PortSlot, Returned, RuntimeError, Serving, boxed,
 };
 use witgraph_wit::hub;
 
-use crate::value::{Data, camel, describe};
+use crate::value::{Data, camel, describe, parse_wave};
 
 /// What the loader provides.
 pub(crate) struct Callbacks {
@@ -166,6 +166,8 @@ pub(crate) struct WebHub {
     server: RefCell<Option<Server>>,
     /// Where a trap no call reports goes: one in a task a guest spawned, say.
     traps: RefCell<Option<UnboundedSender<JsValue>>>,
+    /// Where the instance being served reports what a host call did.
+    events: RefCell<Option<(UnboundedSender<ControlEvent>, Incarnation)>>,
 }
 
 /// The server, for a host waiting on a rebuild to drive.
@@ -193,6 +195,7 @@ impl WebHub {
             fresh: Cell::new(true),
             server: RefCell::new(None),
             traps: RefCell::new(None),
+            events: RefCell::new(None),
         })
     }
 
@@ -278,6 +281,23 @@ impl WebHub {
             .call1(&JsValue::NULL, &number)
             .map_err(|e| thrown(&e))?;
         Ok((!handle.is_undefined()).then_some(handle))
+    }
+
+    /// Tells the scheduler what a host call did.
+    fn report(&self, kind: ControlKind) {
+        if let Some((events, incarnation)) = &*self.events.borrow() {
+            // The receiver lives as long as the scheduler; a send can only fail
+            // while it is being dropped.
+            let _ = events.unbounded_send(ControlEvent {
+                incarnation: *incarnation,
+                kind,
+            });
+        }
+    }
+
+    /// A hub failing as the host calls it is a fault, as a trap in a task is.
+    fn fault(&self, message: String) {
+        self.report_trap(JsValue::from_str(&message));
     }
 
     /// Reports a trap of the live instance, whichever task it was in.
@@ -432,6 +452,7 @@ impl DataPlane for WebPlane {
         let (built_tx, built) = oneshot::channel();
         let (traps_tx, traps) = mpsc::unbounded();
         *hub.traps.borrow_mut() = Some(traps_tx);
+        *hub.events.borrow_mut() = Some((serving.events.clone(), serving.incarnation));
         let future: LocalBoxFuture<'static, Outcome> =
             serve(hub.clone(), fresh, built_tx, traps, serving).boxed_local();
         let future = future.shared();
@@ -445,10 +466,118 @@ impl DataPlane for WebPlane {
     fn stopped(&self) {
         self.0.live.set(false);
         *self.0.traps.borrow_mut() = None;
+        *self.0.events.borrow_mut() = None;
         // The last hold on the server, so calls in flight are abandoned now.
         *self.0.server.borrow_mut() = None;
         if let Some(abandon) = &self.0.callbacks.abandon {
             let _ = abandon.call0(&JsValue::NULL);
         }
+    }
+}
+
+impl HubPorts for WebPlane {
+    type Type = Type;
+    type Value = Rc<Data>;
+    type Write = Rc<Data>;
+
+    // `port` calls are plain calls, which do not wait for what the server has
+    // yet to serve.
+    const WRITES_DIRECTLY: bool = true;
+
+    fn input_type(&self, input: InputIdx) -> Option<&Type> {
+        self.0.input_types[input].as_ref()
+    }
+
+    fn output_type(&self, output: OutputIdx) -> Option<&Type> {
+        self.0.output_types[output].as_ref()
+    }
+
+    fn with_retained<R>(
+        &self,
+        f: impl FnOnce(&mut IndexVec<InputIdx, Option<Rc<Data>>>) -> R,
+    ) -> R {
+        f(&mut self.0.retained.borrow_mut())
+    }
+
+    fn same_write(old: &Rc<Data>, new: &Rc<Data>) -> bool {
+        old.equals(new)
+    }
+
+    fn write_of(value: Rc<Data>) -> Rc<Data> {
+        value
+    }
+
+    fn written_wave(write: &Rc<Data>) -> Option<Result<String, String>> {
+        Some(write.wave())
+    }
+
+    fn parse_value(ty: &Type, text: &str) -> Result<Rc<Data>, String> {
+        let value = parse_wave(ty, text)?;
+        Ok(Rc::new(Data::from_value(value, ty.clone())))
+    }
+
+    fn value_wave(value: &Rc<Data>) -> Result<String, String> {
+        value.wave()
+    }
+
+    fn is_up(&self) -> bool {
+        self.0.live.get()
+    }
+
+    fn send_write(&self, input: InputIdx, write: Rc<Data>) -> BoxFuture<Result<(), RuntimeError>> {
+        let hub = self.0.clone();
+        boxed(async move {
+            match hub.set_input(input, &write) {
+                Ok(changed) => hub.report(ControlKind::HostWrote { input, changed }),
+                Err(message) => hub.fault(message),
+            }
+            Ok(())
+        })
+    }
+
+    fn send_clear(&self, input: InputIdx) -> BoxFuture<Result<(), RuntimeError>> {
+        let hub = self.0.clone();
+        boxed(async move {
+            match hub.clear_input(input) {
+                Ok(cleared) => hub.report(ControlKind::HostCleared { input, cleared }),
+                Err(message) => hub.fault(message),
+            }
+            Ok(())
+        })
+    }
+
+    fn send_restore(
+        &self,
+        writes: Vec<(PortSlot, Rc<Data>)>,
+    ) -> BoxFuture<Result<(), RuntimeError>> {
+        let hub = self.0.clone();
+        boxed(async move {
+            // An instance that cannot be built is a fault for the next tick to report.
+            hub.built().await?;
+            let written = writes.iter().try_for_each(|(slot, val)| {
+                match slot {
+                    PortSlot::Input(input) => hub.set_input(*input, val),
+                    PortSlot::Output(output) => hub.set_output(*output, val),
+                    PortSlot::Feedback(connection) => hub.set_feedback(*connection, val),
+                }
+                .map(|_| ())
+            });
+            match written {
+                Ok(()) => hub.report(ControlKind::Restored),
+                Err(message) => hub.fault(message),
+            }
+            Ok(())
+        })
+    }
+
+    fn read(&self, slot: PortSlot) -> BoxFuture<Result<Option<Rc<Data>>, String>> {
+        let hub = self.0.clone();
+        boxed(async move {
+            match slot {
+                PortSlot::Input(input) => hub.get_input(input),
+                PortSlot::Output(output) => hub.get_output(output),
+                PortSlot::Feedback(connection) => hub.get_feedback(connection),
+            }
+        })
     }
 }

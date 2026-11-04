@@ -25,6 +25,7 @@
 //! - [`error`] — [`RuntimeError`], [`NodeFault`].
 
 pub mod control;
+pub mod hub;
 pub use witgraph_traits::{error, executor, mode, node, plan, schedule};
 pub mod latches;
 pub(crate) mod lifecycle;
@@ -38,6 +39,7 @@ pub use control::{
     DEFAULT_MAX_STEPS_PER_TICK, PortVersions, SchedulerCore, check_max_steps_per_tick,
     check_resources,
 };
+pub use hub::{HubPorts, PortSlot, latched_output, not_a_value_output};
 pub use latches::LatchReader;
 pub use scheduler::Scheduler;
 pub use snapshot::SnapshotError;

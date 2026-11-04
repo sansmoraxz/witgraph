@@ -478,12 +478,11 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
             compiled,
             mode.clone(),
             config.max_steps_per_tick,
-            |_, ports| HubPlane::new(blueprint, ports.clone(), first),
+            |_, ports| HubPlane::new(blueprint, ports.clone(), types.clone(), first),
         )?;
         Ok(Self {
             mode,
             core,
-            types,
             config,
             id: GraphId::fresh(),
         })

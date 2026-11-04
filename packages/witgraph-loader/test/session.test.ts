@@ -2050,3 +2050,51 @@ test('a hub setter throwing during a restore is a fault, with the restore in pla
     web.free();
   }
 });
+
+test('a hub setter throwing during an inject is a fault, as on wasmtime', async () => {
+  const graph = {
+    metadata: { name: 'test' },
+    components: [componentRef(ids.echo)],
+    nodes: [{ id: 'e', component: componentRef(ids.echo) }],
+    connections: [],
+  };
+  const bytes = new Uint8Array(await readFile(new URL('echo.wasm', guests)));
+  let writes = 0;
+  const web = WebGraph.load(
+    JSON.stringify(graph),
+    [{ id: ids.echo, bytes }],
+    {
+      run: () => ({
+        outputsChanged: [],
+        inputsChanged: [],
+        inputsRecorded: [],
+        inputsCleared: [],
+        feedbackBuffered: [],
+      }),
+      rebuild: () => {},
+      instance: () => ({
+        ports: {
+          setInput0: () => {
+            writes++;
+            if (writes === 1) throw new Error('out of memory');
+            return true;
+          },
+        },
+        control: {},
+      }),
+      readHandle: () => undefined,
+    },
+    [],
+  );
+  try {
+    await web.inject('e', 'in', 1.5);
+    await web.tick();
+    const faults = web.takeFaults() as { fault: { kind: string; message: string } }[];
+    assert.equal(faults.length, 1);
+    assert.equal(faults[0].fault.kind, 'trap');
+    assert.match(faults[0].fault.message, /out of memory/);
+    assert.equal(writes, 2, 'the new instance is written what the host wrote');
+  } finally {
+    web.free();
+  }
+});

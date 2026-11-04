@@ -1,7 +1,7 @@
 //! `WebGraph`: a graph loaded on a JavaScript host.
 
 use std::cell::{Ref, RefCell, RefMut};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::future::Future;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -15,15 +15,15 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::{JsFuture, future_to_promise};
 use witgraph_ir::wasm_wave::value::Type;
 use witgraph_ir::{
-    Capability, CompiledGraph, ComponentContract, ComponentRef, FeedbackIdx, Graph, Idx, IndexVec,
-    InputIdx, NodeId, OutputIdx, PortDirection, PortKind, PortName, PortTable,
+    Capability, CompiledGraph, ComponentContract, ComponentRef, Graph, Idx, IndexVec, InputIdx,
+    NodeId, OutputIdx, PortDirection, PortKind, PortName, PortTable,
 };
 use witgraph_sched::{
     DataPlane, NodeFault, PortVersions, RuntimeError, SchedulerCore, Snapshot, TickResult,
-    TraceEvent,
+    TraceEvent, latched_output, not_a_value_output,
 };
 use witgraph_traits::{
-    FaultReport, NodeState, OutputReader, PortValues, PortVersion, RunningGraph, SnapshotError,
+    FaultReport, NodeState, OutputReader, PortVersion, RunningGraph, SnapshotError,
 };
 
 use crate::link::{self, Composed};
@@ -40,14 +40,6 @@ pub(crate) struct WebReader {
     versions: PortVersions,
 }
 
-fn not_a_value_output(node: &NodeId, port: &PortName) -> RuntimeError {
-    RuntimeError::NotAValuePort {
-        node: node.clone(),
-        port: port.clone(),
-        direction: PortDirection::Output,
-    }
-}
-
 impl WebReader {
     /// Checks that `node` exists and `port` is an output of it of a latched kind.
     fn latched(
@@ -55,15 +47,7 @@ impl WebReader {
         node: &NodeId,
         port: &PortName,
     ) -> Result<(OutputIdx, PortKind), RuntimeError> {
-        let ports = &self.hub.ports;
-        ports
-            .node(node)
-            .ok_or_else(|| RuntimeError::UnknownNode { node: node.clone() })?;
-        ports
-            .output(node, port)
-            .map(|output| (output, ports.outputs()[output].kind))
-            .filter(|(_, kind)| kind.is_latched())
-            .ok_or_else(|| not_a_value_output(node, port))
+        latched_output(&self.hub.ports, node, port)
     }
 
     fn value(&self, node: &NodeId, port: &PortName) -> Result<Option<Rc<Data>>, RuntimeError> {
@@ -166,7 +150,6 @@ impl OutputReader for WebReader {
 /// The scheduler on this host, as [`RunningGraph`] has it.
 pub(crate) struct WebRuntime {
     core: SchedulerCore<WebPlane>,
-    hub: Rc<WebHub>,
     reader: WebReader,
 }
 
@@ -186,96 +169,9 @@ impl WebRuntime {
 
     /// A Value input the host may write, and its type.
     fn host_input(&self, node: &NodeId, port: &PortName) -> Result<(InputIdx, Type), RuntimeError> {
-        let ports = self.core.ports();
-        ports
-            .node(node)
-            .ok_or_else(|| RuntimeError::UnknownNode { node: node.clone() })?;
-        let not_a_port = || RuntimeError::NotAValuePort {
-            node: node.clone(),
-            port: port.clone(),
-            direction: PortDirection::Input,
-        };
-        let input = ports.input(node, port).ok_or_else(not_a_port)?;
-        let ty = self.hub.input_types[input].clone().ok_or_else(not_a_port)?;
-        if let Some(connection) = self.core.connected(input) {
-            return Err(RuntimeError::ConnectedInput {
-                node: node.clone(),
-                port: port.clone(),
-                connection: connection.clone(),
-            });
-        }
-        Ok((input, ty))
-    }
-
-    /// Writes `data` to `input`: the hub says whether that changed anything, and
-    /// a stopped graph has it written when it next starts.
-    fn write_input(
-        &mut self,
-        node: &NodeId,
-        port: &PortName,
-        input: InputIdx,
-        data: Rc<Data>,
-    ) -> Result<(), RuntimeError> {
-        self.core().serve_queued();
-        let same = self.hub.retained.borrow()[input]
-            .as_ref()
-            .is_some_and(|old| old.equals(&data));
-        self.hub.retained.borrow_mut()[input] = Some(data.clone());
-        let changed = if self.hub.live.get() {
-            self.hub
-                .set_input(input, &data)
-                .map_err(|message| port_error(node, port, message))?
-        } else {
-            !same
-        };
-        if changed {
-            self.core().host_set(input);
-        } else {
-            self.core().host_kept(input);
-        }
-        Ok(())
-    }
-
-    /// The Value ports of `entries` as WAVE text, by node and port.
-    fn wave_values<I: witgraph_ir::Idx>(
-        entries: &IndexVec<I, witgraph_ir::PortEntry>,
-        get: impl Fn(I) -> Result<Option<Rc<Data>>, String>,
-    ) -> Result<PortValues, SnapshotError> {
-        let mut values: PortValues = BTreeMap::new();
-        for (index, entry) in entries.iter_enumerated() {
-            if entry.kind != PortKind::Value {
-                continue;
-            }
-            let at = || format!("`{}.{}`", entry.port.node, entry.port.port);
-            let text = get(index)
-                .and_then(|data| data.map(|data| data.wave()).transpose())
-                .map_err(|message| SnapshotError { at: at(), message })?;
-            if let Some(text) = text {
-                values
-                    .entry(entry.port.node.clone())
-                    .or_default()
-                    .insert(entry.port.port.clone(), text);
-            }
-        }
-        Ok(values)
-    }
-
-    /// `text` as a value of the type at `ty`.
-    fn parse_snapshot_value(
-        node: &NodeId,
-        port: &PortName,
-        ty: Option<&Type>,
-        direction: PortDirection,
-        text: &str,
-    ) -> Result<Rc<Data>, RuntimeError> {
-        let invalid = |message: String| RuntimeError::SnapshotValue {
-            node: node.clone(),
-            port: port.clone(),
-            message,
-        };
-        let ty = ty.ok_or_else(|| invalid(format!("not a Value {direction} port")))?;
-        let value = parse_wave(ty, text).map_err(invalid)?;
-        Ok(Rc::new(Data::from_value(value, ty.clone())))
+        self.core
+            .host_input(node, port)
+            .map(|(input, ty)| (input, ty.clone()))
     }
 }
 
@@ -298,7 +194,9 @@ impl RunningGraph for WebRuntime {
         let (input, ty) = self.host_input(node, port)?;
         let value = from_js(&value, &ty).map_err(|m| port_error(node, port, m))?;
         check_type(&value, &ty).map_err(|m| port_error(node, port, m))?;
-        self.write_input(node, port, input, Rc::new(Data::from_value(value, ty)))
+        self.core
+            .write_host_input(input, Rc::new(Data::from_value(value, ty)))
+            .await
     }
 
     async fn inject_wave(
@@ -309,24 +207,13 @@ impl RunningGraph for WebRuntime {
     ) -> Result<(), RuntimeError> {
         let (input, ty) = self.host_input(node, port)?;
         let value = parse_wave(&ty, text).map_err(|m| port_error(node, port, m))?;
-        self.write_input(node, port, input, Rc::new(Data::from_value(value, ty)))
+        self.core
+            .write_host_input(input, Rc::new(Data::from_value(value, ty)))
+            .await
     }
 
     async fn clear_input(&mut self, node: &NodeId, port: &PortName) -> Result<(), RuntimeError> {
-        self.core().serve_queued();
-        let (input, _) = self.host_input(node, port)?;
-        let held = self.hub.retained.borrow_mut()[input].take().is_some();
-        let cleared = if self.hub.live.get() {
-            self.hub
-                .clear_input(input)
-                .map_err(|m| port_error(node, port, m))?
-        } else {
-            held
-        };
-        if cleared {
-            self.core().host_cleared(input);
-        }
-        Ok(())
+        self.core.clear_host_input(node, port).await
     }
 
     async fn read_output(
@@ -383,119 +270,11 @@ impl RunningGraph for WebRuntime {
     }
 
     async fn snapshot(&mut self) -> Result<Snapshot, SnapshotError> {
-        self.core().serve_queued();
-        let core: &SchedulerCore<dyn DataPlane> = &self.core;
-        let mut snapshot = core.snapshot_base();
-        let ports = self.core.ports().clone();
-        if !self.hub.live.get() {
-            let retained = self.hub.retained.borrow();
-            snapshot.inputs =
-                Self::wave_values(ports.inputs(), |input| Ok(retained[input].clone()))?;
-            return Ok(snapshot);
-        }
-        let hub = &self.hub;
-        snapshot.inputs = Self::wave_values(ports.inputs(), |input| hub.get_input(input))?;
-        snapshot.outputs = Self::wave_values(ports.outputs(), |output| hub.get_output(output))?;
-        for (connection, entry) in ports.feedback().iter_enumerated() {
-            if ports.outputs()[entry.from].kind != PortKind::Value {
-                continue;
-            }
-            let id = &entry.id;
-            let at = || format!("feedback `{id}`");
-            let text = hub
-                .get_feedback(connection)
-                .and_then(|data| data.map(|data| data.wave()).transpose())
-                .map_err(|message| SnapshotError { at: at(), message })?;
-            if let Some(text) = text {
-                snapshot.feedback.insert(id.clone(), text);
-            }
-        }
-        Ok(snapshot)
+        self.core.snapshot_hub().await
     }
 
     async fn restore(&mut self, snapshot: &Snapshot) -> Result<(), RuntimeError> {
-        self.core().check_snapshot(snapshot)?;
-        let ports = self.core.ports().clone();
-        let mut inputs: Vec<(InputIdx, Rc<Data>)> = Vec::new();
-        for (node, values) in &snapshot.inputs {
-            for (port, text) in values {
-                let index = ports.input(node, port);
-                let ty = index.and_then(|input| self.hub.input_types[input].as_ref());
-                let val = Self::parse_snapshot_value(node, port, ty, PortDirection::Input, text)?;
-                if let Some(index) = index {
-                    inputs.push((index, val));
-                }
-            }
-        }
-        let mut outputs: Vec<(OutputIdx, Rc<Data>)> = Vec::new();
-        for (node, values) in &snapshot.outputs {
-            for (port, text) in values {
-                let index = ports.output(node, port);
-                let ty = index.and_then(|output| self.hub.output_types[output].as_ref());
-                let val = Self::parse_snapshot_value(node, port, ty, PortDirection::Output, text)?;
-                if let Some(index) = index {
-                    outputs.push((index, val));
-                }
-            }
-        }
-        let mut feedback: Vec<(FeedbackIdx, Rc<Data>)> = Vec::new();
-        for (connection, text) in &snapshot.feedback {
-            let index =
-                ports
-                    .feedback_index(connection)
-                    .ok_or_else(|| RuntimeError::SnapshotMismatch {
-                        message: format!(
-                            "`{connection}` is not a feedback connection of this graph"
-                        ),
-                    })?;
-            let from = ports.feedback()[index].from;
-            let source = &ports.outputs()[from].port;
-            let val = Self::parse_snapshot_value(
-                &source.node,
-                &source.port,
-                self.hub.output_types[from].as_ref(),
-                PortDirection::Output,
-                text,
-            )?;
-            feedback.push((index, val));
-        }
-
-        // Nothing fails from here on: what goes wrong in the instance is a fault.
-        let host_written = self.core().host_written_in(snapshot);
-        {
-            let mut retained = self.hub.retained.borrow_mut();
-            *retained = IndexVec::from_fn(ports.inputs().len(), |_| None);
-            for (input, val) in &inputs {
-                if host_written.contains(*input) {
-                    retained[*input] = Some(val.clone());
-                }
-            }
-        }
-        self.core().restart_for_restore();
-        let presence: Vec<InputIdx> = inputs.iter().map(|(input, _)| *input).collect();
-        let pending: Vec<FeedbackIdx> = feedback.iter().map(|(conn, _)| *conn).collect();
-        // An instance that cannot be built is a fault for the next tick to report.
-        if self.hub.built().await.is_ok() {
-            let wrote = || -> Result<(), String> {
-                for (input, val) in &inputs {
-                    if !host_written.contains(*input) {
-                        self.hub.set_input(*input, val)?;
-                    }
-                }
-                for (output, val) in &outputs {
-                    self.hub.set_output(*output, val)?;
-                }
-                for (connection, val) in &feedback {
-                    self.hub.set_feedback(*connection, val)?;
-                }
-                Ok(())
-            };
-            if let Err(message) = wrote() {
-                self.hub.report_trap(JsValue::from_str(&message));
-            }
-        }
-        self.core().apply_restore(&presence, &pending, snapshot);
-        Ok(())
+        self.core.restore_hub(snapshot).await
     }
 
     fn compiled(&self) -> &CompiledGraph {
@@ -893,7 +672,6 @@ impl WebGraph {
         };
         let sched = WebRuntime {
             core,
-            hub,
             reader: reader.clone(),
         };
         refresh(&sched, &live);

@@ -28,12 +28,13 @@ use wasmtime::component::{
 use wasmtime::{AsContextMut, Engine, Store};
 use witgraph_ir::{FeedbackIdx, Idx, IndexVec, InputIdx, NodeId, NodeIdx, OutputIdx, PortTable};
 use witgraph_sched::{
-    BoxFuture, Command, ControlEvent, ControlKind, DataPlane, Latched, NodeFault, Outcome,
-    Returned, RuntimeError, Serving, boxed,
+    BoxFuture, Command, ControlEvent, ControlKind, DataPlane, HubPorts, Latched, NodeFault,
+    Outcome, PortSlot, Returned, RuntimeError, Serving, boxed,
 };
 use witgraph_wit::hub;
 
-use crate::engine::{Host, HostState, StoreData, StoreSettings, classify};
+use crate::engine::{self, Host, HostState, StoreData, StoreSettings, classify};
+use crate::graph::PortTypes;
 use crate::shared::{Shared, SharedMemory};
 
 /// `witgraph:hub/control`'s `returned`, as the guest numbers things.
@@ -775,6 +776,8 @@ pub(crate) struct HubPlane<H: Host> {
     pub(crate) ports: Arc<PortTable>,
     pub(crate) client: ClientSlot<H::Data>,
     pub(crate) retained: Retained<H::Data>,
+    /// The types of the graph's Value ports.
+    pub(crate) types: Arc<PortTypes>,
     /// The instance built at load, until its first serving.
     first: Mutex<Option<Built<H::Data>>>,
 }
@@ -783,6 +786,7 @@ impl<H: Host> HubPlane<H> {
     pub(crate) fn new(
         blueprint: Blueprint<H>,
         ports: Arc<PortTable>,
+        types: Arc<PortTypes>,
         first: Built<H::Data>,
     ) -> Self {
         let retained = IndexVec::from_fn(ports.inputs().len(), |_| None);
@@ -791,6 +795,7 @@ impl<H: Host> HubPlane<H> {
             ports,
             client: Arc::new(Mutex::new(None)),
             retained: Arc::new(Mutex::new(retained)),
+            types,
             first: Mutex::new(Some(first)),
         }
     }
@@ -842,5 +847,138 @@ impl<H: Host> DataPlane for HubPlane<H> {
     fn stopped(&self) {
         // The last hold on the server, so the Store goes now.
         *lock(&self.client) = None;
+    }
+}
+
+impl<H: Host> HubPorts for HubPlane<H> {
+    type Type = Type;
+    type Value = Val;
+    type Write = Arc<dyn HostWrite<H::Data>>;
+
+    // Everything goes through one lane, so a write queues behind what was asked.
+    const WRITES_DIRECTLY: bool = false;
+
+    fn input_type(&self, input: InputIdx) -> Option<&Type> {
+        self.types.inputs[input].as_ref()
+    }
+
+    fn output_type(&self, output: OutputIdx) -> Option<&Type> {
+        self.types.outputs[output].as_ref()
+    }
+
+    fn with_retained<R>(
+        &self,
+        f: impl FnOnce(&mut IndexVec<InputIdx, Option<Self::Write>>) -> R,
+    ) -> R {
+        f(&mut lock(&self.retained))
+    }
+
+    fn same_write(old: &Self::Write, new: &Self::Write) -> bool {
+        // A typed value cannot be compared, so it counts as a change.
+        old.val().is_some() && old.val() == new.val()
+    }
+
+    fn write_of(value: Val) -> Self::Write {
+        Arc::new(ValWrite(value))
+    }
+
+    fn written_wave(write: &Self::Write) -> Option<Result<String, String>> {
+        write.wave()
+    }
+
+    fn parse_value(ty: &Type, text: &str) -> Result<Val, String> {
+        engine::parse_wave(ty, text)
+    }
+
+    fn value_wave(value: &Val) -> Result<String, String> {
+        value.to_wave().map_err(|e| e.to_string())
+    }
+
+    fn is_up(&self) -> bool {
+        lock(&self.client).is_some()
+    }
+
+    fn send_write(
+        &self,
+        input: InputIdx,
+        write: Self::Write,
+    ) -> BoxFuture<Result<(), RuntimeError>> {
+        let client = lock(&self.client).clone();
+        boxed(async move {
+            let client = client.ok_or(RuntimeError::InstanceStopped)?;
+            let report = client.reporter();
+            client
+                .call(move |acc, hub| {
+                    Box::pin(async move {
+                        let changed = write.write(acc, hub, input).await?;
+                        report(ControlKind::HostWrote { input, changed });
+                        Ok(())
+                    })
+                })
+                .await
+        })
+    }
+
+    fn send_clear(&self, input: InputIdx) -> BoxFuture<Result<(), RuntimeError>> {
+        let client = lock(&self.client).clone();
+        boxed(async move {
+            let client = client.ok_or(RuntimeError::InstanceStopped)?;
+            let report = client.reporter();
+            client
+                .call(move |acc, hub| {
+                    Box::pin(async move {
+                        let cleared = hub.clear_input(acc, input).await?;
+                        report(ControlKind::HostCleared { input, cleared });
+                        Ok(())
+                    })
+                })
+                .await
+        })
+    }
+
+    fn send_restore(&self, writes: Vec<(PortSlot, Val)>) -> BoxFuture<Result<(), RuntimeError>> {
+        let client = lock(&self.client).clone();
+        boxed(async move {
+            let client = client.ok_or(RuntimeError::InstanceStopped)?;
+            let report = client.reporter();
+            client
+                .call(move |acc, hub| {
+                    Box::pin(async move {
+                        for (slot, val) in writes {
+                            let set = match slot {
+                                PortSlot::Input(input) => hub.set_input(acc, input)?,
+                                PortSlot::Output(output) => hub.set_output(acc, output)?,
+                                PortSlot::Feedback(connection) => {
+                                    hub.set_feedback(acc, connection)?
+                                }
+                            };
+                            call_set(acc, set, val).await?;
+                        }
+                        report(ControlKind::Restored);
+                        Ok(())
+                    })
+                })
+                .await
+        })
+    }
+
+    fn read(&self, slot: PortSlot) -> BoxFuture<Result<Option<Val>, String>> {
+        let client = lock(&self.client).clone();
+        boxed(async move {
+            let client = client.ok_or_else(|| RuntimeError::InstanceStopped.to_string())?;
+            client
+                .call(move |acc, hub| {
+                    Box::pin(async move {
+                        let get = match slot {
+                            PortSlot::Input(input) => hub.get_input(acc, input)?,
+                            PortSlot::Output(output) => hub.get_output(acc, output)?,
+                            PortSlot::Feedback(connection) => hub.get_feedback(acc, connection)?,
+                        };
+                        call_get(acc, get).await
+                    })
+                })
+                .await
+                .map_err(|e| e.to_string())
+        })
     }
 }

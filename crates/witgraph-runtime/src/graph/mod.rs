@@ -18,7 +18,6 @@
 
 pub(crate) mod load;
 
-use std::collections::BTreeMap;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
@@ -29,20 +28,18 @@ use wasmtime::Engine;
 use wasmtime::component::{Accessor, ComponentNamedList, ComponentType, Lift, Lower, TypedFunc};
 use wasmtime::component::{Type, Val};
 use witgraph_ir::{
-    CompiledGraph, FeedbackIdx, Idx, IndexVec, InputIdx, NodeId, OutputIdx, PortDirection,
-    PortKind, PortName, PortTable,
+    CompiledGraph, Idx, IndexVec, InputIdx, NodeId, OutputIdx, PortDirection, PortKind, PortName,
+    PortTable,
 };
 use witgraph_sched::{
-    ControlKind, DataPlane, FaultReport, Incarnation, NodeState, Perf, PortVersion, PortVersions,
-    RuntimeError, RuntimeMode, SchedulerCore, TickResult,
+    DataPlane, FaultReport, Incarnation, NodeState, Perf, PortVersion, PortVersions, RuntimeError,
+    RuntimeMode, SchedulerCore, TickResult, latched_output, not_a_value_output,
 };
-use witgraph_traits::{OutputReader, PortValues, RunningGraph, Snapshot, SnapshotError};
+use witgraph_traits::{OutputReader, RunningGraph, Snapshot, SnapshotError};
 
 pub use self::load::PreparedGraph;
 use crate::engine::{self, Host, NoCapabilities, StoreData, StoreSettings};
-use crate::plane::{
-    Client, ClientSlot, HostWrite, HubPlane, LiveHub, ValWrite, call_get, call_set, lock,
-};
+use crate::plane::{Client, ClientSlot, HostWrite, HubPlane, LiveHub, ValWrite, call_get, lock};
 use crate::shared::Shared;
 #[cfg(feature = "compile")]
 pub use witgraph_wit::compose::LinkedProvider;
@@ -180,8 +177,8 @@ impl RuntimeConfig {
 /// The types of a graph's Value ports, from its hub's functions.
 #[derive(Debug, Clone)]
 pub(crate) struct PortTypes {
-    inputs: IndexVec<InputIdx, Option<Type>>,
-    outputs: IndexVec<OutputIdx, Option<Type>>,
+    pub(crate) inputs: IndexVec<InputIdx, Option<Type>>,
+    pub(crate) outputs: IndexVec<OutputIdx, Option<Type>>,
 }
 
 /// A compiled graph composed and loaded, ready for execution.
@@ -191,7 +188,6 @@ pub(crate) struct PortTypes {
 pub struct RuntimeGraph<M: RuntimeMode = Perf, H: Host = NoCapabilities> {
     mode: Arc<M>,
     core: SchedulerCore<HubPlane<H>>,
-    types: Arc<PortTypes>,
     config: RuntimeConfig,
     /// Tells a [`Port`] of this graph from one of another.
     id: GraphId,
@@ -288,14 +284,6 @@ pub enum Preview {
     Val(Val),
 }
 
-fn not_a_value_output(node: &NodeId, port: &PortName) -> RuntimeError {
-    RuntimeError::NotAValuePort {
-        node: node.clone(),
-        port: port.clone(),
-        direction: PortDirection::Output,
-    }
-}
-
 /// What reads a graph's outputs, whatever its Store's data.
 trait ReadOutputs: Send + Sync + 'static {
     fn read_val(&self, output: OutputIdx) -> BoxFuture<'static, Result<Option<Val>, RuntimeError>>;
@@ -360,14 +348,7 @@ impl ValReader {
         node: &NodeId,
         port: &PortName,
     ) -> Result<(OutputIdx, PortKind), RuntimeError> {
-        self.ports
-            .node(node)
-            .ok_or_else(|| RuntimeError::UnknownNode { node: node.clone() })?;
-        self.ports
-            .output(node, port)
-            .map(|output| (output, self.ports.outputs()[output].kind))
-            .filter(|(_, kind)| kind.is_latched())
-            .ok_or_else(|| not_a_value_output(node, port))
+        latched_output(&self.ports, node, port)
     }
 }
 
@@ -429,77 +410,6 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
         lock(&self.core.plane.client).clone()
     }
 
-    /// A Value input the host may write, and its type.
-    fn host_input(
-        &self,
-        node: &NodeId,
-        port: &PortName,
-    ) -> Result<(InputIdx, &Type), RuntimeError> {
-        let ty = self.input_type(node, port)?;
-        let input =
-            self.core
-                .ports()
-                .input(node, port)
-                .ok_or_else(|| RuntimeError::NotAValuePort {
-                    node: node.clone(),
-                    port: port.clone(),
-                    direction: PortDirection::Input,
-                })?;
-        if let Some(connection) = self.core.connected(input) {
-            return Err(RuntimeError::ConnectedInput {
-                node: node.clone(),
-                port: port.clone(),
-                connection: connection.clone(),
-            });
-        }
-        Ok((input, ty))
-    }
-
-    /// Writes `write` to `input`: the hub says whether that changed anything,
-    /// and a stopped graph has it written when it next starts.
-    async fn write_input(
-        &mut self,
-        input: InputIdx,
-        write: Arc<dyn HostWrite<H::Data>>,
-    ) -> Result<(), RuntimeError> {
-        self.core().drain();
-        let same = {
-            let mut retained = lock(&self.core.plane.retained);
-            let same = retained[input]
-                .as_ref()
-                .is_some_and(|old| old.val().is_some() && old.val() == write.val());
-            retained[input] = Some(write.clone());
-            same
-        };
-        let Some(client) = self.client() else {
-            // A typed value cannot be compared, so it counts as a change.
-            if same {
-                self.core().host_kept(input);
-            } else {
-                self.core().host_set(input);
-            }
-            return Ok(());
-        };
-        self.core().host_write_started(input);
-        let report = client.reporter();
-        let written = client
-            .call(move |acc, hub| {
-                Box::pin(async move {
-                    let changed = write.write(acc, hub, input).await?;
-                    report(ControlKind::HostWrote { input, changed });
-                    Ok(())
-                })
-            })
-            .await;
-        // Stopped first, it is kept for the next instance.
-        match written {
-            Ok(()) | Err(RuntimeError::InstanceStopped) => {}
-            Err(e) => return Err(e),
-        }
-        self.core().drain();
-        Ok(())
-    }
-
     /// Binds a Value input to `T`, the type of its payload (for an optional
     /// port, the inner type), which the engine checks
     /// ([`RuntimeError::ValueType`]). The same ports as
@@ -514,7 +424,7 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
         T: ComponentType + Lower + Clone + Send + Sync + 'static,
         (Vec<T>,): ComponentNamedList + Lower,
     {
-        let (input, _) = self.host_input(node, port)?;
+        let (input, _) = self.core.host_input(node, port)?;
         let bound = Port::new(self.id, input.position(), node.clone(), port.clone());
         self.bind_input(&bound, input).await?;
         Ok(bound)
@@ -567,7 +477,7 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
         if self.client().is_some() {
             self.bind_input(port, input).await?;
         }
-        self.write_input(input, write).await
+        self.core.write_host_input(input, write).await
     }
 
     /// Binds a Value output to `T`, which the engine checks
@@ -746,7 +656,7 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
             .ok_or_else(|| RuntimeError::UnknownNode { node: node.clone() })?;
         ports
             .input(node, port)
-            .and_then(|input| self.types.inputs[input].as_ref())
+            .and_then(|input| self.core.plane.types.inputs[input].as_ref())
             .ok_or_else(|| RuntimeError::NotAValuePort {
                 node: node.clone(),
                 port: port.clone(),
@@ -762,7 +672,7 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
             .ok_or_else(|| RuntimeError::UnknownNode { node: node.clone() })?;
         ports
             .output(node, port)
-            .and_then(|output| self.types.outputs[output].as_ref())
+            .and_then(|output| self.core.plane.types.outputs[output].as_ref())
             .ok_or_else(|| not_a_value_output(node, port))
     }
 
@@ -791,58 +701,6 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
     /// future Stores.
     pub fn host_mut(&mut self) -> &mut H {
         &mut self.core.plane.blueprint.host
-    }
-
-    /// One direction's Value ports as WAVE text, by node and port.
-    async fn wave_values<I: witgraph_ir::Idx + Send + Sync>(
-        client: &Client<H::Data>,
-        entries: &IndexVec<I, witgraph_ir::PortEntry>,
-        getter: fn(&LiveHub, &Accessor<H::Data>, I) -> wasmtime::Result<wasmtime::component::Func>,
-    ) -> Result<PortValues, SnapshotError> {
-        let mut values: PortValues = BTreeMap::new();
-        for (index, entry) in entries.iter_enumerated() {
-            if entry.kind != PortKind::Value {
-                continue;
-            }
-            let at = || format!("`{}.{}`", entry.port.node, entry.port.port);
-            let read = client
-                .call(move |acc, hub| {
-                    Box::pin(async move { call_get(acc, getter(hub, acc, index)?).await })
-                })
-                .await
-                .map_err(|e| SnapshotError {
-                    at: at(),
-                    message: e.to_string(),
-                })?;
-            if let Some(val) = read {
-                let text = val.to_wave().map_err(|e| SnapshotError {
-                    at: at(),
-                    message: e.to_string(),
-                })?;
-                values
-                    .entry(entry.port.node.clone())
-                    .or_default()
-                    .insert(entry.port.port.clone(), text);
-            }
-        }
-        Ok(values)
-    }
-
-    /// `text` as a value of the type at `ty`.
-    fn parse_snapshot_value(
-        node: &NodeId,
-        port: &PortName,
-        ty: Option<&Type>,
-        direction: PortDirection,
-        text: &str,
-    ) -> Result<Val, RuntimeError> {
-        let invalid = |message: String| RuntimeError::SnapshotValue {
-            node: node.clone(),
-            port: port.clone(),
-            message,
-        };
-        let ty = ty.ok_or_else(|| invalid(format!("not a Value {direction} port")))?;
-        engine::parse_wave(ty, text).map_err(invalid)
     }
 }
 
@@ -896,14 +754,16 @@ impl<M: RuntimeMode, H: Host> RunningGraph for RuntimeGraph<M, H> {
         port: &PortName,
         value: Val,
     ) -> Result<(), RuntimeError> {
-        let (input, ty) = self.host_input(node, port)?;
+        let (input, ty) = self.core.host_input(node, port)?;
         engine::check_type(ty, &value).map_err(|message| RuntimeError::ValueType {
             node: node.clone(),
             port: port.clone(),
             message,
         })?;
         let value = engine::canonical(ty, value);
-        self.write_input(input, Arc::new(ValWrite(value))).await
+        self.core
+            .write_host_input(input, Arc::new(ValWrite(value)))
+            .await
     }
 
     async fn inject_wave(
@@ -912,42 +772,19 @@ impl<M: RuntimeMode, H: Host> RunningGraph for RuntimeGraph<M, H> {
         port: &PortName,
         text: &str,
     ) -> Result<(), RuntimeError> {
-        let (input, ty) = self.host_input(node, port)?;
+        let (input, ty) = self.core.host_input(node, port)?;
         let value = engine::parse_wave(ty, text).map_err(|message| RuntimeError::ValueType {
             node: node.clone(),
             port: port.clone(),
             message,
         })?;
-        self.write_input(input, Arc::new(ValWrite(value))).await
+        self.core
+            .write_host_input(input, Arc::new(ValWrite(value)))
+            .await
     }
 
     async fn clear_input(&mut self, node: &NodeId, port: &PortName) -> Result<(), RuntimeError> {
-        self.core().drain();
-        let (input, _) = self.host_input(node, port)?;
-        let held = lock(&self.core.plane.retained)[input].take().is_some();
-        let Some(client) = self.client() else {
-            if held {
-                self.core().host_cleared(input);
-            }
-            return Ok(());
-        };
-        self.core().host_clear_started(input);
-        let report = client.reporter();
-        let cleared = client
-            .call(move |acc, hub| {
-                Box::pin(async move {
-                    let cleared = hub.clear_input(acc, input).await?;
-                    report(ControlKind::HostCleared { input, cleared });
-                    Ok(())
-                })
-            })
-            .await;
-        match cleared {
-            Ok(()) | Err(RuntimeError::InstanceStopped) => {}
-            Err(e) => return Err(e),
-        }
-        self.core().drain();
-        Ok(())
+        self.core.clear_host_input(node, port).await
     }
 
     async fn read_output(
@@ -1003,176 +840,15 @@ impl<M: RuntimeMode, H: Host> RunningGraph for RuntimeGraph<M, H> {
         self.core().tick_until(stop).await
     }
 
-    /// Captures the graph's host-visible state: what the hub holds, pulled
-    /// through its getters as WAVE text, and what is in flight or owed. A stopped
-    /// graph holds only the inputs the host wrote, and one written through a
-    /// typed [`Port`] has no text ([`SnapshotError`]).
+    /// See [`SchedulerCore::snapshot_hub`]. One written through a typed [`Port`] has
+    /// no text ([`SnapshotError`]) while the graph is stopped.
     async fn snapshot(&mut self) -> Result<Snapshot, SnapshotError> {
-        self.core().drain();
-        let core: &SchedulerCore<dyn DataPlane> = &self.core;
-        let mut snapshot = core.snapshot_base();
-        let ports = self.core.ports().clone();
-        let Some(client) = self.client() else {
-            let retained = crate::plane::retained_writes(&self.core.plane.retained);
-            for (input, write) in retained {
-                let port = &ports.inputs()[input].port;
-                let at = || format!("`{}.{}`", port.node, port.port);
-                let text = write
-                    .wave()
-                    .ok_or_else(|| SnapshotError {
-                        at: at(),
-                        message: "the graph is stopped, and a typed value has no text".into(),
-                    })?
-                    .map_err(|message| SnapshotError { at: at(), message })?;
-                snapshot
-                    .inputs
-                    .entry(port.node.clone())
-                    .or_default()
-                    .insert(port.port.clone(), text);
-            }
-            return Ok(snapshot);
-        };
-        snapshot.inputs = Self::wave_values(&client, ports.inputs(), |hub, acc, input| {
-            hub.get_input(acc, input)
-        })
-        .await?;
-        snapshot.outputs = Self::wave_values(&client, ports.outputs(), |hub, acc, output| {
-            hub.get_output(acc, output)
-        })
-        .await?;
-        for (connection, entry) in ports.feedback().iter_enumerated() {
-            if ports.outputs()[entry.from].kind != PortKind::Value {
-                continue;
-            }
-            let id = &entry.id;
-            let at = || format!("feedback `{id}`");
-            let read = client
-                .call(move |acc, hub| {
-                    Box::pin(async move { call_get(acc, hub.get_feedback(acc, connection)?).await })
-                })
-                .await
-                .map_err(|e| SnapshotError {
-                    at: at(),
-                    message: e.to_string(),
-                })?;
-            if let Some(val) = read {
-                let text = val.to_wave().map_err(|e| SnapshotError {
-                    at: at(),
-                    message: e.to_string(),
-                })?;
-                snapshot.feedback.insert(id.clone(), text);
-            }
-        }
-        Ok(snapshot)
+        self.core.snapshot_hub().await
     }
 
-    /// Replaces the graph's host-visible state with `snapshot`, on a new
-    /// instance built now. The next tick re-runs what was in flight, on the
-    /// latched inputs, and what was owed.
-    ///
-    /// The graph must have nothing in flight ([`RuntimeError::NotQuiescent`])
-    /// and exactly the snapshot's nodes (every one with a phase), components (by
-    /// content hash), connections and links ([`RuntimeError::SnapshotMismatch`]).
-    /// Every value is parsed against its port's type
-    /// ([`RuntimeError::SnapshotValue`]); on any error nothing is changed. Node
-    /// phases and [`Snapshot::quiescent`] are informational and not restored,
-    /// and no guest state outlives a restore. An instance that cannot be built
-    /// is a fault ([`take_faults`](RunningGraph::take_faults)), and the host's
-    /// inputs are written to the next.
+    /// See [`SchedulerCore::restore_hub`].
     async fn restore(&mut self, snapshot: &Snapshot) -> Result<(), RuntimeError> {
-        self.core().check_snapshot(snapshot)?;
-        let ports = self.core.ports().clone();
-        let mut inputs: Vec<(InputIdx, Val)> = Vec::new();
-        for (node, values) in &snapshot.inputs {
-            for (port, text) in values {
-                let index = ports.input(node, port);
-                let ty = index.and_then(|input| self.types.inputs[input].as_ref());
-                let val = Self::parse_snapshot_value(node, port, ty, PortDirection::Input, text)?;
-                if let Some(index) = index {
-                    inputs.push((index, val));
-                }
-            }
-        }
-        let mut outputs: Vec<(OutputIdx, Val)> = Vec::new();
-        for (node, values) in &snapshot.outputs {
-            for (port, text) in values {
-                let index = ports.output(node, port);
-                let ty = index.and_then(|output| self.types.outputs[output].as_ref());
-                let val = Self::parse_snapshot_value(node, port, ty, PortDirection::Output, text)?;
-                if let Some(index) = index {
-                    outputs.push((index, val));
-                }
-            }
-        }
-        let mut feedback: Vec<(FeedbackIdx, Val)> = Vec::new();
-        for (connection, text) in &snapshot.feedback {
-            let index =
-                ports
-                    .feedback_index(connection)
-                    .ok_or_else(|| RuntimeError::SnapshotMismatch {
-                        message: format!(
-                            "`{connection}` is not a feedback connection of this graph"
-                        ),
-                    })?;
-            let from = &ports.outputs()[ports.feedback()[index].from];
-            let val = Self::parse_snapshot_value(
-                &from.port.node,
-                &from.port.port,
-                self.types.outputs[ports.feedback()[index].from].as_ref(),
-                PortDirection::Output,
-                text,
-            )?;
-            feedback.push((index, val));
-        }
-
-        // Nothing fails from here on, but building the instance. It is all in place
-        // before the first wait, so giving up on a restore leaves it to finish, with
-        // nothing starting until it has.
-        let host_written = self.core().host_written_in(snapshot);
-        {
-            let mut retained = lock(&self.core.plane.retained);
-            *retained = IndexVec::from_fn(ports.inputs().len(), |_| None);
-            for (input, val) in &inputs {
-                if host_written.contains(*input) {
-                    retained[*input] = Some(Arc::new(ValWrite(val.clone())));
-                }
-            }
-        }
-        self.core().restart_for_restore();
-        let presence: Vec<InputIdx> = inputs.iter().map(|(input, _)| *input).collect();
-        let pending: Vec<FeedbackIdx> = feedback.iter().map(|(conn, _)| *conn).collect();
-        self.core().apply_restore(&presence, &pending, snapshot);
-        if let Some(client) = self.client() {
-            let graphs: Vec<(InputIdx, Val)> = inputs
-                .into_iter()
-                .filter(|(input, _)| !host_written.contains(*input))
-                .collect();
-            self.core().restore_writes_started();
-            let report = client.reporter();
-            let written = client
-                .call(move |acc, hub| {
-                    Box::pin(async move {
-                        for (input, val) in graphs {
-                            call_set(acc, hub.set_input(acc, input)?, val).await?;
-                        }
-                        for (output, val) in outputs {
-                            call_set(acc, hub.set_output(acc, output)?, val).await?;
-                        }
-                        for (connection, val) in feedback {
-                            call_set(acc, hub.set_feedback(acc, connection)?, val).await?;
-                        }
-                        report(ControlKind::Restored);
-                        Ok(())
-                    })
-                })
-                .await;
-            match written {
-                Ok(()) | Err(RuntimeError::InstanceStopped) => {}
-                Err(e) => return Err(e),
-            }
-            self.core().drain();
-        }
-        Ok(())
+        self.core.restore_hub(snapshot).await
     }
 
     fn compiled(&self) -> &CompiledGraph {
