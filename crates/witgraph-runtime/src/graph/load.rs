@@ -7,7 +7,6 @@ mod precompiled;
 #[cfg(feature = "compile")]
 use std::borrow::Cow;
 use std::collections::HashMap;
-#[cfg(feature = "compile")]
 use std::collections::hash_map::Entry;
 use std::sync::Arc;
 #[cfg(feature = "compile")]
