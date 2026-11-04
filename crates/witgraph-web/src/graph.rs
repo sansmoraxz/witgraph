@@ -59,7 +59,7 @@ impl WebReader {
             return Ok(None);
         }
         self.hub
-            .get_output(output)
+            .host_read(self.hub.get_output(output))
             .map_err(|message| RuntimeError::ValueType {
                 node: node.clone(),
                 port: port.clone(),
@@ -83,7 +83,7 @@ impl WebReader {
         }
         let data = self
             .hub
-            .get_input(input)
+            .host_read(self.hub.get_input(input))
             .map_err(|message| RuntimeError::ValueType {
                 node: node.clone(),
                 port: port.clone(),
@@ -133,7 +133,7 @@ impl OutputReader for WebReader {
             return Ok(None);
         }
         self.hub
-            .read_handle(output)
+            .host_read(self.hub.read_handle(output))
             .map_err(|message| RuntimeError::ValueType {
                 node: node.clone(),
                 port: port.clone(),

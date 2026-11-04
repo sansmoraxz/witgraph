@@ -115,6 +115,14 @@ async fn settle(value: JsValue) -> Result<JsValue, JsValue> {
     }
 }
 
+/// Why a read of the hub failed.
+pub(crate) enum ReadFailure {
+    /// The hub threw: a failure of the instance.
+    Thrown(String),
+    /// What it returned is not what the port holds.
+    Decode(String),
+}
+
 /// A list of port numbers of a `returned`.
 fn numbers<I: Idx>(returned: &JsValue, field: &str, len: usize) -> Result<Vec<I>, String> {
     let list =
@@ -220,11 +228,28 @@ impl WebHub {
     }
 
     /// A getter's `option<T>`, as a value of `T`.
-    fn get(&self, name: &str, ty: &Type) -> Result<Option<Rc<Data>>, String> {
-        let js = self.call("ports", name, &[])?;
+    fn get(&self, name: &str, ty: &Type) -> Result<Option<Rc<Data>>, ReadFailure> {
+        let js = self.call("ports", name, &[]).map_err(ReadFailure::Thrown)?;
         crate::value::option_payload_js(&js, ty)
             .map(|payload| Data::from_output(payload, ty.clone()).map(Rc::new))
             .transpose()
+            .map_err(ReadFailure::Decode)
+    }
+
+    /// What the host is told of a read: as on wasmtime, a hub failing in it faults
+    /// the graph, which then holds nothing to read.
+    pub(crate) fn host_read<T>(
+        &self,
+        read: Result<Option<T>, ReadFailure>,
+    ) -> Result<Option<T>, String> {
+        match read {
+            Ok(value) => Ok(value),
+            Err(ReadFailure::Thrown(message)) => {
+                self.fault(message);
+                Ok(None)
+            }
+            Err(ReadFailure::Decode(message)) => Err(message),
+        }
     }
 
     /// A setter: it takes the value as a one-element list.
@@ -234,21 +259,28 @@ impl WebHub {
         Ok(changed.is_truthy())
     }
 
-    pub(crate) fn get_output(&self, output: OutputIdx) -> Result<Option<Rc<Data>>, String> {
+    pub(crate) fn get_output(&self, output: OutputIdx) -> Result<Option<Rc<Data>>, ReadFailure> {
         let ty = self.output_types[output]
             .as_ref()
-            .ok_or("not a Value port")?;
+            .ok_or_else(not_a_value_port)?;
         self.get(&hub::get_output(output), ty)
     }
 
-    pub(crate) fn get_input(&self, input: InputIdx) -> Result<Option<Rc<Data>>, String> {
-        let ty = self.input_types[input].as_ref().ok_or("not a Value port")?;
+    pub(crate) fn get_input(&self, input: InputIdx) -> Result<Option<Rc<Data>>, ReadFailure> {
+        let ty = self.input_types[input]
+            .as_ref()
+            .ok_or_else(not_a_value_port)?;
         self.get(&hub::get_input(input), ty)
     }
 
-    pub(crate) fn get_feedback(&self, connection: FeedbackIdx) -> Result<Option<Rc<Data>>, String> {
+    pub(crate) fn get_feedback(
+        &self,
+        connection: FeedbackIdx,
+    ) -> Result<Option<Rc<Data>>, ReadFailure> {
         let from = self.ports.feedback()[connection].from;
-        let ty = self.output_types[from].as_ref().ok_or("not a Value port")?;
+        let ty = self.output_types[from]
+            .as_ref()
+            .ok_or_else(not_a_value_port)?;
         self.get(&hub::get_feedback(connection), ty)
     }
 
@@ -273,13 +305,13 @@ impl WebHub {
         Ok(self.call("control", "clear-input", &[number])?.is_truthy())
     }
 
-    pub(crate) fn read_handle(&self, output: OutputIdx) -> Result<Option<JsValue>, String> {
+    pub(crate) fn read_handle(&self, output: OutputIdx) -> Result<Option<JsValue>, ReadFailure> {
         let number = JsValue::from(output.position() as u32);
         let handle = self
             .callbacks
             .read_handle
             .call1(&JsValue::NULL, &number)
-            .map_err(|e| thrown(&e))?;
+            .map_err(|e| ReadFailure::Thrown(thrown(&e)))?;
         Ok((!handle.is_undefined()).then_some(handle))
     }
 
@@ -319,6 +351,10 @@ impl WebHub {
             Either::Left((Err(_), _)) | Either::Right(_) => Err(RuntimeError::InstanceStopped),
         }
     }
+}
+
+fn not_a_value_port() -> ReadFailure {
+    ReadFailure::Decode("not a Value port".into())
 }
 
 /// Per node, the stream and future inputs its outputs feed, for the loader to
@@ -381,7 +417,7 @@ async fn serve(
             .collect();
         for (input, data) in retained {
             hub.set_input(input, &data)
-                .map_err(|message| (NodeFault::Restart { message }, None))?;
+                .map_err(|message| (NodeFault::WasmTrap { message }, None))?;
         }
         send(ControlKind::Built);
     }
@@ -419,9 +455,14 @@ async fn serve(
                         .call("control", "latch-feedback", &[number])
                         .map_err(trap)?;
                     let latched = match latched.as_string().as_deref() {
+                        Some("unchanged") => Latched::Unchanged,
                         Some("changed") => Latched::Changed,
                         Some("cleared") => Latched::Cleared,
-                        _ => Latched::Unchanged,
+                        other => {
+                            return Err(trap(format!(
+                                "`latch-feedback` returned {other:?}, which is no `latched`"
+                            )));
+                        }
                     };
                     send(ControlKind::Latched { connection, latched });
                 }
@@ -573,11 +614,18 @@ impl HubPorts for WebPlane {
     fn read(&self, slot: PortSlot) -> BoxFuture<Result<Option<Rc<Data>>, String>> {
         let hub = self.0.clone();
         boxed(async move {
-            match slot {
+            let read = match slot {
                 PortSlot::Input(input) => hub.get_input(input),
                 PortSlot::Output(output) => hub.get_output(output),
                 PortSlot::Feedback(connection) => hub.get_feedback(connection),
-            }
+            };
+            read.map_err(|failure| match failure {
+                ReadFailure::Thrown(message) => {
+                    hub.fault(message.clone());
+                    message
+                }
+                ReadFailure::Decode(message) => message,
+            })
         })
     }
 }

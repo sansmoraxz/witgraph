@@ -2098,3 +2098,96 @@ test('a hub setter throwing during an inject is a fault, as on wasmtime', async 
     web.free();
   }
 });
+
+/** A scheduler over a stand-in hub: `ports` and `control` are all it has. */
+async function overStandIn(
+  ports: Record<string, unknown>,
+  control: Record<string, unknown> = {},
+  connections: unknown[] = [],
+  returned: Record<string, number[]> = {},
+) {
+  const graph = {
+    metadata: { name: 'test' },
+    components: [componentRef(ids.echo)],
+    nodes: [{ id: 'e', component: componentRef(ids.echo) }],
+    connections,
+  };
+  const bytes = new Uint8Array(await readFile(new URL('echo.wasm', guests)));
+  return WebGraph.load(
+    JSON.stringify(graph),
+    [{ id: ids.echo, bytes }],
+    {
+      run: () => ({
+        outputsChanged: [],
+        inputsChanged: [],
+        inputsRecorded: [],
+        inputsCleared: [],
+        feedbackBuffered: [],
+        ...returned,
+      }),
+      rebuild: () => {},
+      instance: () => ({ ports, control }),
+      readHandle: () => undefined,
+    },
+    [],
+  );
+}
+
+test('a hub getter throwing during a read is a fault and reads nothing, as on wasmtime', async () => {
+  const web = await overStandIn({
+    getOutput0: () => {
+      throw new Error('out of memory');
+    },
+  });
+  try {
+    assert.equal(await web.readOutput('e', 'out'), undefined);
+    await web.tick();
+    const faults = web.takeFaults() as { fault: { kind: string; message: string } }[];
+    assert.equal(faults.length, 1);
+    assert.equal(faults[0].fault.kind, 'trap');
+    assert.match(faults[0].fault.message, /out of memory/);
+  } finally {
+    web.free();
+  }
+});
+
+test('a hub failing as a new instance is written is a trap, as on wasmtime', async () => {
+  const web = await overStandIn({
+    setInput0: () => {
+      throw new Error('out of memory');
+    },
+  });
+  try {
+    await web.inject('e', 'in', 1.5);
+    await web.tick();
+    const faults = web.takeFaults() as { fault: { kind: string } }[];
+    assert.equal(faults.length, 1);
+    assert.equal(faults[0].fault.kind, 'trap');
+  } finally {
+    web.free();
+  }
+});
+
+test('a latch the hub does not answer with a `latched` is a fault', async () => {
+  const web = await overStandIn(
+    {},
+    { latchFeedback: () => 'nonsense' },
+    [
+      {
+        id: 'ee',
+        from: { node: 'e', port: 'out' },
+        to: { node: 'e', port: 'in' },
+        feedback: true,
+      },
+    ],
+    { feedbackBuffered: [0] },
+  );
+  try {
+    await web.tick();
+    const faults = web.takeFaults() as { fault: { kind: string; message: string } }[];
+    assert.equal(faults.length, 1);
+    assert.match(faults[0].fault.message, /latch-feedback/);
+  } finally {
+    web.free();
+  }
+});
