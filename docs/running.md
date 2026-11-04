@@ -200,7 +200,7 @@ anything large.
 let scale = rt.input::<f64>(&"scale".into(), &"value".into()).await?;
 let blob = rt.output::<Vec<u8>>(&"sink".into(), &"blob".into()).await?;
 rt.set(&scale, 21.0).await?;
-rt.tick().await;
+let _ = rt.tick().await;
 let bytes: Option<Vec<u8>> = rt.get(&blob).await?;
 ```
 

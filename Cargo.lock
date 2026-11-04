@@ -640,6 +640,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "doc-snippets"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+ "wasmtime",
+ "witgraph-ir",
+ "witgraph-runtime",
+ "witgraph-source",
+]
+
+[[package]]
 name = "dunce"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"

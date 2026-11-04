@@ -50,7 +50,7 @@ fn echo_wasm(bytes: &[u8]) -> HashMap<ComponentRef, &[u8]> {
     [(contract(ECHO).id, bytes)].into_iter().collect()
 }
 
-fn calc_wasm<'a>(math_bytes: &'a [u8]) -> HashMap<ComponentRef, &'a [u8]> {
+fn calc_wasm(math_bytes: &[u8]) -> HashMap<ComponentRef, &[u8]> {
     [(contract(CALC).id, CALC.wasm), (math(), math_bytes)]
         .into_iter()
         .collect()

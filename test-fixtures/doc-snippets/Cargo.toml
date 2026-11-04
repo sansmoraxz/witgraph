@@ -1,0 +1,16 @@
+[package]
+name = "doc-snippets"
+description = "Compiles the Rust snippets of the README and docs, so they cannot drift from the code"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+witgraph-ir = { workspace = true }
+witgraph-runtime = { workspace = true, features = ["precompiled"] }
+witgraph-source = { path = "../../crates/witgraph-source" }
+wasmtime = { workspace = true }
+tokio = { version = "1", features = ["time"] }

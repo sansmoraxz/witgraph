@@ -116,7 +116,7 @@ graph, is always available.
 
 ## Writing a node in Rust
 
-```rust
+```rust,ignore
 wit_bindgen::generate!({ path: "wit", world: "echo" });
 
 use exports::node::{Guest, Inputs, Outputs};
@@ -135,7 +135,7 @@ export!(Echo);
 A node that produces a stream returns the reader and writes from a spawned
 task:
 
-```rust
+```rust,ignore
 impl Guest for Producer {
     async fn run(inputs: Inputs) -> Outputs {
         let (mut tx, rx) = wit_stream::new::<u32>();

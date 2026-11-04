@@ -35,7 +35,7 @@ world scale {
 
 In Rust, with `wit-bindgen`:
 
-```rust
+```rust,ignore
 wit_bindgen::generate!({ path: "wit", world: "scale" });
 
 use exports::node::{Guest, Inputs, Outputs};
@@ -73,7 +73,9 @@ components. See [docs/graphs.md](docs/graphs.md).
 ```rust
 let mut rt = RuntimeGraph::load(compiled, &wasm, RuntimeConfig::default(), Perf).await?;
 rt.inject(&"scale".into(), &"value".into(), Val::Float64(21.0)).await?;
-rt.tick().await;
+if let TickResult::Faulted(report) = rt.tick().await {
+    return Err(report.fault.into());
+}
 let out = rt.read_output(&"scale".into(), &"out".into()).await?;
 ```
 
