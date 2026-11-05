@@ -14,6 +14,8 @@ interface graph {
 
     /// The graph, as the JSON a `witgraph_ir::Graph` serializes to.
     describe: func() -> string;
+    /// By node, its component's contract, as JSON: what an editor draws its ports from.
+    contracts: func() -> string;
     /// The nodes that run as one, joined by streams and futures.
     stream-groups: func() -> list<list<string>>;
     /// A node's state now, while a tick runs too.
@@ -107,6 +109,8 @@ interface lines {
     files: func() -> list<string>;
     /// The lines of a file that have code.
     lines: func(file: string) -> list<u32>;
+    /// A file's text, as the host has it, for one of `files` only.
+    source: func(file: string) -> option<string>;
     /// Where a guest is stopped, if one is.
     stopped: func() -> option<line-stop>;
     /// Waits for the next stop not yet told of.

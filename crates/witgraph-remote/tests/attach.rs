@@ -81,6 +81,11 @@ async fn a_debugger_holds_a_node_and_sees_in_while_it_is_held() {
         described.contains("\"a\"") && described.contains("\"b\""),
         "{described}"
     );
+    let contracts = graph::contracts(&wrpc, ()).await.unwrap();
+    assert!(
+        contracts.contains("\"inputs\"") && contracts.contains("\"b\""),
+        "{contracts}"
+    );
 
     holds::hold_at(&wrpc, (), &holds::Holding::Nodes(vec!["b".into()]))
         .await
@@ -139,4 +144,148 @@ async fn a_debugger_holds_a_node_and_sees_in_while_it_is_held() {
         })
         .await;
     let _ = (state, PortName::from("in"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_debugger_stops_a_guest_on_a_line_and_reads_its_source() {
+    use client::witgraph::debug::lines;
+    use test_components::{LINE_WALK, RELAY};
+    use witgraph_runtime::OwnLines;
+
+    let mut contracts = Vec::new();
+    let mut wasm = HashMap::new();
+    for guest in [RELAY, LINE_WALK] {
+        let contract = witgraph_wit::load_components(guest.wit).unwrap().remove(0);
+        wasm.insert(contract.id.clone(), guest.wasm);
+        contracts.push(contract);
+    }
+    let graph = Graph::builder("lines")
+        .add_component(&contracts[0])
+        .add_component(&contracts[1])
+        .add_node("counter", contracts[0].id.clone())
+        .add_node("walker", contracts[1].id.clone())
+        .connect_feedback(
+            "loop",
+            PortRef::new("counter", "out"),
+            PortRef::new("counter", "in"),
+        )
+        .connect(
+            "walk",
+            PortRef::new("counter", "out"),
+            PortRef::new("walker", "in"),
+        )
+        .build();
+    let config = RuntimeConfig {
+        debug_lines: Some(OwnLines::default()),
+        ..RuntimeConfig::default()
+    };
+    let mut rt = RuntimeGraph::load(graph.compile(&contracts).unwrap(), &wasm, config, Perf)
+        .await
+        .unwrap();
+    rt.inject_wave(&NodeId::from("counter"), &PortName::from("in"), "0")
+        .await
+        .unwrap();
+    rt.inject_wave(&NodeId::from("counter"), &PortName::from("add"), "1")
+        .await
+        .unwrap();
+    let debuggee = Debuggee::new(rt).unwrap();
+    let served = serve(
+        debuggee.clone(),
+        "127.0.0.1:0".parse().unwrap(),
+        "secret".into(),
+    )
+    .await
+    .unwrap();
+    let ticking = debuggee.clone();
+    tokio::spawn(async move {
+        loop {
+            let _ = ticking.tick().await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    });
+    let wrpc = connect(&served, "secret").await.unwrap();
+    let files = lines::files(&wrpc, ()).await.unwrap();
+    let file = files
+        .iter()
+        .find(|file| file.ends_with("line-walk/src/lib.rs"))
+        .unwrap()
+        .clone();
+    let text = lines::source(&wrpc, (), &file).await.unwrap().unwrap();
+    let line = text
+        .lines()
+        .position(|line| line.ends_with("// mark: walk-first"))
+        .unwrap()
+        + 1;
+    let line = u32::try_from(line).unwrap();
+    assert!(
+        lines::source(&wrpc, (), "/etc/passwd")
+            .await
+            .unwrap()
+            .is_none(),
+        "only its own"
+    );
+
+    // As the editor does: asking for states, again and again, while the program ticks.
+    let polling = connect(&served, "secret").await.unwrap();
+    tokio::spawn(async move {
+        loop {
+            let _ = graph::node_state(&polling, (), "walker").await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    });
+    assert_eq!(
+        lines::set_breakpoint(&wrpc, (), &file, line).await.unwrap(),
+        Some(line)
+    );
+    let stop = tokio::time::timeout(Duration::from_secs(20), lines::next_stop(&wrpc, ()))
+        .await
+        .expect("it stops")
+        .unwrap();
+    assert_eq!((stop.line, stop.node.as_deref()), (line, Some("walker")));
+    assert!(
+        stop.variables.iter().any(|variable| variable.name == "x"),
+        "{:?}",
+        stop.variables
+    );
+    lines::clear_breakpoint(&wrpc, (), &file, line)
+        .await
+        .unwrap();
+    lines::resume(&wrpc, ()).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_debugger_that_goes_lets_go_of_what_it_held() {
+    let (_debuggee, served) = attached().await;
+    let gone = connect(&served, "secret").await.unwrap();
+    holds::hold_at(&gone, (), &holds::Holding::Nodes(vec!["b".into()]))
+        .await
+        .unwrap();
+    graph::inject(&gone, (), "a", "in", "7")
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(20), holds::next_held(&gone, ()))
+        .await
+        .expect("`b` is held")
+        .unwrap();
+    // Gone without a word, as a closed tab goes.
+    drop(gone);
+
+    let next = connect(&served, "secret").await.unwrap();
+    let b = async {
+        loop {
+            let read = graph::read_output(&next, (), "b", "out")
+                .await
+                .unwrap()
+                .unwrap();
+            if read.as_deref() == Some("7") {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(20), b)
+        .await
+        .expect("`b` was let go, and ran");
+    assert!(holds::held(&next, ()).await.unwrap().is_empty());
 }

@@ -428,7 +428,9 @@ the guests and read their memory, so keep it secret. It can hold nodes, stop on 
 Your own calls on the graph go through `debuggee.with(...)`. What it asks that needs the
 graph while a tick runs ends that tick early, is done, and the tick goes on, so a debugger
 sees in even while a held node keeps the tick from ending. The interface is
-`crates/witgraph-remote/wit/debug.wit`.
+`crates/witgraph-remote/wit/debug.wit`. The editor attaches to it
+([Attaching to a graph on wasmtime](editor.md#attaching-to-a-graph-on-wasmtime)), and
+`cargo run -p witgraph-remote --example serve` runs a graph to attach to.
 
 ## Stopping on a source line
 

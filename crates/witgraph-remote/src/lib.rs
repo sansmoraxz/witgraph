@@ -48,6 +48,7 @@ struct Inner<M: RuntimeMode, H: Host> {
     holds: RuntimeHolds,
     lines: Option<RuntimeLines>,
     described: String,
+    contracts: String,
     groups: Vec<Vec<String>>,
 }
 
@@ -73,6 +74,20 @@ impl<M: RuntimeMode, H: Host> Debuggee<M, H> {
     pub fn new(graph: RuntimeGraph<M, H>) -> anyhow::Result<Self> {
         let described = serde_json::to_string(graph.compiled().graph())
             .context("failed to describe the graph")?;
+        let compiled = graph.compiled();
+        let contracts: serde_json::Map<String, serde_json::Value> = compiled
+            .graph()
+            .nodes
+            .iter()
+            .filter_map(|node| {
+                let contract = compiled.contract_for(&node.id)?;
+                let meta = witgraph_wit::metadata::ComponentMeta::of(contract);
+                Some(serde_json::to_value(meta).map(|meta| (node.id.to_string(), meta)))
+            })
+            .collect::<Result<_, _>>()
+            .context("failed to describe the contracts")?;
+        let contracts =
+            serde_json::to_string(&contracts).context("failed to describe the contracts")?;
         let groups = graph
             .compiled()
             .stream_groups()
@@ -88,6 +103,7 @@ impl<M: RuntimeMode, H: Host> Debuggee<M, H> {
                 jobs: Mutex::new(Vec::new()),
                 asked: Notify::new(),
                 described,
+                contracts,
                 groups,
             }),
         })
@@ -178,6 +194,10 @@ impl<M: RuntimeMode, H: Host> Handler<M, H> {
 impl<C: Send + Sync, M: RuntimeMode, H: Host> graph::Handler<C> for Handler<M, H> {
     async fn describe(&self, _: C) -> anyhow::Result<String> {
         Ok(self.inner().described.clone())
+    }
+
+    async fn contracts(&self, _: C) -> anyhow::Result<String> {
+        Ok(self.inner().contracts.clone())
     }
 
     async fn stream_groups(&self, _: C) -> anyhow::Result<Vec<Vec<String>>> {
@@ -339,6 +359,17 @@ impl<C: Send + Sync, M: RuntimeMode, H: Host> lines::Handler<C> for Handler<M, H
             .lines()
             .map(|lines| lines.lines(&file))
             .unwrap_or_default())
+    }
+
+    async fn source(&self, _: C, file: String) -> anyhow::Result<Option<String>> {
+        // Only what the guests' debug info names: nothing else of the host's files.
+        let known = self
+            .lines()
+            .is_some_and(|lines| lines.files().contains(&file));
+        if !known {
+            return Ok(None);
+        }
+        Ok(tokio::fs::read_to_string(&file).await.ok())
     }
 
     async fn stopped(&self, _: C) -> anyhow::Result<Option<lines::LineStop>> {
@@ -510,6 +541,12 @@ pub async fn serve<M: RuntimeMode, H: Host>(
         .context("failed to configure QUIC's TLS")?;
     let mut transport = quinn::TransportConfig::default();
     transport.keep_alive_interval(Some(std::time::Duration::from_secs(3)));
+    // A debugger gone without closing (a tab closed, say) is let go of soon after, and what it
+    // held with it.
+    transport.max_idle_timeout(Some(
+        quinn::IdleTimeout::try_from(std::time::Duration::from_secs(10))
+            .context("failed to set an idle timeout")?,
+    ));
     let mut config = quinn::ServerConfig::with_crypto(Arc::new(tls));
     config.transport_config(Arc::new(transport));
     let endpoint =
@@ -520,6 +557,10 @@ pub async fn serve<M: RuntimeMode, H: Host>(
 
     let server = Arc::new(wrpc_webtransport::Server::new());
     let handler = Handler { debuggee };
+    let left = Left {
+        holds: handler.debuggee.inner.holds.clone(),
+        lines: handler.debuggee.inner.lines.clone(),
+    };
     let invocations = bindings::serve(server.as_ref(), handler)
         .await
         .context("failed to serve the debugger's calls")?;
@@ -534,7 +575,7 @@ pub async fn serve<M: RuntimeMode, H: Host>(
         ip => ip.to_string(),
     };
     let url = format!("https://{host}:{}/?token={token}", bound.port());
-    let task = tokio::spawn(run(endpoint, server, invocations, token.clone()));
+    let task = tokio::spawn(run(endpoint, server, invocations, token.clone(), left));
     Ok(Served {
         url,
         certificate_hash,
@@ -554,6 +595,7 @@ async fn run(
         ),
     > + Unpin,
     token: String,
+    left: Left,
 ) -> anyhow::Result<()> {
     let mut sessions = tokio::task::JoinSet::new();
     let mut calls = tokio::task::JoinSet::new();
@@ -566,7 +608,15 @@ async fn run(
             }
             Some(connecting) = endpoint.accept() => {
                 let (server, token) = (server.clone(), token.clone());
-                sessions.spawn(session(connecting, server, token));
+                let left = left.clone();
+                sessions.spawn(async move {
+                    let attached = session(connecting, server, token).await;
+                    // Whatever ended it, a debugger gone holds nothing and stops nothing.
+                    if matches!(attached, Ok(true) | Err(_)) {
+                        left.release();
+                    }
+                    attached
+                });
             }
             Some(_) = calls.join_next() => {}
             Some(_) = sessions.join_next() => {}
@@ -575,12 +625,28 @@ async fn run(
     }
 }
 
-/// Serves one debugger, if it presents the token.
+/// What a debugger leaves behind, to let go of when it goes.
+#[derive(Clone)]
+struct Left {
+    holds: RuntimeHolds,
+    lines: Option<RuntimeLines>,
+}
+
+impl Left {
+    fn release(&self) {
+        self.holds.release();
+        if let Some(lines) = &self.lines {
+            lines.release();
+        }
+    }
+}
+
+/// Serves one debugger, if it presents the token: says whether it did, once it has gone.
 async fn session(
     connecting: quinn::Incoming,
     server: Arc<wrpc_webtransport::Server>,
     token: String,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     let connection = connecting.await.context("failed to accept QUIC")?;
     let request = web_transport_quinn::Request::accept(connection)
         .await
@@ -595,14 +661,15 @@ async fn session(
             .reject(web_transport_quinn::http::StatusCode::FORBIDDEN)
             .await
             .context("failed to refuse a debugger")?;
-        return Ok(());
+        return Ok(false);
     }
     let session = request.ok().await.context("failed to open the session")?;
-    loop {
-        let (send, receive) = session.accept_bi().await.context("the debugger left")?;
+    // Until it goes, which is how a debugger's session ends.
+    while let Ok((send, receive)) = session.accept_bi().await {
         server
             .accept((), send.into(), receive.into())
             .await
             .context("failed to take a call")?;
     }
+    Ok(true)
 }
