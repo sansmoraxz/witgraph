@@ -1,0 +1,72 @@
+import { type ChildProcess, execFileSync, spawn } from 'node:child_process';
+import { once } from 'node:events';
+import { createInterface } from 'node:readline';
+import { expect, test } from '@playwright/test';
+import type { WitgraphCanvas } from 'witgraph-editor';
+
+// Attaching to a graph a program runs on wasmtime, served with `witgraph-remote` over
+// WebTransport: the `serve` example of that crate is the program.
+const root = new URL('../../../', import.meta.url).pathname;
+let host: ChildProcess | undefined;
+let attach = '';
+
+test.beforeAll(async () => {
+  test.setTimeout(600_000);
+  execFileSync('cargo', ['build', '-q', '-p', 'witgraph-remote', '--example', 'serve'], {
+    cwd: root,
+    stdio: 'inherit',
+  });
+  host = spawn(`${root}target/debug/examples/serve`, [], { stdio: ['ignore', 'pipe', 'inherit'] });
+  if (!host.stdout) throw new Error('the program has no output to read');
+  const lines = createInterface({ input: host.stdout });
+  const [first] = (await once(lines, 'line')) as [string];
+  const { url, certificateHash } = JSON.parse(first) as { url: string; certificateHash: string };
+  attach = `/?attach=${encodeURIComponent(url)}&hash=${certificateHash}`;
+});
+
+test.afterAll(() => {
+  host?.kill();
+});
+
+test('the editor attaches, and holds a node of the graph its program runs', async ({ page }) => {
+  await page.goto(attach);
+  const canvas = page.locator('witgraph-canvas');
+  await expect(canvas.locator('[data-node-id="walker"]')).toBeVisible({ timeout: 20_000 });
+  const controls = page.locator('witgraph-controls');
+  await expect(controls.locator('.badge')).toHaveText('Attached');
+  // The program runs it: here it is only debugged.
+  await expect(controls.locator('button.run')).toBeHidden();
+  await expect(controls.locator('button.stop')).toBeHidden();
+
+  await canvas.evaluate((el: WitgraphCanvas) => el.controller?.toggleBreakpoint('walker'));
+  await expect(controls.locator('.badge')).toHaveText('Paused at a node', { timeout: 10_000 });
+  await expect(page.locator('#status')).toContainText('Paused before node walker');
+
+  // It goes on, and stops there again on its next run.
+  await controls.locator('button.resume').click();
+  await expect(controls.locator('.badge')).toHaveText('Paused at a node', { timeout: 10_000 });
+  await canvas.evaluate((el: WitgraphCanvas) => el.controller?.toggleBreakpoint('walker'));
+  await controls.locator('button.resume').click();
+  await expect(controls.locator('.badge')).toHaveText('Attached');
+});
+
+test("the editor stops on a line of the program's guest, with its source", async ({ page }) => {
+  await page.goto(attach);
+  const canvas = page.locator('witgraph-canvas');
+  await expect(canvas.locator('[data-node-id="walker"]')).toBeVisible({ timeout: 20_000 });
+  const source = page.locator('witgraph-source');
+  // Its text comes from the program's machine.
+  await expect(source.locator('.row', { hasText: 'mark: walk-first' })).toBeVisible({
+    timeout: 20_000,
+  });
+  await source.locator('.row', { hasText: 'mark: walk-first' }).locator('.gutter').click();
+  await expect(source.locator('.row.current')).toContainText('mark: walk-first', {
+    timeout: 20_000,
+  });
+  await expect(source.locator('.where')).toContainText('in walker');
+  await expect(source).toContainText('x');
+
+  await source.locator('.row', { hasText: 'mark: walk-first' }).locator('.gutter').click();
+  await page.locator('witgraph-controls').locator('button.resume').click();
+  await expect(page.locator('witgraph-controls').locator('.badge')).toHaveText('Attached');
+});

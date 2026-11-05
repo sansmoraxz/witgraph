@@ -247,6 +247,26 @@ stays with its guest: others run on past their probes.
   in a function all on one line, which is what a macro usually generates, though a breakpoint
   there does.
 
+## Attaching to a graph on wasmtime
+
+`AttachedSession.attach({ url, certificateHash, beforeRun, onStop, onState })` is a session of a
+graph a program runs on wasmtime, served with `witgraph-remote`
+([Attaching a debugger](running.md#attaching-a-debugger)), over wRPC on WebTransport. It has
+the shape of a worker's `RemoteSession` (`DebugSession`), so a debugger uses either the same
+way, but the program ticks the graph, so `tick` rejects, as do `snapshot`, `restore` and
+`shutdown`. A held run is told to `beforeRun(node, true)` and goes on once it settles; a stop on
+a line to `onStop`. Node states and output versions are asked for every `pollEvery`
+milliseconds (250), and `onState` says when they have moved. `source(file)` reads a guest's
+source from the program's machine.
+
+Its calls are bindings `wit-bindgen-wrpc js` makes from `crates/witgraph-remote/wit`, over
+`@bytecodealliance/wrpc`, both from our wRPC fork. After changing the WIT, generate them again:
+
+```sh
+wit-bindgen-wrpc js --world debugger --generate-all \
+  --out-dir packages/witgraph-loader/src/attach/bindings crates/witgraph-remote/wit
+```
+
 ## When a graph does not compile
 
 `Session.load` throws an error listing what is wrong. `diagnosticsOf(error)` gets the

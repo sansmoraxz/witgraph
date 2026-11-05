@@ -1,12 +1,14 @@
 import {
+  AttachedSession,
   type Contract,
+  type DebugLines,
+  type DebugSession,
   type Diagnostic,
   describeComponent,
   diagnosticsOf,
   endWorker,
   GraphChecker,
   init,
-  type LineDebugger,
   type LineStop,
   type PortValues,
   RemoteSession,
@@ -111,7 +113,9 @@ export interface CompatibleOutput {
 }
 
 export class EditorController extends EventTarget {
-  #session: RemoteSession | null = null;
+  #session: DebugSession | null = null;
+  /** The session, while attached to a graph a program runs elsewhere. */
+  #attached: AttachedSession | null = null;
   /** What sessions run in: made as the first needs it, and ended with the controller. */
   #worker: SessionWorker | null = null;
   /** A stop being seen through, which may take a new worker. */
@@ -273,7 +277,13 @@ export class EditorController extends EventTarget {
    * using: they are refused until it stops, with a warning in the trace.
    */
   get editable(): boolean {
+    if (this.#attached) return false;
     return this.#mode !== 'running' && this.#mode !== 'paused';
+  }
+
+  /** Whether this is attached to a graph a program runs elsewhere, which ticks it itself. */
+  get attached(): boolean {
+    return this.#attached !== null;
   }
 
   /**
@@ -1121,7 +1131,51 @@ export class EditorController extends EventTarget {
 
   // -- Session lifecycle ------------------------------------------------------
 
+  /**
+   * Attaches to a graph a program runs on wasmtime and serves with `witgraph-remote`, at the
+   * URL and certificate hash it printed. The program ticks it: from here, nodes are held,
+   * guests stopped on lines, outputs read and inputs written, and the graph is not changed.
+   */
+  async attach(options: { url: string; certificateHash: Uint8Array<ArrayBuffer> }): Promise<void> {
+    this.#session?.dispose();
+    this.#session = null;
+    this.#attached = null;
+    this.#endWorker();
+    this.#forgetChecker();
+    this.#originalOptions = null;
+    let session: AttachedSession | null = null;
+    session = await AttachedSession.attach({
+      ...options,
+      beforeRun: (node, held) => this.#beforeRun(session, node, held),
+      onStop: (stop: LineStop): void => {
+        if (this.#session === session) this.#stopOnLine(stop);
+      },
+      onState: (): void => {
+        if (this.#session !== session) return;
+        this.#pollState();
+        void this.#pullObserved(false);
+        this.#dispatch('state-changed');
+      },
+    });
+    this.#attached = session;
+    this.#session = session;
+    this.#graphJson = JSON.parse(session.described) as GraphJson;
+    this.#streamGroups = session.graph.streamGroups();
+    this.#compileDiagnostics = [];
+    this.#compileError = null;
+    this.#dirty = false;
+    this.#buildVisuals();
+    this.#observedSent = '';
+    this.#armLineBreakpoints();
+    this.#sendHolds();
+    this.#collectCapabilities();
+    // The program is ticking it.
+    this.#mode = 'running';
+    this.#dispatch('state-changed');
+  }
+
   async load(options: EditorLoadOptions): Promise<void> {
+    this.#attached = null;
     if (this.#originalOptions?.worker !== options.worker) this.#endWorker();
     this.#originalOptions = options;
     this.#forgetChecker();
@@ -1210,6 +1264,8 @@ export class EditorController extends EventTarget {
       this.resumeBreakpoint();
       return;
     }
+    // The program running an attached graph ticks it.
+    if (this.#attached) return;
     if (this.#mode === 'running') return;
     this.#setStepping(false);
     await this.#startRun('run');
@@ -1278,7 +1334,7 @@ export class EditorController extends EventTarget {
   }
 
   /** Lets go of the guest stopped on a line, and settles at its next stop. */
-  async #stepLine(go: (lines: LineDebugger) => void): Promise<void> {
+  async #stepLine(go: (lines: DebugLines) => void): Promise<void> {
     const stopped = this.#nextStop();
     this.#goOnFromLine(go);
     // With no run to end it, a step that finds no line has nothing else to settle it.
@@ -1286,10 +1342,10 @@ export class EditorController extends EventTarget {
     await stopped;
   }
 
-  #goOnFromLine(go: (lines: LineDebugger) => void): void {
+  #goOnFromLine(go: (lines: DebugLines) => void): void {
     const lines = this.#session?.lines;
     this.#lineStop = null;
-    this.#mode = this.#runLoop || this.#ticking ? 'running' : 'idle';
+    this.#mode = this.#runLoop || this.#ticking || this.#attached ? 'running' : 'idle';
     if (lines) go(lines);
     this.#dispatch('state-changed');
   }
@@ -1347,7 +1403,10 @@ export class EditorController extends EventTarget {
     let text = this.#sourceTexts.get(file);
     if (!text) {
       const asked = this.#originalOptions?.sources;
-      text = Promise.resolve(asked?.(file)).catch(() => undefined);
+      const attached = this.#attached;
+      text = Promise.resolve(attached ? attached.source(file) : asked?.(file)).catch(
+        () => undefined,
+      );
       this.#sourceTexts.set(file, text);
     }
     return text;
@@ -1378,7 +1437,7 @@ export class EditorController extends EventTarget {
 
   /** Holds each node from the next on, as a step would. What is running goes on. */
   pause(): void {
-    if (this.#mode !== 'running' || !this.#runLoop) return;
+    if (this.#mode !== 'running' || (!this.#runLoop && !this.#attached)) return;
     this.#setStepping(true);
     this.#mode = 'paused';
     // Or at the next line of what is running, even if it is spinning.
@@ -1389,6 +1448,7 @@ export class EditorController extends EventTarget {
 
   /** Stops what is running and runs the graph again from the top, keeping its inputs. */
   async restart(): Promise<void> {
+    if (this.#attached) return;
     await this.stop();
     await this.#runLoop;
     await this.run();
@@ -1721,7 +1781,7 @@ export class EditorController extends EventTarget {
     // Told first, so that the tick's first runs are seen.
     this.#sendObserved();
     this.#ticking = true;
-    let tick: Awaited<ReturnType<RemoteSession['tick']>>;
+    let tick: Awaited<ReturnType<DebugSession['tick']>>;
     try {
       // Paused at a breakpoint, a tick ends only when resumed or stopped.
       const stop = Promise.race([stopped, slice.then(() => this.#paused())]);
@@ -1770,6 +1830,8 @@ export class EditorController extends EventTarget {
    * stops too. Between ticks, it stops what earlier ticks left running.
    */
   stop(): Promise<void> {
+    // What stops an attached graph is the program's: a debugger only lets go of it.
+    if (this.#attached) return Promise.resolve();
     this.#stopRequested = true;
     if (!this.#ticking && this.#session) {
       // Sent now, in order with what else is asked: what it changes is polled once it is done.
@@ -1796,7 +1858,7 @@ export class EditorController extends EventTarget {
    * is sent, as a node that spins never returns to it, so it is ended, and the graph
    * loaded in another, on the inputs it was given.
    */
-  async #stoppedOrEnded(session: RemoteSession): Promise<void> {
+  async #stoppedOrEnded(session: DebugSession): Promise<void> {
     try {
       let timer: ReturnType<typeof setTimeout> | undefined;
       const answered = await Promise.race([
@@ -2425,30 +2487,7 @@ export class EditorController extends EventTarget {
       mocks: Object.keys(mocks).length > 0 ? mocks : undefined,
       holds: this.#holds(),
 
-      beforeRun: async (node, held): Promise<void> => {
-        const breakpoint = this.#breakpoints.has(node);
-        // Held, it waits for this. One no longer wanted held just goes on.
-        if (held && (breakpoint || this.#stepping)) {
-          // Read when it is hit, as nothing crosses to the host unasked.
-          const inputs = (await session?.readInputs(node)) ?? {};
-          if (this.#stopRequested) return;
-          return new Promise<void>((resume) => {
-            this.#held.push({ node, inputs, resume, breakpoint });
-            this.#showStop();
-          });
-        }
-        // Shown running until the tick ends, however long its run takes
-        // (one reading a stream, say).
-        const visual = this.#nodes.get(node);
-        if (visual && visual.phase !== 'running') {
-          visual.phase = 'running';
-          this.#dispatch('state-changed');
-        }
-        // Its futures are new: until they resolve, the last ones are stale.
-        for (const port of visual?.outputs ?? []) {
-          if (port.kind === 'future') this.#observation(node, port.name).pending = true;
-        }
-      },
+      beforeRun: (node, held): Promise<void> => this.#beforeRun(session, node, held),
 
       afterRun: (node): void => this.#stepReturned(node),
 
@@ -2488,6 +2527,32 @@ export class EditorController extends EventTarget {
     this.#armLineBreakpoints();
     await this.#restoreInjections(graph);
     this.#collectCapabilities();
+  }
+
+  /** A node's run is about to start: held, it waits here until let go. */
+  async #beforeRun(session: DebugSession | null, node: string, held: boolean): Promise<void> {
+    const breakpoint = this.#breakpoints.has(node);
+    // Held, it waits for this. One no longer wanted held just goes on.
+    if (held && (breakpoint || this.#stepping)) {
+      // Read when it is hit, as nothing crosses to the host unasked.
+      const inputs = (await session?.readInputs(node)) ?? {};
+      if (this.#stopRequested) return;
+      return new Promise<void>((resume) => {
+        this.#held.push({ node, inputs, resume, breakpoint });
+        this.#showStop();
+      });
+    }
+    // Shown running until the tick ends, however long its run takes
+    // (one reading a stream, say).
+    const visual = this.#nodes.get(node);
+    if (visual && visual.phase !== 'running') {
+      visual.phase = 'running';
+      this.#dispatch('state-changed');
+    }
+    // Its futures are new: until they resolve, the last ones are stale.
+    for (const port of visual?.outputs ?? []) {
+      if (port.kind === 'future') this.#observation(node, port.name).pending = true;
+    }
   }
 
   #collectCapabilities(): void {
@@ -2693,7 +2758,9 @@ export class EditorController extends EventTarget {
   /** Whether an edit is refused for a run: it is, and the trace says so. */
   #locked(): boolean {
     if (this.editable) return false;
-    const message = 'The graph cannot be edited while it runs: stop it first';
+    const message = this.#attached
+      ? "An attached graph is the program's: it cannot be edited from here"
+      : 'The graph cannot be edited while it runs: stop it first';
     const last = this.#traceEvents.at(-1);
     // A key held down, say, says it once.
     if (last?.event === 'warning' && last.message === message) return true;

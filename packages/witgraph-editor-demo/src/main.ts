@@ -557,6 +557,27 @@ function setUpPicker(current: string): void {
 }
 
 async function loadDemo(): Promise<void> {
+  // `?attach=<url>&hash=<certificate hash>`: a graph a program runs on wasmtime, served with
+  // `witgraph-remote` (`cargo run -p witgraph-remote --example serve` prints both).
+  const asked = new URLSearchParams(location.search);
+  const attachTo = asked.get('attach');
+  if (attachTo) {
+    try {
+      statusEl.textContent = 'Attaching...';
+      const hex = asked.get('hash') ?? '';
+      const certificateHash = new Uint8Array(
+        (hex.match(/../g) ?? []).map((byte) => Number.parseInt(byte, 16)),
+      );
+      await controller.attach({ url: attachTo, certificateHash });
+      await controller.autoLayout();
+      controller.addEventListener('state-changed', updateStatus);
+      updateStatus();
+    } catch (err: unknown) {
+      showError(err);
+    }
+    return;
+  }
+
   const [name, demo] = chosenDemo();
   setUpPicker(name);
   statusEl.textContent = 'Fetching test components...';
@@ -621,7 +642,9 @@ function updateStatus(): void {
     text = `Graph error: ${error}`;
   } else if (mode === 'running') {
     state = 'running';
-    text = `Running — tick ${controller.tickCount}. Click Stop to end the run.`;
+    text = controller.attached
+      ? 'Attached to a graph its program runs. Pause or a breakpoint stops it here.'
+      : `Running — tick ${controller.tickCount}. Click Stop to end the run.`;
   } else if (mode === 'paused') {
     state = 'paused';
     const node = controller.pausedNode;

@@ -446,11 +446,20 @@ export class WitgraphControls extends HTMLElement {
     this.#btnSnapSave.disabled = !this.#controller || mode === 'running';
     this.#btnSnapRestore.disabled =
       !this.#controller || this.#controller.savedSnapshots.length === 0 || mode === 'running';
+    // An attached graph is the program's to run, stop and change: here it is only debugged.
+    const attached = this.#controller?.attached ?? false;
+    for (const button of [this.#btnRun, this.#btnStop, this.#btnRestart, this.#btnReset]) {
+      button.toggleAttribute('hidden', attached);
+    }
+    for (const button of [this.#btnLoad, this.#btnSnapSave, this.#btnSnapRestore]) {
+      if (attached) button.disabled = true;
+    }
 
     // Between ticks too: a step can leave a stream going.
     const shown: EditorMode = mode === 'idle' && anyRunning ? 'running' : mode;
     let badgeText = MODE_LABELS[shown];
     if (mode === 'paused') badgeText = onLine ? 'Paused on a line' : 'Paused at a node';
+    if (attached && mode === 'running') badgeText = 'Attached';
     if (mode === 'idle' && this.#controller?.lastRunDurationMs != null) {
       const ms = this.#controller.lastRunDurationMs;
       const ticks = this.#controller.lastRunTicks;

@@ -118,6 +118,20 @@ Put them anywhere on your page. They all share one `EditorController`.
 - **Snapshots.** _Save_ captures the graph's state and _Restore_ goes back to
   it.
 
+## Attaching to a graph on wasmtime
+
+`controller.attach({ url, certificateHash })` debugs a graph a program runs on wasmtime and
+serves with `witgraph-remote` ([Attaching a debugger](running.md#attaching-a-debugger)), over
+WebTransport: it pins the server's certificate by `certificateHash`, and the `token` is in the
+`url`. In the demo, open `?attach=<url>&hash=<hex of the hash>`;
+`cargo run -p witgraph-remote --example serve` runs a graph to try it on, and prints both.
+
+The program ticks the graph, so _Run_, _Stop_, _Restart_ and _Reset_ are hidden, the badge says
+_Attached_, and the graph cannot be edited. Node breakpoints, _Pause_, _Continue_, _Next node_,
+the source panel (its text comes from the program's machine), _Inject_ and rerunning a node
+work. Values are shown as WAVE text, and a node paused at shows no inputs. A debugger that goes
+lets go of what it held and stopped, within ten seconds if it went without closing.
+
 ## Previews
 
 A node shows one of its outputs in a region below its ports: the frames of a
