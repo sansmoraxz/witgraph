@@ -627,7 +627,7 @@ function updateStatus(): void {
   } else if (mode === 'paused') {
     state = 'paused';
     const node = controller.pausedNode;
-    text = `Paused${node ? ` at ${node}` : ''}. Click Resume to continue.`;
+    text = `Paused${node ? ` at ${node}` : ''}. Step runs it, Continue goes on to the next breakpoint.`;
   } else if (mode === 'error') {
     state = 'error';
     text = 'The run stopped on an error. The timeline says what failed.';

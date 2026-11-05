@@ -90,7 +90,7 @@ test.describe('WIT Graph Editor Demo', () => {
     await expect(canvas.locator('.node-preview')).toHaveCount(11);
     await expect(preview('writer')).toContainText('-');
 
-    await page.locator('witgraph-controls').locator('button.step').click();
+    await page.locator('witgraph-controls').locator('button.run').click();
     const timeout = 20_000;
     // A future: its value once it resolves.
     await expect(preview('writer')).toHaveText('7', { timeout });
@@ -428,18 +428,60 @@ test.describe('WIT Graph Editor Demo', () => {
     await controls.locator('button.stop').click();
   });
 
-  test('paused at a breakpoint, only resuming or stopping is offered', async ({ page }) => {
+  test('the debugger steps, continues, pauses and restarts', async ({ page }) => {
     const controls = page.locator('witgraph-controls');
-    await page
-      .locator('witgraph-canvas')
-      .evaluate((el: WitgraphCanvas) => el.controller?.toggleBreakpoint('relay-b'));
+    const canvas = page.locator('witgraph-canvas');
+    const paused = () => canvas.evaluate((el: WitgraphCanvas) => el.controller?.pausedNode ?? null);
+    const badge = controls.locator('.badge');
+    await canvas.evaluate((el: WitgraphCanvas) => el.controller?.toggleBreakpoint('relay-b'));
+
+    // Run stops at the breakpoint, shown on the node, with what else there is to do.
     await controls.locator('button.run').click();
-    await expect(controls.locator('.badge')).toContainText('Paused');
-    await expect(controls.locator('button.step')).toBeDisabled();
+    await expect.poll(paused).toBe('relay-b');
+    await expect(badge).toContainText('Paused');
+    await expect(canvas.locator('[data-node-id="relay-b"].paused-here')).toBeAttached();
+    await expect(page.locator('witgraph-inspector').locator('.node-id')).toHaveValue('relay-b');
+    await expect(controls.locator('button.step')).toBeEnabled();
+    await expect(controls.locator('button.resume')).toBeEnabled();
     await expect(controls.locator('button.run')).toBeDisabled();
-    await expect(controls.locator('button.stop')).toBeEnabled();
+
+    // Stepping again and again moves on, a node at a time, with no error.
+    const seen = new Set<string>();
+    let previous = await paused();
+    for (let at = 0; at < 6; at++) {
+      await controls.locator('button.step').click();
+      await expect.poll(paused).not.toBe(previous);
+      previous = await paused();
+      seen.add(previous ?? '');
+    }
+    // Around the feedback loop this graph has.
+    expect(seen.size).toBeGreaterThan(1);
+    const errors = () =>
+      canvas.evaluate(
+        (el: WitgraphCanvas) =>
+          el.controller?.traceEvents.filter((e) => e.event === 'error').length,
+      );
+    expect(await errors()).toBe(0);
+
+    // The keys do the same.
+    const before = await paused();
+    await page.keyboard.press('F10');
+    await expect.poll(paused).not.toBe(before);
+
+    // Continue goes on, Pause holds what starts next, Stop ends it.
+    await canvas.evaluate((el: WitgraphCanvas) => el.controller?.toggleBreakpoint('relay-b'));
+    await controls.locator('button.resume').click();
+    await expect(badge).toContainText('Running');
+    await controls.locator('button.pause').click();
+    await expect(badge).toContainText('Paused');
+    await page.keyboard.press('Shift+F5');
+    await expect(badge).not.toContainText('Paused');
+    expect(await errors()).toBe(0);
+
+    // Restart runs it from the top.
+    await controls.locator('button.restart').click();
+    await expect(badge).toContainText('Running');
     await controls.locator('button.stop').click();
-    await expect(controls.locator('.badge')).not.toContainText('Paused');
   });
 
   test('the inspector describes the selected node by its component', async ({ page }) => {
@@ -450,7 +492,7 @@ test.describe('WIT Graph Editor Demo', () => {
   });
 
   test('the timeline names the node of an event', async ({ page }) => {
-    await page.locator('witgraph-controls').locator('button.step').click();
+    await page.locator('witgraph-controls').locator('button.run').click();
     const timeline = page.locator('witgraph-timeline');
     const started = timeline.locator('.event', { hasText: 'run-started' }).first();
     await expect(started).toBeVisible({ timeout: 10_000 });
@@ -577,9 +619,9 @@ test.describe('Video pipeline demo', () => {
       return { frames, rgb: [r, g, b] };
     }, node);
 
-  test('after a step, what still streams shows as running', async ({ page }) => {
-    await page.locator('witgraph-controls').locator('button.step').click();
+  test('after a tick, what still streams shows as running', async ({ page }) => {
     const canvas = page.locator('witgraph-canvas');
+    await canvas.evaluate((el: WitgraphCanvas) => el.controller?.tick());
     const phase = (id: string) =>
       canvas.evaluate((el: WitgraphCanvas, id) => el.controller?.nodes.get(id)?.phase, id);
     await expect.poll(() => phase('camera')).toBe('running');

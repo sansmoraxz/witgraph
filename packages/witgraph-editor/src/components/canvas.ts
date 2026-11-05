@@ -30,6 +30,7 @@ const SVG_CSS = `
   .node-group.selected { filter: drop-shadow(0 0 8px color-mix(in srgb, var(--wg-primary) 50%, transparent)) drop-shadow(0 2px 4px rgba(0,0,0,0.3)); }
   .node-group.selected .node-body { stroke: var(--wg-primary); stroke-width: 2; }
   .node-body { fill: url(#node-gradient); stroke: var(--wg-surface-hover); stroke-width: 1; rx: var(--_node-radius); }
+  .node-group.paused-here .node-body { stroke: var(--wg-warning); stroke-width: 3; stroke-dasharray: 6 3; }
   .node-group.has-warning .node-body { stroke: var(--wg-warning); stroke-width: 2; }
   .node-group.has-error .node-body { stroke: var(--wg-error); stroke-width: 2; }
   .edge.has-warning { stroke: var(--wg-warning); }
@@ -341,6 +342,7 @@ export class WitgraphCanvas extends HTMLElement {
         this.#updateNodeGroup(g, node);
       }
       g.classList.toggle('selected', id === selectedNodeId);
+      g.classList.toggle('paused-here', id === this.#controller?.pausedNode);
       this.#markDiagnostics(g, this.#controller?.diagnosticsForNode(id) ?? []);
     }
     this.#updatePreviews();

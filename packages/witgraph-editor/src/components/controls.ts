@@ -7,9 +7,11 @@ import {
   History,
   LayoutGrid,
   Package,
+  Pause,
   Play,
   Redo2,
   RotateCcw,
+  RotateCw,
   Square,
   StepForward,
   Undo2,
@@ -80,6 +82,8 @@ const TICK_RATES = [1, 2, 5, 10, 20, 30, 60, 0];
 
 const ICONS: Record<string, unknown[]> = {
   play: Play,
+  pause: Pause,
+  'rotate-cw': RotateCw,
   'step-forward': StepForward,
   square: Square,
   'rotate-ccw': RotateCcw,
@@ -106,6 +110,8 @@ export class WitgraphControls extends HTMLElement {
   #onStateChanged = () => this.#render();
   #btnRun!: HTMLButtonElement;
   #btnStep!: HTMLButtonElement;
+  #btnPause!: HTMLButtonElement;
+  #btnRestart!: HTMLButtonElement;
   #btnStop!: HTMLButtonElement;
   #btnReset!: HTMLButtonElement;
   #btnUndo!: HTMLButtonElement;
@@ -121,7 +127,28 @@ export class WitgraphControls extends HTMLElement {
   #showRate: ((rate: number) => void) | null = null;
   #durationSpan!: HTMLSpanElement;
 
+  /** The usual debugger keys, wherever the focus is. */
+  #onKeyDown = (event: KeyboardEvent) => {
+    const controller = this.#controller;
+    if (!controller) return;
+    const act = (action: () => unknown) => {
+      event.preventDefault();
+      void action();
+    };
+    const { key, shiftKey, ctrlKey, metaKey } = event;
+    if (key === 'F5' && shiftKey && (ctrlKey || metaKey)) act(() => controller.restart());
+    else if (key === 'F5' && shiftKey) act(() => controller.stop());
+    else if (key === 'F5' && !ctrlKey && !metaKey) act(() => controller.run());
+    else if (key === 'F6') act(() => controller.pause());
+    else if (key === 'F10') act(() => controller.step());
+    else if (key === 'F9' && controller.selectedNode) {
+      const node = controller.selectedNode;
+      act(() => controller.toggleBreakpoint(node));
+    }
+  };
+
   connectedCallback(): void {
+    document.addEventListener('keydown', this.#onKeyDown);
     if (this.shadowRoot) return;
     const shadow = this.attachShadow({ mode: 'open' });
     adoptStyles(shadow, EXTRA_CSS);
@@ -159,17 +186,36 @@ export class WitgraphControls extends HTMLElement {
     };
 
     // Execution group
-    this.#btnRun = mkBtn('run btn-primary', 'Run (settle)', 'play', 'Run');
-    this.#btnStep = mkBtn('step', 'Step (single tick)', 'step-forward', 'Step');
-    this.#btnStop = mkBtn('stop btn-danger', 'Stop', 'square', 'Stop');
+    this.#btnRun = mkBtn('run btn-primary', 'Run to the next breakpoint (F5)', 'play', 'Run');
+    this.#btnPause = mkBtn('pause', 'Pause before the next node (F6)', 'pause', 'Pause');
+    this.#btnStep = mkBtn('step', 'Run one node, and pause (F10)', 'step-forward', 'Step');
+    this.#btnStop = mkBtn('stop btn-danger', 'Stop (Shift+F5)', 'square', 'Stop');
+    this.#btnRestart = mkBtn(
+      'restart',
+      'Run again from the top (Ctrl+Shift+F5)',
+      'rotate-cw',
+      'Restart',
+    );
     this.#btnReset = mkBtn('reset', 'Reset', 'rotate-ccw', 'Reset');
-    group(this.#btnRun, this.#btnStep, this.#btnStop, this.#btnReset);
+    group(
+      this.#btnRun,
+      this.#btnPause,
+      this.#btnStep,
+      this.#btnStop,
+      this.#btnRestart,
+      this.#btnReset,
+    );
 
     sep();
 
     // Debug group
     this.#btnBreakpoint = mkBtn('breakpoint btn-warn', 'Toggle Breakpoint', 'circle', 'BP');
-    this.#btnResume = mkBtn('resume', 'Resume from breakpoint', 'fast-forward', 'Resume');
+    this.#btnResume = mkBtn(
+      'resume',
+      'Continue to the next breakpoint (F5)',
+      'fast-forward',
+      'Continue',
+    );
     group(this.#btnBreakpoint, this.#btnResume);
 
     sep();
@@ -252,6 +298,8 @@ export class WitgraphControls extends HTMLElement {
 
     this.#btnRun.addEventListener('click', () => this.#controller?.run());
     this.#btnStep.addEventListener('click', () => this.#controller?.step());
+    this.#btnPause.addEventListener('click', () => this.#controller?.pause());
+    this.#btnRestart.addEventListener('click', () => this.#controller?.restart());
     this.#btnStop.addEventListener('click', () => this.#controller?.stop());
     this.#btnReset.addEventListener('click', () => this.#controller?.reset());
     this.#btnUndo.addEventListener('click', () => this.#controller?.undo());
@@ -278,6 +326,7 @@ export class WitgraphControls extends HTMLElement {
   }
 
   disconnectedCallback(): void {
+    document.removeEventListener('keydown', this.#onKeyDown);
     this.#controller?.removeEventListener('state-changed', this.#onStateChanged);
   }
 
@@ -298,9 +347,11 @@ export class WitgraphControls extends HTMLElement {
     const mode = this.#controller?.mode ?? 'idle';
     const hasSelection = !!this.#controller?.selectedNode;
 
-    // Paused, a tick is still under way: Resume is what continues it.
+    // Paused, Continue is what goes on, and Step goes on by one node.
     this.#btnRun.disabled = mode === 'running' || mode === 'paused';
-    this.#btnStep.disabled = mode === 'running' || mode === 'paused';
+    this.#btnStep.disabled = mode === 'running';
+    this.#btnPause.disabled = mode !== 'running';
+    this.#btnRestart.disabled = !this.#controller;
     // A step can leave a stream going: stopping is for that too.
     const anyRunning = [...(this.#controller?.nodes.values() ?? [])].some(
       (node) => node.phase === 'running',

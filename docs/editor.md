@@ -46,10 +46,18 @@ Put them anywhere on your page. They all share one `EditorController`.
 
 ## Running and debugging
 
-- **Run** ticks until the graph settles, so a graph with a feedback loop or
-  an endless stream runs until you stop it. **Step** runs a single tick.
-  **Stop** halts a run and everything it left running, endless streams
-  included, and **Reset** reloads the graph from scratch.
+- **Run** (F5) ticks until the graph settles or reaches a breakpoint, so a graph with a
+  feedback loop or an endless stream runs until you stop it. On a graph that has finished,
+  it runs it again.
+- **Step** (F10) runs one node and pauses before the next, which is selected, with its
+  inputs in the inspector. It works from a stopped graph, a pause or a breakpoint, and past
+  the last node it starts over. A node that is left running, reading an endless stream say,
+  goes on beside what you step through.
+- **Pause** (F6) holds each node from the next on: what is already running, streams
+  included, goes on. **Continue** (F5) goes on to the next breakpoint.
+- **Stop** (Shift+F5) halts a run and everything it left running, endless streams included.
+  **Restart** (Ctrl+Shift+F5) stops and runs the graph again from the top, keeping its
+  inputs, and **Reset** reloads it from scratch, emptied.
 - **Editing waits for the run.** While a graph runs, or is paused in a run,
   what loads it again is refused: adding, removing, connecting, renaming,
   pasting, undoing and redoing, mock mode, importing and **Reset**. The
@@ -67,8 +75,8 @@ Put them anywhere on your page. They all share one `EditorController`.
   node in a stream group stays running until the group's streams have ended. A
   fault stops the whole graph, so every node shows it, with its cause and, when it
   is known, which node caused it. The next change or run starts every node again.
-- **Breakpoints.** Toggle one on a node (toolbar _BP_ button or right-click).
-  The run pauses before that node, and _Resume_ continues.
+- **Breakpoints.** Toggle one on a node (toolbar _BP_ button, right-click, or F9).
+  The run pauses before that node's next run.
 - **Values.** Select a node to see the current value of each output port.
 - **Previews.** A node can show one of its outputs inside it, as it changes:
   see [Previews](#previews).
