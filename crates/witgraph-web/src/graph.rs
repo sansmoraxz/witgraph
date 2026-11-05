@@ -531,14 +531,15 @@ impl WebGraph {
     ///   uses count). Which entry each node runs is `component(node)`.
     ///   Contracts are kept for later loads, by the SHA-256 of the bytes
     ///   and of `wit`.
-    /// - `callbacks` is `{ run, rebuild, instance, readHandle, abandon? }`:
+    /// - `callbacks` is `{ run, rebuild, instance, readHandle, whenIdle, abandon? }`:
     ///   `run(number)` calls the hub's `run` of the node with that number in
     ///   `nodes()` and returns what it returned, or a promise of it;
     ///   `rebuild()` makes a new instance of the composite, throwing or rejecting
     ///   if it cannot (with an error marked `witgraphFatal` when a start function
     ///   called `fatal`); `instance()` returns the live instance's exports,
     ///   `{ control, ports }`; `readHandle(name)` has the hub lend it a handle
-    ///   output and returns the object; `abandon()` says the instance stopped, so
+    ///   output and returns the object; `whenIdle()` returns a promise settled once the
+    ///   live instance has no guest work left; `abandon()` says the instance stopped, so
     ///   whatever it holds and still does belongs to nothing.
     /// - `mocked` names the nodes left out of the composite, which imports each
     ///   as `m<number>` for the host to implement.
@@ -561,6 +562,7 @@ impl WebGraph {
             rebuild: required("rebuild", "rebuild")?,
             instance: required("instance", "instance")?,
             read_handle: required("readHandle", "readHandle")?,
+            when_idle: required("whenIdle", "whenIdle")?,
             abandon: function(&callbacks, "abandon")?,
         };
         let mocked: Vec<NodeId> = mocked

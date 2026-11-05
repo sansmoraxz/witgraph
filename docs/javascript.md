@@ -142,10 +142,6 @@ const diagnostics = checker.check(JSON.stringify(graph));
 ## Differences from wasmtime
 
 - No fuel or memory limits, so a node that spins blocks the thread.
-- A stream group counts as drained when its `run`s have returned, without waiting
-  for background work such as a stream writer, which JavaScript cannot see. So a
-  group can re-run beside an endless stream here, and its next `run` may start
-  while its last stream is still being written.
 - What a failed call is pinned on is the node whose call failed.
 - Nodes are async, so the browser needs JSPI.
 

@@ -46,6 +46,9 @@ pub(crate) struct Callbacks {
     /// `readHandle(name) -> object | undefined`: what the hub lends the host of a
     /// handle output, when its port function `name` is called.
     pub(crate) read_handle: Function,
+    /// `whenIdle() -> Promise<void>`: settled once the live instance has no guest work
+    /// left, what a stream group holds its claims until.
+    pub(crate) when_idle: Function,
     /// `abandon()`: the instance stopped, whatever was in flight in it: what it
     /// holds and what it still does belong to nothing now.
     pub(crate) abandon: Option<Function>,
@@ -424,6 +427,7 @@ async fn serve(
     let _ = built.send(());
     let trap = |message: String| (NodeFault::WasmTrap { message }, None);
     let mut calls = FuturesUnordered::new();
+    let mut idle = FuturesUnordered::new();
     let mut closed = false;
     loop {
         futures::select_biased! {
@@ -436,6 +440,11 @@ async fn serve(
             }
             error = traps.select_next_some() => {
                 return Err(fault_of(&error, None, false));
+            }
+            waited = idle.select_next_some() => {
+                let (at, result): (u64, Result<JsValue, JsValue>) = waited;
+                result.map_err(|error| fault_of(&error, None, false))?;
+                send(ControlKind::Quiet(at));
             }
             command = commands.next() => match command {
                 Some(Command::Run(node)) => {
@@ -470,7 +479,16 @@ async fn serve(
                     let number = JsValue::from(connection.position() as u32);
                     hub.call("control", ControlFunc::DropFeedback.name(), &[number]).map_err(trap)?;
                 }
-                Some(Command::AwaitQuiet(at)) => send(ControlKind::Quiet(at)),
+                Some(Command::AwaitQuiet(at)) => {
+                    let asked = hub.callbacks.when_idle.call0(&JsValue::NULL);
+                    idle.push(async move {
+                        let result = match asked {
+                            Ok(result) => settle(result).await,
+                            Err(error) => Err(error),
+                        };
+                        (at, result)
+                    });
+                }
                 None => closed = true,
             },
             complete => break,

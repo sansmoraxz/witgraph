@@ -65,6 +65,8 @@ const ids: Record<string, string> = {
   relay: 'test:relay/relay@0.1.0',
   'stream-producer': 'test:stream-producer/stream-producer@0.1.0',
   'stream-consumer': 'test:stream-consumer/stream-consumer@0.1.0',
+  'stream-relay': 'test:stream-relay/stream-relay@0.1.0',
+  'stream-drain': 'test:stream-drain/stream-drain@0.1.0',
   'bytes-consumer': 'test:bytes-consumer/bytes-consumer@0.1.0',
   'busy-loop': 'test:busy-loop/busy-loop@0.1.0',
   'mqtt-node': 'test:mqtt-node/mqtt-node@0.1.0',
@@ -1105,6 +1107,7 @@ test('an instance dropped while it rebuilds is abandoned', async () => {
       },
       instance: () => ({ ports: { setInput0: () => true }, control: {} }),
       readHandle: () => undefined,
+      whenIdle: () => undefined,
       abandon: () => void abandoned++,
     },
     [],
@@ -2043,6 +2046,7 @@ test('a hub setter throwing during a restore is a fault, with the restore in pla
       rebuild: () => void rebuilds++,
       instance: () => ({ ports, control: {} }),
       readHandle: () => undefined,
+      whenIdle: () => undefined,
     },
     [],
   );
@@ -2093,6 +2097,7 @@ test('a hub setter throwing during an inject is a fault, as on wasmtime', async 
         control: {},
       }),
       readHandle: () => undefined,
+      whenIdle: () => undefined,
     },
     [],
   );
@@ -2139,6 +2144,7 @@ async function overStandIn(
       rebuild: () => {},
       instance: () => ({ ports, control }),
       readHandle: () => undefined,
+      whenIdle: () => undefined,
     },
     [],
   );
@@ -2315,4 +2321,58 @@ test('a session says what compiling warned of its graph', async () => {
   assert.equal(warning.severity, 'warning');
   assert.equal(warning.code, 'witgraph::ir::feedback_only_input');
   assert.deepEqual(warning.location, { kind: 'port', nodes: ['fed'], port: 'in' });
+});
+
+test('a stream group holds its claims until its guest work is over, not its runs', async () => {
+  // `drain`'s `run` returns before its stream ends, so all of them have returned long
+  // before the producer has written everything: `u`, wanting the same resource, waits.
+  const burst = 2000;
+  const used = ['stream-producer', 'stream-relay', 'stream-drain', 'relay'];
+  const components = await Promise.all(used.map(guestSource));
+  const node = (id: string, guest: string, resources = {}) => ({
+    id,
+    component: componentRef(ids[guest]),
+    resources,
+  });
+  const ends = (id: string, from: string, to: string) => {
+    const [fromNode, fromPort] = from.split('.');
+    const [toNode, toPort] = to.split('.');
+    return {
+      id,
+      from: { node: fromNode, port: fromPort },
+      to: { node: toNode, port: toPort },
+    };
+  };
+  let seen = 0;
+  let seenWhenUStarted: number | undefined;
+  const session = await loaded({
+    graph: {
+      metadata: { name: 'test' },
+      components: used.map((guest) => componentRef(ids[guest])),
+      nodes: [
+        node('prod', 'stream-producer', { gpu: { fraction: 0.6 } }),
+        node('pass', 'stream-relay'),
+        node('drain', 'stream-drain'),
+        node('u', 'relay', { gpu: { fraction: 0.6 } }),
+      ],
+      connections: [
+        ends('a', 'prod.items', 'pass.items'),
+        ends('b', 'pass.items', 'drain.items'),
+        ends('c', 'prod.limit', 'u.in'),
+      ],
+    },
+    components,
+    wasm,
+    onStreamItem: ({ item }: StreamItem) => {
+      seen += ArrayBuffer.isView(item) ? (item as Uint32Array).length : 1;
+    },
+    beforeRun: (at) => {
+      if (at === 'u') seenWhenUStarted = seen;
+    },
+  });
+  await session.graph.inject('prod', 'burst-size', burst);
+  for (let tick = 0; tick < 200 && (await session.graph.tick()).result !== 'idle'; tick++);
+  assert.equal(seen, burst * 2, 'every item, past each of its two connections');
+  assert.equal(seenWhenUStarted, burst * 2, '`u` waited for all of it');
+  assert.equal(await session.graph.readOutput('u', 'out'), burst);
 });

@@ -250,7 +250,7 @@ type NodeNumber = number & { readonly brand: 'node' };
 
 /** A live hub's exports, as jco names them. */
 interface HubInstance {
-  _util: { stop: () => void };
+  _util: { stop: () => void; whenIdle: () => Promise<void> };
   control: {
     run: (node: NodeNumber) => Promise<unknown>;
   } & Record<string, (...args: any[]) => any>;
@@ -394,6 +394,7 @@ export class Session {
         rebuild: () => live().#instantiate(),
         instance: () => live().#instance,
         readHandle: (name: string) => live().#readHandle(name),
+        whenIdle: () => live().#instance?._util.whenIdle(),
         abandon: () => live().#abandon(),
       },
       mocked.filter((node) => known.has(node)),
