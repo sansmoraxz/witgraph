@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::{env, fs};
 
-const GUESTS: [&str; 47] = [
+const GUESTS: [&str; 48] = [
     "echo",
     "m0-import",
     "configurable",
@@ -50,7 +50,12 @@ const GUESTS: [&str; 47] = [
     "tensor-future-sink",
     "corpus-relay",
     "corpus-flat",
+    "line-walk",
 ];
+
+/// The guests built with debug info and no optimizing, so that each source line is there
+/// to step to.
+const WITH_DEBUG_INFO: [&str; 1] = ["line-walk"];
 
 /// The doc comment of the first world in `wit`, as the text WIT gives it.
 fn world_docs(wit: &str) -> Option<String> {
@@ -123,6 +128,18 @@ fn main() {
             // The outer build's flags target the host, not the guest.
             .env_remove("RUSTFLAGS")
             .env_remove("CARGO_ENCODED_RUSTFLAGS")
+            .envs(
+                WITH_DEBUG_INFO
+                    .contains(&name)
+                    .then_some([
+                        ("CARGO_PROFILE_RELEASE_DEBUG", "true"),
+                        ("CARGO_PROFILE_RELEASE_STRIP", "false"),
+                        ("CARGO_PROFILE_RELEASE_OPT_LEVEL", "0"),
+                        ("CARGO_PROFILE_RELEASE_LTO", "false"),
+                    ])
+                    .into_iter()
+                    .flatten(),
+            )
             .status()
             .unwrap_or_else(|e| panic!("failed to build {name} guest: {e}"));
         assert!(status.success(), "cargo build failed for {name} guest");

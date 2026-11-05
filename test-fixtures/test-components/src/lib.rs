@@ -249,3 +249,6 @@ pub const CORPUS_RELAY: Guest = guest!("CORPUS_RELAY_WASM", "corpus-relay");
 /// `mixed` passed through unchanged: a variant whose cases share core
 /// values of different types, in a record small enough to be passed flat.
 pub const CORPUS_FLAT: Guest = guest!("CORPUS_FLAT_WASM", "corpus-flat");
+
+/// A guest built with debug info and no optimizing, for stepping through its source.
+pub const LINE_WALK: Guest = guest!("LINE_WALK_WASM", "line-walk");

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/witgraph-ir", "crates/witgraph-wit", "crates/witgraph-traits", "crates/witgraph-sched", "crates/witgraph-runtime", "crates/witgraph-web", "crates/witgraph-source", "test-fixtures/test-components", "test-fixtures/doc-snippets", "test-fixtures/host-plane", "fuzz"]
+members = ["crates/witgraph-ir", "crates/witgraph-wit", "crates/witgraph-traits", "crates/witgraph-sched", "crates/witgraph-runtime", "crates/witgraph-web", "crates/witgraph-probes", "crates/witgraph-source", "test-fixtures/test-components", "test-fixtures/doc-snippets", "test-fixtures/host-plane", "fuzz"]
 
 [workspace.package]
 version = "0.1.0"
@@ -33,9 +33,11 @@ witgraph-ir = { path = "crates/witgraph-ir", version = "0.1.0" }
 witgraph-wit = { path = "crates/witgraph-wit", version = "0.1.0" }
 witgraph-traits = { path = "crates/witgraph-traits", version = "0.1.0" }
 witgraph-sched = { path = "crates/witgraph-sched", version = "0.1.0" }
+witgraph-probes = { path = "crates/witgraph-probes", version = "0.1.0" }
 witgraph-runtime = { path = "crates/witgraph-runtime", version = "0.1.0" }
 semver = { version = "1.0", default-features = false }
 thiserror = { version = "2.0", default-features = false }
+gimli = { version = "0.33", default-features = false, features = ["read", "std"] }
 miette = "7.6"
 nutype = "0.8"
 petgraph = { version = "0.8", default-features = false }

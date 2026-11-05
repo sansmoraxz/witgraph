@@ -113,6 +113,7 @@ nodes, snapshots, undo and redo, and JSON import and export. See
 | `witgraph-sched`                | The scheduler. It holds no values, has no engine in it, and builds for `wasm32`. |
 | `witgraph-runtime`              | The scheduler on wasmtime.                                                       |
 | `witgraph-web`                  | The scheduler for JavaScript hosts, via `wasm-bindgen`.                          |
+| `witgraph-probes`               | Puts a probe on each source line of a module, for debugging on JavaScript hosts  |
 | `witgraph-source`               | Fetches component bytes from files and OCI registries, pinned by digest.         |
 | `packages/witgraph-loader`      | TypeScript loader that runs a graph in a browser or Node.                        |
 | `packages/witgraph-editor`      | Web Components for editing, running and debugging graphs visually.               |

@@ -1,0 +1,24 @@
+[package]
+name = "witgraph-probes"
+description = "Puts a probe on each source line of a WebAssembly module, from its DWARF, for hosts that cannot set breakpoints"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+gimli = { workspace = true }
+thiserror = { workspace = true, features = ["std"] }
+wasm-encoder = { workspace = true, features = ["wasmparser"] }
+wasmparser = { workspace = true, features = ["std", "validate"] }
+
+[dev-dependencies]
+test-components = { path = "../../test-fixtures/test-components" }
+wat = "1"

@@ -3445,6 +3445,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "witgraph-probes"
+version = "0.1.0"
+dependencies = [
+ "gimli",
+ "test-components",
+ "thiserror 2.0.21",
+ "wasm-encoder",
+ "wasmparser",
+ "wat",
+]
+
+[[package]]
 name = "witgraph-runtime"
 version = "0.1.0"
 dependencies = [
@@ -3522,6 +3534,7 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "witgraph-ir",
+ "witgraph-probes",
  "witgraph-sched",
  "witgraph-traits",
  "witgraph-wit",
