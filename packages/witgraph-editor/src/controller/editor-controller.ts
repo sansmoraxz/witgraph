@@ -39,6 +39,9 @@ const MAX_TRACE_ENTRIES = 1000;
  * endless stream) carries on into the next tick, and the rest of the graph
  * (a feedback loop, say) still advances a tick at a time beside it.
  */
+/** How often phases are brought up to date when no tick is doing so. */
+const FOLLOW_INTERVAL_MS = 100;
+
 const TICK_SLICE_MS = 100;
 
 /** Waits for the next frame, so a run that never settles leaves the page time to draw. */
@@ -149,6 +152,8 @@ export class EditorController extends EventTarget {
   #compileDiagnostics: Diagnostic[] = [];
   /** Compiles what the graph would be, by the rules a load goes by. */
   #checker: GraphChecker | null = null;
+  /** Whether something is keeping phases true between ticks (`#followWhatIsRunning`). */
+  #following = false;
   /**
    * What compiling said of connections, for as long as the graph stays as `graph` says.
    * Asking compiles, and the inspector asks of every port on every state change.
@@ -1169,6 +1174,44 @@ export class EditorController extends EventTarget {
     const mode = this.#mode as EditorMode;
     if (mode === 'running' || mode === 'paused') this.#mode = 'idle';
     this.#dispatch('state-changed');
+    this.#followWhatIsRunning();
+  }
+
+  /**
+   * After a step, what it left running carries on with no tick to report it: keeps node
+   * phases true until it has ended, or the next tick takes over.
+   */
+  #followWhatIsRunning(): void {
+    const session = this.#session;
+    if (this.#following || !session) return;
+    const running = () => [...this.#nodes.values()].some((node) => node.phase === 'running');
+    if (!running()) return;
+    this.#following = true;
+    const follow = () => {
+      if (session !== this.#session || this.#mode !== 'idle') {
+        this.#following = false;
+        return;
+      }
+      if (!this.#ticking) {
+        const before = [...this.#nodes.values()].map((node) => node.phase).join();
+        try {
+          session.graph.catchUp();
+        } catch {}
+        this.#pollState();
+        if ([...this.#nodes.values()].map((node) => node.phase).join() !== before) {
+          void this.#pullObserved(true);
+          this.#dispatch('state-changed');
+        }
+        if (!running()) {
+          this.#following = false;
+          return;
+        }
+      }
+      const timer = setTimeout(follow, FOLLOW_INTERVAL_MS) as { unref?: () => void };
+      // (a graph left running should not keep a process alive for this)
+      timer.unref?.();
+    };
+    follow();
   }
 
   /**

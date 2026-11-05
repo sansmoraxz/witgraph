@@ -2376,3 +2376,32 @@ test('a stream group holds its claims until its guest work is over, not its runs
   assert.equal(seenWhenUStarted, burst * 2, '`u` waited for all of it');
   assert.equal(await session.graph.readOutput('u', 'out'), burst);
 });
+
+test('a node stays running until its stream group has drained', async () => {
+  const session = await load(
+    [
+      ['prod', 'stream-producer'],
+      ['pass', 'stream-relay'],
+      ['drain', 'stream-drain'],
+    ],
+    [
+      ['a', 'prod.items', 'pass.items'],
+      ['b', 'pass.items', 'drain.items'],
+    ],
+  );
+  const graph = session.graph;
+  const phases = () => ['prod', 'pass', 'drain'].map((node) => graph.nodeState(node).phase);
+  await graph.inject('prod', 'burst-size', 2000);
+  // A tick cut short, as a step is: every `run` has returned by now or soon will, and the
+  // stream is still going.
+  await graph.tick(new Promise((resolve) => setTimeout(resolve, 5)));
+  assert.ok(!phases().includes('idle'), `in mid-stream: ${phases()}`);
+
+  // Following it starts nothing, and sees it end with no tick.
+  for (let at = 0; at < 2000 && phases().includes('running'); at++) {
+    graph.catchUp();
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.deepEqual(phases(), ['idle', 'idle', 'idle']);
+  assert.ok(graph.takeTrace().some((e: any) => e.event === 'group-drained'));
+});

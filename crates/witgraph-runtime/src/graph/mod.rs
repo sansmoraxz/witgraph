@@ -828,6 +828,10 @@ impl<M: RuntimeMode, H: Host> RunningGraph for RuntimeGraph<M, H> {
         self.core().take_faults()
     }
 
+    fn catch_up(&mut self) {
+        self.core().catch_up();
+    }
+
     fn shutdown(&mut self) {
         self.core().shutdown();
     }

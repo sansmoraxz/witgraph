@@ -258,6 +258,10 @@ impl RunningGraph for WebRuntime {
         self.core().take_faults()
     }
 
+    fn catch_up(&mut self) {
+        self.core().catch_up();
+    }
+
     fn shutdown(&mut self) {
         self.core().shutdown();
     }
@@ -1057,6 +1061,14 @@ impl WebGraph {
             set(&object, "culprit", &text(culprit.as_str()));
         }
         Ok(object.into())
+    }
+
+    /// Takes in what happened since the last tick, starting nothing, so that `nodeState`
+    /// says what is so between ticks. Throws while a tick runs, which does this itself.
+    #[wasm_bindgen(js_name = catchUp)]
+    pub fn catch_up(&self) -> Result<(), JsError> {
+        self.idle()?.catch_up();
+        Ok(())
     }
 
     /// Takes the faults reported since the last call: an array of

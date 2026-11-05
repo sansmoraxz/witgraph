@@ -690,6 +690,18 @@ impl SchedulerCore<dyn DataPlane> {
         self.drain();
     }
 
+    /// Takes in what happened since the last tick, starting nothing: a `run` that
+    /// returned, and whether guest work has ended, so that phases say what is so between
+    /// ticks. A graph left running by a tick that ended early can be followed with this.
+    pub fn catch_up(&mut self) {
+        self.serve_queued();
+        if self.running == 0 && !self.quiet && self.quiet_asked.is_none() {
+            self.quiet_asked = Some(self.runs_started);
+            self.send(Command::AwaitQuiet(self.runs_started));
+            self.serve_queued();
+        }
+    }
+
     fn drained(&self) -> Option<Drained> {
         (self.outstanding == 0).then_some(Drained(()))
     }

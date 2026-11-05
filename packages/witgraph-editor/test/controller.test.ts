@@ -55,6 +55,8 @@ const ids: Record<string, string> = {
   'video-sink': 'test:video-sink/video-sink@0.1.0',
   'stream-producer': 'test:stream-producer/stream-producer@0.1.0',
   'stream-consumer': 'test:stream-consumer/stream-consumer@0.1.0',
+  'stream-relay': 'test:stream-relay/stream-relay@0.1.0',
+  'stream-drain': 'test:stream-drain/stream-drain@0.1.0',
   'future-writer': 'test:future-writer/future-writer@0.1.0',
   'future-reader': 'test:future-reader/future-reader@0.1.0',
   'tensor-source': 'test:tensor-source/tensor-source@0.1.0',
@@ -939,4 +941,28 @@ test('feedback goes by the rules a load goes by: a handle can have it, a stream 
 
   controller.setConnectionFeedback('handle', true);
   assert.equal(controller.connectionForInput('invert', 'tensor')?.feedback, true);
+});
+
+test('after a step, phases say what is still running, until it has ended', async () => {
+  const controller = await loadController(
+    [
+      ['prod', 'stream-producer'],
+      ['pass', 'stream-relay'],
+      ['drain', 'stream-drain'],
+    ],
+    [
+      ['a', 'prod.items', 'pass.items'],
+      ['b', 'pass.items', 'drain.items'],
+    ],
+  );
+  const phases = () => [...controller.nodes.values()].map((node) => node.phase);
+  // Long enough to outlast a step, which is one short tick.
+  await controller.injectValue('prod', 'burst-size', '2000');
+  await controller.step();
+  assert.equal(controller.mode, 'idle', 'the step is over');
+  assert.deepEqual(phases(), ['running', 'running', 'running'], 'the stream is not');
+  const ticks = controller.tickCount;
+
+  await until(() => phases().every((phase) => phase === 'idle'));
+  assert.equal(controller.tickCount, ticks, 'with no tick, so with nothing new started');
 });

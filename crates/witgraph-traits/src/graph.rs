@@ -161,6 +161,13 @@ pub trait RunningGraph {
     /// stops the whole graph.
     fn take_faults(&mut self) -> Vec<FaultReport>;
 
+    /// Takes in what happened since the last tick, starting nothing, so that
+    /// [`node_state`](Self::node_state) says what is so between ticks: a `run` that has
+    /// returned, or a stream group's background work having ended. A tick that ended
+    /// early can leave a graph running; call this to follow it. It may take more than
+    /// one call to see the work end.
+    fn catch_up(&mut self);
+
     /// Stops everything: what is in flight is dropped and all owed work is
     /// forgotten. A later input change or [`rerun`](Self::rerun) starts again.
     fn shutdown(&mut self);
