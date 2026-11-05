@@ -26,7 +26,7 @@ interface Stop {
   reason: string;
   line: number;
   node?: string;
-  frames: string[];
+  frames: { function: string }[];
 }
 
 async function nthStop(page: Page, nth: number): Promise<Stop> {
@@ -52,7 +52,7 @@ test('a guest stops on a source line, with the page live', async ({ page }) => {
 
   const first = await nthStop(page, 1);
   expect(first).toMatchObject({ reason: 'breakpoint', line: mark('walk-first'), node: 'walker' });
-  expect(first.frames[0]).toContain('walk');
+  expect(first.frames[0].function).toContain('walk');
 
   // Everything on the page still answers, for as long as the guest is held.
   const before = await dbg<number>(page, 'frames');
@@ -67,9 +67,9 @@ test('a guest stops on a source line, with the page live', async ({ page }) => {
   expect((await nthStop(page, 2)).line).toBe(mark('walk-second'));
   await dbg(page, 'stepIn');
   const inside = await nthStop(page, 3);
-  expect(inside.frames[0]).toContain('add');
+  expect(inside.frames[0].function).toContain('add');
   await dbg(page, 'stepOut');
-  expect((await nthStop(page, 4)).frames[0]).toContain('walk');
+  expect((await nthStop(page, 4)).frames[0].function).toContain('walk');
 
   await dbg(page, 'resume');
   await expect.poll(() => dbg(page, 'ticked')).toBeTruthy();
@@ -83,7 +83,7 @@ test('pausing stops a guest in the middle of a spin', async ({ page }) => {
   await dbg(page, 'pause');
   const stop = await nthStop(page, 1);
   expect(stop.reason).toBe('pause');
-  expect(stop.frames[0]).toContain('spin');
+  expect(stop.frames[0].function).toContain('spin');
 
   // And a breakpoint set while it spins is seen, with no message read in the worker.
   await dbg(page, 'resume');

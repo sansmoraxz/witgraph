@@ -580,7 +580,11 @@ export class WitgraphInspector extends HTMLElement {
     if (bp && bp.node === node.id) {
       const section = this.#el('div', 'bp-bg rounded-md p-3');
       section.appendChild(
-        this.#el('div', 'font-semibold text-wg-warning mb-2 text-sm', '⏸ Paused - Inputs'),
+        this.#el(
+          'div',
+          'font-semibold text-wg-warning mb-2 text-sm',
+          '⏸ Paused before this node runs - Inputs',
+        ),
       );
       for (const [key, val] of Object.entries(bp.inputs)) {
         const entry = this.#el('div', 'flex items-center gap-2 font-mono text-xs py-0.5');

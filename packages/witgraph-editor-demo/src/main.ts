@@ -627,8 +627,8 @@ function updateStatus(): void {
     const node = controller.pausedNode;
     const line = controller.lineStop;
     text = line
-      ? `Stopped at line ${line.line}${node ? ` in ${node}` : ''}. Step goes to the next line, Continue to the next breakpoint.`
-      : `Paused${node ? ` at ${node}` : ''}. Step runs it, Continue goes on to the next breakpoint.`;
+      ? `Stopped at line ${line.line}${node ? ` in ${node}` : ''}. Over, Into and Out move through its code; Next node finishes it.`
+      : `Paused before node ${node ?? '?'}. Next node runs it${controller.lineFiles.length > 0 ? ', Into goes into its code' : ''}.`;
   } else if (mode === 'error') {
     state = 'error';
     text = 'The run stopped on an error. The timeline says what failed.';

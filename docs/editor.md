@@ -50,12 +50,12 @@ Put them anywhere on your page. They all share one `EditorController`.
 - **Run** (F5) ticks until the graph settles or reaches a breakpoint, so a graph with a
   feedback loop or an endless stream runs until you stop it. On a graph that has finished,
   it runs it again.
-- **Step** (F10) runs one node and pauses before the next, which is selected, with its
+- **Next node** (F10) runs one node and pauses before the next, which is selected, with its
   inputs in the inspector. It works from a stopped graph, a pause or a breakpoint, and past
   the last node it starts over. A node that is left running, reading an endless stream say,
   goes on beside what you step through.
 - **Pause** (F6) holds each node from the next on: what is already running, streams
-  included, goes on. **Continue** (F5) goes on to the next breakpoint.
+  included, goes on. **Continue** (F5) goes on to the next breakpoint, of either kind below.
 - **Stop** (Shift+F5) halts a run and everything it left running, endless streams included.
   **Restart** (Ctrl+Shift+F5) stops and runs the graph again from the top, keeping its
   inputs, and **Reset** reloads it from scratch, emptied.
@@ -78,17 +78,26 @@ Put them anywhere on your page. They all share one `EditorController`.
   is known, which node caused it. The next change or run starts every node again.
 - **Breakpoints.** Toggle one on a node (toolbar _BP_ button, right-click, or F9).
   The run pauses before that node's next run.
-- **Source lines.** Off unless you ask for it, as it **slows guests down significantly**. Load
-  with `lines: true`, and a guest built with debug info can be stopped
-  on a line of its own code: click in the gutter of the source panel. **Step** (F10) then goes
-  to the next line, over any call, **In** (F11) into a call, and **Out** (Shift+F11) out of the
-  function. **Pause** stops at the next line of what is running, even a node that is spinning,
-  and from a node about to run, **In** stops at its first line. The panel shows the functions on
-  the stack, follows each stop, and lists the variables in scope, marking what changed since the
-  last stop in that function. All of the graph stops with it, so previews wait until it goes
-  on. It takes a page that is cross-origin isolated
+- **Two levels.** The toolbar keeps them apart, and each button always does the same thing:
+
+  | Level                                   | Moves with                                          | Breaks with                   | Stopped, it says   |
+  | --------------------------------------- | --------------------------------------------------- | ----------------------------- | ------------------ |
+  | **Graph**: whole nodes                  | **Next node**                                       | **Break on node** (F9)        | _Paused at a node_ |
+  | **Code**: lines of a guest, if debugged | **Over** (F10), **Into** (F11), **Out** (Shift+F11) | A click in the panel's gutter | _Paused on a line_ |
+
+  They go together. **Next node** from a line finishes that node and pauses before the next, and
+  **Into** from a node about to run stops at its first line. F10 does what is next at the level it
+  is stopped at. **Pause** stops at whichever comes first, and **Continue** at the next of either.
+- **Source lines.** Off unless you ask for it, as it **slows guests down significantly**. Load with
+  `lines: true`, or `lines: { own: [...] }` to name the paths of what counts as the guest's own, and
+  a guest built with debug info can be stopped on a line of its own code, even a node that is
+  spinning. The source panel follows each stop, and lists the call stack, where choosing a caller
+  shows the line it is waiting on, and the variables in scope, marking what changed since the last
+  stop in that function. A caller's variables are out of reach. All of the graph stops with it, so
+  previews wait until it goes on. It takes a page that is cross-origin isolated
   ([why](javascript.md#stopping-on-a-source-line)): elsewhere the graph runs as usual, and the
-  timeline says so. Without debug info in a graph, the panel and its buttons stay hidden. In the demo, add `?debug` to the
+  timeline says so. Without debug info in a graph, the panel and the Code buttons stay hidden.
+  In the demo, add `?debug` to the
   address to turn it on: the page then loads the guests as `setup` built them with debug info.
 - **Values.** Select a node to see the current value of each output port.
 - **Previews.** A node can show one of its outputs inside it, as it changes:

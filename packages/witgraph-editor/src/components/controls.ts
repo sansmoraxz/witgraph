@@ -12,6 +12,7 @@ import {
   Pause,
   Play,
   Redo2,
+  RedoDot,
   RotateCcw,
   RotateCw,
   Square,
@@ -38,11 +39,12 @@ const MODE_BG: Record<EditorMode, string> = {
 };
 
 const EXTRA_CSS = `
-  button[hidden] { display: none; }
+  button[hidden], .btn-group[hidden], .sep[hidden], .level[hidden] { display: none; }
+  .level { font-size: 0.6875rem; color: var(--wg-text-dim); margin: 0 2px 0 4px; }
   :host { display: block;
     --_btn-radius: var(--wg-btn-radius, 4px);
     --_group-radius: var(--wg-group-radius, 6px); }
-  .toolbar { display: flex; align-items: center; gap: 4px; padding: 6px 10px;
+  .toolbar { flex-wrap: wrap; display: flex; align-items: center; gap: 4px; padding: 6px 10px;
     background: var(--wg-surface); border-bottom: 1px solid var(--wg-bg); }
   .btn-group { display: inline-flex; gap: 2px; background: color-mix(in srgb, var(--wg-bg) 50%, transparent);
     padding: 2px; border-radius: var(--_group-radius); }
@@ -87,6 +89,7 @@ const ICONS: Record<string, unknown[]> = {
   play: Play,
   pause: Pause,
   'rotate-cw': RotateCw,
+  'redo-dot': RedoDot,
   'arrow-down-to-line': ArrowDownToLine,
   'arrow-up-from-line': ArrowUpFromLine,
   'step-forward': StepForward,
@@ -116,7 +119,10 @@ export class WitgraphControls extends HTMLElement {
   #btnRun!: HTMLButtonElement;
   #btnStep!: HTMLButtonElement;
   #btnPause!: HTMLButtonElement;
+  #btnStepOver!: HTMLButtonElement;
   #btnStepIn!: HTMLButtonElement;
+  #levelCode!: HTMLSpanElement;
+  #sepCode!: HTMLDivElement;
   #btnStepOut!: HTMLButtonElement;
   #btnRestart!: HTMLButtonElement;
   #btnStop!: HTMLButtonElement;
@@ -147,8 +153,10 @@ export class WitgraphControls extends HTMLElement {
     else if (key === 'F5' && shiftKey) act(() => controller.stop());
     else if (key === 'F5' && !ctrlKey && !metaKey) act(() => controller.run());
     else if (key === 'F6') act(() => controller.pause());
-    else if (key === 'F10') act(() => controller.step());
-    else if (key === 'F11' && shiftKey) act(() => controller.stepOut());
+    else if (key === 'F10') {
+      // What is next, at the level it is stopped at.
+      act(() => (controller.lineStop ? controller.stepOver() : controller.step()));
+    } else if (key === 'F11' && shiftKey) act(() => controller.stepOut());
     else if (key === 'F11') act(() => controller.stepIn());
     else if (key === 'F9' && controller.selectedNode) {
       const node = controller.selectedNode;
@@ -194,21 +202,19 @@ export class WitgraphControls extends HTMLElement {
       toolbar.appendChild(s);
     };
 
-    // Execution group
+    // Running: the same whatever it is stopped at.
     this.#btnRun = mkBtn('run btn-primary', 'Run to the next breakpoint (F5)', 'play', 'Run');
-    this.#btnPause = mkBtn('pause', 'Pause before the next node (F6)', 'pause', 'Pause');
-    this.#btnStep = mkBtn('step', 'Run one node, and pause (F10)', 'step-forward', 'Step');
-    this.#btnStepIn = mkBtn(
-      'step-in',
-      'Step into the call on this line (F11)',
-      'arrow-down-to-line',
-      'In',
+    this.#btnResume = mkBtn(
+      'resume',
+      'Continue to the next breakpoint, of a node or a line (F5)',
+      'fast-forward',
+      'Continue',
     );
-    this.#btnStepOut = mkBtn(
-      'step-out',
-      'Step out of this function (Shift+F11)',
-      'arrow-up-from-line',
-      'Out',
+    this.#btnPause = mkBtn(
+      'pause',
+      'Pause before the next node, or at the next line with debugging on (F6)',
+      'pause',
+      'Pause',
     );
     this.#btnStop = mkBtn('stop btn-danger', 'Stop (Shift+F5)', 'square', 'Stop');
     this.#btnRestart = mkBtn(
@@ -220,10 +226,8 @@ export class WitgraphControls extends HTMLElement {
     this.#btnReset = mkBtn('reset', 'Reset', 'rotate-ccw', 'Reset');
     group(
       this.#btnRun,
+      this.#btnResume,
       this.#btnPause,
-      this.#btnStep,
-      this.#btnStepIn,
-      this.#btnStepOut,
       this.#btnStop,
       this.#btnRestart,
       this.#btnReset,
@@ -231,15 +235,53 @@ export class WitgraphControls extends HTMLElement {
 
     sep();
 
-    // Debug group
-    this.#btnBreakpoint = mkBtn('breakpoint btn-warn', 'Toggle Breakpoint', 'circle', 'BP');
-    this.#btnResume = mkBtn(
-      'resume',
-      'Continue to the next breakpoint (F5)',
-      'fast-forward',
-      'Continue',
+    // Debugging the graph: whole nodes.
+    const level = (text: string) => {
+      const label = document.createElement('span');
+      label.className = 'level';
+      label.textContent = text;
+      toolbar.appendChild(label);
+      return label;
+    };
+    level('Graph');
+    this.#btnStep = mkBtn(
+      'step',
+      'Finish this node and pause before the next (F10 unless stopped on a line)',
+      'step-forward',
+      'Next node',
     );
-    group(this.#btnBreakpoint, this.#btnResume);
+    this.#btnBreakpoint = mkBtn(
+      'breakpoint btn-warn',
+      'Pause before the selected node runs (F9)',
+      'circle',
+      'Break on node',
+    );
+    group(this.#btnStep, this.#btnBreakpoint);
+
+    // Debugging a guest's source: lines. Only with debugging on, and debug info to go by.
+    this.#sepCode = document.createElement('div');
+    this.#sepCode.className = 'sep';
+    toolbar.appendChild(this.#sepCode);
+    this.#levelCode = level('Code');
+    this.#btnStepOver = mkBtn(
+      'step-over',
+      'Go to the next line, over any call on this one (F10)',
+      'redo-dot',
+      'Over',
+    );
+    this.#btnStepIn = mkBtn(
+      'step-in',
+      'Go into the call on this line, or into the code of the node about to run (F11)',
+      'arrow-down-to-line',
+      'Into',
+    );
+    this.#btnStepOut = mkBtn(
+      'step-out',
+      'Run until this function returns (Shift+F11)',
+      'arrow-up-from-line',
+      'Out',
+    );
+    group(this.#btnStepOver, this.#btnStepIn, this.#btnStepOut);
 
     sep();
 
@@ -321,6 +363,7 @@ export class WitgraphControls extends HTMLElement {
 
     this.#btnRun.addEventListener('click', () => this.#controller?.run());
     this.#btnStep.addEventListener('click', () => this.#controller?.step());
+    this.#btnStepOver.addEventListener('click', () => this.#controller?.stepOver());
     this.#btnStepIn.addEventListener('click', () => this.#controller?.stepIn());
     this.#btnStepOut.addEventListener('click', () => this.#controller?.stepOut());
     this.#btnPause.addEventListener('click', () => this.#controller?.pause());
@@ -372,14 +415,16 @@ export class WitgraphControls extends HTMLElement {
     const mode = this.#controller?.mode ?? 'idle';
     const hasSelection = !!this.#controller?.selectedNode;
 
-    // Paused, Continue is what goes on, and Step goes on by one node.
+    // Paused, Continue is what goes on, and Next node goes on by one node.
     this.#btnRun.disabled = mode === 'running' || mode === 'paused';
     this.#btnStep.disabled = mode === 'running';
     // Only with code to step through: most graphs have no debug info.
     const hasLines = (this.#controller?.lineFiles.length ?? 0) > 0;
     const onLine = this.#controller?.lineStop != null;
-    this.#btnStepIn.hidden = !hasLines;
-    this.#btnStepOut.hidden = !hasLines;
+    this.#btnStepOver.parentElement?.toggleAttribute('hidden', !hasLines);
+    this.#levelCode.hidden = !hasLines;
+    this.#sepCode.hidden = !hasLines;
+    this.#btnStepOver.disabled = !onLine;
     this.#btnStepIn.disabled = mode !== 'paused';
     this.#btnStepOut.disabled = !onLine;
     this.#btnPause.disabled = mode !== 'running';
@@ -405,6 +450,7 @@ export class WitgraphControls extends HTMLElement {
     // Between ticks too: a step can leave a stream going.
     const shown: EditorMode = mode === 'idle' && anyRunning ? 'running' : mode;
     let badgeText = MODE_LABELS[shown];
+    if (mode === 'paused') badgeText = onLine ? 'Paused on a line' : 'Paused at a node';
     if (mode === 'idle' && this.#controller?.lastRunDurationMs != null) {
       const ms = this.#controller.lastRunDurationMs;
       const ticks = this.#controller.lastRunTicks;

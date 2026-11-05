@@ -1,4 +1,4 @@
-import type { LineStop, SourceVariable } from 'witgraph-loader';
+import type { LineStop, SourceVariable, StackFrame } from 'witgraph-loader';
 import type { EditorController } from '../controller/editor-controller.ts';
 import { adoptStyles } from './shared-styles.ts';
 
@@ -36,7 +36,16 @@ const EXTRA_CSS = `
   .text { color: var(--wg-text); }
   .row.current .text { font-weight: 600; }
   .missing { padding: 8px; color: var(--wg-text-dim); }
-  .frames { flex: none; padding: 2px 8px; color: var(--wg-text-dim); border-bottom: 1px solid var(--wg-surface-hover); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .frames { padding-bottom: 4px; }
+  .frame { display: flex; gap: 1ch; width: 100%; text-align: left; padding: 0 8px; background: none; border: 0; color: var(--wg-text); font-family: monospace; white-space: nowrap; cursor: pointer; }
+  .frame-name { flex: 1 1 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  .frame:hover:not(:disabled) { background: var(--wg-surface-hover); }
+  .frame:disabled { color: var(--wg-text-dim); cursor: default; }
+  .frame.selected { background: color-mix(in srgb, var(--wg-primary) 18%, transparent); }
+  .frame-at { flex: none; color: var(--wg-text-dim); }
+  .row.frame-line { background: color-mix(in srgb, var(--wg-primary) 18%, transparent); }
+  .caller-note { padding: 2px 8px; color: var(--wg-text-dim); }
+  .caller-note[hidden] { display: none; }
 `;
 
 /** The end of a path, which is what tells most files apart. */
@@ -53,7 +62,10 @@ export class WitgraphSource extends HTMLElement {
   #onStateChanged = () => this.#sync();
   #picker!: HTMLSelectElement;
   #where!: HTMLSpanElement;
-  #frames!: HTMLDivElement;
+  /** The line of the caller picked in the stack, if one is. */
+  #frameLine: number | null = null;
+  /** A line to bring into view, once its file is drawn. */
+  #scrollTo: number | null = null;
   #scroller!: HTMLDivElement;
   #variables!: HTMLDivElement;
   /** The stop whose variables are on show. */
@@ -100,10 +112,6 @@ export class WitgraphSource extends HTMLElement {
     this.#where.className = 'where';
     header.append(title, this.#picker, this.#where);
 
-    this.#frames = document.createElement('div');
-    this.#frames.className = 'frames';
-    this.#frames.hidden = true;
-
     this.#scroller = document.createElement('div');
     this.#scroller.className = 'rows';
 
@@ -115,7 +123,7 @@ export class WitgraphSource extends HTMLElement {
     body.className = 'body';
     body.append(this.#scroller, this.#variables);
 
-    panel.append(header, this.#frames, body);
+    panel.append(header, body);
     shadow.appendChild(panel);
     this.#controller?.addEventListener('state-changed', this.#onStateChanged);
     this.#sync();
@@ -167,9 +175,6 @@ export class WitgraphSource extends HTMLElement {
           stop.file === this.#file ? '' : ` of ${shortName(stop.file)}`
         }`
       : '';
-    this.#frames.hidden = !stop;
-    this.#frames.textContent = stop ? stop.frames.join('  ←  ') : '';
-    this.#frames.title = stop ? stop.frames.join('\n') : '';
     this.#showVariables(stop);
 
     if (this.#drawn !== this.#file) void this.#draw(this.#file);
@@ -198,13 +203,18 @@ export class WitgraphSource extends HTMLElement {
     const { variables } = stop;
     this.#variables.hidden = false;
     // Another function's variables are others, whatever their names.
-    if (stop.frames[0] !== this.#beforeIn) this.#before.clear();
-    this.#beforeIn = stop.frames[0];
+    if (stop.frames[0]?.function !== this.#beforeIn) this.#before.clear();
+    this.#beforeIn = stop.frames[0]?.function;
+    this.#frameLine = null;
     const title = document.createElement('div');
     title.className = 'variables-title';
     title.textContent = 'Variables';
     const now = new Map<string, string>();
-    const shown: HTMLElement[] = [title];
+    const note = document.createElement('div');
+    note.className = 'caller-note';
+    note.hidden = true;
+    note.textContent = "Of the innermost function: a caller's are out of reach.";
+    const shown: HTMLElement[] = [this.#stackRows(stop.frames, note), title, note];
     if (variables.length === 0) {
       const none = document.createElement('div');
       none.className = 'no-variables';
@@ -214,6 +224,45 @@ export class WitgraphSource extends HTMLElement {
     for (const variable of variables) shown.push(this.#variableRow(variable, variable.name, now));
     this.#variables.replaceChildren(...shown);
     this.#before = now;
+  }
+
+  /** The stack, innermost first. Choosing a frame shows the line it is at. */
+  #stackRows(frames: readonly StackFrame[], note: HTMLElement): HTMLElement {
+    const wrap = document.createElement('div');
+    wrap.className = 'frames';
+    const title = document.createElement('div');
+    title.className = 'variables-title';
+    title.textContent = 'Call stack';
+    wrap.appendChild(title);
+    const rows = frames.map((frame, at) => {
+      const row = document.createElement('button');
+      row.type = 'button';
+      row.className = at === 0 ? 'frame selected' : 'frame';
+      row.disabled = frame.line === undefined;
+      row.title = frame.file ? `${frame.function}\n${frame.file}:${frame.line}` : frame.function;
+      const name = document.createElement('span');
+      name.className = 'frame-name';
+      name.textContent = frame.function;
+      row.appendChild(name);
+      if (frame.file && frame.line !== undefined) {
+        const place = document.createElement('span');
+        place.className = 'frame-at';
+        place.textContent = `${frame.file.split('/').at(-1)}:${frame.line}`;
+        row.appendChild(place);
+      }
+      row.addEventListener('click', () => {
+        for (const other of rows) other.classList.toggle('selected', other === row);
+        note.hidden = at === 0;
+        // The innermost's line is marked already, as the one it stopped on.
+        this.#frameLine = at === 0 ? null : (frame.line ?? null);
+        this.#scrollTo = frame.line ?? null;
+        if (frame.file) this.#file = frame.file;
+        this.#sync();
+      });
+      return row;
+    });
+    wrap.append(...rows);
+    return wrap;
   }
 
   #variableRow(variable: SourceVariable, path: string, now: Map<string, string>): HTMLElement {
@@ -284,7 +333,7 @@ export class WitgraphSource extends HTMLElement {
       row.dataset.line = String(number);
       const gutter = document.createElement('span');
       gutter.className = 'gutter';
-      gutter.title = 'Stop here (or at the next line with code)';
+      gutter.title = 'Break on this line (or the next with code)';
       const dot = document.createElement('span');
       dot.className = 'dot';
       gutter.appendChild(dot);
@@ -311,23 +360,26 @@ export class WitgraphSource extends HTMLElement {
     const stop = controller.lineStop;
     const current = stop?.file === file ? stop.line : null;
     const breakpoints = controller.lineBreakpoints(file);
-    const marks = `${current}|${breakpoints.join()}`;
+    const marks = `${current}|${this.#frameLine}|${breakpoints.join()}`;
     if (marks !== this.#marksShown) {
       this.#marksShown = marks;
       const set = new Set(breakpoints);
       for (const [number, row] of this.#rows) {
         row.classList.toggle('breakpoint', set.has(number));
         row.classList.toggle('current', number === current);
+        row.classList.toggle('frame-line', number === this.#frameLine);
       }
     }
     if (stop && stop !== this.#followed && current !== null) {
       this.#followed = stop;
-      const row = this.#rows.get(current);
-      if (row) {
-        const from = this.#scroller.getBoundingClientRect();
-        const at = row.getBoundingClientRect();
-        this.#scroller.scrollTop += at.top - from.top - from.height / 2;
-      }
+      this.#scrollTo = current;
+    }
+    const row = this.#scrollTo === null ? undefined : this.#rows.get(this.#scrollTo);
+    if (row) {
+      this.#scrollTo = null;
+      const from = this.#scroller.getBoundingClientRect();
+      const at = row.getBoundingClientRect();
+      this.#scroller.scrollTop += at.top - from.top - from.height / 2;
     }
   }
 }

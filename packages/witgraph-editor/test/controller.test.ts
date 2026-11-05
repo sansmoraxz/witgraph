@@ -577,23 +577,68 @@ test('a run stops on a line, shows it, and goes on from it by step or continue',
   assert.equal(controller.pausedNode, 'a');
   assert.equal(controller.selectedNode, 'a', 'and its node is shown');
 
-  await controller.step();
-  assert.equal(lineOf(controller), mark('walk-second'), 'step goes over the call');
+  await controller.stepOver();
+  assert.equal(lineOf(controller), mark('walk-second'), 'over the call');
   assert.equal(
     controller.lineStop?.variables.find(({ name }) => name === 'a')?.value,
     '6',
     'and shows what it came to',
   );
   await controller.stepIn();
-  assert.match(controller.lineStop?.frames[0] ?? '', /add/);
+  assert.match(controller.lineStop?.frames[0].function ?? '', /add/);
   await controller.stepOut();
-  assert.match(controller.lineStop?.frames[0] ?? '', /walk/);
+  assert.match(controller.lineStop?.frames[0].function ?? '', /walk/);
 
   controller.resumeBreakpoint();
   assert.equal(controller.lineStop, null);
   await running;
   assert.equal(controller.mode, 'idle');
   assert.equal(await controller.readOutput('a', 'out'), 8);
+});
+
+test('next node finishes the node stopped in, and pauses before the next', async () => {
+  const { controller, file } = await loadLines(
+    [['ab', 'a.out', 'b.in']],
+    [
+      ['a', 'line-walk'],
+      ['b', 'line-walk'],
+    ],
+  );
+  controller.toggleLineBreakpoint(file, mark('walk-first'));
+  const running = controller.run();
+  await eventually(() => controller.lineStop !== null);
+  assert.equal(controller.lineStop?.node, 'a');
+  controller.toggleLineBreakpoint(file, mark('walk-first'));
+
+  await controller.step();
+  assert.equal(controller.lineStop, null, 'no longer in code');
+  assert.equal(controller.mode, 'paused');
+  assert.equal(controller.pausedNode, 'b', 'held before the next, not run past it');
+  assert.equal(await controller.readOutput('a', 'out'), 3, 'with this one finished');
+
+  // From there, into that node's code.
+  await controller.stepIn();
+  assert.equal(controller.lineStop?.node, 'b');
+  controller.resumeBreakpoint();
+  await eventually(() => controller.lineStop === null);
+  await controller.stop();
+  await running;
+});
+
+test('a host can say which lines are its own', async () => {
+  const { file } = await loadLines();
+  const directory = file.slice(0, -'lib.rs'.length);
+  const workers = realWorkers();
+  const under = await loadController([['a', 'line-walk']], [], {
+    worker: workers.make,
+    lines: { own: [directory] },
+  });
+  assert.deepEqual(under.lineFiles, [file]);
+  const nowhere = await loadController([['a', 'line-walk']], [], {
+    worker: realWorkers().make,
+    lines: { own: ['/nowhere/'] },
+  });
+  assert.deepEqual(nowhere.lineFiles, []);
 });
 
 test('a step never stops in what a macro generated', async () => {
@@ -649,7 +694,7 @@ test('pausing stops a guest mid-spin, and stopping it from there ends it', async
   controller.pause();
   assert.equal(controller.mode, 'paused');
   await eventually(() => controller.lineStop !== null);
-  assert.match(controller.lineStop?.frames[0] ?? '', /spin/);
+  assert.match(controller.lineStop?.frames[0].function ?? '', /spin/);
 
   // Let go, it spins on with nothing in the way, so it is the worker that goes.
   await controller.stop();

@@ -54,6 +54,9 @@ const PAUSED_WATCH_MS = 50;
 /** How long a step waits for its node's `run`, before leaving it running. */
 const STEP_GRACE_MS = 250;
 
+/** The same, for the rest of a node stopped in its code: what is left of it can take longer. */
+const NEXT_NODE_GRACE_MS = 5000;
+
 const TICK_SLICE_MS = 100;
 
 /** Waits for the next frame, so a run that never settles leaves the page time to draw. */
@@ -1115,7 +1118,20 @@ export class EditorController extends EventTarget {
    */
   async step(): Promise<void> {
     if (this.#mode === 'running') return;
-    if (this.#lineStop) return this.#stepLine((lines) => lines.stepOver());
+    if (this.#lineStop) {
+      // Stopped in a node's code: the rest of that node is the node to run.
+      this.#stepRunning = this.#lineStop.node ?? null;
+      this.#setStepping(true);
+      const stopped = this.#nextStop();
+      this.#goOnFromLine((lines) => lines.resume());
+      if (this.#stepRunning !== null) {
+        const node = this.#stepRunning;
+        clearTimeout(this.#stepTimer);
+        this.#stepTimer = setTimeout(() => this.#stepReturned(node), NEXT_NODE_GRACE_MS);
+      }
+      await stopped;
+      return;
+    }
     if (this.#mode === 'paused') {
       const held = this.#held.shift();
       if (!held) return;
@@ -1135,6 +1151,11 @@ export class EditorController extends EventTarget {
     const stopped = this.#nextStop();
     await this.#startRun('step');
     await stopped;
+  }
+
+  /** Goes on from a line to the next in this function, or its caller if it returns. */
+  async stepOver(): Promise<void> {
+    if (this.#lineStop) return this.#stepLine((lines) => lines.stepOver());
   }
 
   /** Goes on from a line: into a call, if the line makes one, and stops at the next line. */
@@ -1344,6 +1365,8 @@ export class EditorController extends EventTarget {
   #setStepping(on: boolean): void {
     this.#stepping = on;
     this.#sendHolds();
+    // Directly too: a worker stopped on a line reads no message.
+    this.#session?.lines?.holdNodes(on);
   }
 
   /** Tells the worker whose runs wait for this thread: the others do not. */
@@ -2281,6 +2304,9 @@ export class EditorController extends EventTarget {
       ...(this.#originalOptions.lines && isolated
         ? {
             lines: {
+              ...(typeof this.#originalOptions.lines === 'object'
+                ? this.#originalOptions.lines
+                : {}),
               onStop: (stop: LineStop): void => {
                 if (this.#session !== session) return;
                 // On its way out: nothing is to look at it.
