@@ -1268,7 +1268,7 @@ fn check_group_claims(
             members.iter().filter_map(|m| nodes.get(m).map(|n| &n.id)),
         );
         // Over all of a resource it never starts, which is reported above.
-        if claims.is_empty() || claims.values().any(|sum| *sum > 1.0 + EPSILON) {
+        if claims.values().any(|sum| *sum > 1.0 + EPSILON) {
             continue;
         }
         let mut waits = Vec::new();
@@ -1284,14 +1284,19 @@ fn check_group_claims(
                 nodes_of.iter().filter_map(|m| nodes.get(*m).map(|n| &n.id)),
             );
             if !claims.is_empty() {
+                let below = nodes_of
+                    .iter()
+                    .any(|node| members.iter().any(|m| upstream_of(graph, node).contains(m)));
                 waits.push(Wait {
                     unit,
                     nodes: nodes_of.as_slice(),
                     claims,
+                    below,
                 });
             }
         }
-        if !waits.is_empty() {
+        // A group no one waits on still holds, while any other keeps guest work going.
+        if !waits.is_empty() || !claims.is_empty() {
             holders.push(Holder {
                 group: at,
                 members,
@@ -1310,9 +1315,14 @@ fn check_group_claims(
             continue;
         }
         let mut held: BTreeMap<&ResourceId, f64> = BTreeMap::new();
+        // Of those waiting on something themselves.
+        let mut held_waiting: BTreeMap<&ResourceId, f64> = BTreeMap::new();
         for holder in holding.iter().map(|at| &holders[*at]) {
             for (resource, claim) in &holder.claims {
                 *held.entry(*resource).or_insert(0.0) += claim;
+                if !holder.waits.is_empty() {
+                    *held_waiting.entry(*resource).or_insert(0.0) += claim;
+                }
             }
         }
         // Past what can be searched every set is taken to fit, so nothing is missed.
@@ -1323,11 +1333,21 @@ fn check_group_claims(
         // The resource and nodes each holder waits for that cannot start beside them.
         let mut blocked: BTreeMap<&ResourceId, Vec<&NodeId>> = BTreeMap::new();
         let mut all_blocked = true;
+        let mut any_waiting = false;
         for holder in holding.iter().map(|at| &holders[*at]) {
+            if holder.waits.is_empty() {
+                continue;
+            }
+            any_waiting = true;
             let mut this_one = false;
             for wait in holder.waits.iter().filter(|wait| !holds(wait.unit)) {
+                // What is below a member has to run for its group to get anywhere, so
+                // that group's guest work goes on, and with it nothing counts as drained:
+                // every group that has started is holding. What is above and not below
+                // only waits on those themselves waiting.
+                let others = if wait.below { &held } else { &held_waiting };
                 for (resource, claim) in &wait.claims {
-                    let beside = held.get(resource).copied().unwrap_or(0.0);
+                    let beside = others.get(resource).copied().unwrap_or(0.0);
                     if beside + claim > 1.0 + EPSILON && beside > 0.0 {
                         this_one = true;
                         let nodes = blocked.entry(*resource).or_default();
@@ -1341,7 +1361,7 @@ fn check_group_claims(
             }
             all_blocked &= this_one;
         }
-        if !all_blocked {
+        if !all_blocked || !any_waiting {
             continue;
         }
         for (resource, waited_for) in blocked {
@@ -1425,8 +1445,9 @@ fn stallable_units(
 /// but never lets through one that would not.
 const MOST_HOLDERS_SEARCHED: usize = 12;
 
-/// A stream group that can start while something only some of its members wait for
-/// has not run, holding its claims meanwhile.
+/// A stream group that can be holding its claims while something waits to start: one
+/// with something only some of its members wait for, which has yet to run, or any other
+/// with claims.
 struct Holder<'g> {
     /// Its index among the units, and the groups.
     group: usize,
@@ -1440,6 +1461,8 @@ struct Wait<'g> {
     unit: usize,
     nodes: &'g [&'g NodeId],
     claims: BTreeMap<&'g ResourceId, f64>,
+    /// Whether it is below a member too, so needs the group started to run.
+    below: bool,
 }
 
 /// Every set of `holders` holders, the smaller first, as a set that is stuck makes
@@ -2766,6 +2789,72 @@ mod tests {
             .set_resource("g", "disk", claim(gh))
             .unwrap()
             .build()
+    }
+
+    /// A group `a`-`b` that needs `u`, which is below `a` and above `b`, to reach its
+    /// reader; and groups beside it that wait for nothing, each with the claim given.
+    fn a_group_needing_a_node_beside(others: &[f64]) -> TestGraph {
+        let claim = |fraction| ResourceClaim::new(fraction).unwrap();
+        let mut graph = builder("t")
+            .add_component(contract(
+                "head",
+                vec![],
+                vec![port("st", PortKind::Stream), port("out", PortKind::Value)],
+                &[],
+            ))
+            .add_component(contract(
+                "tail",
+                vec![
+                    port("st", PortKind::Stream),
+                    port("in", PortKind::Value).optional(),
+                ],
+                vec![],
+                &[],
+            ))
+            .add_component(contract(
+                "solo",
+                vec![port("in", PortKind::Value)],
+                vec![port("out", PortKind::Value)],
+                &[],
+            ))
+            .add_node("a", cref("head"))
+            .add_node("b", cref("tail"))
+            .add_node("u", cref("solo"))
+            .connect("ab", PortRef::new("a", "st"), PortRef::new("b", "st"))
+            .connect("au", PortRef::new("a", "out"), PortRef::new("u", "in"))
+            .connect("ub", PortRef::new("u", "out"), PortRef::new("b", "in"))
+            .set_resource("u", "gpu", claim(0.2))
+            .unwrap();
+        for (at, fraction) in others.iter().enumerate() {
+            let (head, tail) = (format!("c{at}"), format!("d{at}"));
+            graph = graph
+                .add_node(head.as_str(), cref("head"))
+                .add_node(tail.as_str(), cref("tail"))
+                .connect(
+                    format!("s{at}").as_str(),
+                    PortRef::new(head.as_str(), "st"),
+                    PortRef::new(tail.as_str(), "st"),
+                )
+                .set_resource(head.as_str(), "gpu", claim(*fraction))
+                .unwrap();
+        }
+        graph.build()
+    }
+
+    #[test]
+    fn what_a_group_needs_below_it_must_fit_beside_every_group() {
+        // The groups beside it cannot count as drained while `a`'s writer waits on `b`,
+        // and `b` waits on `u`, which does not fit beside them.
+        let found = diags(a_group_needing_a_node_beside(&[0.6, 0.4]).compile());
+        assert!(
+            found
+                .iter()
+                .any(|d| matches!(d, Diagnostic::ClaimsCanDeadlock { .. })),
+            "{found:?}"
+        );
+        assert!(a_group_needing_a_node_beside(&[0.6, 0.2]).compile().is_ok());
+        // Two that cannot hold together leave room beside either.
+        assert!(a_group_needing_a_node_beside(&[0.8, 0.8]).compile().is_ok());
     }
 
     #[test]
