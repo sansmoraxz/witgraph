@@ -1,4 +1,6 @@
 import {
+  ArrowDownToLine,
+  ArrowUpFromLine,
   Camera,
   Circle,
   createElement,
@@ -36,6 +38,7 @@ const MODE_BG: Record<EditorMode, string> = {
 };
 
 const EXTRA_CSS = `
+  button[hidden] { display: none; }
   :host { display: block;
     --_btn-radius: var(--wg-btn-radius, 4px);
     --_group-radius: var(--wg-group-radius, 6px); }
@@ -84,6 +87,8 @@ const ICONS: Record<string, unknown[]> = {
   play: Play,
   pause: Pause,
   'rotate-cw': RotateCw,
+  'arrow-down-to-line': ArrowDownToLine,
+  'arrow-up-from-line': ArrowUpFromLine,
   'step-forward': StepForward,
   square: Square,
   'rotate-ccw': RotateCcw,
@@ -111,6 +116,8 @@ export class WitgraphControls extends HTMLElement {
   #btnRun!: HTMLButtonElement;
   #btnStep!: HTMLButtonElement;
   #btnPause!: HTMLButtonElement;
+  #btnStepIn!: HTMLButtonElement;
+  #btnStepOut!: HTMLButtonElement;
   #btnRestart!: HTMLButtonElement;
   #btnStop!: HTMLButtonElement;
   #btnReset!: HTMLButtonElement;
@@ -141,6 +148,8 @@ export class WitgraphControls extends HTMLElement {
     else if (key === 'F5' && !ctrlKey && !metaKey) act(() => controller.run());
     else if (key === 'F6') act(() => controller.pause());
     else if (key === 'F10') act(() => controller.step());
+    else if (key === 'F11' && shiftKey) act(() => controller.stepOut());
+    else if (key === 'F11') act(() => controller.stepIn());
     else if (key === 'F9' && controller.selectedNode) {
       const node = controller.selectedNode;
       act(() => controller.toggleBreakpoint(node));
@@ -189,6 +198,18 @@ export class WitgraphControls extends HTMLElement {
     this.#btnRun = mkBtn('run btn-primary', 'Run to the next breakpoint (F5)', 'play', 'Run');
     this.#btnPause = mkBtn('pause', 'Pause before the next node (F6)', 'pause', 'Pause');
     this.#btnStep = mkBtn('step', 'Run one node, and pause (F10)', 'step-forward', 'Step');
+    this.#btnStepIn = mkBtn(
+      'step-in',
+      'Step into the call on this line (F11)',
+      'arrow-down-to-line',
+      'In',
+    );
+    this.#btnStepOut = mkBtn(
+      'step-out',
+      'Step out of this function (Shift+F11)',
+      'arrow-up-from-line',
+      'Out',
+    );
     this.#btnStop = mkBtn('stop btn-danger', 'Stop (Shift+F5)', 'square', 'Stop');
     this.#btnRestart = mkBtn(
       'restart',
@@ -201,6 +222,8 @@ export class WitgraphControls extends HTMLElement {
       this.#btnRun,
       this.#btnPause,
       this.#btnStep,
+      this.#btnStepIn,
+      this.#btnStepOut,
       this.#btnStop,
       this.#btnRestart,
       this.#btnReset,
@@ -298,6 +321,8 @@ export class WitgraphControls extends HTMLElement {
 
     this.#btnRun.addEventListener('click', () => this.#controller?.run());
     this.#btnStep.addEventListener('click', () => this.#controller?.step());
+    this.#btnStepIn.addEventListener('click', () => this.#controller?.stepIn());
+    this.#btnStepOut.addEventListener('click', () => this.#controller?.stepOut());
     this.#btnPause.addEventListener('click', () => this.#controller?.pause());
     this.#btnRestart.addEventListener('click', () => this.#controller?.restart());
     this.#btnStop.addEventListener('click', () => this.#controller?.stop());
@@ -350,6 +375,13 @@ export class WitgraphControls extends HTMLElement {
     // Paused, Continue is what goes on, and Step goes on by one node.
     this.#btnRun.disabled = mode === 'running' || mode === 'paused';
     this.#btnStep.disabled = mode === 'running';
+    // Only with code to step through: most graphs have no debug info.
+    const hasLines = (this.#controller?.lineFiles.length ?? 0) > 0;
+    const onLine = this.#controller?.lineStop != null;
+    this.#btnStepIn.hidden = !hasLines;
+    this.#btnStepOut.hidden = !hasLines;
+    this.#btnStepIn.disabled = mode !== 'paused';
+    this.#btnStepOut.disabled = !onLine;
     this.#btnPause.disabled = mode !== 'running';
     this.#btnRestart.disabled = !this.#controller;
     // A step can leave a stream going: stopping is for that too.

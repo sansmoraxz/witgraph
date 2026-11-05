@@ -22,6 +22,7 @@ import {
   type WitgraphCatalog,
   type WitgraphControls,
   type WitgraphInspector,
+  type WitgraphSource,
   type WitgraphTimeline,
 } from 'witgraph-editor';
 import type { ComponentSource } from 'witgraph-loader';
@@ -37,6 +38,7 @@ const canvas = document.querySelector('witgraph-canvas') as WitgraphCanvas;
 const controls = document.querySelector('witgraph-controls') as WitgraphControls;
 const inspector = document.querySelector('witgraph-inspector') as WitgraphInspector;
 const timeline = document.querySelector('witgraph-timeline') as WitgraphTimeline;
+const source = document.querySelector('witgraph-source') as WitgraphSource;
 const catalog = document.querySelector('witgraph-catalog') as WitgraphCatalog;
 const statusEl = document.getElementById('status')!;
 
@@ -44,6 +46,7 @@ canvas.controller = controller;
 controls.controller = controller;
 inspector.controller = controller;
 timeline.controller = controller;
+source.controller = controller;
 catalog.controller = controller;
 
 // -- Component references -----------------------------------------------------
@@ -121,6 +124,7 @@ const videoSinkRef = {
  */
 const GUESTS = [
   'busy-loop',
+  'line-walk',
   'relay',
   'stream-producer',
   'stream-consumer',
@@ -150,6 +154,11 @@ const allComponents = GUESTS.map((guest) => ({
   package: { namespace: 'test', name: guest, version: '0.1.0' },
   world: guest,
 }));
+
+const lineWalkRef = {
+  package: { namespace: 'test', name: 'line-walk', version: '0.1.0' },
+  world: 'line-walk',
+};
 
 const portKinds: GraphJson = {
   metadata: {
@@ -460,8 +469,31 @@ const spin: GraphJson = {
   connections: [],
 };
 
+/** Two nodes of a guest built with debug info: stop on a line of it, and step through. */
+const lines: GraphJson = {
+  metadata: { name: 'demo-lines', description: 'A guest with debug info, to step through.' },
+  components: allComponents,
+  nodes: [
+    {
+      id: 'first',
+      component: lineWalkRef,
+      label: 'First',
+      attrs: { 'inject.in': '5' },
+    },
+    { id: 'second', component: lineWalkRef, label: 'Second' },
+  ],
+  connections: [
+    {
+      id: 'first-second',
+      from: { node: 'first', port: 'out' },
+      to: { node: 'second', port: 'in' },
+    },
+  ],
+};
+
 const demos: Record<string, Demo> = {
   spin: { graph: spin, select: 'busy' },
+  lines: { graph: lines, select: 'first' },
   'port-kinds': {
     graph: portKinds,
     select: 'relay-a',
@@ -481,6 +513,16 @@ const demos: Record<string, Demo> = {
 };
 
 // -- Load and display ---------------------------------------------------------
+
+/**
+ * A guest's source, by the path its debug info gives. The dev server can read it, if it is under
+ * the repository. A built page has no such server, and shows only which lines have code.
+ */
+async function sources(file: string): Promise<string | undefined> {
+  const response = await fetch(`/@fs${file}`);
+  const type = response.headers.get('content-type') ?? '';
+  return response.ok && !type.includes('html') ? response.text() : undefined;
+}
 
 async function fetchWasm(name: string): Promise<Uint8Array> {
   const url = new URL(`../components/${name}.wasm`, import.meta.url);
@@ -543,7 +585,7 @@ async function loadDemo(): Promise<void> {
       return made;
     };
 
-    await controller.load({ graph: demo.graph, components, wasm, worker });
+    await controller.load({ graph: demo.graph, components, wasm, worker, lines: true, sources });
 
     statusEl.textContent = 'Computing layout...';
     await controller.autoLayout();
@@ -573,7 +615,10 @@ function updateStatus(): void {
   } else if (mode === 'paused') {
     state = 'paused';
     const node = controller.pausedNode;
-    text = `Paused${node ? ` at ${node}` : ''}. Step runs it, Continue goes on to the next breakpoint.`;
+    const line = controller.lineStop;
+    text = line
+      ? `Stopped at line ${line.line}${node ? ` in ${node}` : ''}. Step goes to the next line, Continue to the next breakpoint.`
+      : `Paused${node ? ` at ${node}` : ''}. Step runs it, Continue goes on to the next breakpoint.`;
   } else if (mode === 'error') {
     state = 'error';
     text = 'The run stopped on an error. The timeline says what failed.';

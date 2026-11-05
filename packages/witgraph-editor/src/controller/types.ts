@@ -243,6 +243,13 @@ export interface EditorLoadOptions {
    * whichever thread serves it, but with no `terminate` a node that spins cannot be ended.
    */
   worker: () => SessionWorker;
+  /**
+   * Lets a guest built with debug info be stopped on a line of its source. It needs a page
+   * that is cross-origin isolated: elsewhere the graph runs, and the timeline says why not.
+   */
+  lines?: boolean;
+  /** The text of a source file, by the path the debug info gives, for showing where it stops. */
+  sources?: (file: string) => string | undefined | Promise<string | undefined>;
   /** Mock replacements for nodes, keyed by node id. */
   mocks?: Record<string, (inputs: PortValues) => PortValues | Promise<PortValues>>;
 }

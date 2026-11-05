@@ -26,6 +26,7 @@ import { WitgraphCanvas } from './components/canvas.ts';
 import { WitgraphCatalog } from './components/catalog.ts';
 import { WitgraphControls } from './components/controls.ts';
 import { WitgraphInspector } from './components/inspector.ts';
+import { WitgraphSource } from './components/source.ts';
 import { WitgraphTimeline } from './components/timeline.ts';
 
 export { autoLayout } from './controller/layout.ts';
@@ -35,7 +36,14 @@ export { registerViewer, viewerFor } from './viewers/registry.ts';
 export { numeric, plotPoints, seriesViewer } from './viewers/series.ts';
 export { describe, summarize, textViewer } from './viewers/text.ts';
 export type { PortViewer, ViewerInstance } from './viewers/types.ts';
-export { WitgraphCanvas, WitgraphCatalog, WitgraphControls, WitgraphInspector, WitgraphTimeline };
+export {
+  WitgraphCanvas,
+  WitgraphCatalog,
+  WitgraphControls,
+  WitgraphInspector,
+  WitgraphSource,
+  WitgraphTimeline,
+};
 
 const define = (name: string, ctor: CustomElementConstructor) =>
   customElements.get(name) || customElements.define(name, ctor);
@@ -45,5 +53,6 @@ export function registerAll(): void {
   define('witgraph-controls', WitgraphControls);
   define('witgraph-inspector', WitgraphInspector);
   define('witgraph-timeline', WitgraphTimeline);
+  define('witgraph-source', WitgraphSource);
   define('witgraph-catalog', WitgraphCatalog);
 }

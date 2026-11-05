@@ -23,7 +23,9 @@
     witgraph-inspector { grid-column: 5; grid-row: 2; min-height: 0; }
     .resize-bottom     { grid-column: 1 / -1; grid-row: 3; cursor: row-resize; background: var(--wg-surface); }
     .resize-bottom:hover, .resize-bottom.active { background: var(--wg-primary); }
-    witgraph-timeline  { grid-column: 1 / -1; grid-row: 4; }
+    .bottom-row        { grid-column: 1 / -1; grid-row: 4; display: flex; min-height: 0; }
+    witgraph-source    { flex: 3 1 0; min-width: 0; border-right: 1px solid var(--wg-surface-hover); }
+    witgraph-timeline  { flex: 2 1 0; min-width: 0; }
     /* The status, marked by state the way the timeline marks its events. */
     #status            { border-left: 3px solid var(--wg-primary); }
     #status.ready      { border-left-color: var(--wg-success); }
@@ -42,13 +44,17 @@
     <div class="resize-right" data-resize="right"></div>
     <witgraph-inspector></witgraph-inspector>
     <div class="resize-bottom" data-resize="bottom"></div>
-    <witgraph-timeline></witgraph-timeline>
+    <div class="bottom-row">
+      <witgraph-source></witgraph-source>
+      <witgraph-timeline></witgraph-timeline>
+    </div>
 
     <label class="z-10 px-2 py-1 bg-wg-surface border border-wg-surface-hover rounded-md text-xs text-wg-text flex items-center gap-2"
            style="grid-column: 3; grid-row: 2; align-self: start; justify-self: end; margin: 8px;">
       Graph
       <select id="graph-picker" class="bg-wg-bg text-wg-text border border-wg-surface-hover rounded px-1 py-0.5 text-xs">
         <option value="port-kinds">All port kinds</option>
+        <option value="lines">Source lines</option>
         <option value="video">Video pipeline</option>
         <option value="webgpu">Edge detection: WebGPU</option>
         <option value="webnn">Edge detection: WebNN</option>

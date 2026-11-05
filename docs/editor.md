@@ -20,6 +20,7 @@ stream through grayscale and invert filters.](assets/editor-demo.gif)
 | `<witgraph-inspector>` | Details for whatever is selected: a node, a connection, or the graph.                                                                   |
 | `<witgraph-controls>`  | The toolbar: run, step, stop, reset, tick rate, breakpoints, undo and redo, layout, snapshots, import and export.                       |
 | `<witgraph-timeline>`  | A trace of what ran, when, and what faulted.                                                                                            |
+| `<witgraph-source>`    | The source of guests with debug info: set breakpoints in it and step through.                                                           |
 
 Put them anywhere on your page. They all share one `EditorController`.
 
@@ -77,6 +78,15 @@ Put them anywhere on your page. They all share one `EditorController`.
   is known, which node caused it. The next change or run starts every node again.
 - **Breakpoints.** Toggle one on a node (toolbar _BP_ button, right-click, or F9).
   The run pauses before that node's next run.
+- **Source lines.** Load with `lines: true`, and a guest built with debug info can be stopped
+  on a line of its own code: click in the gutter of the source panel. **Step** (F10) then goes
+  to the next line, over any call, **In** (F11) into a call, and **Out** (Shift+F11) out of the
+  function. **Pause** stops at the next line of what is running, even a node that is spinning,
+  and from a node about to run, **In** stops at its first line. The panel shows the functions on
+  the stack and follows each stop. All of the graph stops with it, so previews wait until it goes
+  on. It takes a page that is cross-origin isolated
+  ([why](javascript.md#stopping-on-a-source-line)): elsewhere the graph runs as usual, and the
+  timeline says so. Without debug info in a graph, the panel and its buttons stay hidden.
 - **Values.** Select a node to see the current value of each output port.
 - **Previews.** A node can show one of its outputs inside it, as it changes:
   see [Previews](#previews).
@@ -187,6 +197,10 @@ const worker = () => new Worker(new URL('./worker.ts', import.meta.url), { type:
 await controller.load({ graph, components, wasm, worker });
 await controller.autoLayout();
 ```
+
+`sources` gives the panel a file's text, by the path the debug info has for it. Without it, or
+when it returns nothing, the panel lists only the lines with code. A file changed since the guest
+was built is shown as it is now, so lines may not match up.
 
 The graph runs in a worker `worker` makes, so a node that spins leaves the editor working.
 **Stop** gives a worker two seconds to answer. One that doesn't is ended, and the graph loaded

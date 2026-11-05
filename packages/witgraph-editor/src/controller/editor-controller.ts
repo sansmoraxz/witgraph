@@ -6,6 +6,8 @@ import {
   endWorker,
   GraphChecker,
   init,
+  type LineDebugger,
+  type LineStop,
   type PortValues,
   RemoteSession,
   type SessionWorker,
@@ -110,6 +112,12 @@ export class EditorController extends EventTarget {
   #worker: SessionWorker | null = null;
   /** A stop being seen through, which may take a new worker. */
   #stopping: Promise<void> | null = null;
+  /** Where a guest is stopped on a line. The worker answers nothing until it goes on. */
+  #lineStop: LineStop | null = null;
+  /** By file, the lines to stop on, kept here as each session starts with none. */
+  #lineBreakpoints = new Map<string, Set<number>>();
+  /** By file, its text as asked of `sources` once per load. */
+  #sourceTexts = new Map<string, Promise<string | undefined>>();
   #originalOptions: EditorLoadOptions | null = null;
   #graphJson: GraphJson | null = null;
   #dirty = false;
@@ -205,7 +213,7 @@ export class EditorController extends EventTarget {
     return this.#graphJson ?? {};
   }
   get pausedNode(): string | null {
-    return this.#held[0]?.node ?? null;
+    return this.#held[0]?.node ?? this.#lineStop?.node ?? null;
   }
   get breakpointState(): BreakpointState | null {
     const [first] = this.#held;
@@ -1039,6 +1047,9 @@ export class EditorController extends EventTarget {
     this.#session?.dispose();
     this.#session = null;
     this.#endWorker();
+    this.#lineStop = null;
+    this.#lineBreakpoints.clear();
+    this.#sourceTexts.clear();
     this.#streamGroups = [];
     this.#warned.clear();
     this.#nodes.clear();
@@ -1104,6 +1115,7 @@ export class EditorController extends EventTarget {
    */
   async step(): Promise<void> {
     if (this.#mode === 'running') return;
+    if (this.#lineStop) return this.#stepLine((lines) => lines.stepOver());
     if (this.#mode === 'paused') {
       const held = this.#held.shift();
       if (!held) return;
@@ -1125,10 +1137,105 @@ export class EditorController extends EventTarget {
     await stopped;
   }
 
+  /** Goes on from a line: into a call, if the line makes one, and stops at the next line. */
+  async stepIn(): Promise<void> {
+    if (this.#lineStop) return this.#stepLine((lines) => lines.stepIn());
+    // From a node about to run, into its code.
+    if (this.#mode !== 'paused' || this.#held.length === 0) return;
+    this.#session?.lines?.pause();
+    return this.step();
+  }
+
+  /** Goes on from a line until its function has returned. */
+  async stepOut(): Promise<void> {
+    if (this.#lineStop) return this.#stepLine((lines) => lines.stepOut());
+  }
+
+  /** Lets go of the guest stopped on a line, and settles at its next stop. */
+  async #stepLine(go: (lines: LineDebugger) => void): Promise<void> {
+    const stopped = this.#nextStop();
+    this.#goOnFromLine(go);
+    // With no run to end it, a step that finds no line has nothing else to settle it.
+    if (!this.#runLoop && !this.#ticking) this.#settleStopWaiters();
+    await stopped;
+  }
+
+  #goOnFromLine(go: (lines: LineDebugger) => void): void {
+    const lines = this.#session?.lines;
+    this.#lineStop = null;
+    this.#mode = this.#runLoop || this.#ticking ? 'running' : 'idle';
+    if (lines) go(lines);
+    this.#dispatch('state-changed');
+  }
+
+  /** Whether any guest of the graph can be stopped on a line. */
+  get lineFiles(): readonly string[] {
+    return this.#session?.lines?.files ?? [];
+  }
+
+  /** The lines of `file` with code. */
+  linesOf(file: string): readonly number[] {
+    return this.#session?.lines?.lines(file) ?? [];
+  }
+
+  /** Where a guest is stopped on a line, if one is. */
+  get lineStop(): LineStop | null {
+    return this.#lineStop;
+  }
+
+  /** The lines of `file` guests stop on. */
+  lineBreakpoints(file: string): readonly number[] {
+    return [...(this.#lineBreakpoints.get(file) ?? [])];
+  }
+
+  /**
+   * Stops guests on `line` of `file`, or the next line with code, or stops doing so if they
+   * do. A guest that is running sees it at once.
+   */
+  toggleLineBreakpoint(file: string, line: number): void {
+    const lines = this.#session?.lines;
+    const actual = this.linesOf(file).find((candidate) => candidate >= line);
+    if (!lines || actual === undefined) return;
+    const set = this.#lineBreakpoints.get(file) ?? new Set<number>();
+    this.#lineBreakpoints.set(file, set);
+    if (set.delete(actual)) {
+      lines.clearBreakpoint(file, actual);
+    } else {
+      set.add(actual);
+      lines.setBreakpoint(file, actual);
+    }
+    this.#dispatch('state-changed');
+  }
+
+  /** Gives the session the breakpoints: each starts with none, and a stop clears them. */
+  #armLineBreakpoints(): void {
+    const lines = this.#session?.lines;
+    if (!lines) return;
+    for (const [file, set] of this.#lineBreakpoints) {
+      for (const line of set) lines.setBreakpoint(file, line);
+    }
+  }
+
+  /** The text of a source file, if the host can say. */
+  sourceOf(file: string): Promise<string | undefined> {
+    let text = this.#sourceTexts.get(file);
+    if (!text) {
+      const asked = this.#originalOptions?.sources;
+      text = Promise.resolve(asked?.(file)).catch(() => undefined);
+      this.#sourceTexts.set(file, text);
+    }
+    return text;
+  }
+
   /** Stops holding anything but breakpoints from the next node on, and goes on. */
   resumeBreakpoint(): void {
     if (this.#mode !== 'paused') return;
     this.#setStepping(false);
+    if (this.#lineStop) {
+      this.#goOnFromLine((lines) => lines.resume());
+      this.#showStop();
+      return;
+    }
     this.#stepRunning = null;
     clearTimeout(this.#stepTimer);
     // The node paused at goes on, as does any only held for a step. Another at a breakpoint
@@ -1148,6 +1255,8 @@ export class EditorController extends EventTarget {
     if (this.#mode !== 'running' || !this.#runLoop) return;
     this.#setStepping(true);
     this.#mode = 'paused';
+    // Or at the next line of what is running, even if it is spinning.
+    this.#session?.lines?.pause();
     this.#showStop();
     this.#dispatch('state-changed');
   }
@@ -1199,8 +1308,36 @@ export class EditorController extends EventTarget {
 
     const mode = this.#mode as EditorMode;
     if (mode === 'running' || mode === 'paused') this.#mode = 'idle';
+    this.#settleStopWaiters();
     this.#dispatch('state-changed');
     this.#followWhatIsRunning();
+  }
+
+  /** A guest has stopped on a line: shows where. */
+  #stopOnLine(stop: LineStop): void {
+    clearTimeout(this.#stepTimer);
+    this.#stepRunning = null;
+    this.#lineStop = stop;
+    this.#mode = 'paused';
+    if (stop.node) {
+      this.#selectedNode = stop.node;
+      this.#selectedEdge = null;
+    }
+    this.#pollState();
+    this.#settleStopWaiters();
+    this.#dispatch('state-changed');
+    this.#watchWhilePaused();
+  }
+
+  #warnOfNoLines(): void {
+    const message =
+      'Guests cannot be stopped on source lines here: that needs shared memory, so a page ' +
+      'served with Cross-Origin-Opener-Policy: same-origin and ' +
+      'Cross-Origin-Embedder-Policy: require-corp';
+    if (this.#warned.has(message)) return;
+    this.#warned.add(message);
+    this.#traceEvents.push({ event: 'warning', message, timestamp: performance.now() });
+    this.#dispatch('trace-event');
   }
 
   /** Whether each node is held before it runs, or only those with a breakpoint. */
@@ -1359,6 +1496,8 @@ export class EditorController extends EventTarget {
     if (this.#stepRunning !== null) return;
     const [first] = this.#held;
     if (!first) return;
+    // Stopped here first: a pause asked for has what it asked for.
+    this.#session?.lines?.cancelPause();
     clearTimeout(this.#stepTimer);
     this.#mode = 'paused';
     this.#selectedNode = first.node;
@@ -1483,7 +1622,7 @@ export class EditorController extends EventTarget {
 
   /** Resolves once no node is held at a breakpoint. */
   async #paused(): Promise<void> {
-    while (this.#held.length > 0 && !this.#stopRequested) await nextFrame();
+    while ((this.#held.length > 0 || this.#lineStop) && !this.#stopRequested) await nextFrame();
   }
 
   /** Stops the graph: what is still running ends, streams included. */
@@ -1515,6 +1654,10 @@ export class EditorController extends EventTarget {
     }
     for (const { resume } of this.#held.splice(0)) resume();
     this.#setStepping(false);
+    // No line stops it on its way out, or the worker would answer nothing, and be taken to
+    // be stuck: they are set again once it has stopped.
+    this.#lineStop = null;
+    this.#session?.lines?.release();
     if (this.#stopResolve) {
       this.#stopResolve();
       this.#stopResolve = null;
@@ -1545,6 +1688,8 @@ export class EditorController extends EventTarget {
       clearTimeout(timer);
       if (!answered && this.#session === session && this.#worker?.terminate) {
         await this.#replaceWorker();
+      } else if (this.#session === session) {
+        this.#armLineBreakpoints();
       }
     } finally {
       this.#stopping = null;
@@ -2129,7 +2274,25 @@ export class EditorController extends EventTarget {
     // Set once loaded: until then, and once replaced, its hooks are stale.
     let session: RemoteSession | null = null;
     this.#worker ??= this.#originalOptions.worker();
+    const isolated =
+      (globalThis as { crossOriginIsolated?: boolean }).crossOriginIsolated !== false;
+    if (this.#originalOptions.lines && !isolated) this.#warnOfNoLines();
     session = await RemoteSession.load(this.#worker, {
+      ...(this.#originalOptions.lines && isolated
+        ? {
+            lines: {
+              onStop: (stop: LineStop): void => {
+                if (this.#session !== session) return;
+                // On its way out: nothing is to look at it.
+                if (this.#stopRequested) {
+                  session?.lines?.resume();
+                  return;
+                }
+                this.#stopOnLine(stop);
+              },
+            },
+          }
+        : {}),
       graph: graph,
       components: this.#originalOptions.components,
       wasm: this.#originalOptions.wasm,
@@ -2196,6 +2359,7 @@ export class EditorController extends EventTarget {
     this.#buildVisuals();
     this.#observedSent = '';
     this.#sendObserved();
+    this.#armLineBreakpoints();
     await this.#restoreInjections(graph);
     this.#collectCapabilities();
   }
