@@ -318,18 +318,20 @@ export class WitgraphControls extends HTMLElement {
     this.#btnSnapRestore.disabled =
       !this.#controller || this.#controller.savedSnapshots.length === 0 || mode === 'running';
 
-    let badgeText = MODE_LABELS[mode];
+    // Between ticks too: a step can leave a stream going.
+    const shown: EditorMode = mode === 'idle' && anyRunning ? 'running' : mode;
+    let badgeText = MODE_LABELS[shown];
     if (mode === 'idle' && this.#controller?.lastRunDurationMs != null) {
       const ms = this.#controller.lastRunDurationMs;
       const ticks = this.#controller.lastRunTicks;
       const timeStr = ms < 1000 ? `${ms.toFixed(0)}ms` : `${(ms / 1000).toFixed(2)}s`;
-      badgeText = `Idle`;
+      badgeText = shown === 'running' ? 'Running' : 'Idle';
       this.#durationSpan.textContent = ` ${ticks} tick${ticks !== 1 ? 's' : ''} · ${timeStr}`;
     } else {
       this.#durationSpan.textContent = '';
     }
     this.#badge.childNodes[0].textContent = badgeText;
-    this.#badge.className = `badge ${MODE_BG[mode]}`;
+    this.#badge.className = `badge ${MODE_BG[shown]}`;
   }
 }
 

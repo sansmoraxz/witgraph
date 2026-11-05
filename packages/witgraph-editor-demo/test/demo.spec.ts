@@ -557,11 +557,18 @@ test.describe('Video pipeline demo', () => {
     for (const id of ['gray', 'gray-invert', 'gray-sink', 'camera-b', 'invert', 'sink']) {
       expect(await phase(id), id).toBe('running');
     }
+    const controls = page.locator('witgraph-controls');
+    await expect(controls.locator('.badge')).toContainText('Running');
+    // Nothing here is wrong, so nothing should read as though it were.
+    const inspector = page.locator('witgraph-inspector');
+    await canvas.evaluate((el: WitgraphCanvas) => el.controller?.select('gray'));
+
     // The step is over and the stream is not, so it can still be stopped.
     const stop = page.locator('witgraph-controls').locator('button.stop');
     await stop.click();
     await expect.poll(() => phase('camera')).toBe('cancelled');
     await expect(stop).toBeDisabled();
+    await expect(controls.locator('.badge')).toContainText('Idle');
   });
 
   test('every filter previews the frames it streams', async ({ page }) => {
