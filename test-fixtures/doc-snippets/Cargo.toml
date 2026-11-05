@@ -12,5 +12,6 @@ publish = false
 witgraph-ir = { workspace = true }
 witgraph-runtime = { workspace = true, features = ["precompiled"] }
 witgraph-source = { path = "../../crates/witgraph-source" }
+witgraph-remote = { path = "../../crates/witgraph-remote" }
 wasmtime = { workspace = true }
 tokio = { version = "1", features = ["time"] }

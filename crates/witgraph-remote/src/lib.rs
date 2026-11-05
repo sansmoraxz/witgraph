@@ -1,0 +1,608 @@
+//! Lets a debugger attach to a graph running on wasmtime, over wRPC on WebTransport.
+//!
+//! A program running a graph wraps it in a [`Debuggee`] and ticks it through that, then
+//! [`serve`]s it. A debugger, such as the editor, attaches with the URL, certificate hash
+//! and token [`Served`] says, and can pause, step, hold nodes, stop on lines, read outputs
+//! and write inputs. It cannot change the graph.
+//!
+//! Anything it asks that needs the graph while a tick runs ends that tick early, is done, and
+//! the tick goes on: a held node keeps a tick from ending, and the debugger must see in then.
+//! Dropping or interrupting a tick loses nothing ([`RunningGraph::tick_until`]).
+
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
+
+use anyhow::Context as _;
+use futures::StreamExt as _;
+use futures::future::BoxFuture;
+use futures::stream::select_all;
+use tokio::sync::{Notify, oneshot};
+use witgraph_ir::{NodeId, PortName};
+use witgraph_runtime::witgraph_traits::RuntimeMode;
+use witgraph_runtime::{
+    HoldAt, HoldId, Host, LineDebugger, NodeHolds, OutputReader, RunningGraph, RuntimeGraph,
+    RuntimeHolds, RuntimeLines, StopReason, TickResult, ValReader,
+};
+
+mod bindings {
+    #![allow(missing_docs, clippy::all)]
+    wit_bindgen_wrpc::generate!({
+        world: "debuggee",
+        path: "wit",
+        generate_all,
+    });
+}
+
+use bindings::exports::witgraph::debug::{graph, holds, lines};
+
+/// Something asked of the graph, done when nothing else has it.
+type Job<M, H> = Box<dyn for<'a> FnOnce(&'a mut RuntimeGraph<M, H>) -> BoxFuture<'a, ()> + Send>;
+
+struct Inner<M: RuntimeMode, H: Host> {
+    graph: tokio::sync::Mutex<RuntimeGraph<M, H>>,
+    /// What waits for the graph, in the order asked.
+    jobs: Mutex<Vec<Job<M, H>>>,
+    /// Ends a tick early, for what waits.
+    asked: Notify,
+    reader: ValReader,
+    holds: RuntimeHolds,
+    lines: Option<RuntimeLines>,
+    described: String,
+    groups: Vec<Vec<String>>,
+}
+
+/// A graph a debugger can attach to. Tick it through this, not the graph itself.
+pub struct Debuggee<M: RuntimeMode, H: Host> {
+    inner: Arc<Inner<M, H>>,
+}
+
+impl<M: RuntimeMode, H: Host> Clone for Debuggee<M, H> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl<M: RuntimeMode, H: Host> Debuggee<M, H> {
+    /// Wraps a loaded graph.
+    ///
+    /// # Errors
+    ///
+    /// If the graph cannot be described as JSON, which should not happen.
+    pub fn new(graph: RuntimeGraph<M, H>) -> anyhow::Result<Self> {
+        let described = serde_json::to_string(graph.compiled().graph())
+            .context("failed to describe the graph")?;
+        let groups = graph
+            .compiled()
+            .stream_groups()
+            .iter()
+            .map(|group| group.iter().map(ToString::to_string).collect())
+            .collect();
+        Ok(Self {
+            inner: Arc::new(Inner {
+                reader: graph.reader(),
+                holds: graph.holds(),
+                lines: graph.lines(),
+                graph: tokio::sync::Mutex::new(graph),
+                jobs: Mutex::new(Vec::new()),
+                asked: Notify::new(),
+                described,
+                groups,
+            }),
+        })
+    }
+
+    /// Runs one tick, as [`RunningGraph::tick`] does, doing what a debugger asks meanwhile.
+    pub async fn tick(&self) -> TickResult {
+        let mut graph = self.inner.graph.lock().await;
+        loop {
+            self.drain(&mut graph).await;
+            let asked = self.inner.asked.notified();
+            let result = graph.tick_until(asked).await;
+            let waiting = !lock(&self.inner.jobs).is_empty();
+            if matches!(result, TickResult::Interrupted) && waiting {
+                continue;
+            }
+            self.drain(&mut graph).await;
+            return result;
+        }
+    }
+
+    /// Does `work` on the graph, between ticks or by ending one early: as the program running
+    /// it writes its inputs, say.
+    pub async fn with<T: Send + 'static>(
+        &self,
+        work: impl for<'a> FnOnce(&'a mut RuntimeGraph<M, H>) -> BoxFuture<'a, T> + Send + 'static,
+    ) -> T {
+        let (done, result) = oneshot::channel();
+        lock(&self.inner.jobs).push(Box::new(move |graph| {
+            Box::pin(async move {
+                let _ = done.send(work(graph).await);
+            })
+        }));
+        self.inner.asked.notify_one();
+        // Done here when no tick has the graph; otherwise the tick does it.
+        if let Ok(mut graph) = self.inner.graph.try_lock() {
+            self.drain(&mut graph).await;
+        }
+        match result.await {
+            Ok(value) => value,
+            // The graph went away with what was asked: nothing more can come of it.
+            Err(_) => std::future::pending().await,
+        }
+    }
+
+    async fn drain(&self, graph: &mut RuntimeGraph<M, H>) {
+        loop {
+            let jobs = std::mem::take(&mut *lock(&self.inner.jobs));
+            if jobs.is_empty() {
+                return;
+            }
+            for job in jobs {
+                job(graph).await;
+            }
+        }
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Serves a [`Debuggee`]'s calls.
+struct Handler<M: RuntimeMode, H: Host> {
+    debuggee: Debuggee<M, H>,
+}
+
+impl<M: RuntimeMode, H: Host> Clone for Handler<M, H> {
+    fn clone(&self) -> Self {
+        Self {
+            debuggee: self.debuggee.clone(),
+        }
+    }
+}
+
+impl<M: RuntimeMode, H: Host> Handler<M, H> {
+    fn inner(&self) -> &Inner<M, H> {
+        &self.debuggee.inner
+    }
+
+    fn lines(&self) -> Option<&RuntimeLines> {
+        self.inner().lines.as_ref()
+    }
+}
+
+impl<C: Send + Sync, M: RuntimeMode, H: Host> graph::Handler<C> for Handler<M, H> {
+    async fn describe(&self, _: C) -> anyhow::Result<String> {
+        Ok(self.inner().described.clone())
+    }
+
+    async fn stream_groups(&self, _: C) -> anyhow::Result<Vec<Vec<String>>> {
+        Ok(self.inner().groups.clone())
+    }
+
+    async fn node_state(&self, _: C, node: String) -> anyhow::Result<Result<graph::State, String>> {
+        let node = NodeId::from(node);
+        Ok(self
+            .debuggee
+            .with(move |graph| {
+                Box::pin(async move {
+                    let state = graph.node_state(&node).map_err(|e| e.to_string())?;
+                    let phase = serde_json::to_value(state.phase())
+                        .ok()
+                        .and_then(|value| value.as_str().map(str::to_string))
+                        .unwrap_or_default();
+                    Ok(graph::State {
+                        phase,
+                        fault: state.fault_cause().map(ToString::to_string),
+                        culprit: state.culprit().map(ToString::to_string),
+                    })
+                })
+            })
+            .await)
+    }
+
+    async fn output_version(
+        &self,
+        _: C,
+        node: String,
+        port: String,
+    ) -> anyhow::Result<Result<u64, String>> {
+        let version = self
+            .inner()
+            .reader
+            .output_version(&NodeId::from(node), &PortName::from(port));
+        Ok(version
+            .map(|version| version.get())
+            .map_err(|e| e.to_string()))
+    }
+
+    async fn read_output(
+        &self,
+        _: C,
+        node: String,
+        port: String,
+    ) -> anyhow::Result<Result<Option<String>, String>> {
+        let read = self
+            .inner()
+            .reader
+            .read_output_wave(&NodeId::from(node), &PortName::from(port))
+            .await;
+        Ok(read.map_err(|e| e.to_string()))
+    }
+
+    async fn inject(
+        &self,
+        _: C,
+        node: String,
+        port: String,
+        wave: String,
+    ) -> anyhow::Result<Result<(), String>> {
+        let (node, port) = (NodeId::from(node), PortName::from(port));
+        Ok(self
+            .debuggee
+            .with(move |graph| {
+                Box::pin(async move {
+                    graph
+                        .inject_wave(&node, &port, &wave)
+                        .await
+                        .map_err(|e| e.to_string())
+                })
+            })
+            .await)
+    }
+
+    async fn clear_input(
+        &self,
+        _: C,
+        node: String,
+        port: String,
+    ) -> anyhow::Result<Result<(), String>> {
+        let (node, port) = (NodeId::from(node), PortName::from(port));
+        Ok(self
+            .debuggee
+            .with(move |graph| {
+                Box::pin(async move {
+                    graph
+                        .clear_input(&node, &port)
+                        .await
+                        .map_err(|e| e.to_string())
+                })
+            })
+            .await)
+    }
+
+    async fn rerun(&self, _: C, node: String) -> anyhow::Result<Result<(), String>> {
+        let node = NodeId::from(node);
+        Ok(self
+            .debuggee
+            .with(move |graph| {
+                Box::pin(async move { graph.rerun(&node).map_err(|e| e.to_string()) })
+            })
+            .await)
+    }
+}
+
+impl<C: Send + Sync, M: RuntimeMode, H: Host> holds::Handler<C> for Handler<M, H> {
+    async fn hold_at(&self, _: C, at: holds::Holding) -> anyhow::Result<()> {
+        self.inner().holds.hold_at(match at {
+            holds::Holding::Nodes(nodes) => {
+                HoldAt::Nodes(nodes.into_iter().map(NodeId::from).collect())
+            }
+            holds::Holding::All => HoldAt::All,
+        });
+        Ok(())
+    }
+
+    async fn held(&self, _: C) -> anyhow::Result<Vec<holds::HeldRun>> {
+        Ok(self
+            .inner()
+            .holds
+            .held()
+            .into_iter()
+            .map(held_run)
+            .collect())
+    }
+
+    async fn next_held(&self, _: C) -> anyhow::Result<holds::HeldRun> {
+        Ok(held_run(self.inner().holds.next_held().await))
+    }
+
+    async fn resume(&self, _: C, id: u64) -> anyhow::Result<()> {
+        self.inner().holds.resume(HoldId(id));
+        Ok(())
+    }
+
+    async fn release(&self, _: C) -> anyhow::Result<()> {
+        self.inner().holds.release();
+        Ok(())
+    }
+}
+
+fn held_run(held: witgraph_runtime::HeldRun) -> holds::HeldRun {
+    holds::HeldRun {
+        id: held.id.0,
+        node: held.node.to_string(),
+    }
+}
+
+impl<C: Send + Sync, M: RuntimeMode, H: Host> lines::Handler<C> for Handler<M, H> {
+    async fn files(&self, _: C) -> anyhow::Result<Vec<String>> {
+        Ok(self.lines().map(LineDebugger::files).unwrap_or_default())
+    }
+
+    async fn lines(&self, _: C, file: String) -> anyhow::Result<Vec<u32>> {
+        Ok(self
+            .lines()
+            .map(|lines| lines.lines(&file))
+            .unwrap_or_default())
+    }
+
+    async fn stopped(&self, _: C) -> anyhow::Result<Option<lines::LineStop>> {
+        Ok(self.lines().and_then(LineDebugger::stopped).map(line_stop))
+    }
+
+    async fn next_stop(&self, _: C) -> anyhow::Result<lines::LineStop> {
+        match self.lines() {
+            Some(lines) => Ok(line_stop(lines.next_stop().await)),
+            // Loaded without debugging lines: no stop ever comes.
+            None => std::future::pending().await,
+        }
+    }
+
+    async fn set_breakpoint(&self, _: C, file: String, line: u32) -> anyhow::Result<Option<u32>> {
+        Ok(self
+            .lines()
+            .and_then(|lines| lines.set_breakpoint(&file, line)))
+    }
+
+    async fn clear_breakpoint(&self, _: C, file: String, line: u32) -> anyhow::Result<()> {
+        if let Some(lines) = self.lines() {
+            lines.clear_breakpoint(&file, line);
+        }
+        Ok(())
+    }
+
+    async fn pause(&self, _: C) -> anyhow::Result<()> {
+        self.lines().map(LineDebugger::pause);
+        Ok(())
+    }
+
+    async fn cancel_pause(&self, _: C) -> anyhow::Result<()> {
+        self.lines().map(LineDebugger::cancel_pause);
+        Ok(())
+    }
+
+    async fn resume(&self, _: C) -> anyhow::Result<()> {
+        self.lines().map(LineDebugger::resume);
+        Ok(())
+    }
+
+    async fn step_in(&self, _: C) -> anyhow::Result<()> {
+        self.lines().map(LineDebugger::step_in);
+        Ok(())
+    }
+
+    async fn step_over(&self, _: C) -> anyhow::Result<()> {
+        self.lines().map(LineDebugger::step_over);
+        Ok(())
+    }
+
+    async fn step_out(&self, _: C) -> anyhow::Result<()> {
+        self.lines().map(LineDebugger::step_out);
+        Ok(())
+    }
+
+    async fn release(&self, _: C) -> anyhow::Result<()> {
+        self.lines().map(LineDebugger::release);
+        Ok(())
+    }
+}
+
+fn line_stop(stop: witgraph_runtime::LineStop) -> lines::LineStop {
+    lines::LineStop {
+        reason: match stop.reason {
+            StopReason::Breakpoint => lines::StopReason::Breakpoint,
+            StopReason::Pause => lines::StopReason::Pause,
+            StopReason::Step => lines::StopReason::Step,
+        },
+        file: stop.file,
+        line: stop.line,
+        column: stop.column,
+        node: stop.node.map(|node| node.to_string()),
+        frames: stop
+            .frames
+            .into_iter()
+            .map(|frame| lines::StackFrame {
+                function: frame.function,
+                file: frame.file,
+                line: frame.line,
+            })
+            .collect(),
+        variables: stop
+            .variables
+            .into_iter()
+            .map(|variable| {
+                let mut children = Vec::new();
+                flatten(&variable.name, &variable.children, &mut children);
+                lines::Variable {
+                    name: variable.name,
+                    type_name: variable.type_name,
+                    value: variable.value,
+                    children,
+                }
+            })
+            .collect(),
+    }
+}
+
+/// A variable's fields and items, each with the path to it.
+fn flatten(path: &str, children: &[witgraph_runtime::SourceVariable], out: &mut Vec<lines::Child>) {
+    for child in children {
+        let path = format!("{path}.{}", child.name);
+        out.push(lines::Child {
+            path: path.clone(),
+            type_name: child.type_name.clone(),
+            value: child.value.clone(),
+        });
+        flatten(&path, &child.children, out);
+    }
+}
+
+/// Where a [`Debuggee`] is served, and what a debugger needs to attach.
+pub struct Served {
+    /// The URL to attach to, with the token in it.
+    pub url: String,
+    /// The SHA-256 of the server's certificate, which a browser pins
+    /// (`serverCertificateHashes`): it is self-signed, and valid for 14 days.
+    pub certificate_hash: [u8; 32],
+    /// What a debugger must present, in the URL's `token` parameter.
+    pub token: String,
+    /// Serves until dropped, or until it fails.
+    pub task: tokio::task::JoinHandle<anyhow::Result<()>>,
+}
+
+/// Serves `debuggee` on `addr`, to debuggers presenting `token`.
+///
+/// # Errors
+///
+/// If the certificate cannot be made, or the address bound.
+pub async fn serve<M: RuntimeMode, H: Host>(
+    debuggee: Debuggee<M, H>,
+    addr: SocketAddr,
+    token: String,
+) -> anyhow::Result<Served> {
+    let names = vec![
+        "localhost".to_string(),
+        "127.0.0.1".to_string(),
+        "::1".to_string(),
+        addr.ip().to_string(),
+    ];
+    let mut params =
+        rcgen::CertificateParams::new(names).context("failed to describe the certificate")?;
+    // Browsers pin a certificate by its hash only if it is valid for at most 14 days.
+    params.not_before = time::OffsetDateTime::now_utc();
+    params.not_after = params.not_before + time::Duration::days(14);
+    let key = rcgen::KeyPair::generate().context("failed to make a key")?;
+    let cert = params
+        .self_signed(&key)
+        .context("failed to make a certificate")?;
+    let cert = rustls::pki_types::CertificateDer::from(cert);
+    let provider = web_transport_quinn::crypto::default_provider();
+    let hash = web_transport_quinn::crypto::sha256(&provider, &cert);
+    let mut certificate_hash = [0; 32];
+    certificate_hash.copy_from_slice(hash.as_ref());
+
+    let mut tls = rustls::ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .context("failed to choose TLS 1.3")?
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![cert],
+            rustls::pki_types::PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
+        )
+        .context("failed to configure TLS")?;
+    tls.alpn_protocols = vec![web_transport_quinn::ALPN.as_bytes().to_vec()];
+    let tls = quinn::crypto::rustls::QuicServerConfig::try_from(tls)
+        .context("failed to configure QUIC's TLS")?;
+    let mut transport = quinn::TransportConfig::default();
+    transport.keep_alive_interval(Some(std::time::Duration::from_secs(3)));
+    let mut config = quinn::ServerConfig::with_crypto(Arc::new(tls));
+    config.transport_config(Arc::new(transport));
+    let endpoint =
+        quinn::Endpoint::server(config, addr).with_context(|| format!("failed to bind {addr}"))?;
+    let bound = endpoint
+        .local_addr()
+        .context("failed to read the bound address")?;
+
+    let server = Arc::new(wrpc_webtransport::Server::new());
+    let handler = Handler { debuggee };
+    let invocations = bindings::serve(server.as_ref(), handler)
+        .await
+        .context("failed to serve the debugger's calls")?;
+    let invocations = select_all(
+        invocations
+            .into_iter()
+            .map(|(instance, name, calls)| calls.map(move |call| (instance, name, call))),
+    );
+
+    let host = match bound.ip() {
+        std::net::IpAddr::V6(ip) => format!("[{ip}]"),
+        ip => ip.to_string(),
+    };
+    let url = format!("https://{host}:{}/?token={token}", bound.port());
+    let task = tokio::spawn(run(endpoint, server, invocations, token.clone()));
+    Ok(Served {
+        url,
+        certificate_hash,
+        token,
+        task,
+    })
+}
+
+async fn run(
+    endpoint: quinn::Endpoint,
+    server: Arc<wrpc_webtransport::Server>,
+    mut invocations: impl futures::Stream<
+        Item = (
+            &'static str,
+            &'static str,
+            anyhow::Result<impl std::future::Future<Output = anyhow::Result<()>> + Send + 'static>,
+        ),
+    > + Unpin,
+    token: String,
+) -> anyhow::Result<()> {
+    let mut sessions = tokio::task::JoinSet::new();
+    let mut calls = tokio::task::JoinSet::new();
+    loop {
+        tokio::select! {
+            Some((_, _, call)) = invocations.next() => {
+                if let Ok(call) = call {
+                    calls.spawn(call);
+                }
+            }
+            Some(connecting) = endpoint.accept() => {
+                let (server, token) = (server.clone(), token.clone());
+                sessions.spawn(session(connecting, server, token));
+            }
+            Some(_) = calls.join_next() => {}
+            Some(_) = sessions.join_next() => {}
+            else => return Ok(()),
+        }
+    }
+}
+
+/// Serves one debugger, if it presents the token.
+async fn session(
+    connecting: quinn::Incoming,
+    server: Arc<wrpc_webtransport::Server>,
+    token: String,
+) -> anyhow::Result<()> {
+    let connection = connecting.await.context("failed to accept QUIC")?;
+    let request = web_transport_quinn::Request::accept(connection)
+        .await
+        .context("failed to accept WebTransport")?;
+    let presented = request
+        .url
+        .query_pairs()
+        .find(|(key, _)| key == "token")
+        .map(|(_, value)| value.into_owned());
+    if presented.as_deref() != Some(token.as_str()) {
+        request
+            .reject(web_transport_quinn::http::StatusCode::FORBIDDEN)
+            .await
+            .context("failed to refuse a debugger")?;
+        return Ok(());
+    }
+    let session = request.ok().await.context("failed to open the session")?;
+    loop {
+        let (send, receive) = session.accept_bi().await.context("the debugger left")?;
+        server
+            .accept((), send.into(), receive.into())
+            .await
+            .context("failed to take a call")?;
+    }
+}

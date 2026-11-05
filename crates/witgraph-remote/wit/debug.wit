@@ -1,0 +1,143 @@
+package witgraph:debug@0.1.0;
+
+/// The graph a debugger is attached to: what it is, its state, and what may be asked of it.
+interface graph {
+    /// A node's phase, and why it faulted if it did.
+    record state {
+        /// `idle`, `pending`, `running`, `faulted` or `cancelled`.
+        phase: string,
+        /// What went wrong, if it faulted.
+        fault: option<string>,
+        /// The node whose fault stopped the graph, if known.
+        culprit: option<string>,
+    }
+
+    /// The graph, as the JSON a `witgraph_ir::Graph` serializes to.
+    describe: func() -> string;
+    /// The nodes that run as one, joined by streams and futures.
+    stream-groups: func() -> list<list<string>>;
+    /// A node's state now, while a tick runs too.
+    node-state: func(node: string) -> result<state, string>;
+    /// A number that moves on each time an output is written.
+    output-version: func(node: string, port: string) -> result<u64, string>;
+    /// A Value or handle output port's latched value, as WAVE text.
+    read-output: func(node: string, port: string) -> result<option<string>, string>;
+    /// Writes a Value input port, from WAVE text.
+    inject: func(node: string, port: string, wave: string) -> result<_, string>;
+    /// Clears what was written to an input port.
+    clear-input: func(node: string, port: string) -> result<_, string>;
+    /// Makes a node owe a run on its latched inputs.
+    rerun: func(node: string) -> result<_, string>;
+}
+
+/// Node runs held before they start: node breakpoints, and stepping a node at a time.
+interface holds {
+    /// Whose runs are held.
+    variant holding {
+        /// These nodes'.
+        nodes(list<string>),
+        /// Every node's.
+        all,
+    }
+
+    /// A run held before it starts.
+    record held-run {
+        /// What lets it go.
+        id: u64,
+        /// Whose run it is.
+        node: string,
+    }
+
+    /// Holds these runs from the next to start.
+    hold-at: func(at: holding);
+    /// The runs held now.
+    held: func() -> list<held-run>;
+    /// Waits for the next run held that has not been told of.
+    next-held: func() -> held-run;
+    /// Lets a held run go.
+    resume: func(id: u64);
+    /// Holds nothing, and lets go of all held.
+    release: func();
+}
+
+/// Source lines of guests built with debug info: breakpoints, stepping and variables.
+interface lines {
+    /// Why a guest stopped.
+    enum stop-reason {
+        breakpoint,
+        pause,
+        step,
+    }
+
+    /// A frame of a stopped guest's stack, innermost first.
+    record stack-frame {
+        function: string,
+        file: option<string>,
+        line: option<u32>,
+    }
+
+    /// A variable in scope where a guest stopped, as its source would write it.
+    record variable {
+        name: string,
+        type-name: string,
+        value: string,
+        /// Its fields or items, flattened: `path` says where each sits, `a.b`.
+        children: list<child>,
+    }
+
+    /// A field or item of a variable.
+    record child {
+        path: string,
+        type-name: string,
+        value: string,
+    }
+
+    /// Where a guest stopped.
+    record line-stop {
+        reason: stop-reason,
+        file: string,
+        line: u32,
+        column: u32,
+        node: option<string>,
+        frames: list<stack-frame>,
+        variables: list<variable>,
+    }
+
+    /// The source files with lines to stop on.
+    files: func() -> list<string>;
+    /// The lines of a file that have code.
+    lines: func(file: string) -> list<u32>;
+    /// Where a guest is stopped, if one is.
+    stopped: func() -> option<line-stop>;
+    /// Waits for the next stop not yet told of.
+    next-stop: func() -> line-stop;
+    /// Stops on this line, or the next with code. Says which, if any.
+    set-breakpoint: func(file: string, line: u32) -> option<u32>;
+    /// Stops on it no more.
+    clear-breakpoint: func(file: string, line: u32);
+    /// Stops at the next line any guest reaches.
+    pause: func();
+    /// Takes back a pause no guest has reached.
+    cancel-pause: func();
+    /// Lets the stopped guest go on.
+    resume: func();
+    step-in: func();
+    step-over: func();
+    step-out: func();
+    /// Lets go of everything, with no breakpoints left.
+    release: func();
+}
+
+/// What a debugger attaches to.
+world debuggee {
+    export graph;
+    export holds;
+    export lines;
+}
+
+/// What attaches: a debugger's side of [`debuggee`].
+world debugger {
+    import graph;
+    import holds;
+    import lines;
+}

@@ -28,6 +28,7 @@ let mut linker: Linker<PluginData> = unimplemented!();
 let node: NodeId = unimplemented!();
 let port: PortName = unimplemented!();
 let seen: PortVersion = unimplemented!();
+let token: String = unimplemented!();
 "#;
 
 const DOCS: [&str; 5] = [

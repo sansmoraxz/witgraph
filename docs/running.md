@@ -404,6 +404,32 @@ goes on with the rest until it has nothing else to do. `release()` holds nothing
 lets go of all held. A run held when the graph is shut down or rebuilt is dropped with its
 instance. It is the `NodeHolds` trait of `witgraph-traits`.
 
+## Attaching a debugger
+
+`witgraph-remote` lets a debugger attach to a graph you run, from elsewhere, over
+[wRPC](https://github.com/bytecodealliance/wrpc) on WebTransport. Wrap the graph in a
+`Debuggee`, tick it through that, and serve it:
+
+```rust
+use witgraph_remote::{Debuggee, serve};
+
+let debuggee = Debuggee::new(rt)?;
+let served = serve(debuggee.clone(), "0.0.0.0:4433".parse()?, token).await?;
+println!("{} {:02x?}", served.url, served.certificate_hash);
+loop {
+    let _ = debuggee.tick().await; // as `rt.tick()` was
+}
+```
+
+A debugger presents the token in the URL, and pins the server's self-signed certificate by
+the hash, as a browser does with `serverCertificateHashes`: anyone with the token can pause
+the guests and read their memory, so keep it secret. It can hold nodes, stop on lines (with
+`debug_lines` set), read outputs, write inputs and rerun nodes, but not change the graph.
+Your own calls on the graph go through `debuggee.with(...)`. What it asks that needs the
+graph while a tick runs ends that tick early, is done, and the tick goes on, so a debugger
+sees in even while a held node keeps the tick from ending. The interface is
+`crates/witgraph-remote/wit/debug.wit`.
+
 ## Stopping on a source line
 
 Debugging is off unless you ask for it, twice over, as **it slows a graph down significantly**: it
