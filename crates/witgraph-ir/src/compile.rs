@@ -1177,20 +1177,6 @@ fn check_group_start(
     }
 }
 
-/// Every node with a path of connections to `node`, feedback aside.
-fn upstream_of<'g>(graph: &'g Graph, node: &'g NodeId) -> HashSet<&'g NodeId> {
-    let mut upstream: HashSet<&NodeId> = HashSet::new();
-    let mut waiting = vec![node];
-    while let Some(next) = waiting.pop() {
-        for conn in graph.connections.iter().filter(|conn| !conn.feedback) {
-            if conn.to.node == *next && upstream.insert(&conn.from.node) {
-                waiting.push(&conn.from.node);
-            }
-        }
-    }
-    upstream
-}
-
 /// A stream group holds its members' claims together from when the first
 /// starts until it has drained (see [`ResourceClaim`](crate::ResourceClaim)),
 /// as its producer's writer outlives `run`. So a group whose claims on one
@@ -1199,18 +1185,11 @@ fn upstream_of<'g>(graph: &'g Graph, node: &'g NodeId) -> HashSet<&'g NodeId> {
 /// what the next needs would wait for it forever.
 ///
 /// What is only above a group needs no room beside it, as the scheduler does not start
-/// the group until that has settled. There are two exceptions: what is below the group
-/// too may need it started, and what can stall (see [`stallable_units`]) does not count
-/// as able to run, so the group starts without it. Either way the group holds its claims
-/// while that waits. Groups in that state must leave room for what they wait for,
-/// together, as each can fit alone while all of them leave none of them room. Others
-/// drain by themselves, so they only delay it.
-fn check_group_claims(
-    graph: &Graph,
-    contracts: &HashMap<&NodeId, &ComponentContract>,
-    groups: &StreamGroups,
-    diagnostics: &mut Diagnostics,
-) {
+/// the group until that has settled. What is below the group too may need it started, so
+/// the group holds its claims while that waits. Groups in that state must leave room for
+/// what they wait for, together, as each can fit alone while all of them leave none of
+/// them room. Others drain by themselves, so they only delay it.
+fn check_group_claims(graph: &Graph, groups: &StreamGroups, diagnostics: &mut Diagnostics) {
     // Tolerates float rounding in sums of fractions such as 0.1 + 0.2.
     const EPSILON: f64 = 1e-9;
     let mut nodes: HashMap<&NodeId, &Node> = HashMap::new();
@@ -1263,7 +1242,6 @@ fn check_group_claims(
         }
     }
     let below_map = below_map(graph);
-    let stalls = stallable_units(contracts, groups, &units, graph, &below_map);
     let mut holders: Vec<Holder<'_>> = Vec::new();
     for (at, members) in groups.groups.iter().enumerate() {
         let claims = claims_of(
@@ -1275,16 +1253,13 @@ fn check_group_claims(
         if claims.is_empty() || claims.values().any(|sum| *sum > 1.0 + EPSILON) {
             continue;
         }
-        let above: HashSet<&NodeId> = members
-            .iter()
-            .flat_map(|member| upstream_of(graph, member))
-            .collect();
+        let above = above_group(members, graph, groups);
         let below = below_group(members, &below_map, groups);
         let mut waits = Vec::new();
         for (unit, nodes_of) in units.iter().enumerate().filter(|(unit, _)| *unit != at) {
             let waited_for = nodes_of
                 .iter()
-                .any(|node| above.contains(*node) && (stalls[unit] || below.contains(*node)));
+                .any(|node| above.contains(*node) && below.contains(*node));
             if !waited_for {
                 continue;
             }
@@ -1375,53 +1350,6 @@ fn check_group_claims(
     }
 }
 
-/// By unit: whether what reads it may start before it has run. The scheduler holds a node
-/// back for what above it could run now, and a stream group that lacks a required input
-/// from outside cannot run now, so what reads its other members goes ahead. The same goes
-/// for everything below such a group.
-fn stallable_units(
-    contracts: &HashMap<&NodeId, &ComponentContract>,
-    groups: &StreamGroups,
-    units: &[Vec<&NodeId>],
-    graph: &Graph,
-    below_map: &HashMap<&NodeId, Vec<&NodeId>>,
-) -> Vec<bool> {
-    let mut stalled: HashSet<&NodeId> = HashSet::new();
-    for members in &groups.groups {
-        let lacks = members.iter().any(|member| {
-            contracts.get(member).is_some_and(|contract| {
-                contract
-                    .inputs
-                    .iter()
-                    .filter(|input| !input.is_optional())
-                    .any(|input| {
-                        graph.connections.iter().any(|conn| {
-                            !conn.feedback
-                                && conn.to.node == *member
-                                && conn.to.port == input.name
-                                && !members.contains(&conn.from.node)
-                        })
-                    })
-            })
-        });
-        if lacks {
-            stalled.extend(members.iter());
-        }
-    }
-    let mut waiting: Vec<&NodeId> = stalled.iter().copied().collect();
-    while let Some(next) = waiting.pop() {
-        for node in below_map.get(next).into_iter().flatten() {
-            if stalled.insert(node) {
-                waiting.push(node);
-            }
-        }
-    }
-    units
-        .iter()
-        .map(|nodes_of| nodes_of.iter().any(|node| stalled.contains(*node)))
-        .collect()
-}
-
 /// By node, the nodes it writes to over a non-feedback connection.
 fn below_map(graph: &Graph) -> HashMap<&NodeId, Vec<&NodeId>> {
     let mut below: HashMap<&NodeId, Vec<&NodeId>> = HashMap::new();
@@ -1432,6 +1360,35 @@ fn below_map(graph: &Graph) -> HashMap<&NodeId, Vec<&NodeId>> {
             .push(&conn.to.node);
     }
     below
+}
+
+/// What is above any of `members`, a group above counting as one, as the scheduler has it.
+fn above_group<'g>(
+    members: &'g [NodeId],
+    graph: &'g Graph,
+    groups: &'g StreamGroups,
+) -> HashSet<&'g NodeId> {
+    let mut above: HashSet<&NodeId> = HashSet::new();
+    let mut waiting: Vec<&NodeId> = members.iter().collect();
+    while let Some(next) = waiting.pop() {
+        let upstream = graph
+            .connections
+            .iter()
+            .filter(|conn| !conn.feedback && conn.to.node == *next)
+            .map(|conn| &conn.from.node);
+        let in_group = groups
+            .in_group
+            .get(next)
+            .and_then(|group| groups.groups.get(*group))
+            .into_iter()
+            .flatten();
+        for node in upstream.chain(in_group) {
+            if above.insert(node) {
+                waiting.push(node);
+            }
+        }
+    }
+    above
 }
 
 /// What is below any of `members`, with one member of another group making all of that
@@ -1617,7 +1574,7 @@ impl Graph {
         }
         if let Some(groups) = &groups {
             check_group_start(&self, &node_contracts, groups, &mut diagnostics);
-            check_group_claims(&self, &node_contracts, groups, &mut diagnostics);
+            check_group_claims(&self, groups, &mut diagnostics);
         }
 
         // `order` (and with it `groups`) is None only when IllegalCycle
@@ -2838,17 +2795,12 @@ mod tests {
     }
 
     #[test]
-    fn being_above_a_group_does_not_put_a_stalled_group_before_it() {
-        let found = diags(a_group_above_others_yet_after_one(0.6).compile());
-        assert!(
-            found.iter().any(|d| matches!(
-                d,
-                Diagnostic::ClaimsCanDeadlock { resource, .. } if resource.as_str() == "disk"
-            )),
-            "{found:?}"
-        );
-        // With room for `e`'s group beside the other two, it runs.
-        assert!(a_group_above_others_yet_after_one(0.4).compile().is_ok());
+    fn a_group_waiting_for_what_is_above_it_holds_back_what_it_is_above() {
+        // `e`'s group waits for `a`, and is above `g`'s, which the scheduler holds back: only
+        // `e`'s group and `a`'s must fit together.
+        a_group_above_others_yet_after_one(0.6)
+            .compile()
+            .expect("`g`'s group waits its turn");
     }
 
     #[test]

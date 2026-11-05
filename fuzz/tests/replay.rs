@@ -101,6 +101,15 @@ fn graphs_that_once_failed() {
     }
 }
 
+/// Inputs of `graph_run` that once failed, for what a graph with no changes does not show.
+#[test]
+fn runs_that_once_failed() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("regressions/graph_run");
+    for entry in fs::read_dir(root).unwrap() {
+        graph_run(&fs::read(entry.unwrap().path()).unwrap());
+    }
+}
+
 /// Writes generated graphs as JSON, for `graph_json` to start from:
 /// `WITGRAPH_FUZZ_SEEDS=fuzz/corpus/graph_json cargo test -p witgraph-fuzz write_seeds`.
 #[test]
