@@ -559,6 +559,9 @@ test.describe('Video pipeline demo', () => {
     }
     const controls = page.locator('witgraph-controls');
     await expect(controls.locator('.badge')).toContainText('Running');
+    const status = page.locator('#status');
+    await expect(status).toHaveClass(/running/);
+    await expect(status).toContainText('Still running — 7 of 7 nodes');
     // Nothing here is wrong, so nothing should read as though it were.
     const inspector = page.locator('witgraph-inspector');
     await canvas.evaluate((el: WitgraphCanvas) => el.controller?.select('gray'));
@@ -572,6 +575,8 @@ test.describe('Video pipeline demo', () => {
     await expect.poll(() => phase('camera')).toBe('cancelled');
     await expect(stop).toBeDisabled();
     await expect(controls.locator('.badge')).toContainText('Idle');
+    await expect(status).toHaveClass(/ready/);
+    await expect(status).toContainText('Graph compiles');
     await expect(inspector).toContainText('stream ended');
   });
 

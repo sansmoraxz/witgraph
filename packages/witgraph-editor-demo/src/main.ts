@@ -614,6 +614,8 @@ async function loadDemo(): Promise<void> {
 function updateStatus(): void {
   const error = controller.compileError;
   const mode = controller.mode;
+  // A step can leave a stream going, with no run under way.
+  const running = [...controller.nodes.values()].filter((node) => node.phase === 'running');
   let state: 'ready' | 'running' | 'paused' | 'error';
   let text: string;
   if (error) {
@@ -629,6 +631,9 @@ function updateStatus(): void {
   } else if (mode === 'error') {
     state = 'error';
     text = 'The run stopped on an error. The timeline says what failed.';
+  } else if (running.length > 0) {
+    state = 'running';
+    text = `Still running — ${running.length} of ${controller.nodes.size} nodes. Click Stop to end them.`;
   } else {
     state = 'ready';
     text = `Graph compiles — ${controller.nodes.size} nodes, ${controller.edges.length} edges. Click Run or Step to execute.`;
