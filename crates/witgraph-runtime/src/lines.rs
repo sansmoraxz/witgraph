@@ -139,7 +139,7 @@ impl Shared {
 
     /// Makes what the Store has set what is wanted.
     fn sync<D: 'static>(&self, store: &mut StoreContextMut<'_, D>) {
-        let (modules, adding, removing, single, kept) = {
+        let (modules, adding, removing, single) = {
             let mut state = self.state();
             let wanted = state.wanted();
             let adding: Vec<_> = wanted.difference(&state.set).copied().collect();
@@ -159,8 +159,7 @@ impl Shared {
             let change = (single != state.single_stepping).then_some(single);
             state.set = wanted;
             state.single_stepping = single;
-            let kept: Vec<_> = state.set.iter().copied().collect();
-            (state.modules.clone(), adding, removing, change, kept)
+            (state.modules.clone(), adding, removing, change)
         };
         if adding.is_empty() && removing.is_empty() && single.is_none() {
             return;
@@ -184,15 +183,6 @@ impl Shared {
         }
         if let Some(on) = single {
             let _ = edit.single_step(on);
-            // Ending single-stepping leaves the code unpatched for what is set: set them again.
-            if !on {
-                for (at, probe) in kept {
-                    if let Some((module, pc)) = offset(at, probe) {
-                        let _ = edit.remove_breakpoint(module, pc);
-                        let _ = edit.add_breakpoint(module, pc);
-                    }
-                }
-            }
         }
     }
 

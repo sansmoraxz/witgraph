@@ -48,13 +48,13 @@ serde_json = "1.0"
 sha2 = "0.11"
 # wasmtime and the wasm-tools crates move together: this wasmtime is built on
 # wasm-tools 0.263. Bump every wasm-tools crate below together with wasmtime.
-# Bugs in wit-parser and wac are fixed on `witgraph-patches` in our forks, as
-# are those in oci-client, which is patched below.
+# Bugs in wasmtime, wit-parser and wac are fixed on `witgraph-patches` in our
+# forks, as are those in oci-client, which is patched below.
 #
-# wasmtime is pinned to a commit of main: the fix for a table leak in
-# guest-to-guest async calls is not in 50.0.1. Move back to crates.io once
-# 51.0.0 is out, expected 2026-11-20.
-wasmtime = { git = "https://github.com/bytecodealliance/wasmtime", rev = "4c1c3f3404e85d2838f3ebfdbf957d458139cb55", default-features = false }
+# wasmtime's is on upstream main, for the fix for a table leak in
+# guest-to-guest async calls, not in 50.0.1, and keeps a component's
+# breakpoints when single-stepping ends.
+wasmtime = { git = "https://github.com/sansmoraxz/wasmtime", rev = "3bf0aff7612b91910772b3ceb0137aed4f3e7022", default-features = false }
 wit-parser = "0.263"
 wit-component = "0.263"
 wasmparser = { version = "0.263", default-features = false }
