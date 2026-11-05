@@ -23,12 +23,14 @@ use wasm_encoder::{
     BlockType, CodeSection, EntityType, ExportKind, ExportSection, Function, ImportSection,
     Instruction, MemArg, MemArgTarget, MemorySection, MemoryType, TypeSection, ValType,
 };
-use wasmparser::{CompositeInnerType, FunctionBody, KnownCustom, Name, Parser, Payload, TypeRef};
+use wasmparser::{
+    CompositeInnerType, FunctionBody, KnownCustom, Name, Operator, Parser, Payload, TypeRef,
+};
 
 mod variables;
 use variables::ReadFrom;
 pub use variables::{Frame, ModuleDebug};
-pub use witgraph_traits::lines::SourceVariable as Variable;
+pub use witgraph_traits::lines::{OwnLines, SourceVariable as Variable};
 
 /// The module of the import a probe calls.
 pub const IMPORT_MODULE: &str = "witgraph:debug";
@@ -57,16 +59,6 @@ pub enum ProbeError {
         /// The lines there were.
         sites: usize,
     },
-}
-
-/// Which source lines to probe.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Lines {
-    /// The guest's own: not the standard library's, or a dependency's. Stepping stays out of
-    /// those, and a probe in a tight loop of theirs costs nothing.
-    Own,
-    /// Every line the debug info has.
-    All,
 }
 
 /// Where a probe's flag is, and what it passes to the import.
@@ -100,8 +92,21 @@ pub struct Instrumented {
     pub module: Vec<u8>,
     /// The probes, each at its [`ProbeId`].
     pub probes: Vec<Probe>,
+    /// The calls in functions with probes, for finding the line of a stack frame.
+    pub calls: Vec<CallSite>,
     /// Where a firing probe writes out what it can see, in the memory of flags.
     pub spill: Spill,
+}
+
+/// A call, in the module with probes and in the original.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CallSite {
+    /// Where it is in the new module, as a stack trace of that gives it.
+    pub offset: ModuleOffset,
+    /// Where it is in the original.
+    pub original: ModuleOffset,
+    /// The function it is in, by its index in the original.
+    pub function: u32,
 }
 
 /// Where a firing probe writes out locals and globals: 8 bytes for each, little-endian, the
@@ -145,21 +150,6 @@ struct Row {
     file: String,
     line: u32,
     column: u32,
-}
-
-/// Paths a guest's own code does not live under.
-const NOT_OWN: [&str; 6] = [
-    "/rustc/",
-    "/rustlib/",
-    "/rust/deps/",
-    "/.cargo/",
-    "/cargo/registry/",
-    "/cargo/git/",
-];
-
-/// Whether `file` is the guest's own, not the standard library's or a dependency's.
-fn is_own(file: &str) -> bool {
-    !NOT_OWN.iter().any(|path| file.contains(path))
 }
 
 /// The first row of each run of one line, by address.
@@ -706,15 +696,13 @@ fn rewrite(
 
 /// Puts a probe on each of `lines` in `module`. `None` if it has none: it has no debug info,
 /// or only of code that is not its own, and can run as it is.
-pub fn instrument(module: &[u8], lines: Lines) -> Result<Option<Instrumented>, ProbeError> {
+pub fn instrument(module: &[u8], lines: &OwnLines) -> Result<Option<Instrumented>, ProbeError> {
     let shape = shape_of(module)?;
     let Some(code_start) = shape.code_start else {
         return Ok(None);
     };
     let mut rows = line_rows(module)?;
-    if lines == Lines::Own {
-        rows.retain(|row| is_own(&row.file));
-    }
+    rows.retain(|row| lines.covers(&row.file));
     if rows.is_empty() {
         return Ok(None);
     }
@@ -724,7 +712,11 @@ pub fn instrument(module: &[u8], lines: Lines) -> Result<Option<Instrumented>, P
         Some(debug) => debug.read_from()?,
         None => ReadFrom::default(),
     };
-    let (module, functions, spill) = rewrite(module, shape, read_from, &sites)?;
+    let imported = shape.imported_functions;
+    let (rewritten, functions, spill) = rewrite(module, shape, read_from, &sites)?;
+    let with_probes: HashSet<u32> = functions.iter().copied().collect();
+    let calls = call_sites(module, &rewritten, imported, &with_probes)?;
+    let module = rewritten;
     let probes = rows
         .into_iter()
         .zip(functions)
@@ -740,21 +732,69 @@ pub fn instrument(module: &[u8], lines: Lines) -> Result<Option<Instrumented>, P
     Ok(Some(Instrumented {
         module,
         probes,
+        calls,
         spill,
     }))
 }
 
+/// The offsets of the calls in each function of `module`, but for those of `leaving_out`.
+fn calls_by_function(module: &[u8], leaving_out: Option<u32>) -> Result<Vec<Vec<u32>>, ProbeError> {
+    let mut calls = Vec::new();
+    for payload in Parser::new(0).parse_all(module) {
+        if let Payload::CodeSectionEntry(body) = payload? {
+            let mut here = Vec::new();
+            let mut reader = body.get_operators_reader()?;
+            while !reader.eof() {
+                let at = u32::try_from(reader.original_position()).unwrap_or(u32::MAX);
+                match reader.read()? {
+                    Operator::Call { function_index } if Some(function_index) == leaving_out => {}
+                    Operator::Call { .. }
+                    | Operator::CallIndirect { .. }
+                    | Operator::CallRef { .. } => here.push(at),
+                    _ => {}
+                }
+            }
+            calls.push(here);
+        }
+    }
+    Ok(calls)
+}
+
+/// Pairs up the calls of a module and of what [`rewrite`] made of it, whose only new ones call
+/// the probe.
+fn call_sites(
+    original: &[u8],
+    rewritten: &[u8],
+    imported: u32,
+    with_probes: &HashSet<u32>,
+) -> Result<Vec<CallSite>, ProbeError> {
+    let before = calls_by_function(original, None)?;
+    let after = calls_by_function(rewritten, Some(imported))?;
+    let mut sites = Vec::new();
+    for (at, (before, after)) in before.iter().zip(&after).enumerate() {
+        let function = imported + u32::try_from(at).unwrap_or(u32::MAX);
+        if with_probes.contains(&function) {
+            for (old, new) in before.iter().zip(after) {
+                sites.push(CallSite {
+                    offset: ModuleOffset(*new),
+                    original: ModuleOffset(*old),
+                    function,
+                });
+            }
+        }
+    }
+    Ok(sites)
+}
+
 /// `module`'s source lines, with no change to it, for a host that can set breakpoints itself:
 /// each [`Probe`] says where it stands, moved up to the operator a breakpoint can be set on.
-pub fn source_lines(module: &[u8], lines: Lines) -> Result<Vec<Probe>, ProbeError> {
+pub fn source_lines(module: &[u8], lines: &OwnLines) -> Result<Vec<Probe>, ProbeError> {
     let shape = shape_of(module)?;
     let Some(code_start) = shape.code_start else {
         return Ok(Vec::new());
     };
     let mut rows = line_rows(module)?;
-    if lines == Lines::Own {
-        rows.retain(|row| is_own(&row.file));
-    }
+    rows.retain(|row| lines.covers(&row.file));
     let mut rows = rows.into_iter().peekable();
     let mut function = shape.imported_functions;
     let mut probes = Vec::new();
@@ -778,6 +818,11 @@ pub fn source_lines(module: &[u8], lines: Lines) -> Result<Vec<Probe>, ProbeErro
         }
     }
     Ok(probes)
+}
+
+/// How many functions `module` imports: a defined function's index comes after those.
+pub fn imported_functions(module: &[u8]) -> Result<u32, ProbeError> {
+    Ok(shape_of(module)?.imported_functions)
 }
 
 /// By a defined function's index among those a module defines, its name as a person reads it.
@@ -903,6 +948,17 @@ impl LineIndex {
         self.by_offset.get(&offset).copied()
     }
 
+    /// The line `offset` is on, in `function`: the last to start at or before it there.
+    #[must_use]
+    pub fn line_at(&self, function: u32, offset: u32) -> Option<&Probe> {
+        let after = self
+            .probes
+            .partition_point(|probe| probe.offset.0 <= offset);
+        self.probes
+            .get(after.checked_sub(1)?)
+            .filter(|probe| probe.function == function)
+    }
+
     /// A line, by its id.
     #[must_use]
     pub fn probe(&self, id: ProbeId) -> Option<&Probe> {
@@ -999,7 +1055,7 @@ mod tests {
 
     #[test]
     fn probes_stand_on_the_guests_own_lines() {
-        let instrumented = instrument(&line_walk(), Lines::Own).unwrap().unwrap();
+        let instrumented = instrument(&line_walk(), &OwnLines::Guess).unwrap().unwrap();
         validate(&instrumented.module);
         assert!(
             instrumented
@@ -1035,17 +1091,21 @@ mod tests {
     #[test]
     fn all_lines_reach_into_what_is_not_the_guests() {
         let module = line_walk();
-        let own = instrument(&module, Lines::Own).unwrap().unwrap();
-        let all = instrument(&module, Lines::All).unwrap().unwrap();
+        let own = instrument(&module, &OwnLines::Guess).unwrap().unwrap();
+        let all = instrument(&module, &OwnLines::All).unwrap().unwrap();
         validate(&all.module);
         assert!(all.probes.len() > own.probes.len() * 2);
-        assert!(all.probes.iter().any(|probe| !is_own(&probe.file)));
+        assert!(
+            all.probes
+                .iter()
+                .any(|probe| !OwnLines::Guess.covers(&probe.file))
+        );
     }
 
     #[test]
     fn the_rewrite_keeps_memories_and_names_where_they_mean_the_same() {
         let module = line_walk();
-        let instrumented = instrument(&module, Lines::Own).unwrap().unwrap();
+        let instrumented = instrument(&module, &OwnLines::Guess).unwrap().unwrap();
         let shape = shape_of(&module).unwrap();
 
         let found = exports(&instrumented.module);
@@ -1095,9 +1155,80 @@ mod tests {
     }
 
     #[test]
+    fn a_host_can_say_what_counts_as_its_own() {
+        let module = line_walk();
+        let guessed = instrument(&module, &OwnLines::Guess).unwrap().unwrap();
+        let file = guessed.probes[0].file.clone();
+        let directory = file.strip_suffix("lib.rs").unwrap().to_string();
+
+        let under = OwnLines::Under(vec![directory]);
+        let mine = instrument(&module, &under).unwrap().unwrap();
+        assert_eq!(mine.probes.len(), guessed.probes.len());
+
+        // Not what a Rust guess would pick: only the standard library's.
+        let library = OwnLines::Under(vec!["/rustc/".to_string()]);
+        let all = instrument(&module, &OwnLines::All).unwrap().unwrap();
+        let rustc = all
+            .probes
+            .iter()
+            .find(|probe| probe.file.starts_with("/rustc/"));
+        let theirs = instrument(&module, &library).unwrap();
+        assert_eq!(rustc.is_some(), theirs.is_some());
+
+        let nothing = OwnLines::Under(vec!["/nowhere/".to_string()]);
+        assert!(instrument(&module, &nothing).unwrap().is_none());
+    }
+
+    #[test]
+    fn calls_are_paired_up_past_the_probes_and_find_their_lines() {
+        let module = line_walk();
+        let instrumented = instrument(&module, &OwnLines::Guess).unwrap().unwrap();
+        let index = LineIndex::new(source_lines(&module, &OwnLines::Guess).unwrap());
+        let [file] = index.files().collect::<Vec<_>>()[..] else {
+            panic!("one file of its own");
+        };
+        let first = index
+            .probe(index.sites(file, marked("walk-first"))[0])
+            .unwrap();
+        // `walk` calls `add` from its first line.
+        let call = instrumented
+            .calls
+            .iter()
+            .find(|call| {
+                call.function == first.function
+                    && index
+                        .line_at(call.function, call.original.0)
+                        .map(|p| p.line)
+                        == Some(marked("walk-first"))
+            })
+            .expect("a call on `walk`'s first line");
+        assert_ne!(call.offset, call.original, "the probes moved it");
+        let mut read = Parser::new(0).parse_all(&instrumented.module);
+        let is_call = read.any(|payload| match payload.unwrap() {
+            Payload::CodeSectionEntry(body) => {
+                let mut reader = body.get_operators_reader().unwrap();
+                let mut found = false;
+                while !reader.eof() {
+                    let at = u32::try_from(reader.original_position()).unwrap();
+                    let operator = reader.read().unwrap();
+                    found |= at == call.offset.0 && matches!(operator, Operator::Call { .. });
+                }
+                found
+            }
+            _ => false,
+        });
+        assert!(is_call, "the offset is that of a call in the new module");
+        assert_eq!(
+            index.line_at(first.function + 1, first.offset.0),
+            None,
+            "in that function"
+        );
+    }
+
+    #[test]
     fn lines_stand_on_operators_and_say_how_a_step_ends() {
         let module = line_walk();
-        let index = LineIndex::new(source_lines(&module, Lines::Own).unwrap());
+        let index = LineIndex::new(source_lines(&module, &OwnLines::Guess).unwrap());
         let [file] = index.files().collect::<Vec<_>>()[..] else {
             panic!("one file of its own");
         };
@@ -1128,7 +1259,7 @@ mod tests {
         let module = line_walk();
         let shape = shape_of(&module).unwrap();
         let names = defined_function_names(&module).unwrap();
-        let index = LineIndex::new(source_lines(&module, Lines::Own).unwrap());
+        let index = LineIndex::new(source_lines(&module, &OwnLines::Guess).unwrap());
         let [file] = index.files().collect::<Vec<_>>()[..] else {
             panic!("one file of its own");
         };
@@ -1150,7 +1281,7 @@ mod tests {
         let read = debug.read_from().unwrap();
         // Rust keeps each variable in memory, behind a frame pointer, at this level.
         let mut body = None;
-        let walk = instrument(&module, Lines::Own)
+        let walk = instrument(&module, &OwnLines::Guess)
             .unwrap()
             .unwrap()
             .probes
@@ -1173,7 +1304,7 @@ mod tests {
     #[test]
     fn a_module_with_no_debug_info_runs_as_it_is() {
         let module = wat::parse_str("(module (func (export \"f\")))").unwrap();
-        assert!(instrument(&module, Lines::All).unwrap().is_none());
+        assert!(instrument(&module, &OwnLines::All).unwrap().is_none());
         let component = wat::parse_str("(component)").unwrap();
         assert!(core_modules(&component).unwrap().is_empty());
     }

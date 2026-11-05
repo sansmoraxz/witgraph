@@ -1138,7 +1138,7 @@ fn summary_of(type_name: &str, children: &[Variable]) -> String {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use crate::{Lines, core_modules, instrument};
+    use crate::{OwnLines, core_modules, instrument};
 
     const SOURCE: &str =
         include_str!("../../../test-fixtures/test-components/guests/line-walk/src/lib.rs");
@@ -1169,7 +1169,7 @@ mod tests {
     fn names_at(mark: &str) -> Vec<String> {
         let modules = core_modules(test_components::LINE_WALK.wasm).unwrap();
         let module = modules.iter().max_by_key(|module| module.len()).unwrap();
-        let instrumented = instrument(module, Lines::Own).unwrap().unwrap();
+        let instrumented = instrument(module, &OwnLines::Guess).unwrap().unwrap();
         let line = marked(mark);
         let probe = instrumented
             .probes

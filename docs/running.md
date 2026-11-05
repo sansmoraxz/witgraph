@@ -365,12 +365,13 @@ unseen on wasmtime, so they aren't traced.
 ## Stopping on a source line
 
 Debugging is off unless you ask for it, twice over, as **it slows a graph down significantly**: it
-takes the `debug` feature, and `debug_lines` set. Then a guest built with debug info can be stopped
+takes the `debug` feature, and `debug_lines` set to which of a guest's lines count as its own
+(`OwnLines`: `Guess`, by Rust's paths, `Under` paths you name, or `All`). Then a guest built with debug info can be stopped
 on a line of its source, with `RuntimeGraph::lines`. This is the `LineDebugger` trait, which the
 [JavaScript host](javascript.md#stopping-on-a-source-line) has too, in its own idiom:
 
 ```rust,ignore
-let config = RuntimeConfig { debug_lines: true, ..RuntimeConfig::default() };
+let config = RuntimeConfig { debug_lines: Some(OwnLines::Guess), ..RuntimeConfig::default() };
 let mut graph = RuntimeGraph::load(compiled, &wasm, config, Perf).await?;
 let lines = graph.lines().expect("loaded to debug");
 

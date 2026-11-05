@@ -95,7 +95,7 @@ export interface RemoteSessionOptions {
    * says where a guest has stopped. It needs shared memory, so a page that is
    * cross-origin isolated, and a real worker, as a stop blocks the thread.
    */
-  lines?: { all?: boolean; onStop: (stop: LineStop) => void };
+  lines?: { all?: boolean; own?: readonly string[]; onStop: (stop: LineStop) => void };
 }
 
 /** The state a worker reports. */
@@ -251,7 +251,7 @@ class Served {
       mocked: string[];
       holds: readonly string[] | 'all';
       observed: readonly (readonly [string, string])[];
-      lines?: { all?: boolean };
+      lines?: { all?: boolean; own?: readonly string[] };
     },
     ask: (kind: string, fields: object) => Promise<unknown>,
   ): Promise<Loaded> {
@@ -262,7 +262,7 @@ class Served {
       this.#lines = new LineProbes(
         (kind, fields) => this.#post(kind, fields),
         () => this.report(),
-        message.lines.all,
+        message.lines,
       );
     }
     const mocks = Object.fromEntries(
@@ -316,7 +316,8 @@ class Served {
   }
 
   #beforeRun(node: string): void | Promise<void> {
-    const held = this.#holds === 'all' || this.#holds.has(node);
+    const held =
+      this.#holds === 'all' || this.#holds.has(node) || this.#lines?.holdingNodes === true;
     this.#reportSoon();
     if (!held) {
       this.#post('before', { node });
@@ -842,7 +843,7 @@ export class RemoteSession {
         mocked: Object.keys(mocks).filter((node) => typeof mocks[node] === 'function'),
         holds: options.holds ?? [],
         observed: options.observed ?? [],
-        ...(options.lines ? { lines: { all: options.lines.all } } : {}),
+        ...(options.lines ? { lines: { all: options.lines.all, own: options.lines.own } } : {}),
       })) as Loaded;
     } catch (error) {
       channel.sessions.delete(id);

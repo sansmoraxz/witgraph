@@ -254,6 +254,7 @@ interface Transpiled {
   probed: {
     module: WebAssembly.Module;
     probes: SourceProbe[];
+    calls: Uint32Array;
     sha256: string;
     variables?: ModuleVariables;
   }[];
@@ -264,6 +265,7 @@ interface InstrumentedModule {
   bytes: Uint8Array;
   sha256: string;
   probes: SourceProbe[];
+  calls: Uint32Array;
   spill: { base: number; globals: number };
 }
 
@@ -442,8 +444,9 @@ export class Session {
       const imports = web.imports(transpiled.imports) as ImportKind[];
       const ofModule = web.moduleNodes() as Record<string, string[]>;
       options.lines?.modules?.(
-        transpiled.probed.map(({ probes, sha256, variables }) => ({
+        transpiled.probed.map(({ probes, calls, sha256, variables }) => ({
           probes,
+          calls,
           nodes: ofModule[sha256] ?? [],
           variablesAt: (offset, flags, memory) =>
             (variables?.at(offset, flags, memory) ?? []) as SourceVariable[],
@@ -916,7 +919,9 @@ function transpileCached(
   lines: SessionLines | undefined,
 ): Promise<Transpiled> {
   // Probes make other modules of the same bytes.
-  const key = lines ? `${sha256}:lines:${lines.all ?? false}` : sha256;
+  const key = lines
+    ? `${sha256}:lines:${lines.all ?? false}:${JSON.stringify(lines.own ?? null)}`
+    : sha256;
   let transpiled = transpileCache.get(key);
   if (transpiled === undefined) {
     transpiled = transpileComposite(bytes, lines);
@@ -957,7 +962,12 @@ async function transpileComposite(
   for (const [name, contents] of files as [string, Uint8Array<ArrayBuffer>][]) {
     if (name.endsWith('.wasm')) {
       const rewritten =
-        lines && (instrumentModule(contents, lines.all ?? false) as InstrumentedModule | null);
+        lines &&
+        (instrumentModule(
+          contents,
+          lines.all ?? false,
+          lines.own ? [...lines.own] : undefined,
+        ) as InstrumentedModule | null);
       const compiling = WebAssembly.compile(
         rewritten ? (rewritten.bytes as Uint8Array<ArrayBuffer>) : contents,
       );
@@ -966,6 +976,7 @@ async function transpileComposite(
         probed.push({
           module: await compiling,
           probes: rewritten.probes,
+          calls: rewritten.calls,
           sha256: rewritten.sha256,
           variables:
             moduleVariables(contents, rewritten.spill.base, rewritten.spill.globals) ?? undefined,
@@ -1032,6 +1043,7 @@ export {
   type SessionLines,
   type SourceProbe,
   type SourceVariable,
+  type StackFrame,
 } from './lines.ts';
 export {
   describeHandle,

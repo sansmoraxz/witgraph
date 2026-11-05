@@ -128,9 +128,10 @@ pub struct RuntimeConfig {
     /// Lets guests built with debug info be stopped on a line of their source:
     /// [`RuntimeGraph::lines`]. Wasmtime then keeps every value where it can be looked at, so
     /// guests run about 20 times slower, breakpoints or not. It needs an engine from
-    /// [`new_engine`](Self::new_engine) with this set, as the default one is.
+    /// [`new_engine`](Self::new_engine) with this set, as the default one is. What it says is
+    /// which of a guest's lines count as its own.
     #[cfg(feature = "debug")]
-    pub debug_lines: bool,
+    pub debug_lines: Option<witgraph_traits::lines::OwnLines>,
     /// The wasmtime engine to load the graph into: one from
     /// [`RuntimeConfig::new_engine`], or another graph's
     /// [`engine`](RuntimeGraph::engine), so several graphs share one. It is
@@ -155,7 +156,7 @@ impl Default for RuntimeConfig {
             hostcall_fuel: usize::try_from(4u64 << 30).unwrap_or(usize::MAX),
             memory_reservation: None,
             #[cfg(feature = "debug")]
-            debug_lines: false,
+            debug_lines: None,
             engine: None,
         }
     }
@@ -168,7 +169,7 @@ impl RuntimeConfig {
     pub fn new_engine(&self) -> Result<Engine, RuntimeError> {
         let memory_reservation = self.memory_reservation.map(|bytes| bytes.0);
         #[cfg(feature = "debug")]
-        let made = if self.debug_lines {
+        let made = if self.debug_lines.is_some() {
             engine::new_debug_engine(memory_reservation)
         } else {
             engine::new_engine(memory_reservation)

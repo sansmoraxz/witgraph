@@ -27,11 +27,23 @@ export interface SourceVariable {
   children: SourceVariable[];
 }
 
+/** A function on a stopped guest's stack. */
+export interface StackFrame {
+  /** Its name, as the module has it. */
+  function: string;
+  /** The source file it is at, if it has lines that count as the guest's own. */
+  file?: string;
+  /** The line it is at: the call it is waiting on, unless it is the innermost. */
+  line?: number;
+}
+
 /** A core module with probes in it, as the graph's session knows it. */
 export interface LineModule {
   probes: SourceProbe[];
   /** The node of each of its instances, in order. A module of a link has none. */
   nodes: string[];
+  /** Three numbers for each call: where it is here, where in the original, and its function. */
+  calls?: Uint32Array;
   /**
    * The variables at an offset in the module, of an instance stopped there: `flags` and
    * `memory` are its own, as {@link SessionLines.instance} gave them.
@@ -43,6 +55,11 @@ export interface LineModule {
 export interface SessionLines {
   /** Probes reach into the standard library and dependencies too. */
   all?: boolean;
+  /**
+   * The files whose lines count as the guest's own, by what their paths start with. Otherwise
+   * it is a guess from Rust's paths, so another language's libraries count as its own.
+   */
+  own?: readonly string[];
   /** The modules with probes, before any is instantiated. */
   modules?(modules: readonly LineModule[]): void;
   /** The graph is being instantiated: the instances before this one are gone. */
@@ -67,8 +84,8 @@ export interface LineStop {
   column: number;
   /** The node whose guest it is, if it is a node's. */
   node?: string;
-  /** The functions on its stack, innermost first, as the module names them. */
-  frames: string[];
+  /** The functions on its stack, innermost first. */
+  frames: StackFrame[];
   /**
    * The variables in scope where it stopped, innermost scope first, of the innermost function
    * only: nothing outside a function can read its locals, so those of its callers are out of
@@ -103,7 +120,9 @@ const Control = {
   StepDepth: 5,
   /** 1 while a guest is stopped: it goes on when this is 0. */
   Stopped: 6,
-  Count: 7,
+  /** Hold every node's run, from the next on, however long a message would take. */
+  HoldNodes: 7,
+  Count: 8,
 } as const;
 
 const Step = { Into: 1, Over: 2, Out: 3 } as const;
@@ -132,6 +151,7 @@ function frameName(frame: string): string {
 /** Where a guest's lines are probed, on its thread. Blocks there, so never on a page's. */
 export class LineProbes implements SessionLines {
   readonly all?: boolean;
+  readonly own?: readonly string[];
   #control = new Int32Array(new SharedArrayBuffer(Control.Count * 4));
   #modules: readonly LineModule[] = [];
   #breakpoints: Uint8Array<SharedArrayBuffer>[] = [];
@@ -144,10 +164,20 @@ export class LineProbes implements SessionLines {
   #post: (kind: string, fields: object) => void;
   #report: () => void;
 
-  constructor(post: (kind: string, fields: object) => void, report: () => void, all?: boolean) {
+  constructor(
+    post: (kind: string, fields: object) => void,
+    report: () => void,
+    { all, own }: { all?: boolean; own?: readonly string[] },
+  ) {
     this.#post = post;
     this.#report = report;
     this.all = all;
+    this.own = own;
+  }
+
+  /** Whether every node's run is to wait: said here, as a stopped worker reads no message. */
+  get holdingNodes(): boolean {
+    return Atomics.load(this.#control, Control.HoldNodes) !== 0;
   }
 
   info(): LinesInfo {
@@ -239,6 +269,32 @@ export class LineProbes implements SessionLines {
     return depth < fromDepth;
   }
 
+  /** A frame of the stack: `probe` is where it is, for the innermost, the one that fired. */
+  #frame(module: number, frame: string, probe: number | undefined): StackFrame {
+    const { probes, calls } = this.#modules[module];
+    const named = { function: frameName(frame) };
+    const here = probe === undefined ? this.#lineOfCall(frame, probes, calls) : probes[probe];
+    return here ? { ...named, file: here.file, line: here.line } : named;
+  }
+
+  /** The line a frame waits on: the call it is at, in the original, comes after the line's start. */
+  #lineOfCall(
+    frame: string,
+    probes: SourceProbe[],
+    calls: Uint32Array | undefined,
+  ): SourceProbe | undefined {
+    const at = /:0x([0-9a-f]+)\)?\s*$/.exec(frame);
+    if (!at || !calls) return undefined;
+    const offset = Number.parseInt(at[1], 16);
+    for (let call = 0; call < calls.length; call += 3) {
+      if (calls[call] !== offset) continue;
+      const original = calls[call + 1];
+      const start = probes.findLast((candidate) => candidate.offset <= original);
+      return start?.function === calls[call + 2] ? start : undefined;
+    }
+    return undefined;
+  }
+
   /** Read now: stopped, this thread can be asked nothing. A failure costs only the variables. */
   #variables(module: number, instance: number, id: number): SourceVariable[] {
     const { offset } = this.#modules[module].probes[id];
@@ -271,7 +327,7 @@ export class LineProbes implements SessionLines {
       line,
       column,
       node: this.#modules[module].nodes[instance],
-      frames: frames.map(frameName),
+      frames: frames.map((frame, at) => this.#frame(module, frame, at === 0 ? id : undefined)),
       variables: this.#variables(module, instance, id),
       module,
       instance,
@@ -384,6 +440,14 @@ export class LineDebugger {
     if (this.#stopped) return;
     Atomics.store(this.#control, Control.Pause, 0);
     this.#restore();
+  }
+
+  /**
+   * Holds every node's run from the next on, or stops doing so. Unlike {@link RemoteSession.holdAt}
+   * it reaches a stopped worker before the guest goes on, so no node can slip past.
+   */
+  holdNodes(on: boolean): void {
+    Atomics.store(this.#control, Control.HoldNodes, on ? 1 : 0);
   }
 
   /** Goes on, to the next breakpoint. */

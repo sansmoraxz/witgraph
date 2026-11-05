@@ -443,7 +443,7 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
         let data = store_data(&host, max_memory, &shared_memory, components)
             .map_err(|e| instantiation(format!("store data: {e:#}")))?;
         #[cfg(feature = "debug")]
-        let lines = if config.debug_lines {
+        let lines = if let Some(own) = &config.debug_lines {
             if !crate::lines::RuntimeLines::engine_can(&engine) {
                 return Err(RuntimeError::InvalidConfig {
                     message: "`debug_lines` needs an engine made by `RuntimeConfig::new_engine` \
@@ -455,6 +455,7 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
             Some(crate::lines::RuntimeLines::new(
                 engine.clone(),
                 prepared.node_modules.clone(),
+                own.clone(),
             ))
         } else {
             None

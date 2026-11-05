@@ -114,7 +114,7 @@ async function load(
   nodes: [string, string][],
   connections: [string, string, string, boolean?][] = [],
   more: Partial<RemoteSessionOptions> = {},
-  all?: boolean,
+  which: { all?: boolean; own?: readonly string[] } = {},
 ) {
   const stops: LineStop[] = [];
   const waiting: ((stop: LineStop) => void)[] = [];
@@ -124,7 +124,7 @@ async function load(
     await options(nodes, connections, {
       ...more,
       lines: {
-        all,
+        ...which,
         onStop(stop) {
           const next = waiting.shift();
           if (next) next(stop);
@@ -155,7 +155,7 @@ test('a breakpoint stops on its line, naming the node, and resuming goes on', as
   assert.equal(stop.file, file);
   assert.equal(stop.line, mark('walk-first'));
   assert.equal(stop.node, 'a');
-  assert.equal(stop.frames[0], 'line_walk_guest::walk', `innermost of ${stop.frames}`);
+  assert.equal(stop.frames[0].function, 'line_walk_guest::walk');
   assert.deepEqual(lines.stopped?.line, stop.line);
 
   // This thread goes on, for as long as the guest is held.
@@ -198,7 +198,7 @@ test('a stop says what its variables hold, and which are in scope', async () => 
   lines.stepIn();
   const body = await nextStop();
   assert.equal(body.line, mark('add-body'), 'past its opening line, to where its parameters are');
-  assert.match(body.frames[0], /add/);
+  assert.match(body.frames[0].function, /add/);
   assert.equal(variable(body, 'a').value, '6', "the callee's own `a`");
   assert.equal(variable(body, 'b').value, '2');
   assert.ok(!body.variables.some(({ name }) => name === 'x'), "its caller's is out of scope");
@@ -294,6 +294,32 @@ test('a variable of each kind reads as its source would write it', async () => {
   await session.settle();
 });
 
+test('a frame says the line it is waiting on', async () => {
+  const { session, lines, nextStop, file } = await load([['a', 'line-walk']]);
+  lines.setBreakpoint(file, mark('add-body'));
+  const tick = session.tick();
+  const stop = await nextStop();
+  assert.equal(stop.frames[0].function, 'line_walk_guest::add');
+  assert.equal(stop.frames[0].line, mark('add-body'));
+  assert.equal(stop.frames[0].file, file);
+  assert.equal(stop.frames[1].function, 'line_walk_guest::walk');
+  assert.equal(stop.frames[1].line, mark('walk-first'), 'the call it made');
+  assert.equal(stop.frames[1].file, file);
+  lines.release();
+  await tick;
+});
+
+test('a host says which lines are its own', async () => {
+  const guessed = await load([['a', 'line-walk']]);
+  const directory = guessed.file.slice(0, -'lib.rs'.length);
+  const under = await load([['a', 'line-walk']], [], {}, { own: [directory] });
+  assert.deepEqual(under.lines.files, guessed.lines.files);
+  const nowhere = await load([['a', 'line-walk']], [], {}, { own: ['/nowhere/'] });
+  assert.deepEqual(nowhere.lines.files, []);
+  await nowhere.session.settle();
+  assert.equal(await nowhere.session.graph.readOutput('a', 'out'), 3);
+});
+
 test('a line with no code comes to the next that has it', async () => {
   const { session, lines, nextStop, file } = await load([['a', 'line-walk']]);
   const asked = mark('above-walk');
@@ -324,12 +350,12 @@ test('stepping goes over a call, into one, and out of it', async () => {
 
   lines.stepIn();
   const inside = await nextStop();
-  assert.match(inside.frames[0], /add/, `in ${inside.frames}`);
+  assert.match(inside.frames[0].function, /add/);
   assert.ok(inside.frames.length > second.frames.length, 'a frame deeper');
 
   lines.stepOut();
   const back = await nextStop();
-  assert.match(back.frames[0], /walk/, `in ${back.frames}`);
+  assert.match(back.frames[0].function, /walk/);
   assert.equal(back.frames.length, second.frames.length);
 
   lines.resume();
@@ -353,7 +379,7 @@ test('pausing stops a guest in the middle of a spin', async () => {
   assert.equal(stop.reason, 'pause');
   assert.equal(stop.file, file);
   assert.equal(stop.node, 'a');
-  assert.match(stop.frames[0], /spin/, `in ${stop.frames}`);
+  assert.match(stop.frames[0].function, /spin/);
   assert.equal(ended, false);
 
   // A breakpoint set while it spins is seen too, with nothing in the worker reading messages.
@@ -593,7 +619,7 @@ test('a guest with no debug info has no lines, and runs', async () => {
 });
 
 test("all lines reach into what is not the guest's own", async () => {
-  const { lines, file } = await load([['a', 'line-walk']], [], {}, true);
+  const { lines, file } = await load([['a', 'line-walk']], [], {}, { all: true });
   assert.ok(file);
   assert.ok(lines.files.some((name) => name.includes('/rustlib/') || name.includes('/rustc/')));
   const own = await load([['a', 'line-walk']]);

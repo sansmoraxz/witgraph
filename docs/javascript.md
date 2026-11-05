@@ -202,6 +202,7 @@ const session = await RemoteSession.load(worker, {
 });
 const { lines } = session;
 lines.setBreakpoint(file, 42); // from `lines.files`; returns the line it came to
+// `stop.frames` is the stack: `{ function, file?, line? }`, the line a caller's call is on.
 void session.tick();
 // ... `onStop` says where it stopped, and what its variables hold; then one of:
 lines.stepOver();
@@ -234,7 +235,10 @@ stays with its guest: others run on past their probes.
   some lines with no code of their own. A guest with none has no lines, and runs as usual.
 - **Only the guest's own lines** have probes, by the path the debug info gives: not the
   standard library's, or a dependency's. Stepping stays out of those, and so does their cost.
-  `lines: { all: true }` puts them on every line, at about twice the time. A step does not stop
+  That is a guess from Rust's paths, so another language's libraries count as the guest's own, and
+  so does a dependency kept in your repository: `lines: { own: ['/home/me/project/'] }` says which
+  they are instead, by what their paths start with. `lines: { all: true }` puts them on every line,
+  at about twice the time. A step does not stop
   in a function all on one line, which is what a macro usually generates, though a breakpoint
   there does.
 

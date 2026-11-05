@@ -13,8 +13,8 @@ use witgraph_ir::{
     ComponentContract, ComponentRef, Graph, GraphBuilder, NodeId, PortName, PortRef,
 };
 use witgraph_runtime::{
-    LineDebugger, LineStop, Perf, RunningGraph, RuntimeConfig, RuntimeGraph, RuntimeLines,
-    StopReason, TickResult,
+    LineDebugger, LineStop, OwnLines, Perf, RunningGraph, RuntimeConfig, RuntimeGraph,
+    RuntimeLines, StopReason, TickResult,
 };
 
 const SOURCE: &str =
@@ -64,7 +64,7 @@ impl Kit {
 
     async fn load(&self, graph: Graph) -> (RuntimeGraph<Perf>, RuntimeLines) {
         let config = RuntimeConfig {
-            debug_lines: true,
+            debug_lines: Some(OwnLines::default()),
             ..RuntimeConfig::default()
         };
         let compiled = graph.compile(&self.contracts).expect("graph compiles");
@@ -152,7 +152,11 @@ async fn a_breakpoint_stops_on_its_line_naming_the_node_and_resuming_goes_on() {
         assert_eq!(stop.file, file);
         assert_eq!(stop.line, mark("walk-first"));
         assert_eq!(node_of(&stop), Some("a"));
-        assert_eq!(stop.frames[0], "line_walk_guest::walk", "{:?}", stop.frames);
+        assert_eq!(
+            stop.frames[0].function, "line_walk_guest::walk",
+            "{:?}",
+            stop.frames
+        );
         assert_eq!(lines.stopped().as_ref(), Some(&stop));
 
         // Held for as long as it takes.
@@ -210,7 +214,7 @@ async fn stepping_goes_over_a_call_into_one_and_out_of_it() {
             "past its opening line, to where its parameters are",
         );
         assert_eq!(
-            inside.frames[0], "line_walk_guest::add",
+            inside.frames[0].function, "line_walk_guest::add",
             "{:?}",
             inside.frames
         );
@@ -218,7 +222,11 @@ async fn stepping_goes_over_a_call_into_one_and_out_of_it() {
 
         lines.step_out();
         let back = lines.next_stop().await;
-        assert_eq!(back.frames[0], "line_walk_guest::walk", "{:?}", back.frames);
+        assert_eq!(
+            back.frames[0].function, "line_walk_guest::walk",
+            "{:?}",
+            back.frames
+        );
         assert_eq!(back.frames.len(), second.frames.len());
         lines.resume();
     })
@@ -349,7 +357,11 @@ async fn pausing_stops_a_guest_in_the_middle_of_a_spin() {
         assert_eq!(stop.reason, StopReason::Pause);
         assert_eq!(stop.file, file);
         assert_eq!(node_of(&stop), Some("a"));
-        assert!(stop.frames[0].contains("spin"), "{:?}", stop.frames);
+        assert!(
+            stop.frames[0].function.contains("spin"),
+            "{:?}",
+            stop.frames
+        );
 
         // A breakpoint set while it spins is seen too, with nothing else reaching the Store.
         lines.resume();
@@ -487,6 +499,62 @@ async fn shutting_down_ends_a_guest_stopped_on_a_line() {
 }
 
 #[tokio::test]
+async fn a_frame_says_the_line_it_is_waiting_on() {
+    let (mut rt, lines) = line_walk(&["a"]).await;
+    let file = file_of(&lines);
+    lines.set_breakpoint(&file, mark("add-body"));
+    settling(&mut rt, async {
+        let stop = lines.next_stop().await;
+        assert_eq!(stop.frames[0].function, "line_walk_guest::add");
+        assert_eq!(stop.frames[0].line, Some(mark("add-body")));
+        assert_eq!(stop.frames[0].file.as_deref(), Some(file.as_str()));
+        assert_eq!(
+            stop.frames[1].function, "line_walk_guest::walk",
+            "{:?}",
+            stop.frames
+        );
+        assert_eq!(
+            stop.frames[1].line,
+            Some(mark("walk-first")),
+            "the call it made"
+        );
+        assert_eq!(stop.frames[1].file.as_deref(), Some(file.as_str()));
+        lines.release();
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_host_says_which_lines_are_its_own() {
+    let kit = Kit::new(&[LINE_WALK]);
+    let load = async |own: OwnLines| {
+        let config = RuntimeConfig {
+            debug_lines: Some(own),
+            ..RuntimeConfig::default()
+        };
+        let graph = kit.builder().add_node("a", kit.id(0)).build();
+        let compiled = graph.compile(&kit.contracts).unwrap();
+        let rt = RuntimeGraph::load(compiled, &kit.wasm, config, Perf)
+            .await
+            .unwrap();
+        rt.lines().unwrap().files()
+    };
+    let guessed = load(OwnLines::Guess).await;
+    assert_eq!(guessed.len(), 1);
+    let directory = guessed[0].strip_suffix("lib.rs").unwrap().to_string();
+    assert_eq!(load(OwnLines::Under(vec![directory])).await, guessed);
+    assert!(
+        load(OwnLines::Under(vec!["/nowhere/".to_string()]))
+            .await
+            .is_empty()
+    );
+    assert!(
+        load(OwnLines::All).await.len() > 1,
+        "the standard library's too"
+    );
+}
+
+#[tokio::test]
 async fn a_guest_with_no_debug_info_has_no_lines_and_runs() {
     let kit = Kit::new(&[RELAY]);
     let graph = kit
@@ -510,7 +578,7 @@ async fn an_engine_not_made_to_debug_is_refused_and_a_graph_may_share_one_that_i
 
     let plain = RuntimeConfig::default().new_engine().unwrap();
     let config = RuntimeConfig {
-        debug_lines: true,
+        debug_lines: Some(OwnLines::default()),
         engine: Some(plain),
         ..RuntimeConfig::default()
     };
@@ -524,7 +592,7 @@ async fn an_engine_not_made_to_debug_is_refused_and_a_graph_may_share_one_that_i
 
     // A graph that does not ask to debug still runs on an engine that can.
     let debugging = RuntimeConfig {
-        debug_lines: true,
+        debug_lines: Some(OwnLines::default()),
         ..RuntimeConfig::default()
     };
     let config = RuntimeConfig {

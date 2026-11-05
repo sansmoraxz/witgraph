@@ -19,6 +19,51 @@ pub struct SourceVariable {
     pub children: Vec<SourceVariable>,
 }
 
+/// Which of a guest's source lines count as its own, to stop and step on.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum OwnLines {
+    /// All but what looks like the Rust standard library's or a dependency's, by its path.
+    /// Another language's libraries look like the guest's own to this: say where it is instead.
+    #[default]
+    Guess,
+    /// Only the files whose path starts with one of these.
+    Under(Vec<String>),
+    /// Every line the debug info has, at about twice the cost.
+    All,
+}
+
+impl OwnLines {
+    /// Whether `file` counts, by the path the debug info gives it.
+    #[must_use]
+    pub fn covers(&self, file: &str) -> bool {
+        /// Paths a guest's own code does not live under.
+        const NOT_OWN: [&str; 6] = [
+            "/rustc/",
+            "/rustlib/",
+            "/rust/deps/",
+            "/.cargo/",
+            "/cargo/registry/",
+            "/cargo/git/",
+        ];
+        match self {
+            Self::Guess => !NOT_OWN.iter().any(|path| file.contains(path)),
+            Self::Under(paths) => paths.iter().any(|path| file.starts_with(path.as_str())),
+            Self::All => true,
+        }
+    }
+}
+
+/// A function on a stopped guest's stack.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StackFrame {
+    /// Its name, as the module has it.
+    pub function: String,
+    /// The source file it is at, if it has lines that count as the guest's own.
+    pub file: Option<String>,
+    /// The line it is at: the call it is waiting on, unless it is the innermost.
+    pub line: Option<u32>,
+}
+
 /// What stopped a guest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopReason {
@@ -43,8 +88,8 @@ pub struct LineStop {
     pub column: u32,
     /// The node whose guest it is, if it is a node's.
     pub node: Option<NodeId>,
-    /// The functions on its stack, innermost first, as the module names them.
-    pub frames: Vec<String>,
+    /// The functions on its stack, innermost first.
+    pub frames: Vec<StackFrame>,
     /// The variables in scope where it stopped, innermost scope first, of the innermost
     /// function only.
     pub variables: Vec<SourceVariable>,

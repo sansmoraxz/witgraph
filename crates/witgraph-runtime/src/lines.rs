@@ -20,11 +20,11 @@ use wasmtime::{
 };
 use witgraph_ir::NodeId;
 use witgraph_probes::{
-    Frame, LineIndex, Lines, ModuleDebug, ProbeId, StepKind, core_modules, defined_function_names,
-    source_lines,
+    Frame, LineIndex, ModuleDebug, ProbeId, StepKind, core_modules, defined_function_names,
+    imported_functions, source_lines,
 };
 use witgraph_traits::executor::MaybeSend;
-use witgraph_traits::lines::{LineDebugger, LineStop, StopReason};
+use witgraph_traits::lines::{LineDebugger, LineStop, OwnLines, StackFrame, StopReason};
 
 /// What tells one core module from another, for finding its nodes.
 fn fingerprint(module: &[u8]) -> u64 {
@@ -51,6 +51,8 @@ struct ModuleLines {
     index: LineIndex,
     debug: Option<ModuleDebug>,
     names: HashMap<u32, String>,
+    /// How many functions it imports: a defined function's index comes after those.
+    imported: u32,
     /// The node of each of its instances, in order.
     nodes: Vec<NodeId>,
 }
@@ -112,6 +114,7 @@ impl State {
 struct Shared {
     engine: Engine,
     nodes: Vec<(NodeId, Vec<u64>)>,
+    own: OwnLines,
     state: Mutex<State>,
 }
 
@@ -163,12 +166,13 @@ impl Shared {
         }
     }
 
-    /// The frames of `module` on the stack from `top`, innermost first.
+    /// The frames of `module` on the stack from `top`, innermost first: each function, among
+    /// those it defines, and where in the module it is.
     fn own_frames<D: 'static>(
         store: &mut StoreContextMut<'_, D>,
         top: &FrameHandle,
         module: u64,
-    ) -> Vec<(FrameHandle, u32)> {
+    ) -> Vec<(u32, u32)> {
         let mut frames = Vec::new();
         let mut at = Some(top.clone());
         while let Some(frame) = at {
@@ -176,8 +180,9 @@ impl Shared {
                 frame.module(store.as_context_mut()),
                 Ok(Some(found)) if found.debug_index_in_engine() == module
             );
-            if same && let Ok(Some((function, _))) = frame.wasm_function_index_and_pc(&mut *store) {
-                frames.push((frame.clone(), function.as_u32()));
+            if same && let Ok(Some((function, pc))) = frame.wasm_function_index_and_pc(&mut *store)
+            {
+                frames.push((function.as_u32(), pc.raw()));
             }
             at = frame.parent(&mut *store).ok().flatten();
         }
@@ -247,10 +252,17 @@ impl Shared {
             node: ordinal.and_then(|ordinal| module.nodes.get(ordinal).cloned()),
             frames: frames
                 .iter()
-                .map(|(_, function)| {
-                    let name = module.names.get(function);
-                    name.cloned()
-                        .unwrap_or_else(|| format!("function {function}"))
+                .map(|(function, pc)| {
+                    let line = module.index.line_at(module.imported + function, *pc);
+                    StackFrame {
+                        function: module
+                            .names
+                            .get(function)
+                            .cloned()
+                            .unwrap_or_else(|| format!("function {function}")),
+                        file: line.map(|probe| probe.file.clone()),
+                        line: line.map(|probe| probe.line),
+                    }
                 })
                 .collect(),
             variables: read_variables(store, &top, instance, &module, source.offset),
@@ -425,11 +437,12 @@ pub struct RuntimeLines {
 }
 
 impl RuntimeLines {
-    pub(crate) fn new(engine: Engine, nodes: Vec<(NodeId, Vec<u64>)>) -> Self {
+    pub(crate) fn new(engine: Engine, nodes: Vec<(NodeId, Vec<u64>)>, own: OwnLines) -> Self {
         Self {
             shared: Arc::new(Shared {
                 engine,
                 nodes,
+                own,
                 state: Mutex::default(),
             }),
         }
@@ -467,7 +480,7 @@ impl RuntimeLines {
                 let Some(bytes) = module.debug_bytecode() else {
                     continue;
                 };
-                let probes = source_lines(bytes, Lines::Own).unwrap_or_default();
+                let probes = source_lines(bytes, &self.shared.own).unwrap_or_default();
                 if probes.is_empty() {
                     continue;
                 }
@@ -476,6 +489,7 @@ impl RuntimeLines {
                     index: LineIndex::new(probes),
                     debug: ModuleDebug::new(bytes).ok().flatten(),
                     names: defined_function_names(bytes).unwrap_or_default(),
+                    imported: imported_functions(bytes).unwrap_or(0),
                     nodes: self
                         .shared
                         .nodes

@@ -69,6 +69,8 @@ pub use witgraph_sched::{
     RuntimeMode, Snapshot, SnapshotError, TickResult, Trace, TraceEvent,
 };
 #[cfg(feature = "debug")]
-pub use witgraph_traits::lines::{LineDebugger, LineStop, SourceVariable, StopReason};
+pub use witgraph_traits::lines::{
+    LineDebugger, LineStop, OwnLines, SourceVariable, StackFrame, StopReason,
+};
 pub use witgraph_traits::{OutputReader, RunningGraph, until};
 pub use {wasmtime, witgraph_ir, witgraph_sched, witgraph_traits};

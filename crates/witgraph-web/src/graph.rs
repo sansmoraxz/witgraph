@@ -9,7 +9,7 @@ use std::sync::Arc;
 use futures::FutureExt;
 use futures::channel::oneshot;
 use futures::future::{Either, Shared as SharedFuture};
-use js_sys::{Array, Function, Object, Promise, Reflect, Uint8Array};
+use js_sys::{Array, Function, Object, Promise, Reflect, Uint8Array, Uint32Array};
 use sha2::{Digest, Sha256};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::{JsFuture, future_to_promise};
@@ -19,7 +19,7 @@ use witgraph_ir::{
     OutputIdx, PortDirection, PortKind, PortName, PortTable,
 };
 use witgraph_probes::{
-    Frame, Lines, ModuleDebug, ModuleOffset, Spill, Variable, core_modules, instrument,
+    Frame, ModuleDebug, ModuleOffset, OwnLines, Spill, Variable, core_modules, instrument,
 };
 use witgraph_sched::{
     DataPlane, NodeFault, PortVersions, RuntimeError, SchedulerCore, Snapshot, TickResult,
@@ -506,16 +506,27 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// What a debugger needs of a core module of the composite: its `bytes` with a probe on
 /// each source line, or `null` if there is nothing to probe.
 ///
-/// Returns `{ bytes, sha256, probes, spill }`: `spill` is `{ base, globals }`, for
+/// Returns `{ bytes, sha256, probes, calls, spill }`: `calls` has three numbers for each call in
+/// a function with probes, its offset here, its offset in `bytes` and its function, and `spill`
+/// is `{ base, globals }`, for
 /// [`module_variables`], and `sha256` is the module's as given, to find its nodes
 /// by ([`WebGraph::module_nodes`]), and `probes` lists `{ offset, function, file, line, column }`,
 /// each at the index its probe calls the `witgraph:debug` import `probe` with, and its flag
 /// is at in the shared memory the module exports as `witgraph:debug/flags`. `allLines` reaches
-/// into the standard library and dependencies, which a guest's own lines leave out.
+/// into the standard library and dependencies, which a guest's own lines leave out, as a guess
+/// from their paths, or `own` says which they are: the files under these paths.
 #[wasm_bindgen(js_name = instrumentModule)]
-pub fn instrument_module(bytes: &[u8], all_lines: bool) -> Result<JsValue, JsError> {
-    let lines = if all_lines { Lines::All } else { Lines::Own };
-    let Some(instrumented) = instrument(bytes, lines).map_err(error)? else {
+pub fn instrument_module(
+    bytes: &[u8],
+    all_lines: bool,
+    own: Option<Vec<String>>,
+) -> Result<JsValue, JsError> {
+    let lines = match (all_lines, own) {
+        (true, _) => OwnLines::All,
+        (false, Some(paths)) => OwnLines::Under(paths),
+        (false, None) => OwnLines::Guess,
+    };
+    let Some(instrumented) = instrument(bytes, &lines).map_err(error)? else {
         return Ok(JsValue::NULL);
     };
     let probes = Array::new();
@@ -536,6 +547,12 @@ pub fn instrument_module(bytes: &[u8], all_lines: bool) -> Result<JsValue, JsErr
     );
     set(&object, "sha256", &text(&sha256_hex(bytes)));
     set(&object, "probes", &probes);
+    let calls: Vec<u32> = instrumented
+        .calls
+        .iter()
+        .flat_map(|call| [call.offset.0, call.original.0, call.function])
+        .collect();
+    set(&object, "calls", &Uint32Array::from(calls.as_slice()));
     let spill = Object::new();
     set(&spill, "base", &JsValue::from(instrumented.spill.base));
     set(
