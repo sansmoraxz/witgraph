@@ -352,25 +352,6 @@ pub enum Diagnostic {
         /// Every connection reading from it.
         connections: Vec<ConnectionId>,
     },
-    /// A stream group whose members' claims on one resource sum to more than
-    /// all of it. A group holds its members' claims together from its first
-    /// start until it has drained, so it could never start.
-    #[error(
-        "the stream group of {} claims more than all of resource `{resource}`",
-        join_nodes(nodes)
-    )]
-    #[diagnostic(
-        code(witgraph::ir::group_overclaims),
-        help(
-            "lower the claims, raise the resource's capacity, or split the group: its nodes share a stream or future connection"
-        )
-    )]
-    GroupOverclaims {
-        /// The group's members, in topological order.
-        nodes: Vec<NodeId>,
-        /// The overclaimed resource.
-        resource: ResourceId,
-    },
     /// A node that claims more of a resource than there is, so it could never start.
     #[error("node `{node}` claims more than all of resource `{resource}`")]
     #[diagnostic(
@@ -381,24 +362,6 @@ pub enum Diagnostic {
         /// The node.
         node: NodeId,
         /// The overclaimed resource.
-        resource: ResourceId,
-    },
-    /// Stream groups and what they wait on whose claims on one resource do not
-    /// fit together: groups that each wait on a node of the next, on a cycle, or
-    /// a group and what only some of its members wait on. One holding the
-    /// resource would wait for one that cannot get it.
-    #[error(
-        "nodes {} are in stream groups waiting on what claims more than the rest of resource `{resource}`",
-        join_nodes(nodes)
-    )]
-    #[diagnostic(
-        code(witgraph::ir::claims_can_deadlock),
-        help("lower the claims, or mark a connection between them `feedback`")
-    )]
-    ClaimsCanDeadlock {
-        /// The groups' members, and what they wait on.
-        nodes: Vec<NodeId>,
-        /// The resource.
         resource: ResourceId,
     },
     /// Stream groups, and the nodes between them, that wait on each other to
@@ -494,9 +457,7 @@ impl Diagnostic {
                 Location::Component(component.clone())
             }
             Diagnostic::IllegalCycle { nodes } => Location::Cycle(nodes.clone()),
-            Diagnostic::GroupOverclaims { nodes, .. }
-            | Diagnostic::ClaimsCanDeadlock { nodes, .. }
-            | Diagnostic::GroupWaitsOnItself { nodes } => Location::Group(nodes.clone()),
+            Diagnostic::GroupWaitsOnItself { nodes } => Location::Group(nodes.clone()),
         }
     }
 }

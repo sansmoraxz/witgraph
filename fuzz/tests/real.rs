@@ -17,7 +17,7 @@ use test_components::{
     FUTURE_READER, FUTURE_WRITER, Guest, MAYBE, RELAY, STREAM_CONSUMER, STREAM_PRODUCER,
     STREAM_RELAY,
 };
-use witgraph_ir::{ComponentContract, ComponentRef, Diagnostic, Graph, PortRef, ResourceClaim};
+use witgraph_ir::{ComponentContract, ComponentRef, Graph, PortRef, ResourceClaim};
 use witgraph_runtime::{Perf, RunningGraph, RuntimeConfig, RuntimeGraph, TickResult, Val};
 
 struct Rng(u64);
@@ -455,25 +455,13 @@ async fn settle(rt: &mut RuntimeGraph<Perf>, seed: u64, json: &str) {
     panic!("seed {seed}: never settled\n{json}");
 }
 
-async fn case(seed: u64, kit: &Kit, config: RuntimeConfig) -> bool {
+async fn case(seed: u64, kit: &Kit, config: RuntimeConfig) {
     let mut rng = Rng::new(seed);
     let plan = plan(&mut rng);
     let graph = graph_of(&plan, kit);
     let json = serde_json::to_string(&graph).unwrap();
     let compiled = match graph.compile(&kit.contracts) {
         Ok(compiled) => compiled,
-        // Claims may rightly be refused; nothing else in these graphs may.
-        Err(failure)
-            if !plan.claims.is_empty()
-                && failure.diagnostics.errors().all(|d| {
-                    matches!(
-                        d,
-                        Diagnostic::ClaimsCanDeadlock { .. } | Diagnostic::GroupOverclaims { .. }
-                    )
-                }) =>
-        {
-            return false;
-        }
         Err(failure) => panic!("seed {seed}: does not compile: {failure}\n{json}"),
     };
     let mut rt = RuntimeGraph::load(compiled, &kit.wasm, config, Perf)
@@ -512,7 +500,6 @@ async fn case(seed: u64, kit: &Kit, config: RuntimeConfig) -> bool {
             Step::Restore => rt.restore(snapshot.as_ref().unwrap()).await.unwrap(),
         }
     }
-    true
 }
 
 fn env(name: &str) -> Option<u64> {
@@ -529,15 +516,7 @@ async fn real_graphs_compute_what_they_should() {
         None => (1..=env("WITGRAPH_REAL_CASES").unwrap_or(25)).collect(),
     };
     seeds.reverse();
-    let mut ran = 0usize;
-    let total = seeds.len();
     while let Some(seed) = seeds.pop() {
-        ran += usize::from(case(seed, &kit, RuntimeConfig::default()).await);
+        case(seed, &kit, RuntimeConfig::default()).await;
     }
-    eprintln!("ran {ran} of {total}: the rest had their claims refused");
-    // Of many: one seed again may rightly be one refused.
-    assert!(
-        total < 10 || ran * 2 > total,
-        "too few ran: {ran} of {total}"
-    );
 }

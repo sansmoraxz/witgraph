@@ -3554,21 +3554,35 @@ async fn compatible_claims_run_together() {
 }
 
 #[tokio::test]
-async fn a_group_over_committing_a_resource_is_rejected() {
+async fn a_group_claiming_more_than_there_is_still_runs() {
     let kit = Kit::new(&[STREAM_PRODUCER, STREAM_CONSUMER]);
     let mut graph = pipeline(&kit);
     for node in &mut graph.nodes {
         node.resources
             .insert("disk".to_string().into(), ResourceClaim::new(0.6).unwrap());
     }
-    let failure = graph
-        .compile(&kit.contracts)
-        .expect_err("the group sums to 1.2");
+    let mut rt = kit
+        .load(graph, RuntimeConfig::default(), Trace::new())
+        .await;
+    feed_pipeline(&mut rt, Some(5), None).await;
+    settle(&mut rt).await;
+    assert_eq!(read_u32(&mut rt, "cons", "count").await, 5);
+    assert!(faults(&rt.mode().trace()).is_empty());
+}
+
+#[tokio::test]
+async fn a_node_claiming_more_than_there_is_is_rejected() {
+    let kit = Kit::new(&[STREAM_PRODUCER, STREAM_CONSUMER]);
+    let mut graph = pipeline(&kit);
+    graph.nodes[0]
+        .resources
+        .insert("disk".to_string().into(), ResourceClaim::new(1.5).unwrap());
+    let failure = graph.compile(&kit.contracts).expect_err("there is 1 of it");
     assert!(
         failure
             .diagnostics
             .iter()
-            .any(|d| matches!(d, witgraph_ir::Diagnostic::GroupOverclaims { .. })),
+            .any(|d| matches!(d, witgraph_ir::Diagnostic::NodeOverclaims { .. })),
         "{failure:?}"
     );
 }

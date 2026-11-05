@@ -109,10 +109,11 @@ pub struct ResourceDecl {
 ///
 /// A resource has a capacity of 1.0 unless the graph declares otherwise
 /// ([`Graph::resources`]), and an amount is in the same units: with a capacity of 2.0, a claim
-/// of 1.0 is half of it. The runtime holds a node's claims for as long as its `run` takes, and
-/// a stream group's together from its first start until it has drained, and does not start
-/// what would take the sum of held claims on any resource over its capacity. A node or group
-/// whose own claims exceed it is rejected when the graph is compiled.
+/// of 1.0 is half of it. A node claiming more than there is is rejected when the graph is
+/// compiled. Anything else runs: the scheduler starts a node once its claim fits beside what
+/// is running. A member of a stream group holds its claim past its `run`, until the group has
+/// drained, so nothing else starts in its room; but what the group is itself waiting on may,
+/// as the group could never drain otherwise. So a group can go over a capacity while it works.
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(deny_unknown_fields))]

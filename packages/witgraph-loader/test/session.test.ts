@@ -2384,6 +2384,47 @@ test('a stream group holds its claims until its guest work is over, not its runs
   await groupBesideANode();
 });
 
+test('a stream group claiming more than there is runs all the same', async () => {
+  const burst = 500;
+  const used = ['stream-producer', 'stream-relay', 'stream-drain'];
+  const components = await Promise.all(used.map(guestSource));
+  const node = (id: string, guest: string) => ({
+    id,
+    component: componentRef(ids[guest]),
+    resources: { gpu: { amount: 1 } },
+  });
+  const ends = (id: string, from: string, to: string) => {
+    const [fromNode, fromPort] = from.split('.');
+    const [toNode, toPort] = to.split('.');
+    return {
+      id,
+      from: { node: fromNode, port: fromPort },
+      to: { node: toNode, port: toPort },
+    };
+  };
+  let seen = 0;
+  const session = await loaded({
+    graph: {
+      metadata: { name: 'test' },
+      components: used.map((guest) => componentRef(ids[guest])),
+      nodes: [
+        node('prod', 'stream-producer'),
+        node('pass', 'stream-relay'),
+        node('drain', 'stream-drain'),
+      ],
+      connections: [ends('a', 'prod.items', 'pass.items'), ends('b', 'pass.items', 'drain.items')],
+    },
+    components,
+    wasm,
+    onStreamItem: ({ item }: StreamItem) => {
+      seen += ArrayBuffer.isView(item) ? (item as Uint32Array).length : 1;
+    },
+  });
+  await session.graph.inject('prod', 'burst-size', burst);
+  for (let tick = 0; tick < 200 && (await session.graph.tick()).result !== 'idle'; tick++);
+  assert.equal(seen, burst * 2, 'every item, past each of its two connections');
+});
+
 test('a capacity with room for both lets a node start beside a stream group', async () => {
   await groupBesideANode(1.2);
 });

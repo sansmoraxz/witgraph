@@ -225,6 +225,15 @@ impl<'g> Model<'g> {
     /// What should be said of the whole graph, once it has no local errors.
     pub fn global(&self) -> BTreeSet<Said> {
         let mut said = BTreeSet::new();
+        // Whatever else is wrong with the graph.
+        for node in &self.graph.nodes {
+            for (resource, claim) in &node.resources {
+                let thousandths = (claim.amount.get() * 1000.0).round() as u64;
+                if thousandths > self.capacity_thousandths(resource.as_str()) {
+                    said.insert(("node_overclaims", resource.to_string()));
+                }
+            }
+        }
         let name = |at: usize| self.graph.nodes[at].id.to_string();
         let cycles = self.cycles();
         for cycle in &cycles {
@@ -252,31 +261,6 @@ impl<'g> Model<'g> {
         }
 
         let groups = self.groups();
-        for (at, node) in self.graph.nodes.iter().enumerate() {
-            if groups.iter().any(|group| group.contains(&at)) {
-                continue;
-            }
-            for (resource, claim) in &node.resources {
-                let thousandths = (claim.amount.get() * 1000.0).round() as u64;
-                if thousandths > self.capacity_thousandths(resource.as_str()) {
-                    said.insert(("node_overclaims", resource.to_string()));
-                }
-            }
-        }
-        for group in &groups {
-            let mut claims: BTreeMap<&str, u64> = BTreeMap::new();
-            for at in group {
-                for (resource, claim) in &self.graph.nodes[*at].resources {
-                    *claims.entry(resource.as_str()).or_default() +=
-                        (claim.amount.get() * 1000.0).round() as u64;
-                }
-            }
-            for (resource, thousandths) in claims {
-                if thousandths > self.capacity_thousandths(resource) {
-                    said.insert(("group_overclaims", resource.to_string()));
-                }
-            }
-        }
         if !self.can_all_start(&groups) {
             said.insert(("group_waits_on_itself", String::new()));
         }
@@ -409,7 +393,6 @@ pub fn observed(diagnostic: &Diagnostic) -> Option<Said> {
         ),
         D::UselessFeedback { conn } => ("useless_feedback", conn.to_string()),
         D::NodeOverclaims { resource, .. } => ("node_overclaims", resource.to_string()),
-        D::GroupOverclaims { resource, .. } => ("group_overclaims", resource.to_string()),
         D::GroupWaitsOnItself { .. } => ("group_waits_on_itself", String::new()),
         _ => return None,
     })
@@ -419,10 +402,6 @@ pub fn observed(diagnostic: &Diagnostic) -> Option<Said> {
 pub fn is_local(kind: &str) -> bool {
     !matches!(
         kind,
-        "illegal_cycle"
-            | "useless_feedback"
-            | "group_overclaims"
-            | "node_overclaims"
-            | "group_waits_on_itself"
+        "illegal_cycle" | "useless_feedback" | "node_overclaims" | "group_waits_on_itself"
     )
 }

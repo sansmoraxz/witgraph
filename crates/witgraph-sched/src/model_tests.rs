@@ -332,13 +332,12 @@ impl Model {
         }
     }
 
-    /// `v` alone, or the group `{p, q}` once either has started, holds the resource.
+    /// `v` and `p` each claim more than half of the resource, so their runs never overlap.
     fn check_claims(&self) {
-        let (v, group) = (self.node("v"), [self.node("p"), self.node("q")]);
-        let lone = self.pending.runs.contains(&v);
-        let grouped = group.iter().any(|m| self.pending.runs.contains(m));
-        if lone && grouped {
-            self.fail("`v` and the group run at once, past their claims");
+        if self.pending.runs.contains(&self.node("v"))
+            && self.pending.runs.contains(&self.node("p"))
+        {
+            self.fail("`v` and `p` run at once, past their claims");
         }
     }
 

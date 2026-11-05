@@ -125,7 +125,7 @@ pub fn check(graph: &Graph) {
     speaks_sensibly(graph, &result);
     same_in_any_order(graph, &contracts, &result);
     if let Some(model) = Model::new(graph) {
-        follows_the_rules(graph, &model, &said, accepted, &result);
+        follows_the_rules(graph, &model, &said, accepted);
     }
     if let Ok(compiled) = &result {
         count(&REACHED.compiled);
@@ -238,13 +238,7 @@ fn same_in_any_order(
     }
 }
 
-fn follows_the_rules(
-    graph: &Graph,
-    model: &Model<'_>,
-    said: &BTreeSet<Said>,
-    accepted: bool,
-    result: &Result<CompiledGraph, witgraph_ir::CompilationFailure>,
-) {
+fn follows_the_rules(graph: &Graph, model: &Model<'_>, said: &BTreeSet<Said>, accepted: bool) {
     let expected_local = model.local();
     let said_local: BTreeSet<Said> = said.iter().filter(|(k, _)| is_local(k)).cloned().collect();
     if said_local != expected_local {
@@ -267,15 +261,7 @@ fn follows_the_rules(
         fail("whole-graph rules disagree", graph, (missed, extra));
     }
     let errors_expected = expected.iter().any(|(kind, _)| *kind != "useless_feedback");
-    // Claims that can deadlock are a judgement of their own: see the run target.
-    let deadlock_only = match result {
-        Err(failure) => failure
-            .diagnostics
-            .errors()
-            .all(|e| matches!(e, witgraph_ir::Diagnostic::ClaimsCanDeadlock { .. })),
-        Ok(_) => false,
-    };
-    if errors_expected == accepted && !(deadlock_only && !errors_expected) {
+    if errors_expected == accepted {
         fail("accepted the wrong way", graph, (accepted, expected));
     }
 }

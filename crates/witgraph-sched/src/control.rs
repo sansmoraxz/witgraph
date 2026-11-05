@@ -89,7 +89,7 @@ use witgraph_traits::{
 };
 
 use crate::lifecycle::{GraphState, Group, GroupLife, Instance, Node, NodeLife, StopCause};
-use crate::resource::ResourcePool;
+use crate::resource::{ResourcePool, Room};
 
 /// Every output port's version, shared: readable while a tick holds the
 /// scheduler.
@@ -821,7 +821,9 @@ impl SchedulerCore<dyn DataPlane> {
     fn end_group_draining(&mut self, at: usize) {
         if let GroupLife::Draining(group) = self.groups[at].life {
             self.groups[at].life = GroupLife::Quiet(group.drained());
-            self.resources.release(self.ports.node_count() + at);
+            for member in self.groups[at].members.iter() {
+                self.resources.release(member.position());
+            }
             let nodes: Vec<NodeId> = self.groups[at]
                 .members
                 .iter()
@@ -867,6 +869,7 @@ impl SchedulerCore<dyn DataPlane> {
         self.mode.on_run_returned(self.ports.node_id(node));
         match self.nodes[node].group {
             Some(group) => {
+                self.resources.linger(node.position());
                 if let GroupLife::Active(active) = self.groups[group].life {
                     self.groups[group].life = active.returned();
                     if matches!(self.groups[group].life, GroupLife::Draining(_)) {
@@ -1056,6 +1059,7 @@ impl SchedulerCore<dyn DataPlane> {
             return Started::Nothing;
         }
         let (_, blocked, can_run) = self.unsettled();
+        let awaited = self.awaited();
         let mut started = Started::Nothing;
         for at in 0..self.ports.node_count() {
             let node = NodeIdx::from_position(at);
@@ -1064,7 +1068,12 @@ impl SchedulerCore<dyn DataPlane> {
             }
             let activate = match self.nodes[node].life {
                 NodeLife::Running(_) => continue,
-                NodeLife::Scheduled(_) => false,
+                NodeLife::Scheduled(_) => {
+                    if !self.fits(node, &awaited) {
+                        continue;
+                    }
+                    false
+                }
                 NodeLife::Waiting(_) => {
                     if !self.owed.contains(node) || !self.ready(node) {
                         continue;
@@ -1074,7 +1083,7 @@ impl SchedulerCore<dyn DataPlane> {
                     if !self.group_is_quiet(node) || self.group_is_held_back(node, &can_run) {
                         continue;
                     }
-                    if !self.resources.can_acquire(self.unit(node)) {
+                    if !self.fits(node, &awaited) {
                         continue;
                     }
                     true
@@ -1085,8 +1094,8 @@ impl SchedulerCore<dyn DataPlane> {
                 self.dirty = true;
                 return Started::LimitReached;
             }
+            self.resources.acquire(node.position());
             if activate {
-                self.resources.acquire(self.unit(node));
                 self.schedule_group(node);
             }
             *steps += 1;
@@ -1115,12 +1124,35 @@ impl SchedulerCore<dyn DataPlane> {
         self.groups[group].life = GroupLife::Active(quiet.start(members.len()));
     }
 
-    /// What holds `node`'s claims: itself, or its group.
-    fn unit(&self, node: NodeIdx) -> usize {
-        match self.nodes[node].group {
-            Some(group) => self.ports.node_count() + group,
-            None => node.position(),
+    /// What a stream group at work is waiting on: each member yet to run, and all that
+    /// is above it. The group cannot drain without them, as streams are not buffered.
+    fn awaited(&self) -> PortSet<NodeIdx> {
+        let mut awaited = PortSet::new(self.ports.node_count());
+        let mut waiting: Vec<NodeIdx> = (0..self.ports.node_count())
+            .map(NodeIdx::from_position)
+            .filter(|node| matches!(self.nodes[*node].life, NodeLife::Scheduled(_)))
+            .collect();
+        while let Some(node) = waiting.pop() {
+            if !awaited.insert(node) {
+                continue;
+            }
+            let entry = &self.nodes[node];
+            waiting.extend(entry.preds.iter().copied());
+            if let Some(group) = entry.group {
+                waiting.extend(self.groups[group].members.iter().copied());
+            }
         }
+        awaited
+    }
+
+    /// Whether `node`'s claims fit, given what the groups at work are waiting on.
+    fn fits(&self, node: NodeIdx, awaited: &PortSet<NodeIdx>) -> bool {
+        let room = if awaited.contains(node) {
+            Room::PastLingering
+        } else {
+            Room::Free
+        };
+        self.resources.can_acquire(node.position(), room)
     }
 
     fn start_run(&mut self, node: NodeIdx) {
@@ -1169,7 +1201,7 @@ impl SchedulerCore<dyn DataPlane> {
         for at in 0..self.ports.node_count() {
             let node = NodeIdx::from_position(at);
             self.nodes[node].life = NodeLife::Waiting(Node::fresh());
-            self.resources.release(self.unit(node));
+            self.resources.release(node.position());
         }
         for group in &mut self.groups {
             group.life = GroupLife::Quiet(Group::fresh());
@@ -1587,10 +1619,8 @@ pub fn check_resources(compiled: &CompiledGraph) -> Result<(), RuntimeError> {
     register_resources(compiled, &ports).map(|_| ())
 }
 
-/// Each unit's summed claims: a node, or a stream group after the nodes.
-/// Compilation already rejects a node or group whose own claims on a resource exceed
-/// all of it; one could never start, so it stays an error here
-/// ([`RuntimeError::InvalidConfig`]).
+/// Each node's claims. Compilation already rejects one claiming more than all of a resource;
+/// it could never start, so it stays an error here ([`RuntimeError::InvalidConfig`]).
 fn register_resources(
     compiled: &CompiledGraph,
     ports: &PortTable,
@@ -1603,41 +1633,22 @@ fn register_resources(
             .map(|(resource, declared)| (resource.clone(), declared.capacity.get()))
             .collect(),
     );
-    let invalid = |node: &str, resource: ResourceId| RuntimeError::InvalidConfig {
-        message: format!(
-            "`{node}` or its stream group claims more than all of resource `{resource}`"
-        ),
-    };
-    let mut groups: Vec<BTreeMap<ResourceId, f64>> =
-        vec![BTreeMap::new(); compiled.stream_groups().len()];
     for node in &graph.nodes {
         let claims: BTreeMap<ResourceId, f64> = node
             .resources
             .iter()
             .map(|(resource, claim)| (resource.clone(), claim.amount.get()))
             .collect();
-        match compiled.group_of(&node.id) {
-            Some(group) => {
-                for (resource, amount) in claims {
-                    *groups[group].entry(resource).or_insert(0.0) += amount;
-                }
-            }
-            None => {
-                if let Some(at) = ports.node(&node.id) {
-                    resources
-                        .register(at.position(), claims)
-                        .map_err(|resource| invalid(node.id.as_str(), resource))?;
-                }
-            }
+        if let Some(at) = ports.node(&node.id) {
+            resources
+                .register(at.position(), claims)
+                .map_err(|resource| RuntimeError::InvalidConfig {
+                    message: format!(
+                        "node `{}` claims more than all of resource `{resource}`",
+                        node.id
+                    ),
+                })?;
         }
-    }
-    for (group, claims) in groups.into_iter().enumerate() {
-        let first = compiled.stream_groups()[group]
-            .first()
-            .map_or("?", |n| n.as_str());
-        resources
-            .register(ports.node_count() + group, claims)
-            .map_err(|resource| invalid(first, resource))?;
     }
     Ok(resources)
 }

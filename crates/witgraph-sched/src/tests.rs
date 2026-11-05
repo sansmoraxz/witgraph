@@ -93,11 +93,19 @@ impl Scripted {
 /// `p -> r` over a stream, `v` on its own, and `gpu` claims of `p` and `v` that
 /// do not fit together.
 fn stream_group(claims: bool) -> (SchedulerCore<Scripted>, Scripted) {
+    let claims: &[(&str, f64)] = if claims {
+        &[("p", 0.6), ("v", 0.6)]
+    } else {
+        &[]
+    };
     stream_group_with(claims, None)
 }
 
-/// The same, with a capacity declared for the resource they claim.
-fn stream_group_with(claims: bool, capacity: Option<f64>) -> (SchedulerCore<Scripted>, Scripted) {
+/// The same, with these claims on `gpu`, and a capacity declared for it.
+fn stream_group_with(
+    claims: &[(&str, f64)],
+    capacity: Option<f64>,
+) -> (SchedulerCore<Scripted>, Scripted) {
     let contract = |world: &str, inputs, outputs| ComponentContract {
         id: ComponentRef {
             content_hash: Some("cc".into()),
@@ -128,13 +136,9 @@ fn stream_group_with(claims: bool, capacity: Option<f64>) -> (SchedulerCore<Scri
         .add_node("r", reader.id.clone())
         .add_node("v", lone.id.clone())
         .connect("s", PortRef::new("p", "s"), PortRef::new("r", "s"));
-    if claims {
-        let claim = || witgraph_ir::ResourceClaim::new(0.6).unwrap();
-        builder = builder
-            .set_resource("p", "gpu", claim())
-            .unwrap()
-            .set_resource("v", "gpu", claim())
-            .unwrap();
+    for (node, amount) in claims {
+        let claim = witgraph_ir::ResourceClaim::new(*amount).unwrap();
+        builder = builder.set_resource(*node, "gpu", claim).unwrap();
     }
     if let Some(capacity) = capacity {
         builder = builder.set_capacity("gpu", witgraph_ir::Capacity::new(capacity).unwrap());
@@ -154,10 +158,67 @@ fn poll_tick(core: &mut SchedulerCore<dyn DataPlane>) -> Option<TickResult> {
     core.tick().now_or_never()
 }
 
+/// Each fits by itself and they cannot all fit at once, and the reader has to run for the
+/// group to drain: it may use the room its writer goes on holding.
+#[test]
+fn a_group_claiming_more_than_there_is_runs_each_member_in_turn() {
+    let (mut core, plane) = stream_group_with(&[("p", 0.6), ("r", 0.6)], None);
+    let (p, r) = (index(&core, "p"), index(&core, "r"));
+    assert!(poll_tick(&mut core).is_none());
+    let started = plane.commands();
+    assert!(started.contains(&Command::Run(p)), "{started:?}");
+    plane.returned(p);
+    assert!(poll_tick(&mut core).is_none());
+    assert!(plane.commands().contains(&Command::Run(r)));
+}
+
+/// What the group is not waiting on stays out of the room it holds until it has drained.
+#[test]
+fn a_lingering_claim_keeps_out_what_its_group_does_not_wait_on() {
+    let (mut core, plane) = stream_group_with(&[("p", 0.6), ("r", 0.6), ("v", 0.6)], None);
+    let (p, r, v) = (index(&core, "p"), index(&core, "r"), index(&core, "v"));
+    assert!(poll_tick(&mut core).is_none());
+    assert_eq!(plane.commands(), [Command::Run(p)]);
+    plane.returned(p);
+    assert!(poll_tick(&mut core).is_none());
+    assert_eq!(plane.commands(), [Command::Run(r)]);
+    plane.returned(r);
+    assert!(poll_tick(&mut core).is_none());
+    let (drain, _) = quiet_after_drain(&plane);
+    plane.report(ControlKind::Drained {
+        group: 0,
+        at: drain,
+    });
+    assert!(poll_tick(&mut core).is_none());
+    assert!(
+        plane.commands().contains(&Command::Run(v)),
+        "it has room now"
+    );
+}
+
+/// Only what lingers is lent: what the group waits on still waits for a `run` in flight.
+#[test]
+fn a_run_in_flight_is_never_lent() {
+    let (mut core, plane) = stream_group_with(&[("r", 0.6), ("v", 0.6)], None);
+    let (p, r, v) = (index(&core, "p"), index(&core, "r"), index(&core, "v"));
+    assert!(poll_tick(&mut core).is_none());
+    let started = plane.commands();
+    assert!(started.contains(&Command::Run(v)), "{started:?}");
+    plane.returned(p);
+    assert!(poll_tick(&mut core).is_none());
+    assert!(
+        !plane.commands().contains(&Command::Run(r)),
+        "`v` is still running"
+    );
+    plane.returned(v);
+    assert!(poll_tick(&mut core).is_none());
+    assert!(plane.commands().contains(&Command::Run(r)));
+}
+
 /// What does not fit at the default capacity starts beside it at a larger one.
 #[test]
 fn a_capacity_lets_a_node_start_beside_a_group() {
-    let (mut core, plane) = stream_group_with(true, Some(1.2));
+    let (mut core, plane) = stream_group_with(&[("p", 0.6), ("v", 0.6)], Some(1.2));
     let (p, v) = (index(&core, "p"), index(&core, "v"));
     assert!(poll_tick(&mut core).is_none());
     let started = plane.commands();

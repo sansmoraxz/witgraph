@@ -273,10 +273,8 @@ does nothing, unless it was written through a typed port, which can't be compare
 one tick may do. The defaults are generous. All values share the hub's one 32-bit
 memory, so a graph holds at most 4 GiB of them, and that memory never shrinks.
 
-Nodes can also claim an amount of a named resource. A node holds its claims while
-it runs, and a stream group holds its members' from when it starts until it has
-drained. The scheduler won't start what doesn't fit, so a resource's capacity is how
-much can be held at once. It is 1 unless the graph declares otherwise:
+Nodes can also claim an amount of a named resource. A resource's capacity is how much
+can be held at once, 1 unless the graph declares otherwise:
 
 ```json
 {
@@ -287,12 +285,22 @@ much can be held at once. It is 1 unless the graph declares otherwise:
 }
 ```
 
-`GraphBuilder::set_capacity` and `set_resource` say the same. Claims decide what runs
-at the same time and nothing else: names mean nothing to witgraph, and a node can use
-more of the real thing than it claims. Compiling rejects a node or group claiming more
-than all of a resource, groups that wait on each other whose claims can't fit
-together, and a group whose claims leave no room for a node only some of its members
-wait on, since they would deadlock.
+`GraphBuilder::set_capacity` and `set_resource` say the same. Only a node claiming more
+than all of a resource is refused, when compiling. The scheduler sorts out the rest,
+starting whatever is ready and fits, in topological order, as room comes free:
+
+- A node holds its claim while its `run` is in flight. Those claims never go past a
+  capacity.
+- A member of a stream group goes on holding its claim after its `run` returns, until
+  the group has drained, as its guest work goes on. Others wait for that room, so a
+  stream that never ends keeps it.
+- A stream group's streams are not buffered, so it can't drain without its remaining
+  members and what they read. Those may start in the room its finished members hold, so
+  **a group can go over a capacity while it works**: members of 0.6 each on a capacity
+  of 1 run alongside each other once they have all started.
+
+Claims decide what runs at the same time and nothing else: names mean nothing to
+witgraph, and a node can use more of the real thing than it claims.
 
 ## Snapshots
 

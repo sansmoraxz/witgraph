@@ -14,7 +14,7 @@ use std::hash::BuildHasher;
 use crate::component::ComponentContract;
 use crate::diagnostics::{Diagnostic, Diagnostics};
 use crate::graph::{Connection, Graph, Link, Node};
-use crate::id::{ComponentRef, ConnectionId, NodeId, PackageRef, PortName, PortRef, ResourceId};
+use crate::id::{ComponentRef, ConnectionId, NodeId, PackageRef, PortName, PortRef};
 use crate::port::{PortDef, PortDirection, PortKind};
 use crate::topo;
 
@@ -1100,20 +1100,6 @@ fn check_async_fan_out(
     }
 }
 
-/// What a group of nodes claims, resource by resource.
-fn claims_of<'g>(
-    nodes: &HashMap<&NodeId, &'g Node>,
-    members: impl Iterator<Item = &'g NodeId>,
-) -> BTreeMap<&'g ResourceId, f64> {
-    let mut claims: BTreeMap<&ResourceId, f64> = BTreeMap::new();
-    for node in members.filter_map(|m| nodes.get(m)) {
-        for (resource, claim) in &node.resources {
-            *claims.entry(resource).or_insert(0.0) += claim.amount.get();
-        }
-    }
-    claims
-}
-
 /// A vertex per stream group, then one per node in none, and the nodes of each.
 fn units<'g>(
     graph: &'g Graph,
@@ -1177,46 +1163,12 @@ fn check_group_start(
     }
 }
 
-/// A stream group holds its members' claims together from when the first
-/// starts until it has drained (see [`ResourceClaim`](crate::ResourceClaim)),
-/// as its producer's writer outlives `run`. So a group whose claims on one
-/// resource sum to more than all of it could never start, and groups on a
-/// cycle, each waiting for a node of the next, must all fit at once: one holding
-/// what the next needs would wait for it forever.
-///
-/// What is only above a group needs no room beside it, as the scheduler does not start
-/// the group until that has settled. What is below the group too may need it started, so
-/// the group holds its claims while that waits. Groups in that state must leave room for
-/// what they wait for, together, as each can fit alone while all of them leave none of
-/// them room. Others drain by themselves, so they only delay it.
-fn check_group_claims(graph: &Graph, groups: &StreamGroups, diagnostics: &mut Diagnostics) {
-    // Tolerates float rounding in sums of claims such as 0.1 + 0.2.
+/// A node claiming more of a resource than there is could never start. That is the
+/// only claim to refuse: the scheduler starts everything else as room comes free.
+fn check_claims(graph: &Graph, diagnostics: &mut Diagnostics) {
+    // Tolerates float rounding, as the scheduler does.
     const EPSILON: f64 = 1e-9;
-    let mut nodes: HashMap<&NodeId, &Node> = HashMap::new();
     for node in &graph.nodes {
-        nodes.entry(&node.id).or_insert(node);
-    }
-    for members in &groups.groups {
-        let claims = claims_of(
-            &nodes,
-            members.iter().filter_map(|m| nodes.get(m).map(|n| &n.id)),
-        );
-        for (resource, _) in claims
-            .into_iter()
-            .filter(|(resource, sum)| *sum > graph.capacity_of(resource) + EPSILON)
-        {
-            diagnostics.push(Diagnostic::GroupOverclaims {
-                nodes: members.clone(),
-                resource: resource.clone(),
-            });
-        }
-    }
-    // A group's are summed above; a node by itself can still claim more than there is.
-    for node in graph
-        .nodes
-        .iter()
-        .filter(|node| !groups.in_group.contains_key(&node.id))
-    {
         for (resource, claim) in &node.resources {
             if claim.amount.get() > graph.capacity_of(resource) + EPSILON {
                 diagnostics.push(Diagnostic::NodeOverclaims {
@@ -1226,259 +1178,6 @@ fn check_group_claims(graph: &Graph, groups: &StreamGroups, diagnostics: &mut Di
             }
         }
     }
-    // Joined by what must return before what.
-    let (vertex, units) = units(graph, groups);
-    let mut reported: Vec<(Vec<NodeId>, &ResourceId)> = Vec::new();
-    let edges = graph
-        .connections
-        .iter()
-        .filter(|conn| !conn.feedback)
-        .filter_map(|conn| Some((*vertex.get(&conn.from.node)?, *vertex.get(&conn.to.node)?)))
-        .filter(|(from, to)| from != to);
-    for cycle in topo::cyclic_groups(units.len(), edges) {
-        let on_it: Vec<&Vec<NodeId>> = cycle
-            .iter()
-            .filter_map(|at| groups.groups.get(*at))
-            .collect();
-        if on_it.len() < 2 {
-            continue;
-        }
-        let members = || on_it.iter().flat_map(|members| members.iter());
-        let claims = claims_of(
-            &nodes,
-            members().filter_map(|m| nodes.get(m).map(|n| &n.id)),
-        );
-        for (resource, _) in claims
-            .into_iter()
-            .filter(|(resource, sum)| *sum > graph.capacity_of(resource) + EPSILON)
-        {
-            let nodes: Vec<NodeId> = members().cloned().collect();
-            let mut sorted = nodes.clone();
-            sorted.sort();
-            reported.push((sorted, resource));
-            diagnostics.push(Diagnostic::ClaimsCanDeadlock {
-                nodes,
-                resource: resource.clone(),
-            });
-        }
-    }
-    let below_map = below_map(graph);
-    let mut holders: Vec<Holder<'_>> = Vec::new();
-    for (at, members) in groups.groups.iter().enumerate() {
-        let claims = claims_of(
-            &nodes,
-            members.iter().filter_map(|m| nodes.get(m).map(|n| &n.id)),
-        );
-        // Over all of a resource it never starts, which is reported above; and a group
-        // claiming nothing is in nobody's way.
-        if claims.is_empty()
-            || claims
-                .iter()
-                .any(|(resource, sum)| *sum > graph.capacity_of(resource) + EPSILON)
-        {
-            continue;
-        }
-        let above = above_group(members, graph, groups);
-        let below = below_group(members, &below_map, groups);
-        let mut waits = Vec::new();
-        for (unit, nodes_of) in units.iter().enumerate().filter(|(unit, _)| *unit != at) {
-            let waited_for = nodes_of
-                .iter()
-                .any(|node| above.contains(*node) && below.contains(*node));
-            if !waited_for {
-                continue;
-            }
-            let claims = claims_of(
-                &nodes,
-                nodes_of.iter().filter_map(|m| nodes.get(*m).map(|n| &n.id)),
-            );
-            if !claims.is_empty() {
-                waits.push(Wait {
-                    unit,
-                    nodes: nodes_of.as_slice(),
-                    claims,
-                });
-            }
-        }
-        if !waits.is_empty() {
-            holders.push(Holder {
-                group: at,
-                members,
-                claims,
-                waits,
-            });
-        }
-    }
-
-    let mut stuck: Vec<Vec<usize>> = Vec::new();
-    for holding in holder_sets(holders.len()) {
-        if stuck
-            .iter()
-            .any(|set| set.iter().all(|h| holding.contains(h)))
-        {
-            continue;
-        }
-        let mut held: BTreeMap<&ResourceId, f64> = BTreeMap::new();
-        for holder in holding.iter().map(|at| &holders[*at]) {
-            for (resource, claim) in &holder.claims {
-                *held.entry(*resource).or_insert(0.0) += claim;
-            }
-        }
-        // Past what can be searched every set is taken to fit, so nothing is missed.
-        if holders.len() <= MOST_HOLDERS_SEARCHED
-            && held
-                .iter()
-                .any(|(resource, sum)| *sum > graph.capacity_of(resource) + EPSILON)
-        {
-            continue;
-        }
-        let holds = |unit: usize| holding.iter().any(|at| holders[*at].group == unit);
-        // The resource and nodes each holder waits for that cannot start beside them.
-        let mut blocked: BTreeMap<&ResourceId, Vec<&NodeId>> = BTreeMap::new();
-        let mut all_blocked = true;
-        for holder in holding.iter().map(|at| &holders[*at]) {
-            let mut this_one = false;
-            for wait in holder.waits.iter().filter(|wait| !holds(wait.unit)) {
-                for (resource, claim) in &wait.claims {
-                    let beside = held.get(resource).copied().unwrap_or(0.0);
-                    if beside + claim > graph.capacity_of(resource) + EPSILON && beside > 0.0 {
-                        this_one = true;
-                        let nodes = blocked.entry(*resource).or_default();
-                        for node in wait.nodes {
-                            if !nodes.contains(node) {
-                                nodes.push(*node);
-                            }
-                        }
-                    }
-                }
-            }
-            all_blocked &= this_one;
-        }
-        if !all_blocked {
-            continue;
-        }
-        for (resource, waited_for) in blocked {
-            let nodes: Vec<NodeId> = holding
-                .iter()
-                .flat_map(|at| holders[*at].members.iter())
-                .chain(waited_for)
-                .cloned()
-                .collect();
-            let mut sorted = nodes.clone();
-            sorted.sort();
-            if reported.iter().any(|r| r.0 == sorted && *r.1 == *resource) {
-                continue;
-            }
-            reported.push((sorted, resource));
-            diagnostics.push(Diagnostic::ClaimsCanDeadlock {
-                nodes,
-                resource: resource.clone(),
-            });
-        }
-        stuck.push(holding);
-    }
-}
-
-/// By node, the nodes it writes to over a non-feedback connection.
-fn below_map(graph: &Graph) -> HashMap<&NodeId, Vec<&NodeId>> {
-    let mut below: HashMap<&NodeId, Vec<&NodeId>> = HashMap::new();
-    for conn in graph.connections.iter().filter(|conn| !conn.feedback) {
-        below
-            .entry(&conn.from.node)
-            .or_default()
-            .push(&conn.to.node);
-    }
-    below
-}
-
-/// What is above any of `members`, a group above counting as one, as the scheduler has it.
-fn above_group<'g>(
-    members: &'g [NodeId],
-    graph: &'g Graph,
-    groups: &'g StreamGroups,
-) -> HashSet<&'g NodeId> {
-    let mut above: HashSet<&NodeId> = HashSet::new();
-    let mut waiting: Vec<&NodeId> = members.iter().collect();
-    while let Some(next) = waiting.pop() {
-        let upstream = graph
-            .connections
-            .iter()
-            .filter(|conn| !conn.feedback && conn.to.node == *next)
-            .map(|conn| &conn.from.node);
-        let in_group = groups
-            .in_group
-            .get(next)
-            .and_then(|group| groups.groups.get(*group))
-            .into_iter()
-            .flatten();
-        for node in upstream.chain(in_group) {
-            if above.insert(node) {
-                waiting.push(node);
-            }
-        }
-    }
-    above
-}
-
-/// What is below any of `members`, with one member of another group making all of that
-/// group below, as the scheduler has it: that group may need this one to start.
-fn below_group<'g>(
-    members: &'g [NodeId],
-    below_map: &HashMap<&'g NodeId, Vec<&'g NodeId>>,
-    groups: &'g StreamGroups,
-) -> HashSet<&'g NodeId> {
-    let mut below: HashSet<&NodeId> = members.iter().collect();
-    let mut waiting: Vec<&NodeId> = members.iter().collect();
-    while let Some(next) = waiting.pop() {
-        let downstream = below_map.get(next).into_iter().flatten().copied();
-        let in_group = groups
-            .in_group
-            .get(next)
-            .and_then(|group| groups.groups.get(*group))
-            .into_iter()
-            .flatten();
-        for node in downstream.chain(in_group) {
-            if below.insert(node) {
-                waiting.push(node);
-            }
-        }
-    }
-    below
-}
-
-/// How many groups [`check_group_claims`] tries every combination of: past this, it
-/// takes them all to be holding at once, which can refuse a graph that would have run,
-/// but never lets through one that would not.
-const MOST_HOLDERS_SEARCHED: usize = 12;
-
-/// A stream group that can be holding its claims while something it waits for has yet to
-/// run: something above a member and below the group.
-struct Holder<'g> {
-    /// Its index among the units, and the groups.
-    group: usize,
-    members: &'g [NodeId],
-    claims: BTreeMap<&'g ResourceId, f64>,
-    waits: Vec<Wait<'g>>,
-}
-
-/// What a [`Holder`] waits for that claims anything.
-struct Wait<'g> {
-    unit: usize,
-    nodes: &'g [&'g NodeId],
-    claims: BTreeMap<&'g ResourceId, f64>,
-}
-
-/// Every set of `holders` holders, the smaller first, as a set that is stuck makes
-/// any larger one with it stuck too. When too many to try, only all of them.
-fn holder_sets(holders: usize) -> Vec<Vec<usize>> {
-    if holders > MOST_HOLDERS_SEARCHED {
-        return vec![(0..holders).collect()];
-    }
-    let mut sets: Vec<Vec<usize>> = (1..1usize << holders)
-        .map(|set| (0..holders).filter(|at| set & (1 << at) != 0).collect())
-        .collect();
-    sets.sort_by_key(Vec::len);
-    sets
 }
 
 /// The graph's stream groups (see [`CompiledGraph::stream_groups`]): union-find
@@ -1603,8 +1302,8 @@ impl Graph {
         }
         if let Some(groups) = &groups {
             check_group_start(&self, &node_contracts, groups, &mut diagnostics);
-            check_group_claims(&self, groups, &mut diagnostics);
         }
+        check_claims(&self, &mut diagnostics);
 
         // `order` (and with it `groups`) is None only when IllegalCycle
         // errors were pushed, so the arms are exhaustive without any panic
@@ -1682,7 +1381,7 @@ mod tests {
     use super::*;
     use crate::Type;
     use crate::component::Capability;
-    use crate::graph::{Capacity, GraphBuilder, ResourceClaim, ResourceDecl};
+    use crate::graph::{Capacity, GraphBuilder, ResourceClaim};
     use crate::id::ComponentRef;
     use crate::port::PortKind;
 
@@ -2646,219 +2345,26 @@ mod tests {
     }
 
     #[test]
-    fn what_only_a_member_waits_for_runs_before_the_group_holds_anything() {
-        // The group does not start until `u` has settled, whichever was added first.
-        for u_first in [false, true] {
-            group_and_a_claiming_node(u_first, u_feeds_b)
-                .compile()
-                .expect("`u` has returned before `a` starts");
-        }
-    }
-
-    /// Two stream groups, each a head and a tail, whose heads feed a node of its own that
-    /// feeds back to the tail, so each group holds its claims while that waits to run.
-    fn two_groups_each_needing_a_node(group: f64, needed: f64) -> TestGraph {
-        let claim = |amount| ResourceClaim::new(amount).unwrap();
-        let mut graph = builder("t")
-            .add_component(contract(
-                "head",
-                vec![],
-                vec![port("st", PortKind::Stream), port("out", PortKind::Value)],
-                &[],
-            ))
-            .add_component(contract(
-                "tail",
-                vec![
-                    port("st", PortKind::Stream),
-                    port("in", PortKind::Value).optional(),
-                ],
-                vec![],
-                &[],
-            ))
-            .add_component(contract(
-                "solo",
-                vec![port("in", PortKind::Value)],
-                vec![port("out", PortKind::Value)],
-                &[],
-            ));
-        for (head, tail, node) in [("a", "b", "x"), ("c", "d", "y")] {
-            graph = graph
-                .add_node(head, cref("head"))
-                .add_node(tail, cref("tail"))
-                .add_node(node, cref("solo"))
-                .connect(
-                    format!("{head}{tail}").as_str(),
-                    PortRef::new(head, "st"),
-                    PortRef::new(tail, "st"),
-                )
-                .connect(
-                    format!("{head}{node}").as_str(),
-                    PortRef::new(head, "out"),
-                    PortRef::new(node, "in"),
-                )
-                .connect(
-                    format!("{node}{tail}").as_str(),
-                    PortRef::new(node, "out"),
-                    PortRef::new(tail, "in"),
-                )
-                .set_resource(head, "gpu", claim(group))
-                .unwrap()
-                .set_resource(node, "gpu", claim(needed))
-                .unwrap();
-        }
-        graph.build()
+    fn what_a_stream_group_claims_together_is_the_schedulers_to_sort_out() {
+        // 0.6 each in a group, and between its members: 1.8 of 1.0 by the end of it.
+        let graph = group_and_a_claiming_node(false, |graph| {
+            u_feeds_b(graph).connect("au", PortRef::new("a", "out"), PortRef::new("u", "in"))
+        });
+        let mut graph = graph;
+        graph.graph.nodes[1]
+            .resources
+            .insert("gpu".into(), ResourceClaim::new(0.6).unwrap());
+        graph.compile().expect("each one fits by itself");
     }
 
     #[test]
-    fn what_groups_need_below_them_must_fit_beside_all_of_them() {
-        // Beside either group its node fits, and both can start before either node.
+    fn a_member_of_a_stream_group_cannot_claim_more_than_a_resource_has_either() {
+        let graph = group_and_a_claiming_node(false, |graph| graph.set_capacity("gpu", 0.5));
         assert_eq!(
-            diags(two_groups_each_needing_a_node(0.4, 0.3).compile()),
-            vec![Diagnostic::ClaimsCanDeadlock {
-                nodes: ["a", "b", "c", "d", "x", "y"].map(Into::into).to_vec(),
-                resource: "gpu".into(),
-            }]
-        );
-    }
-
-    #[test]
-    fn groups_that_cannot_hold_together_do_not_block_what_they_need() {
-        // Only one can be holding at a time, and its node fits beside it.
-        assert!(two_groups_each_needing_a_node(0.6, 0.3).compile().is_ok());
-        // And with room for a node beside both, nothing waits.
-        assert!(two_groups_each_needing_a_node(0.3, 0.3).compile().is_ok());
-    }
-
-    /// Three stream groups: `a`-`b`, which `e` is above; `e`-`f`, whose reader needs a
-    /// value from `a`; and `g`-`h`, which `e` is above too. `e`'s group can start only
-    /// after `a`'s has, so being above `a` and `g` does not put it before them.
-    fn a_group_above_others_yet_after_one(gh: f64) -> TestGraph {
-        let claim = |amount| ResourceClaim::new(amount).unwrap();
-        builder("t")
-            .add_component(contract(
-                "head",
-                vec![port("in", PortKind::Value).optional()],
-                vec![port("st", PortKind::Stream), port("out", PortKind::Value)],
-                &[],
-            ))
-            .add_component(contract(
-                "tail",
-                vec![port("st", PortKind::Stream)],
-                vec![],
-                &[],
-            ))
-            .add_component(contract(
-                "gated",
-                vec![port("st", PortKind::Stream), port("gate", PortKind::Value)],
-                vec![],
-                &[],
-            ))
-            .add_node("a", cref("head"))
-            .add_node("b", cref("tail"))
-            .add_node("e", cref("head"))
-            .add_node("f", cref("gated"))
-            .add_node("g", cref("head"))
-            .add_node("h", cref("tail"))
-            .connect("ab", PortRef::new("a", "st"), PortRef::new("b", "st"))
-            .connect("ef", PortRef::new("e", "st"), PortRef::new("f", "st"))
-            .connect("gh", PortRef::new("g", "st"), PortRef::new("h", "st"))
-            .connect("ea", PortRef::new("e", "out"), PortRef::new("a", "in"))
-            .connect("eg", PortRef::new("e", "out"), PortRef::new("g", "in"))
-            .connect("af", PortRef::new("a", "out"), PortRef::new("f", "gate"))
-            .set_resource("a", "disk", claim(0.3))
-            .unwrap()
-            .set_resource("e", "disk", claim(0.3))
-            .unwrap()
-            .set_resource("g", "disk", claim(gh))
-            .unwrap()
-            .build()
-    }
-
-    /// A group `a`-`b` that needs `u`, which is below `a` and above `b`, to reach its
-    /// reader; and groups beside it that wait for nothing, each with the claim given.
-    fn a_group_needing_a_node_beside(others: &[f64]) -> TestGraph {
-        let claim = |amount| ResourceClaim::new(amount).unwrap();
-        let mut graph = builder("t")
-            .add_component(contract(
-                "head",
-                vec![],
-                vec![port("st", PortKind::Stream), port("out", PortKind::Value)],
-                &[],
-            ))
-            .add_component(contract(
-                "tail",
-                vec![
-                    port("st", PortKind::Stream),
-                    port("in", PortKind::Value).optional(),
-                ],
-                vec![],
-                &[],
-            ))
-            .add_component(contract(
-                "solo",
-                vec![port("in", PortKind::Value)],
-                vec![port("out", PortKind::Value)],
-                &[],
-            ))
-            .add_node("a", cref("head"))
-            .add_node("b", cref("tail"))
-            .add_node("u", cref("solo"))
-            .connect("ab", PortRef::new("a", "st"), PortRef::new("b", "st"))
-            .connect("au", PortRef::new("a", "out"), PortRef::new("u", "in"))
-            .connect("ub", PortRef::new("u", "out"), PortRef::new("b", "in"))
-            .set_resource("u", "gpu", claim(0.2))
-            .unwrap();
-        for (at, amount) in others.iter().enumerate() {
-            let (head, tail) = (format!("c{at}"), format!("d{at}"));
-            graph = graph
-                .add_node(head.as_str(), cref("head"))
-                .add_node(tail.as_str(), cref("tail"))
-                .connect(
-                    format!("s{at}").as_str(),
-                    PortRef::new(head.as_str(), "st"),
-                    PortRef::new(tail.as_str(), "st"),
-                )
-                .set_resource(head.as_str(), "gpu", claim(*amount))
-                .unwrap();
-        }
-        graph.build()
-    }
-
-    #[test]
-    fn a_capacity_makes_room_for_what_sits_between_members() {
-        let graph = |capacity: Option<f64>| {
-            group_and_a_claiming_node(false, |graph| {
-                let graph = u_feeds_b(graph).connect(
-                    "au",
-                    PortRef::new("a", "out"),
-                    PortRef::new("u", "in"),
-                );
-                match capacity {
-                    Some(capacity) => graph.set_capacity("gpu", capacity),
-                    None => graph,
-                }
-            })
-        };
-        assert!(
-            graph(None).compile().is_err(),
-            "0.6 and 0.6 do not fit in 1.0"
-        );
-        assert!(graph(Some(1.0)).compile().is_err(), "the same, said");
-        assert!(graph(Some(1.2)).compile().is_ok(), "they fit exactly");
-    }
-
-    #[test]
-    fn a_group_can_claim_up_to_a_capacity() {
-        let graph = |capacity: f64| {
-            group_and_a_claiming_node(false, |graph| graph.set_capacity("gpu", capacity))
-        };
-        // Its one claim of 0.6, and `u`'s beside it.
-        assert!(graph(0.6).compile().is_ok(), "they take turns");
-        assert_eq!(
-            diags(graph(0.5).compile()),
+            diags(graph.compile()),
             vec![
-                Diagnostic::GroupOverclaims {
-                    nodes: vec!["a".into(), "b".into()],
+                Diagnostic::NodeOverclaims {
+                    node: "a".into(),
                     resource: "gpu".into(),
                 },
                 Diagnostic::NodeOverclaims {
@@ -2892,74 +2398,12 @@ mod tests {
     }
 
     #[test]
-    fn groups_waiting_on_each_other_are_measured_against_a_capacity() {
-        assert!(two_groups_each_needing_a_node(0.6, 0.6).compile().is_err());
-        let mut fits = two_groups_each_needing_a_node(0.6, 0.6);
-        fits.graph.resources.insert(
-            "gpu".into(),
-            ResourceDecl {
-                capacity: Capacity::new(1.8).unwrap(),
-            },
-        );
-        fits.compile()
-            .expect("each group and its node fit beside the other group");
-        // Claiming more than the default is no reason to leave a group out of the search.
-        let mut large = two_groups_each_needing_a_node(1.2, 1.0);
-        large.graph.resources.insert(
-            "gpu".into(),
-            ResourceDecl {
-                capacity: Capacity::new(2.0).unwrap(),
-            },
-        );
-        assert!(large.compile().is_err(), "1.2 and 1.0 do not fit in 2.0");
-    }
-
-    #[test]
     fn a_capacity_is_positive_and_finite() {
         assert!(Capacity::new(2.0).is_ok());
         assert_eq!(Capacity::default().get(), 1.0);
         for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
             assert!(Capacity::new(bad).is_err(), "{bad}");
         }
-    }
-
-    #[test]
-    fn groups_beside_what_a_group_needs_only_delay_it() {
-        // They drain by themselves, and then `u` fits.
-        assert!(a_group_needing_a_node_beside(&[0.6, 0.4]).compile().is_ok());
-    }
-
-    #[test]
-    fn a_group_waiting_for_what_is_above_it_holds_back_what_it_is_above() {
-        // `e`'s group waits for `a`, and is above `g`'s, which the scheduler holds back: only
-        // `e`'s group and `a`'s must fit together.
-        a_group_above_others_yet_after_one(0.6)
-            .compile()
-            .expect("`g`'s group waits its turn");
-    }
-
-    #[test]
-    fn what_sits_between_members_must_fit_beside_the_group() {
-        let graph = group_and_a_claiming_node(false, |graph| {
-            u_feeds_b(graph).connect("au", PortRef::new("a", "out"), PortRef::new("u", "in"))
-        });
-        assert_eq!(
-            diags(graph.compile()),
-            vec![Diagnostic::ClaimsCanDeadlock {
-                nodes: vec!["a".into(), "b".into(), "u".into()],
-                resource: "gpu".into(),
-            }]
-        );
-    }
-
-    #[test]
-    fn what_a_group_does_not_wait_for_needs_no_room_beside_it() {
-        let graph = group_and_a_claiming_node(false, |graph| graph);
-        graph.compile().expect("`u` waits its turn");
-        let feedback = group_and_a_claiming_node(false, |graph| {
-            graph.connect_feedback("ub", PortRef::new("u", "out"), PortRef::new("b", "in"))
-        });
-        feedback.compile().expect("feedback waits for nothing");
     }
 
     /// A value path out of a group and back no longer joins anything: each
@@ -2985,63 +2429,6 @@ mod tests {
         assert_eq!(compiled.stream_groups().len(), 1);
         assert_eq!(compiled.group_of(&NodeId::from("r")), None);
         assert!(compiled.warnings().is_empty(), "{:?}", compiled.warnings());
-    }
-
-    /// `{a, b}` and `{c, d}`, joined by `a -> c`, `a -> d` and `d -> b`: `b`
-    /// waits for `d`, whose group may not fit while the other holds its claim.
-    /// Two stream groups, claiming 0.6 each, each of which waits on the other to finish.
-    fn groups_waiting_on_each_other() -> TestBuilder {
-        let claim = || ResourceClaim::new(0.6).unwrap();
-        builder("t")
-            .add_component(contract(
-                "head",
-                vec![port("in", PortKind::Value).optional()],
-                vec![port("st", PortKind::Stream), port("out", PortKind::Value)],
-                &[],
-            ))
-            .add_component(contract(
-                "tail",
-                vec![
-                    port("st", PortKind::Stream),
-                    port("in", PortKind::Value).optional(),
-                ],
-                vec![port("out", PortKind::Value)],
-                &[],
-            ))
-            .add_node("a", cref("head"))
-            .add_node("b", cref("tail"))
-            .add_node("c", cref("head"))
-            .add_node("d", cref("tail"))
-            .connect("ab", PortRef::new("a", "st"), PortRef::new("b", "st"))
-            .connect("cd", PortRef::new("c", "st"), PortRef::new("d", "st"))
-            .connect("ac", PortRef::new("a", "out"), PortRef::new("c", "in"))
-            .connect("ad", PortRef::new("a", "out"), PortRef::new("d", "in"))
-            .connect("db", PortRef::new("d", "out"), PortRef::new("b", "in"))
-            .set_resource("a", "gpu", claim())
-            .unwrap()
-            .set_resource("c", "gpu", claim())
-            .unwrap()
-    }
-
-    #[test]
-    fn groups_waiting_on_each_other_must_fit_their_claims_together() {
-        let graph = groups_waiting_on_each_other().build();
-        let diagnostics = diags(graph.compile());
-        assert_eq!(
-            diagnostics,
-            vec![Diagnostic::ClaimsCanDeadlock {
-                nodes: vec!["a".into(), "b".into(), "c".into(), "d".into()],
-                resource: "gpu".into(),
-            }]
-        );
-    }
-
-    #[test]
-    fn a_capacity_makes_room_for_groups_waiting_on_each_other() {
-        let graph = groups_waiting_on_each_other()
-            .set_capacity("gpu", 1.2)
-            .build();
-        graph.compile().expect("0.6 and 0.6 fit in 1.2");
     }
 
     #[test]
@@ -3747,51 +3134,6 @@ mod tests {
                 port: PortRef::new("c", "inn"),
             }]
         );
-    }
-
-    #[test]
-    fn a_group_claiming_more_than_a_resource_is_rejected() {
-        let producer = contract("producer", vec![], vec![port("out", PortKind::Stream)], &[]);
-        let consumer = contract("consumer", vec![port("in", PortKind::Stream)], vec![], &[]);
-        let claim = || ResourceClaim::new(0.6).unwrap();
-        let graph = builder("t")
-            .add_component(producer)
-            .add_component(consumer)
-            .add_node("p", cref("producer"))
-            .add_node("c", cref("consumer"))
-            .connect("st", PortRef::new("p", "out"), PortRef::new("c", "in"))
-            .set_resource("p", "gpu", claim())
-            .unwrap()
-            .set_resource("c", "gpu", claim())
-            .unwrap()
-            .build();
-        let diagnostics = diags(graph.compile());
-        assert_eq!(
-            diagnostics,
-            vec![Diagnostic::GroupOverclaims {
-                nodes: vec!["p".into(), "c".into()],
-                resource: "gpu".into(),
-            }]
-        );
-        assert_eq!(
-            diagnostics[0].location(),
-            crate::Location::Group(vec!["p".into(), "c".into()])
-        );
-        // Apart, each node fits.
-        let graph = builder("t")
-            .add_component(source())
-            .add_component(sink())
-            .add_node("s", cref("source"))
-            .add_node("d", cref("sink"))
-            .connect("v", PortRef::new("s", "out"), PortRef::new("d", "in"))
-            .set_resource("s", "gpu", claim())
-            .unwrap()
-            .set_resource("d", "gpu", claim())
-            .unwrap()
-            .build();
-        graph
-            .compile()
-            .expect("value-connected nodes hold their claims apart");
     }
 
     #[test]
