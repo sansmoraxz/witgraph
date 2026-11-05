@@ -1118,15 +1118,15 @@ test('an instance dropped while it rebuilds is abandoned', async () => {
   try {
     await web.inject('a', 'in', 1);
     await web.tick();
-    web.shutdown();
-    web.rerun('a');
+    await web.shutdown();
+    await web.rerun('a');
     let stop!: () => void;
     const ticked = web.tick(new Promise<void>((resolve) => (stop = resolve)));
     await rebuilding.promise;
     stop();
     assert.equal((await ticked).result, 'interrupted');
     assert.equal(abandoned, 1, 'the first shutdown');
-    web.shutdown();
+    await web.shutdown();
     assert.equal(abandoned, 2);
   } finally {
     web.free();
@@ -2432,7 +2432,7 @@ test('a capacity with room for both lets a node start beside a stream group', as
   await groupBesideANode(1.2);
 });
 
-test('a value written while a tick runs is written once it is over, in order', async () => {
+test('what is asked while a tick runs is done once it is over, in order', async () => {
   let release = () => {};
   let holding = true;
   const reached = Promise.withResolvers<void>();
@@ -2460,6 +2460,7 @@ test('a value written while a tick runs is written once it is over, in order', a
   const written: string[] = [];
   const first = session.graph.inject('a', 'in', 5).then(() => written.push('first'));
   const second = session.graph.injectWave('a', 'in', '7').then(() => written.push('second'));
+  const rerun = session.graph.rerun('b').then(() => written.push('rerun'));
   await assert.rejects(session.graph.tick(), /a tick is in progress/, 'one tick at a time');
   await new Promise((resolve) => setTimeout(resolve, 20));
   assert.deepEqual(written, [], 'they wait for the tick');
@@ -2467,9 +2468,25 @@ test('a value written while a tick runs is written once it is over, in order', a
   holding = false;
   release();
   await tick;
-  await Promise.all([first, second]);
-  assert.deepEqual(written, ['first', 'second']);
+  await Promise.all([first, second, rerun]);
+  assert.deepEqual(written, ['first', 'second', 'rerun']);
   assert.equal(await session.graph.readInput('a', 'in'), 7, 'the last one written');
+
+  // A shutdown waits as well, and ends what the tick left running.
+  holding = true;
+  const again = session.tick();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  let shut = false;
+  const shutdown = session.graph.shutdown().then(() => {
+    shut = true;
+  });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(shut, false, 'it waits for the tick');
+  holding = false;
+  release();
+  await again;
+  await shutdown;
+  assert.equal(await session.graph.readInput('a', 'in'), undefined, 'the graph was stopped');
 });
 
 test('a node stays running until its stream group has drained', async () => {

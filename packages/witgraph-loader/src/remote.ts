@@ -185,10 +185,12 @@ const GRAPH_CALLS = new Set([
   'readOutputWave',
   'snapshot',
   'restore',
+  'rerun',
+  'shutdown',
 ]);
 
 /** The calls of the graph that return at once, and that nothing waits on. */
-const GRAPH_POSTS = new Set(['rerun', 'shutdown', 'catchUp']);
+const GRAPH_POSTS = new Set(['catchUp']);
 
 /** How often state is reported while a tick runs, whatever else happens. */
 const REPORT_EVERY_MS = 50;
@@ -466,9 +468,14 @@ class Served {
     if (method === 'readHandle') return this.readHandle(args[0] as string, args[1] as string);
     if (method === 'sync') return void this.report();
     if (!GRAPH_CALLS.has(method)) throw new Error(`a session has no call \`${method}\``);
-    return (this.session.graph as unknown as Record<string, (...args: unknown[]) => unknown>)[
+    const done = (this.session.graph as unknown as Record<string, (...args: unknown[]) => unknown>)[
       method
     ](...args);
+    // What they change is told as soon as it is done, as it is for what the session runs.
+    if (method === 'rerun' || method === 'shutdown') {
+      return Promise.resolve(done).finally(() => this.#reportSoon());
+    }
+    return done;
   }
 
   /** The calls nothing waits on: a failed one is as if not made. */
@@ -760,13 +767,13 @@ export class RemoteGraph {
   }
 
   /** The node owes a run. In order with what else is asked of the session. */
-  rerun(node: string): void {
-    this.#session.postGraph('rerun', [node]);
+  rerun(node: string): Promise<void> {
+    return this.#call('rerun', node);
   }
 
   /** Ends what is running. In order with what else is asked of the session. */
-  shutdown(): void {
-    this.#session.postGraph('shutdown', []);
+  shutdown(): Promise<void> {
+    return this.#call('shutdown');
   }
 
   /** Takes in what is reported between ticks. In order with what else is asked. */

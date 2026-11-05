@@ -1110,7 +1110,8 @@ test('only what is previewed or selected is recorded', async () => {
   // Selected, the inspector shows it: it is recorded from then on.
   controller.select('n');
   assert.equal(controller.isObserved('n', 'out'), true);
-  await pause(0);
+  // Read from the worker: a message there and back, which no fixed pause is sure to outlast.
+  await until(() => controller.observe('n', 'out').count === 1);
   assert.equal(controller.observe('n', 'out').count, 1, 'what it holds now');
   await controller.tick();
   assert.equal(controller.observe('n', 'out').count, 2);

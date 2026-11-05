@@ -100,10 +100,12 @@ the TypeScript and let `init` fetch the module from beside the script.
 - **The same calls as on wasmtime.** `inject`, `injectWave`, `clearInput`,
   `readOutput`, `readOutputWave`, `readHandle`, `snapshot` and `restore` return
   promises, on both hosts, and `tick` too. A handle output is read with
-  `readHandle`. Reads work while a tick runs. Writes made while one does wait
-  for it to end, and land in the order they were made, so one made while
-  paused at a breakpoint lands once you go on. On wasmtime, as here, a write
-  lands between ticks. A second tick rejects while one runs.
+  `readHandle`. Reads work while a tick runs. Writes, `rerun` and `shutdown`
+  made while one does wait for it to end, and are done in the order they were
+  made, so a write made while paused at a breakpoint lands once you go on.
+  `rerun` and `shutdown` return promises here, for that. On wasmtime, they and
+  the writes take the graph mutably, so they come between ticks there anyway.
+  A second tick rejects while one runs.
 - **Reading only what's new.** `outputVersion` says which value of an output is
   latched: a number that moves on each time the node writes it, or a snapshot
   is restored. It costs nothing to ask, so a host previewing an output on its
@@ -178,8 +180,8 @@ Functions and resources can't cross, so a few things differ from a `Session`:
 - **What needs no waiting is as last reported.** `nodeState`, `outputVersion`, `takeTrace`
   and `takeFaults` read what the worker last sent, which it does as things happen, at most
   every 16 ms. A tick's reply comes after the state as it ended, and `graph.sync()` waits for
-  the state as it is. `onState` says when it has moved. `rerun`, `shutdown` and `catchUp`
-  return at once, and stay in order with everything else asked of the session.
+  the state as it is. `onState` says when it has moved. `catchUp` returns at once, and
+  stays in order with everything else asked of the session.
 
 A value that can't be cloned rejects the call that asked for it. One worker serves any
 number of sessions. `endWorker(worker)` is the only way to end a node that spins, since

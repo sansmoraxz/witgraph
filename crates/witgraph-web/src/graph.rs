@@ -909,8 +909,8 @@ impl WebGraph {
     /// callback, say), another rejects at once. `readOutput`,
     /// `readOutputWave`, `nodeState`, `takeTrace` and `component` report
     /// what the tick has done so far. `inject`, `injectWave`, `clearInput`,
-    /// `snapshot` and `restore` wait for it to end, in the order they were
-    /// called; the other methods throw.
+    /// `rerun`, `shutdown`, `snapshot` and `restore` wait for it to end, in the
+    /// order they were called; the other methods throw.
     pub fn tick(&self, stop: JsValue) -> Promise {
         self.start_tick(&stop)
             .unwrap_or_else(|e| Promise::reject(&JsValue::from(e)))
@@ -1193,15 +1193,21 @@ impl WebGraph {
         })
     }
 
-    /// Makes the node owe a run on its latched inputs.
-    pub fn rerun(&self, node: &str) -> Result<(), JsError> {
-        self.idle()?.rerun(&node.into()).map_err(error)
+    /// Makes the node owe a run on its latched inputs. Resolves once it does.
+    pub fn rerun(&self, node: &str) -> Promise {
+        let node = NodeId::from(node);
+        self.on_idle(async move |sched| {
+            sched.rerun(&node).map_err(error)?;
+            Ok(JsValue::UNDEFINED)
+        })
     }
 
-    /// Stops the graph.
-    pub fn shutdown(&self) -> Result<(), JsError> {
-        self.idle()?.shutdown();
-        Ok(())
+    /// Stops the graph. Resolves once it has.
+    pub fn shutdown(&self) -> Promise {
+        self.on_idle(async move |sched| {
+            sched.shutdown();
+            Ok(JsValue::UNDEFINED)
+        })
     }
 
     /// Which value of a Value or handle output port is latched: a number

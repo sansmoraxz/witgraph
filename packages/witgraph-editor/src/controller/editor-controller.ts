@@ -1416,7 +1416,7 @@ export class EditorController extends EventTarget {
 
     this.#mode = 'running';
     this.#stopRequested = false;
-    this.#rerunCancelled();
+    await this.#rerunCancelled();
     this.#dispatch('state-changed');
 
     const startTime = performance.now();
@@ -1529,7 +1529,7 @@ export class EditorController extends EventTarget {
     this.#lastRunDurationMs = null;
     this.#lastRunTicks = 0;
     this.#stopRequested = false;
-    this.#rerunCancelled();
+    await this.#rerunCancelled();
     this.#dispatch('state-changed');
     this.#runLoop = this.#runTicks(name).finally(() => {
       this.#runLoop = null;
@@ -1549,7 +1549,7 @@ export class EditorController extends EventTarget {
         if (result === 'idle' && ticks === 1 && !this.#stopRequested) {
           // Nothing was owed, so the graph had finished: this starts it again, as running
           // a finished program would, or breakpoints and steps would have nothing to stop at.
-          this.#rerunAll();
+          await this.#rerunAll();
           continue;
         }
         if (result === 'idle' || result === 'stopped') break;
@@ -1579,13 +1579,11 @@ export class EditorController extends EventTarget {
     }
   }
 
-  /** Every node owes a run, on the inputs it has. */
-  #rerunAll(): void {
-    for (const id of this.#nodes.keys()) {
-      try {
-        this.#session?.graph.rerun(id);
-      } catch {}
-    }
+  /** Every node owes a run, on the inputs it has. A node the graph has no longer is no matter. */
+  async #rerunAll(): Promise<void> {
+    const graph = this.#session?.graph;
+    if (!graph) return;
+    await Promise.all([...this.#nodes.keys()].map((id) => graph.rerun(id).catch(() => {})));
   }
 
   /** Settled at the next pause, or when the run is over. */
@@ -1739,7 +1737,7 @@ export class EditorController extends EventTarget {
     }
     this.#tickCount++;
     const stop = this.#stopRequested;
-    if (stop) this.#shutdown();
+    if (stop) await this.#shutdown();
     this.#pollState();
     await this.#pullObserved(stop);
     if (stop) return 'stopped';
@@ -1754,20 +1752,17 @@ export class EditorController extends EventTarget {
   }
 
   /** Stops the graph: what is still running ends, streams included. */
-  #shutdown(): void {
-    try {
-      this.#session?.graph.shutdown();
-    } catch {}
+  async #shutdown(): Promise<void> {
+    // A worker ended for not stopping takes it with it.
+    await this.#session?.graph.shutdown().catch(() => {});
   }
 
   /** Nodes a stop cancelled run again on their latched inputs. */
-  #rerunCancelled(): void {
-    for (const [id, visual] of this.#nodes) {
-      if (visual.phase !== 'cancelled') continue;
-      try {
-        this.#session?.graph.rerun(id);
-      } catch {}
-    }
+  async #rerunCancelled(): Promise<void> {
+    const graph = this.#session?.graph;
+    if (!graph) return;
+    const cancelled = [...this.#nodes].filter(([, visual]) => visual.phase === 'cancelled');
+    await Promise.all(cancelled.map(([id]) => graph.rerun(id).catch(() => {})));
   }
 
   /**
@@ -1777,8 +1772,8 @@ export class EditorController extends EventTarget {
   stop(): Promise<void> {
     this.#stopRequested = true;
     if (!this.#ticking && this.#session) {
-      this.#shutdown();
-      this.#pollState();
+      // Sent now, in order with what else is asked: what it changes is polled once it is done.
+      void this.#shutdown().then(() => this.#pollState());
     }
     for (const { resume } of this.#held.splice(0)) resume();
     this.#setStepping(false);
