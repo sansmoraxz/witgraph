@@ -249,7 +249,8 @@ type ImportKind =
 type NodeNumber = number & { readonly brand: 'node' };
 
 /** A live hub's exports, as jco names them. */
-interface HubInstance extends Disposable {
+interface HubInstance {
+  _util: { stop: () => void };
   control: {
     run: (node: NodeNumber) => Promise<unknown>;
   } & Record<string, (...args: any[]) => any>;
@@ -706,7 +707,7 @@ function mockableNodes(graph: string): string[] {
 /** Ends `instance`. What disposing the host objects it held throws is only logged. */
 function end(instance: HubInstance): void {
   try {
-    instance[Symbol.dispose]();
+    instance._util.stop();
   } catch (error) {
     console.error('disposing a handle threw:', error);
   }
