@@ -121,6 +121,68 @@ stops, its next call of a host import fails, and every object it still holds is
 disposed once. An instance the scheduler lets go of (on a fault, shutdown or restore)
 goes the same way.
 
+## In a worker
+
+A node runs on the thread its session is on, so one that spins holds up everything else
+there, and a page that is busy holds up the nodes. `serveSession` puts a session in a
+worker, and `RemoteSession` is the same session seen from the page:
+
+```ts
+// worker.ts
+import { serveSession } from 'witgraph-loader';
+
+serveSession(self, {
+  capabilities: (capability) =>
+    capability.interface === 'demo:caps/clock@0.1.0' ? clock : undefined,
+  views: { tensor: tensorView },
+});
+```
+
+```ts
+// the page
+const worker = new Worker(new URL('./worker.ts', import.meta.url), { type: 'module' });
+const session = await RemoteSession.load(worker, {
+  graph,
+  components,
+  wasm,
+  observed: [['camera', 'frames']],
+  onHandle: ({ node, port, shown }) => draw(shown),
+});
+await session.graph.inject('scale', 'factor', 10);
+await session.tick();
+await session.graph.readOutput('scale', 'out');
+session.dispose();
+```
+
+Functions and resources can't cross, so a few things differ from a `Session`:
+
+- **Capabilities are provided in the worker**, and so has to be whatever they use. Most of
+  the web platform is there (WebGPU, WebNN, timers, `fetch`). What only a page has, like
+  opening a camera, it does for the worker: the demo's `data/camera-page.ts` sends it
+  `VideoFrame`s.
+- **Handles stay in the worker.** A `HandleView`, named for the viewer an output asks for,
+  says what the page is shown of one: `keep` takes a reference as it passes, and `read`
+  makes a value of it, which can be cloned. Reads run one at a time for each output, and
+  what arrives meanwhile waits, the newest only, so a stream of handles is sampled as fast
+  as it reads back. With no view, a handle is described by its `toString`, or its resource.
+- **Hooks run on the page, and most do not wait.** `beforeRun` is told each run, but only
+  those `holds` names wait for what it returns (`holdAt` changes them, from the next run to
+  start), so a busy page does not hold up the rest. `afterRun` does not wait.
+- **Only what is observed crosses.** `onStreamItem`, `onFutureValue` and `onHandle` are told
+  of the outputs in `observed` (`observeOnly` changes them), as each item is cloned to get
+  there.
+- **`mocks` run on the page**, on inputs and outputs that can be cloned.
+- **What needs no waiting is as last reported.** `nodeState`, `outputVersion`, `takeTrace`
+  and `takeFaults` read what the worker last sent, which it does as things happen, at most
+  every 16 ms. A tick's reply comes after the state as it ended, and `graph.sync()` waits for
+  the state as it is. `onState` says when it has moved. `rerun`, `shutdown` and `catchUp`
+  return at once, and stay in order with everything else asked of the session.
+
+A value that can't be cloned rejects the call that asked for it. One worker serves any
+number of sessions. Terminating it is the only way to end a node that spins, since the
+worker never gets to read a `shutdown`, and it ends all of them. A `MessagePort` will do
+for `self` and `worker`, with `serveSession` on either side of it, even on one thread.
+
 ## When a graph does not compile
 
 `Session.load` throws an error listing what is wrong. `diagnosticsOf(error)` gets the
@@ -141,7 +203,8 @@ const diagnostics = checker.check(JSON.stringify(graph));
 
 ## Differences from wasmtime
 
-- No fuel or memory limits, so a node that spins blocks the thread.
+- No fuel or memory limits, so a node that spins blocks its thread. In a
+  [worker](#in-a-worker) that thread is not the page's.
 - What a failed call is pinned on is the node whose call failed.
 - Nodes are async, so the browser needs JSPI.
 

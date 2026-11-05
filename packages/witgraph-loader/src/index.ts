@@ -929,4 +929,15 @@ export function diagnosticsOf(error: unknown): Diagnostic[] | undefined {
   return Array.isArray(diagnostics) ? (diagnostics as Diagnostic[]) : undefined;
 }
 
+export {
+  describeHandle,
+  type Endpoint,
+  type HandleItem,
+  type HandleView,
+  RemoteGraph,
+  RemoteSession,
+  type RemoteSessionOptions,
+  type ServeOptions,
+  serveSession,
+} from './remote.ts';
 export { GraphChecker, WebGraph };
