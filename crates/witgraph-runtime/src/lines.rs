@@ -20,8 +20,8 @@ use wasmtime::{
 };
 use witgraph_ir::NodeId;
 use witgraph_probes::{
-    Frame, LineIndex, ModuleDebug, ProbeId, StepKind, core_modules, defined_function_names,
-    imported_functions, source_lines,
+    Frame, LeavingLine, LineIndex, ModuleDebug, Passing, ProbeId, StepKind, core_modules,
+    defined_function_names, imported_functions, source_lines,
 };
 use witgraph_traits::executor::MaybeSend;
 use witgraph_traits::lines::{LineDebugger, LineStop, OwnLines, StackFrame, StopReason};
@@ -93,6 +93,15 @@ struct State {
     /// What the live Store has set.
     set: BTreeSet<(usize, ProbeId)>,
     single_stepping: bool,
+    /// Guests gone on from a line that would stop them again before they have left it.
+    leaving: Vec<Leaving>,
+}
+
+/// A guest on its way off a line.
+struct Leaving {
+    module: usize,
+    instance: Instance,
+    line: LeavingLine,
 }
 
 impl State {
@@ -130,16 +139,28 @@ impl Shared {
 
     /// Makes what the Store has set what is wanted.
     fn sync<D: 'static>(&self, store: &mut StoreContextMut<'_, D>) {
-        let (modules, adding, removing, single) = {
+        let (modules, adding, removing, single, kept) = {
             let mut state = self.state();
             let wanted = state.wanted();
             let adding: Vec<_> = wanted.difference(&state.set).copied().collect();
             let removing: Vec<_> = state.set.difference(&wanted).copied().collect();
-            let single = state.pause || state.step.is_some();
+            let State {
+                leaving, modules, ..
+            } = &mut *state;
+            leaving.retain(|leaving| {
+                modules.get(leaving.module).is_some_and(|known| {
+                    known.index.still_armed(&leaving.line, |site| {
+                        wanted.contains(&(leaving.module, site))
+                    })
+                })
+            });
+            // Watched at every line, to see it leave, which is over quickly.
+            let single = state.pause || state.step.is_some() || !state.leaving.is_empty();
             let change = (single != state.single_stepping).then_some(single);
             state.set = wanted;
             state.single_stepping = single;
-            (state.modules.clone(), adding, removing, change)
+            let kept: Vec<_> = state.set.iter().copied().collect();
+            (state.modules.clone(), adding, removing, change, kept)
         };
         if adding.is_empty() && removing.is_empty() && single.is_none() {
             return;
@@ -163,6 +184,15 @@ impl Shared {
         }
         if let Some(on) = single {
             let _ = edit.single_step(on);
+            // Ending single-stepping leaves the code unpatched for what is set: set them again.
+            if !on {
+                for (at, probe) in kept {
+                    if let Some((module, pc)) = offset(at, probe) {
+                        let _ = edit.remove_breakpoint(module, pc);
+                        let _ = edit.add_breakpoint(module, pc);
+                    }
+                }
+            }
         }
     }
 
@@ -200,7 +230,7 @@ impl Shared {
             .module(store.as_context_mut())
             .ok()??
             .debug_index_in_engine();
-        let (at, module, pause, armed, step) = {
+        let (at, module, pause, mut armed, step) = {
             let state = self.state();
             let at = state
                 .modules
@@ -220,6 +250,25 @@ impl Shared {
         let instance = top.instance(&mut *store).ok()?;
         let frames = Self::own_frames(store, &top, module_id);
         let depth = frames.len();
+        {
+            let mut state = self.state();
+            let leaving = state
+                .leaving
+                .iter()
+                .position(|leaving| leaving.module == at && leaving.instance == instance);
+            if let Some(leaving) = leaving {
+                match module
+                    .index
+                    .passing(&mut state.leaving[leaving].line, probe, depth)
+                {
+                    Passing::OnTheLine => armed = false,
+                    Passing::InACall => {}
+                    Passing::Left => {
+                        state.leaving.remove(leaving);
+                    }
+                }
+            }
+        }
         let stepped = step.is_some_and(|step| {
             step.module == at
                 && step.instance == instance
@@ -279,6 +328,19 @@ impl Shared {
             probe,
             depth,
         });
+        state
+            .leaving
+            .retain(|leaving| leaving.module != at || leaving.instance != instance);
+        let line = module
+            .index
+            .leaving_line(probe, depth, |site| state.set.contains(&(at, site)));
+        if let Some(line) = line {
+            state.leaving.push(Leaving {
+                module: at,
+                instance,
+                line,
+            });
+        }
         state.go = Some(go);
         state.unseen.push_back(stop);
         for waker in state.wakers.drain(..) {
@@ -461,6 +523,7 @@ impl RuntimeLines {
         let mut state = self.shared.state();
         state.set.clear();
         state.single_stepping = false;
+        state.leaving.clear();
     }
 
     /// Learns what a new Store's modules have to say, and sets what is wanted there.

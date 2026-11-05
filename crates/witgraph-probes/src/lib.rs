@@ -880,19 +880,16 @@ impl LineIndex {
         let mut index = Self::default();
         let mut line_of: HashMap<u32, Option<u32>> = HashMap::new();
         let mut opened = HashSet::new();
-        let mut seen = HashSet::new();
         for (at, probe) in probes.iter().enumerate() {
             let id = ProbeId(u32::try_from(at).unwrap_or(u32::MAX));
             index.by_offset.entry(probe.offset.0).or_insert(id);
-            if seen.insert((probe.function, probe.file.clone(), probe.line)) {
-                index
-                    .sites
-                    .entry(probe.file.clone())
-                    .or_default()
-                    .entry(probe.line)
-                    .or_default()
-                    .push(id);
-            }
+            index
+                .sites
+                .entry(probe.file.clone())
+                .or_default()
+                .entry(probe.line)
+                .or_default()
+                .push(id);
             if opened.insert(probe.function) {
                 index.opening.insert(id);
             }
@@ -933,13 +930,63 @@ impl LineIndex {
             .copied()
     }
 
-    /// Where stopping on a line of a file stops.
+    /// Where stopping on a line of a file stops: all of it, as which way the code gets to a
+    /// line says nothing of where it starts. An async function is a state machine, with a line
+    /// in several places, and the first by address may be taken once or never.
+    /// [`LeavingLine`] keeps that to one stop each time the line runs.
     #[must_use]
     pub fn sites(&self, file: &str, line: u32) -> &[ProbeId] {
         self.sites
             .get(file)
             .and_then(|lines| lines.get(&line))
             .map_or(&[], Vec::as_slice)
+    }
+
+    /// What to watch for once a guest stopped at `stopped` goes on, if that line would stop it
+    /// again before it has left: when `armed` has more than one site on the line.
+    #[must_use]
+    pub fn leaving_line(
+        &self,
+        stopped: ProbeId,
+        depth: usize,
+        armed: impl Fn(ProbeId) -> bool,
+    ) -> Option<LeavingLine> {
+        let probe = self.probe(stopped)?;
+        let sites = self.sites(&probe.file, probe.line);
+        (sites.len() > 1 && sites.iter().any(|site| armed(*site))).then(|| LeavingLine {
+            from: stopped,
+            seen: HashSet::from([stopped]),
+            depth,
+        })
+    }
+
+    /// Whether a line being left is still armed.
+    #[must_use]
+    pub fn still_armed(&self, leaving: &LeavingLine, armed: impl Fn(ProbeId) -> bool) -> bool {
+        self.probe(leaving.from).is_some_and(|probe| {
+            self.sites(&probe.file, probe.line)
+                .iter()
+                .any(|site| armed(*site))
+        })
+    }
+
+    /// What reaching `here` says of the line being left.
+    pub fn passing(&self, leaving: &mut LeavingLine, here: ProbeId, depth: usize) -> Passing {
+        let (Some(from), Some(probe)) = (self.probe(leaving.from), self.probe(here)) else {
+            return Passing::Left;
+        };
+        if probe.file == from.file && probe.line == from.line {
+            // Back at a place it has been: this is the line running again.
+            return if leaving.seen.insert(here) {
+                Passing::OnTheLine
+            } else {
+                Passing::Left
+            };
+        }
+        if probe.function != from.function && depth > leaving.depth {
+            return Passing::InACall;
+        }
+        Passing::Left
     }
 
     /// The line a module offset starts, if one does.
@@ -990,6 +1037,26 @@ impl LineIndex {
             StepKind::Out => depth < from_depth,
         }
     }
+}
+
+/// A guest going on from a stop, until it has left the line: a line can be many sites, and
+/// passing through them is one time running it, so one stop.
+#[derive(Clone, Debug)]
+pub struct LeavingLine {
+    from: ProbeId,
+    seen: HashSet<ProbeId>,
+    depth: usize,
+}
+
+/// What reaching a probe says of a line being left.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Passing {
+    /// Still on it, somewhere else: a breakpoint here is the one it stopped for.
+    OnTheLine,
+    /// In a call the line makes, which it comes back from. Breakpoints there stop.
+    InACall,
+    /// It has left, or is running the line again.
+    Left,
 }
 
 /// The core modules inside a component, nested ones too, as their bytes.
@@ -1223,6 +1290,55 @@ mod tests {
             None,
             "in that function"
         );
+    }
+
+    #[test]
+    fn a_line_is_all_its_sites_and_passing_through_them_is_one_time_running_it() {
+        let probe = |function, line| Probe {
+            offset: ModuleOffset(0),
+            function,
+            file: "f".into(),
+            line,
+            column: 0,
+        };
+        // Line 2 is in three places in function 0. Line 3 is one, and line 9 is in a callee.
+        let index = LineIndex::new(vec![
+            probe(0, 2),
+            probe(0, 2),
+            probe(0, 3),
+            probe(0, 2),
+            probe(1, 9),
+        ]);
+        let id = ProbeId;
+        assert_eq!(index.sites("f", 2), [id(0), id(1), id(3)]);
+        let armed = |site: ProbeId| index.probe(site).is_some_and(|probe| probe.line == 2);
+        let Some(mut leaving) = index.leaving_line(id(0), 1, armed) else {
+            panic!("line 2 has more than one site");
+        };
+        assert!(index.leaving_line(id(2), 1, |_| true).is_none(), "one site");
+        assert!(
+            index.leaving_line(id(0), 1, |_| false).is_none(),
+            "not armed"
+        );
+
+        assert_eq!(index.passing(&mut leaving, id(1), 1), Passing::OnTheLine);
+        assert_eq!(index.passing(&mut leaving, id(4), 2), Passing::InACall);
+        assert_eq!(index.passing(&mut leaving, id(3), 1), Passing::OnTheLine);
+        assert_eq!(
+            index.passing(&mut leaving, id(1), 1),
+            Passing::Left,
+            "around again"
+        );
+        let mut leaving = index.leaving_line(id(0), 1, armed).unwrap();
+        assert_eq!(index.passing(&mut leaving, id(2), 1), Passing::Left);
+        let mut leaving = index.leaving_line(id(0), 1, armed).unwrap();
+        assert_eq!(
+            index.passing(&mut leaving, id(4), 1),
+            Passing::Left,
+            "returned to a caller"
+        );
+        assert!(index.still_armed(&leaving, armed));
+        assert!(!index.still_armed(&leaving, |_| false));
     }
 
     #[test]

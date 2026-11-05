@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::{env, fs};
 
-const GUESTS: [&str; 48] = [
+const GUESTS: [&str; 50] = [
     "echo",
     "m0-import",
     "configurable",
@@ -51,11 +51,13 @@ const GUESTS: [&str; 48] = [
     "corpus-relay",
     "corpus-flat",
     "line-walk",
+    "line-stream",
+    "line-stream-sink",
 ];
 
 /// The guests built with debug info and no optimizing, so that each source line is there
 /// to step to.
-const WITH_DEBUG_INFO: [&str; 1] = ["line-walk"];
+const WITH_DEBUG_INFO: [&str; 3] = ["line-walk", "line-stream", "line-stream-sink"];
 
 /// Names guests, comma-separated, to build with debug info too, as `{name}.debug.wasm`.
 const DEBUG_GUESTS: &str = "WITGRAPH_DEBUG_GUESTS";

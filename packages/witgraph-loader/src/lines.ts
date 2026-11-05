@@ -148,6 +148,21 @@ function frameName(frame: string): string {
   return /wasm-function\[(\d+)\]/.exec(frame)?.[1] ?? frame.trim();
 }
 
+/** A guest on its way off a line. */
+interface Leaving {
+  module: number;
+  instance: number;
+  file: string;
+  line: number;
+  function: number;
+  depth: number;
+  seen: Set<number>;
+  sites: readonly number[];
+  /** The function it was last seen in, and whether that is a call the line makes. */
+  lastFunction: number;
+  inCall: boolean;
+}
+
 /** Where a guest's lines are probed, on its thread. Blocks there, so never on a page's. */
 export class LineProbes implements SessionLines {
   readonly all?: boolean;
@@ -159,6 +174,10 @@ export class LineProbes implements SessionLines {
   #oneLine: Set<number>[] = [];
   /** By module, the probe a function starts at: before it has stored its parameters. */
   #opening: Set<number>[] = [];
+  /** By module, the probes of each line: passing through them is one time running it. */
+  #lineSites: Map<string, number[]>[] = [];
+  /** Guests gone on from a line that would stop them again before they have left it. */
+  #leaving = new Map<string, Leaving>();
   /** By module and instance, what its variables are read from. */
   #instances: { flags: Uint8Array; memory?: WebAssembly.Memory }[][] = [];
   #post: (kind: string, fields: object) => void;
@@ -196,6 +215,16 @@ export class LineProbes implements SessionLines {
     this.#breakpoints = modules.map(
       (module) => new Uint8Array(new SharedArrayBuffer(Math.max(1, module.probes.length))),
     );
+    this.#lineSites = modules.map(({ probes }) => {
+      const sites = new Map<string, number[]>();
+      for (const [id, { file, line }] of probes.entries()) {
+        const key = `${file}\0${line}`;
+        const known = sites.get(key);
+        if (known) known.push(id);
+        else sites.set(key, [id]);
+      }
+      return sites;
+    });
     this.#opening = modules.map(({ probes }) => {
       const first = new Map<number, number>();
       for (const [id, { function: inFunction }] of probes.entries()) {
@@ -215,6 +244,7 @@ export class LineProbes implements SessionLines {
 
   instantiating(): void {
     this.#instances = this.#modules.map(() => []);
+    this.#leaving.clear();
     this.#post('lines-instantiating', {});
   }
 
@@ -236,12 +266,83 @@ export class LineProbes implements SessionLines {
   probe(module: number, instance: number, id: number): void {
     const control = this.#control;
     const asked = Atomics.load(control, Control.Pause) !== 0;
-    const breakpoint = this.#breakpoints[module][id] !== 0;
+    const breakpoint =
+      this.#breakpoints[module][id] !== 0 && !this.#stillOnLine(module, instance, id);
     const step = this.#stepEnds(module, instance, id);
     if (!asked && !breakpoint && !step) return;
     const frames = ownFrames();
     const reason = breakpoint ? 'breakpoint' : asked ? 'pause' : 'step';
     this.#stop(reason, module, instance, id, frames);
+  }
+
+  /** Whether this guest is passing through the line it last stopped on, and not stopping again. */
+  #stillOnLine(module: number, instance: number, id: number): boolean {
+    const key = `${module}:${instance}`;
+    const leaving = this.#leaving.get(key);
+    if (!leaving) return false;
+    const here = this.#modules[module].probes[id];
+    if (here.file === leaving.file && here.line === leaving.line) {
+      // Back at a place it has been: this is the line running again.
+      if (!leaving.seen.has(id)) {
+        leaving.seen.add(id);
+        return true;
+      }
+    } else if (here.function !== leaving.function) {
+      // In a call it makes, which it comes back from, or in its caller. Reading the stack is
+      // slow, and a call stays in one function for most of its probes.
+      if (here.function !== leaving.lastFunction) {
+        leaving.lastFunction = here.function;
+        leaving.inCall = ownFrames().length > leaving.depth;
+      }
+      if (leaving.inCall) return false;
+    }
+    this.#leaving.delete(key);
+    this.#stopWatching(module, instance);
+    return false;
+  }
+
+  /** Back to stopping only where it should, unless a pause or a step has it stopping anywhere. */
+  #stopWatching(module: number, instance: number): void {
+    const control = this.#control;
+    if (Atomics.load(control, Control.Pause) !== 0) return;
+    if (
+      Atomics.load(control, Control.Step) !== 0 &&
+      Atomics.load(control, Control.StepModule) === module &&
+      Atomics.load(control, Control.StepInstance) === instance
+    ) {
+      return;
+    }
+    this.#instances[module]?.[instance]?.flags.set(this.#breakpoints[module]);
+  }
+
+  /** Once it goes on, watches this line being left, and any other: the page has reset them. */
+  #watchLeaving(module: number, instance: number, id: number, depth: number): void {
+    const { file, line, function: inFunction } = this.#modules[module].probes[id];
+    const key = `${module}:${instance}`;
+    const sites = this.#lineSites[module].get(`${file}\0${line}`) ?? [];
+    this.#leaving.delete(key);
+    if (sites.length > 1) {
+      this.#leaving.set(key, {
+        module,
+        instance,
+        file,
+        line,
+        function: inFunction,
+        depth,
+        seen: new Set([id]),
+        sites,
+        lastFunction: inFunction,
+        inCall: false,
+      });
+    }
+    for (const [at, leaving] of this.#leaving) {
+      const breakpoints = this.#breakpoints[leaving.module];
+      if (leaving.sites.some((site) => breakpoints[site] !== 0)) {
+        this.#instances[leaving.module]?.[leaving.instance]?.flags.fill(1);
+      } else {
+        this.#leaving.delete(at);
+      }
+    }
   }
 
   /** Whether a step under way ends here. Other guests go on past their own probes. */
@@ -340,6 +441,7 @@ export class LineProbes implements SessionLines {
     while (Atomics.load(control, Control.Stopped) === 1) {
       Atomics.wait(control, Control.Stopped, 1);
     }
+    this.#watchLeaving(module, instance, id, frames.length);
   }
 }
 
@@ -350,7 +452,10 @@ export class LineDebugger {
   #breakpoints: Uint8Array[];
   /** By module, the flags of each instance. */
   #flags: (Uint8Array | undefined)[][];
-  /** By file and line, where probing it stops: the first site in each function. */
+  /**
+   * By file and line, where probing it stops: all of it, as an async function has a line in
+   * several places, and the first by address may be taken once or never.
+   */
   #sites = new Map<string, Map<number, { module: number; probe: number }[]>>();
   /** By what was asked for, the line it came to. */
   #asked = new Map<string, Map<number, number>>();
@@ -365,11 +470,7 @@ export class LineDebugger {
     this.#flags = info.modules.map(() => []);
     this.#onStop = onStop;
     for (const [module, { probes }] of info.modules.entries()) {
-      const seen = new Set<string>();
-      for (const [probe, { file, line, function: inFunction }] of probes.entries()) {
-        const key = `${inFunction}\0${file}\0${line}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
+      for (const [probe, { file, line }] of probes.entries()) {
         const lines = this.#sites.get(file) ?? new Map();
         this.#sites.set(file, lines);
         const sites = lines.get(line) ?? [];

@@ -1,0 +1,15 @@
+package test:line-stream@0.1.0;
+
+/// Built with debug info, for stopping on a stream's lines: doubles what it reads, from a task
+/// that outlives `run`. Tests find the `mark:` comments in `src/lib.rs`.
+world line-stream {
+    export node: interface {
+        record inputs {
+            items: stream<u32>,
+        }
+        record outputs {
+            items: stream<u32>,
+        }
+        run: async func(inputs: inputs) -> outputs;
+    }
+}

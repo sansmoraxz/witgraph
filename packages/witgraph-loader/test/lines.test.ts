@@ -172,6 +172,76 @@ test('a breakpoint stops on its line, naming the node, and resuming goes on', as
   assert.equal(await session.graph.readOutput('a', 'out'), 8);
 });
 
+/** Runs `nodes` until idle with a breakpoint on `line`, and says how many stops it has. */
+async function countStops(
+  loaded: Awaited<ReturnType<typeof load>>,
+  file: string,
+  line: number,
+): Promise<number> {
+  const { session, lines, nextStop } = loaded;
+  lines.setBreakpoint(file, line);
+  const done = session
+    .tick()
+    .then(() => session.settle())
+    .then(() => null);
+  let stops = 0;
+  for (;;) {
+    const stop = await Promise.race([nextStop(), done]);
+    if (!stop) return stops;
+    assert.equal(stop.line, line);
+    stops++;
+    lines.resume();
+  }
+}
+
+test('a breakpoint stops once for each time its line runs', async () => {
+  for (const [name, port, value, wanted] of [
+    ['walk-first', 'in', 5, 1],
+    ['spin-body', 'spin', 6, 6],
+  ] as const) {
+    const loaded = await load([['a', 'line-walk']]);
+    await loaded.session.graph.inject('a', port, value);
+    assert.equal(await countStops(loaded, loaded.file as string, mark(name)), wanted, name);
+  }
+});
+
+test('a breakpoint in a stream loop stops for every item', async () => {
+  const guestsDir = '../../../test-fixtures/test-components/guests/';
+  // A line that awaits runs again when it is polled again, so can stop more than once for an
+  // item, but never less. One that does not stops exactly once.
+  for (const [guest, name, wanted, exact] of [
+    ['line-stream', 'read', 5, false],
+    ['line-stream', 'body', 4, true],
+    ['line-stream', 'write', 4, false],
+    ['line-stream-sink', 'read', 5, false],
+    ['line-stream-sink', 'body', 4, true],
+  ] as const) {
+    const text = await readFile(
+      new URL(`${guestsDir}${guest}/src/lib.rs`, import.meta.url),
+      'utf8',
+    );
+    const line = text.split('\n').findIndex((row) => row.endsWith(`// mark: ${name}`)) + 1;
+    const piped = guest === 'line-stream';
+    const loaded = await load(
+      [
+        ['source', 'stream-producer'],
+        ['guest', guest],
+        ...(piped ? ([['sink', 'stream-drain']] as [string, string][]) : []),
+      ],
+      [
+        ['in', 'source.items', 'guest.items'],
+        ...(piped ? ([['out', 'guest.items', 'sink.items']] as [string, string, string][]) : []),
+      ],
+    );
+    const file = loaded.lines.files.find((known) => known.endsWith(`${guest}/src/lib.rs`));
+    assert.ok(file, 'the guest has its own lines');
+    await loaded.session.graph.inject('source', 'burst-size', 4);
+    const stops = await countStops(loaded, file, line);
+    if (exact) assert.equal(stops, wanted, `${guest}: ${name}`);
+    else assert.ok(stops >= wanted, `${guest}: ${name} stopped ${stops} times`);
+  }
+});
+
 /** One of a stop's variables, by name. */
 function variable(stop: LineStop, name: string) {
   const found = stop.variables.find((candidate) => candidate.name === name);

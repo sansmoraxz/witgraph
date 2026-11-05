@@ -252,3 +252,5 @@ pub const CORPUS_FLAT: Guest = guest!("CORPUS_FLAT_WASM", "corpus-flat");
 
 /// A guest built with debug info and no optimizing, for stepping through its source.
 pub const LINE_WALK: Guest = guest!("LINE_WALK_WASM", "line-walk");
+pub const LINE_STREAM: Guest = guest!("LINE_STREAM_WASM", "line-stream");
+pub const LINE_STREAM_SINK: Guest = guest!("LINE_STREAM_SINK_WASM", "line-stream-sink");

@@ -1,0 +1,15 @@
+package test:line-stream-sink@0.1.0;
+
+/// Built with debug info, for stopping on a stream's lines: reads it to the end in `run`.
+/// Tests find the `mark:` comments in `src/lib.rs`.
+world line-stream-sink {
+    export node: interface {
+        record inputs {
+            items: stream<u32>,
+        }
+        record outputs {
+            count: u32,
+        }
+        run: async func(inputs: inputs) -> outputs;
+    }
+}

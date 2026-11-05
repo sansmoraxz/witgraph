@@ -8,7 +8,9 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::time::Duration;
 
-use test_components::{Guest, LINE_WALK, RELAY};
+use test_components::{
+    Guest, LINE_STREAM, LINE_STREAM_SINK, LINE_WALK, RELAY, STREAM_DRAIN, STREAM_PRODUCER,
+};
 use witgraph_ir::{
     ComponentContract, ComponentRef, Graph, GraphBuilder, NodeId, PortName, PortRef,
 };
@@ -167,6 +169,141 @@ async fn a_breakpoint_stops_on_its_line_naming_the_node_and_resuming_goes_on() {
     })
     .await;
     assert_eq!(output(&mut rt, "a", "out").await.as_deref(), Some("8"));
+}
+
+/// How many stops a breakpoint on `line` of `file` has, with the guest's input already written.
+async fn count_stops(
+    rt: &mut RuntimeGraph<Perf>,
+    lines: &RuntimeLines,
+    file: &str,
+    line: u32,
+) -> usize {
+    assert_eq!(lines.set_breakpoint(file, line), Some(line));
+    let mut stops = 0;
+    let ticking = async {
+        loop {
+            match rt.tick().await {
+                TickResult::Idle => break,
+                TickResult::Progress | TickResult::StepLimitReached => {}
+                other => panic!("a tick went wrong: {other:?}"),
+            }
+        }
+    };
+    let stopping = async {
+        loop {
+            let stop = lines.next_stop().await;
+            assert_eq!((stop.file.as_str(), stop.line), (file, line));
+            stops += 1;
+            lines.resume();
+        }
+    };
+    let both = async {
+        tokio::select! {
+            () = ticking => {}
+            () = stopping => {}
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(60), both)
+        .await
+        .expect("it never finished");
+    stops
+}
+
+/// How many stops `line-walk` has on `name`, with `port` written.
+async fn stops_on(name: &str, port: &str, wave: &str) -> usize {
+    let (mut rt, lines) = line_walk(&["a"]).await;
+    let file = file_of(&lines);
+    inject(&mut rt, "a", port, wave).await;
+    count_stops(&mut rt, &lines, &file, mark(name)).await
+}
+
+#[tokio::test]
+async fn a_breakpoint_stops_once_for_each_time_its_line_runs() {
+    assert_eq!(stops_on("walk-first", "in", "5").await, 1);
+    assert_eq!(stops_on("spin-body", "spin", "6").await, 6);
+}
+
+/// How many stops a stream guest has on the line marked `name`, reading 4 items.
+async fn stream_stops(guest: Guest, source: &str, name: &str, sink: Option<Guest>) -> usize {
+    let wanted = format!("// mark: {name}");
+    let line = source
+        .lines()
+        .position(|line| line.trim_end().ends_with(&wanted))
+        .unwrap();
+    let line = u32::try_from(line).unwrap() + 1;
+    let mut guests = vec![STREAM_PRODUCER, guest];
+    guests.extend(sink);
+    let kit = Kit::new(&guests);
+    let mut builder = kit
+        .builder()
+        .add_node("source", kit.id(0))
+        .add_node("guest", kit.id(1))
+        .connect(
+            "in",
+            PortRef::new("source", "items"),
+            PortRef::new("guest", "items"),
+        );
+    if sink.is_some() {
+        builder = builder.add_node("sink", kit.id(2)).connect(
+            "out",
+            PortRef::new("guest", "items"),
+            PortRef::new("sink", "items"),
+        );
+    }
+    let (mut rt, lines) = kit.load(builder.build()).await;
+    let file = lines
+        .files()
+        .into_iter()
+        .find(|file| file.contains("/line-stream"))
+        .expect("the guest has its own lines");
+    inject(&mut rt, "source", "burst-size", "4").await;
+    count_stops(&mut rt, &lines, &file, line).await
+}
+
+const STREAM_SOURCE: &str =
+    include_str!("../../../test-fixtures/test-components/guests/line-stream/src/lib.rs");
+const SINK_SOURCE: &str =
+    include_str!("../../../test-fixtures/test-components/guests/line-stream-sink/src/lib.rs");
+
+#[tokio::test]
+async fn a_breakpoint_in_a_stream_loop_stops_for_every_item() {
+    // A line that awaits runs again when it is polled again, so can stop more than once for
+    // an item, but never less. One that does not stops exactly once.
+    for (name, at_least) in [("read", 5), ("write", 4)] {
+        let stops = stream_stops(LINE_STREAM, STREAM_SOURCE, name, Some(STREAM_DRAIN)).await;
+        assert!(
+            stops >= at_least,
+            "writing on: {name} stopped {stops} times"
+        );
+    }
+    let body = stream_stops(LINE_STREAM, STREAM_SOURCE, "body", Some(STREAM_DRAIN)).await;
+    assert_eq!(body, 4, "writing on");
+    let read = stream_stops(LINE_STREAM_SINK, SINK_SOURCE, "read", None).await;
+    assert!(read >= 5, "reading in `run`: stopped {read} times");
+    let body = stream_stops(LINE_STREAM_SINK, SINK_SOURCE, "body", None).await;
+    assert_eq!(body, 4, "reading in `run`");
+}
+
+#[tokio::test]
+async fn a_breakpoint_still_stops_after_a_step() {
+    let (mut rt, lines) = line_walk(&["a"]).await;
+    let file = file_of(&lines);
+    lines.set_breakpoint(&file, mark("spin-body"));
+    inject(&mut rt, "a", "spin", "3").await;
+    settling(&mut rt, async {
+        let first = lines.next_stop().await;
+        assert_eq!(first.line, mark("spin-body"));
+        lines.step_over();
+        let stepped = lines.next_stop().await;
+        assert_ne!(stepped.line, mark("spin-body"));
+        lines.resume();
+        let again = lines.next_stop().await;
+        assert_eq!(again.line, mark("spin-body"));
+        assert_eq!(again.reason, StopReason::Breakpoint);
+        lines.clear_breakpoint(&file, mark("spin-body"));
+        lines.resume();
+    })
+    .await;
 }
 
 #[tokio::test]
