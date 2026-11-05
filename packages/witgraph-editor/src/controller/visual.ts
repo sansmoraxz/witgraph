@@ -112,10 +112,4 @@ export function nodeVisual(source: NodeVisualSource): NodeVisual {
   };
 }
 
-/** A handle as text: by the object's own `toString`, or else its resource. */
-export function describeHandle(value: unknown, resource: string): string {
-  const own = (value as { toString?: unknown } | null)?.toString;
-  return typeof own === 'function' && own !== Object.prototype.toString
-    ? String(value)
-    : `<${resource}>`;
-}
+export { describeHandle } from 'witgraph-loader';

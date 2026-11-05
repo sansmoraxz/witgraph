@@ -7,6 +7,8 @@ export default defineConfig({
   // puts it under /<repository>/.
   base: './',
   plugins: [tailwindcss()],
+  // The graph runs in a module worker.
+  worker: { format: 'es' },
 
   server: {
     fs: {

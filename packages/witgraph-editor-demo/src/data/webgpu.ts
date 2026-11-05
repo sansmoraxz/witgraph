@@ -153,7 +153,7 @@ export async function webgpu(): Promise<Backend> {
     destroy: (storage) => (storage as GPUBuffer).destroy(),
     capture: software
       ? undefined
-      : async (video, [h, w]) => {
+      : async (frame, [h, w]) => {
           const output = buffer(h * w * 3 * 4, STORAGE);
           const params = buffer(16, USAGE.UNIFORM | USAGE.COPY_DST, Uint32Array.of(h, w, 0, 0));
           const encoder = device.createCommandEncoder();
@@ -165,7 +165,7 @@ export async function webgpu(): Promise<Backend> {
               layout: capture.getBindGroupLayout(0),
               entries: [
                 { binding: 0, resource: { buffer: params } },
-                { binding: 1, resource: device.importExternalTexture({ source: video }) },
+                { binding: 1, resource: device.importExternalTexture({ source: frame }) },
                 { binding: 2, resource: { buffer: output } },
               ],
             }),

@@ -26,10 +26,10 @@ export interface Backend {
   conv3x3(storage: Storage, shape: number[], weights: Float32Array): Promise<Storage>;
   destroy(storage: Storage): void;
   /**
-   * A `[height, width, 3]` frame of `video` as elements here, if the backend
+   * A `[height, width, 3]` video frame as elements here, if the backend
    * can take one without the page's memory in between.
    */
-  capture?(video: HTMLVideoElement, shape: number[]): Promise<Storage>;
+  capture?(frame: VideoFrame, shape: number[]): Promise<Storage>;
 }
 
 /** A tensor's elements, shared by every reference to it. */

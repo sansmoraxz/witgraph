@@ -1,6 +1,7 @@
 // Spike: how fast frames move through a stream of handles in a browser.
 import { type Capability, type ComponentSource, Session } from 'witgraph-loader';
 import { camera } from './data/camera.ts';
+import { cameraFrames } from './data/camera-page.ts';
 import { type Backend, cpu as cpuTensors, tensors } from './data/tensors.ts';
 import { webgpu } from './data/webgpu.ts';
 import { webnn } from './data/webnn.ts';
@@ -130,7 +131,7 @@ async function cameraChain(c: { backend: string; frames: number }) {
   const { backend, live } = counted(await makers[c.backend]());
   backend.name();
   const imports = tensors(backend);
-  const source = camera(backend, imports.Tensor);
+  const source = camera(backend, imports.Tensor, cameraFrames());
   const s = await session(
     [
       ['camera', 'camera-source'],

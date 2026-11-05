@@ -1,4 +1,4 @@
-import type { Capability, ComponentSource, PortValues, Wasm } from 'witgraph-loader';
+import type { ComponentSource, Endpoint, PortValues, Wasm } from 'witgraph-loader';
 
 // ---------------------------------------------------------------------------
 // Editor state
@@ -118,7 +118,7 @@ export interface OutputView {
   /**
    * A Value output's current value, the last item of a stream, or what a
    * future resolved to; `undefined` before there is one. For a stream or
-   * future of handles, what the viewer kept of it ({@link PortViewer.keep}).
+   * future of handles, what the worker showed of it (`HandleView`, in `witgraph-loader`).
    */
   latest: unknown;
   /**
@@ -236,8 +236,11 @@ export interface EditorLoadOptions {
   components: ComponentSource[];
   /** The compiled `witgraph-web` WASM module. */
   wasm?: Wasm;
-  /** Host-provided capabilities for node imports. */
-  capabilities?: (capability: Capability) => object | undefined;
+  /**
+   * The worker sessions run in, which calls `serveSession` from `witgraph-loader`:
+   * capabilities are provided there. A `MessagePort` will do, whichever thread serves it.
+   */
+  worker: Endpoint;
   /** Mock replacements for nodes, keyed by node id. */
   mocks?: Record<string, (inputs: PortValues) => PortValues | Promise<PortValues>>;
 }

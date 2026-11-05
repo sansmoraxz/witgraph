@@ -1,17 +1,12 @@
 import { failure } from '../accel/cnn.ts';
 import type { Backend, TensorClass } from './tensors.ts';
 
-/** How long after its last frame the camera stays on. */
-const IDLE_MS = 2000;
-/** A hidden page gets no video frame callbacks: go on at this pace instead. */
-const HIDDEN_FRAME_MS = 100;
-
-/** A frame's RGB through the page's memory, for a backend that needs that. */
-function pixels(video: HTMLVideoElement, [height, width]: number[]): Uint8Array {
+/** A frame's RGB through this thread's memory, for a backend that needs that. */
+function pixels(frame: VideoFrame, [height, width]: number[]): Uint8Array {
   const canvas = new OffscreenCanvas(width, height);
   const context = canvas.getContext('2d', { willReadFrequently: true });
   if (!context) failure('no 2D canvas to read the camera through');
-  context.drawImage(video, 0, 0);
+  context.drawImage(frame, 0, 0);
   const { data } = context.getImageData(0, 0, width, height);
   const rgb = new Uint8Array(width * height * 3);
   for (let i = 0; i < width * height; i++) {
@@ -21,58 +16,51 @@ function pixels(video: HTMLVideoElement, [height, width]: number[]): Uint8Array 
 }
 
 /**
- * `test:camera/camera` for jco: the page's camera, its frames as tensors on
- * `backend`. It is turned on by the first frame asked for, and off once none
- * has been for a while. Values are as jco hands them over; a `result`'s `err`
- * is thrown as `{ payload }`.
+ * Frames from the page a worker belongs to, which has the camera
+ * (`serveCameraFrames`, in `camera-page.ts`).
  */
-export function camera(backend: Backend, Tensor: TensorClass): { nextFrame(): Promise<object> } {
-  let opening: Promise<HTMLVideoElement> | undefined;
-  let idle: ReturnType<typeof setTimeout> | undefined;
+export function framesFrom(page: {
+  postMessage(message: unknown): void;
+  addEventListener(type: 'message', listener: (event: MessageEvent) => void): void;
+}): () => Promise<VideoFrame> {
+  const waiting = new Map<number, { resolve(frame: VideoFrame): void; reject(e: Error): void }>();
+  let next = 0;
+  page.addEventListener('message', ({ data }) => {
+    const asked = waiting.get(data?.cameraFrame);
+    if (!asked) return;
+    waiting.delete(data.cameraFrame);
+    if (data.error) asked.reject(new Error(data.error));
+    else asked.resolve(data.frame);
+  });
+  return () =>
+    new Promise((resolve, reject) => {
+      const cameraFrame = next++;
+      waiting.set(cameraFrame, { resolve, reject });
+      page.postMessage({ cameraFrame });
+    });
+}
 
-  const open = async (): Promise<HTMLVideoElement> => {
-    let stream: MediaStream;
-    try {
-      stream = await navigator.mediaDevices.getUserMedia({
-        video: { width: { ideal: 640 }, height: { ideal: 480 } },
-      });
-    } catch (error) {
-      opening = undefined;
-      return failure(`no camera: ${error instanceof Error ? error.message : String(error)}`);
-    }
-    const video = document.createElement('video');
-    video.muted = true;
-    video.playsInline = true;
-    video.srcObject = stream;
-    await video.play();
-    return video;
-  };
-
-  const close = async () => {
-    const closing = opening;
-    opening = undefined;
-    const video = await closing?.catch(() => undefined);
-    for (const track of (video?.srcObject as MediaStream | null)?.getTracks() ?? []) track.stop();
-  };
-
+/**
+ * `test:camera/camera` for jco: `frames`, as tensors on `backend`. Values are as jco hands
+ * them over; a `result`'s `err` is thrown as `{ payload }`.
+ */
+export function camera(
+  backend: Backend,
+  Tensor: TensorClass,
+  frames: () => Promise<VideoFrame>,
+): { nextFrame(): Promise<object> } {
   return {
     async nextFrame() {
       backend.name();
-      clearTimeout(idle);
-      opening ??= open();
-      const video = await opening;
-      await new Promise((resolve) => {
-        const hidden = setTimeout(resolve, HIDDEN_FRAME_MS);
-        video.requestVideoFrameCallback(() => {
-          clearTimeout(hidden);
-          resolve(undefined);
-        });
-      });
-      idle = setTimeout(close, IDLE_MS);
-      const shape = [video.videoHeight, video.videoWidth, 3];
-      const storage = await (backend.capture?.(video, shape) ??
-        backend.upload(shape, pixels(video, shape)));
-      return Tensor.fromStorage(storage, shape);
+      const frame = await frames().catch((error: Error) => failure(error.message));
+      try {
+        const shape = [frame.displayHeight, frame.displayWidth, 3];
+        const storage = await (backend.capture?.(frame, shape) ??
+          backend.upload(shape, pixels(frame, shape)));
+        return Tensor.fromStorage(storage, shape);
+      } finally {
+        frame.close();
+      }
     },
   };
 }

@@ -13,7 +13,6 @@
  * (setup.mjs is cross-platform — no bash required)
  */
 
-import { monotonicClock } from '@bytecodealliance/preview3-shim/clocks';
 import {
   EditorController,
   type GraphJson,
@@ -25,15 +24,9 @@ import {
   type WitgraphInspector,
   type WitgraphTimeline,
 } from 'witgraph-editor';
-import type { Capability, ComponentSource } from 'witgraph-loader';
-import { type Cnn, cpu } from './accel/cnn.ts';
-import { webgpu } from './accel/webgpu.ts';
-import { webnn } from './accel/webnn.ts';
-import { camera } from './data/camera.ts';
-import { type Backend, cpu as cpuTensors, tensors } from './data/tensors.ts';
+import type { ComponentSource } from 'witgraph-loader';
+import { serveCameraFrames } from './data/camera-page.ts';
 import { tensorViewer } from './data/viewer.ts';
-import { webgpu as webgpuTensors } from './data/webgpu.ts';
-import { webnn as webnnTensors } from './data/webnn.ts';
 
 registerAll();
 registerViewer(tensorViewer);
@@ -127,6 +120,7 @@ const videoSinkRef = {
  * graph has them all, so the catalog offers them all whichever is loaded.
  */
 const GUESTS = [
+  'busy-loop',
   'relay',
   'stream-producer',
   'stream-consumer',
@@ -443,19 +437,31 @@ function cameraGraph(where: string): GraphJson {
   };
 }
 
-/**
- * A graph the demo can load, the node to select, what runs
- * `test:accel/cnn` for it (the CPU unless it says otherwise), and where
- * `test:data/tensor` keeps its tensors (the CPU unless it says otherwise).
- */
+/** A graph the demo can load, and the node to select. What it runs on: `session-worker.ts`. */
 interface Demo {
   graph: GraphJson;
   select: string;
-  accelerator?: () => Promise<Cnn>;
-  tensors?: () => Promise<Backend>;
 }
 
+/** A node to make spin: it cannot freeze the page, as it is not on the page's thread. */
+const spin: GraphJson = {
+  metadata: { name: 'demo-spin', description: 'A node that misbehaves on request.' },
+  components: allComponents,
+  nodes: [
+    {
+      id: 'busy',
+      component: {
+        package: { namespace: 'test', name: 'busy-loop', version: '0.1.0' },
+        world: 'busy-loop',
+      },
+      label: 'Busy loop',
+    },
+  ],
+  connections: [],
+};
+
 const demos: Record<string, Demo> = {
+  spin: { graph: spin, select: 'busy' },
   'port-kinds': {
     graph: portKinds,
     select: 'relay-a',
@@ -465,78 +471,14 @@ const demos: Record<string, Demo> = {
     select: 'gray',
   },
   webgpu: { graph: edgeGraph('WebGPU'), select: 'edges' },
-  webnn: { graph: edgeGraph('WebNN'), select: 'edges', accelerator: webnn },
+  webnn: { graph: edgeGraph('WebNN'), select: 'edges' },
   tensors: { graph: tensorGraph('CPU'), select: 'edges' },
-  'tensors-webgpu': { graph: tensorGraph('WebGPU'), select: 'edges', tensors: webgpuTensors },
-  'tensors-webnn': { graph: tensorGraph('WebNN'), select: 'edges', tensors: webnnTensors },
+  'tensors-webgpu': { graph: tensorGraph('WebGPU'), select: 'edges' },
+  'tensors-webnn': { graph: tensorGraph('WebNN'), select: 'edges' },
   camera: { graph: cameraGraph('CPU'), select: 'edges' },
-  'camera-webgpu': { graph: cameraGraph('WebGPU'), select: 'edges', tensors: webgpuTensors },
-  'camera-webnn': { graph: cameraGraph('WebNN'), select: 'edges', tensors: webnnTensors },
+  'camera-webgpu': { graph: cameraGraph('WebGPU'), select: 'edges' },
+  'camera-webnn': { graph: cameraGraph('WebNN'), select: 'edges' },
 };
-
-// -- External capabilities (JS implementations for host-provided imports) -----
-
-/**
- * Implements `test:math/ops@0.1.0` in pure JS for the `calc` component.
- * Demonstrates sync, async, and streaming capability provision.
- */
-function mathOps() {
-  let callCount = 0;
-  return {
-    double: (x: number) => {
-      callCount++;
-      return x * 2;
-    },
-    slowDouble: async (x: number) => x * 2,
-    count: async function* (n: number) {
-      for (let i = 0; i < n; i++) yield i;
-    },
-    calls: () => callCount,
-  };
-}
-
-/**
- * Implements `test:mqtt/source@0.1.0` in pure JS for the `mqtt-node`.
- * Returns canned sensor readings as byte buffers, then `undefined` to
- * signal end-of-feed.
- */
-function mqttSource() {
-  const feed = [
-    new Uint8Array([0x48, 0x45, 0x4c, 0x4c, 0x4f]), // "HELLO"
-    new Uint8Array([0x74, 0x65, 0x6d, 0x70, 0x3a, 0x32, 0x33]), // "temp:23"
-    new Uint8Array([0x6f, 0x6b]), // "ok"
-  ];
-  let index = 0;
-  return {
-    nextMessage: () => (index < feed.length ? feed[index++] : undefined),
-  };
-}
-
-/** What runs `test:accel/cnn`: chosen by the demo loaded. */
-let cnn: Cnn = cpu();
-
-/**
- * `test:data/tensor`, over the backend the demo loaded chose: one import
- * object for every node, so a tensor one node makes is one another takes.
- */
-let tensorBackend = cpuTensors();
-let tensorImport = tensors(tensorBackend);
-
-/** `test:camera/camera`, its frames among those tensors. */
-let cameraImport = camera(tensorBackend, tensorImport.Tensor);
-
-function capabilities(capability: Capability): object | undefined {
-  const iface = capability.implements ?? capability.interface;
-  if (iface.startsWith('wasi:clocks/monotonic-clock')) return monotonicClock;
-  if (iface.startsWith('wasi:webgpu/webgpu')) return webgpu;
-  if (iface.startsWith('test:accel/cnn')) return cnn;
-  if (iface.startsWith('test:data/tensor')) return tensorImport;
-  if (iface.startsWith('test:camera/camera')) return cameraImport;
-  // Asked once per instantiation: fresh state each time.
-  if (iface.startsWith('test:math/ops')) return mathOps();
-  if (iface.startsWith('test:mqtt/source')) return mqttSource();
-  return undefined;
-}
 
 // -- Load and display ---------------------------------------------------------
 
@@ -572,12 +514,6 @@ async function loadDemo(): Promise<void> {
   statusEl.textContent = 'Fetching test components...';
 
   try {
-    if (demo.accelerator) cnn = await demo.accelerator();
-    if (demo.tensors) {
-      tensorBackend = await demo.tensors();
-      tensorImport = tensors(tensorBackend);
-      cameraImport = camera(tensorBackend, tensorImport.Tensor);
-    }
     const components: ComponentSource[] = await Promise.all(
       GUESTS.map(async (guest) => ({
         id: `test:${guest}/${guest}@0.1.0`,
@@ -597,7 +533,14 @@ async function loadDemo(): Promise<void> {
     }
     const wasm = new Uint8Array(await wasmResp.arrayBuffer());
 
-    await controller.load({ graph: demo.graph, components, wasm, capabilities });
+    // Named for its demo, which says what its capabilities run on.
+    const worker = new Worker(new URL('./session-worker.ts', import.meta.url), {
+      type: 'module',
+      name,
+    });
+    serveCameraFrames(worker);
+
+    await controller.load({ graph: demo.graph, components, wasm, worker });
 
     statusEl.textContent = 'Computing layout...';
     await controller.autoLayout();

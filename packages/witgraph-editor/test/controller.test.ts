@@ -6,10 +6,17 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { readdir, readFile, stat } from 'node:fs/promises';
-import { afterEach, test } from 'node:test';
+import { after, afterEach, test } from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { MessageChannel } from 'node:worker_threads';
 import { monotonicClock } from '@bytecodealliance/preview3-shim/clocks';
-import type { Capability, ComponentSource } from 'witgraph-loader';
+import {
+  type Capability,
+  type ComponentSource,
+  type Endpoint,
+  type ServeOptions,
+  serveSession,
+} from 'witgraph-loader';
 import { EditorController } from '../src/controller/editor-controller.ts';
 import type { EditorLoadOptions, GraphJson } from '../src/controller/types.ts';
 import { registerViewer } from '../src/viewers/registry.ts';
@@ -89,10 +96,26 @@ afterEach(() => {
 type Connection = [id: string, from: string, to: string, feedback?: boolean];
 
 /** Loads an EditorController over the named guests, disposed after the test. */
+const ports: { close(): void }[] = [];
+after(() => {
+  for (const port of ports.splice(0)) port.close();
+});
+
+/**
+ * What a session runs over: the worker's side served here, where a test can reach what the
+ * worker provides. `packages/witgraph-editor-demo` runs over a real one.
+ */
+function served(options: ServeOptions = {}): Endpoint {
+  const { port1, port2 } = new MessageChannel();
+  ports.push(port1, port2);
+  serveSession(port2 as unknown as Endpoint, options);
+  return port1 as unknown as Endpoint;
+}
+
 async function loadController(
   nodes: [string, string][],
   connections: Connection[] = [],
-  options: Partial<EditorLoadOptions> = {},
+  { capabilities, views, ...options }: Partial<EditorLoadOptions> & ServeOptions = {},
 ): Promise<EditorController> {
   const used = [...new Set(nodes.map(([, guest]) => guest))];
   const components = await Promise.all(used.map(guestSource));
@@ -112,7 +135,8 @@ async function loadController(
     })),
   };
   const controller = new EditorController();
-  await controller.load({ graph, components, wasm, ...options });
+  const worker = served({ capabilities, views });
+  await controller.load({ graph, components, wasm, worker, ...options });
   controllers.push(controller);
   return controller;
 }
@@ -892,39 +916,35 @@ test('a stream of handles connects only to a stream of that resource', async () 
   assert.match(asFeedback.reason ?? '', /carries a stream port/);
 });
 
-test('a preview keeps a reference to a stream of handles, one at a time', async () => {
+test('a preview shows what a view read of a stream of handles, and keeps none', async () => {
   const tensors = cpuTensors();
   const kept: unknown[] = [];
-  registerViewer({
-    id: 'tensor',
-    mount: () => ({ update() {}, dispose() {} }),
-    keep(item) {
-      const reference = (item as { clone(): unknown }).clone();
-      kept.push(reference);
-      return reference;
-    },
-  });
+  registerViewer({ id: 'tensor', mount: () => ({ update() {}, dispose() {} }) });
   const controller = await loadController(...streamOfTensors, {
     capabilities: tensors.capabilities,
+    views: {
+      tensor: {
+        keep(item) {
+          const reference = (item as { clone(): { label: string } }).clone();
+          kept.push(reference);
+          return reference;
+        },
+        read: (reference) => ({ label: (reference as { label: string }).label }),
+      },
+    },
   });
   await controller.injectValue('src', 'frames', '4');
   await settled(controller);
+  await eventually(() => controller.observe('src', 'tensors').count === 4);
   const view = controller.observe('src', 'tensors');
-  assert.equal(view.count, 4);
-  assert.equal(kept.length >= 4, true, 'each node previewing its stream keeps its own');
-  assert.ok(kept.includes(view.latest));
-  assert.equal((view.latest as { label: string }).label, 'kept');
+  assert.ok(kept.length >= 4, 'each node previewing its stream keeps its own');
+  assert.deepEqual(view.latest, { label: 'kept' });
   assert.deepEqual(view.recent, [view.latest], 'no history holding on to them');
-  // Only the previews' latest references are left, not what the nodes passed.
-  assert.equal(tensors.live.size, 2, 'the latest of `src` and of `inv`');
-  assert.ok(tensors.live.has(view.latest as object));
-
-  controller.dispose();
-  controllers.splice(controllers.indexOf(controller), 1);
-  assert.equal(tensors.live.size, 0, 'what was kept goes with the graph');
+  // What a view keeps is gone once read: nothing waits for a preview to let go of it.
+  await eventually(() => tensors.live.size === 0);
 });
 
-test('without a way to keep them, a preview describes a stream of handles', async () => {
+test('with no view of them, a preview describes a stream of handles', async () => {
   const tensors = cpuTensors();
   registerViewer({ id: 'tensor', mount: () => ({ update() {}, dispose() {} }) });
   const controller = await loadController(...streamOfTensors, {
@@ -938,13 +958,9 @@ test('without a way to keep them, a preview describes a stream of handles', asyn
   assert.equal(tensors.live.size, 0, 'it holds on to none');
 });
 
-test('a future of a handle is kept and released like a stream item', async () => {
+test('a future of a handle is shown like a stream item', async () => {
   const tensors = cpuTensors();
-  registerViewer({
-    id: 'tensor',
-    mount: () => ({ update() {}, dispose() {} }),
-    keep: (item) => (item as { clone(): unknown }).clone(),
-  });
+  registerViewer({ id: 'tensor', mount: () => ({ update() {}, dispose() {} }) });
   const controller = await loadController(
     [
       ['src', 'tensor-future-source'],

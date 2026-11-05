@@ -113,14 +113,11 @@ node previews the first one it names.
   object's own methods, and must expect it to be disposed once the next one
   replaces it. The inspector shows a handle by the object's `toString`, or by
   its resource, and offers no inject box for a handle input.
-- **Streams and futures of handles.** An item is its reader's, and may be
-  disposed before anything is drawn, so a viewer takes what it wants as the item
-  passes, with `keep` (below). The editor shows it what it kept as `latest`, and
-  disposes that when the next replaces it, so a viewer still using it later
-  needs another reference of its own. A viewer with no `keep` is shown the
-  item's description. There's no history, since each kept item would hold on to
-  what it refers to. Read back only what you draw: on a GPU, reading every
-  frame can halve the frame rate.
+- **Streams and futures of handles.** A handle stays in the worker, so a viewer is
+  shown what a [`HandleView`](javascript.md#in-a-worker) of the same name read of it, or
+  else its description. There's no history, since each would hold on to what it read.
+  Only what is previewed or selected is read: on a GPU, reading every frame can halve the
+  frame rate.
 - **Viewers.** `image` draws RGBA frames and PNG, JPEG, GIF or WebP bytes;
   `series` plots recent numbers; `text` shows any value, a stream's recent
   items, or a pending future. Add your own with `registerViewer`; it is
@@ -142,14 +139,21 @@ registerViewer({
 });
 ```
 
-A viewer for a stream or future of handles also says what to keep of each item:
+A viewer of handles has a second half in the worker, which reads what it draws:
 
 ```ts
+// worker.ts
+const tensorView = {
+  keep: (handle) => (handle as Tensor).clone(),
+  read: async (tensor) => ({ shape: tensor.shape(), bytes: await tensor.read(0n, size(tensor)) }),
+};
+serveSession(self, { capabilities, views: { tensor: tensorView } });
+
+// the page
 registerViewer({
   id: 'tensor',
-  keep: (item) => (item as Tensor).clone(),
   mount(host) {
-    /* `latest` is what `keep` returned, disposed when the next replaces it. */
+    /* `latest` is what `read` returned. */
   },
 });
 ```
@@ -179,14 +183,16 @@ for (const name of ['canvas', 'catalog', 'inspector', 'controls', 'timeline']) {
   document.querySelector(`witgraph-${name}`).controller = controller;
 }
 
-await controller.load({ graph, components, wasm, capabilities });
+const worker = new Worker(new URL('./worker.ts', import.meta.url), { type: 'module' });
+await controller.load({ graph, components, wasm, worker });
 await controller.autoLayout();
 ```
 
-`load` takes the same things as `Session.load` in [the loader](javascript.md):
-the graph as JSON, the component bytes, the scheduler's `wasm`, and a
-`capabilities` callback for anything the graph imports, which is asked each time
-the graph is instantiated. The controller emits
+The graph runs in `worker`, so a node that spins leaves the editor working, though Stop
+can't end such a node. It calls `serveSession` from [the loader](javascript.md#in-a-worker),
+with a `capabilities` callback for anything the graph imports, which is asked each time the
+graph is instantiated. `load` takes the graph as JSON, the component bytes and the
+scheduler's `wasm`. The controller emits
 `state-changed`, `trace-event`, `fault` and `output-changed` events, so you can
 show your own status or react to edits. `output-changed` fires at most once a
 frame while streams carry items.

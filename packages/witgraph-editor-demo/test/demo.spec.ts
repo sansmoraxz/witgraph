@@ -102,11 +102,17 @@ test.describe('WIT Graph Editor Demo', () => {
     // A stream of bytes: its items, as text.
     await expect(preview('mqtt')).toContainText('"HELLO"', { timeout });
     await expect(preview('mqtt')).toContainText('3 items');
-    // Values: a point a tick.
+    // Values: a point a tick, of a loop that goes on.
     await expect(preview('configurable')).toContainText('7.5', { timeout });
-    await expect(preview('relay-a').locator('svg')).toHaveAttribute('data-points', '1', {
-      timeout,
-    });
+    await expect
+      .poll(
+        () =>
+          preview('relay-a')
+            .locator('svg')
+            .evaluate((svg: SVGElement) => Number(svg.dataset.points ?? 0)),
+        { timeout },
+      )
+      .toBeGreaterThan(0);
     // Frames.
     await expect
       .poll(
@@ -525,6 +531,7 @@ test.describe('WIT Graph Editor Demo', () => {
     expect(rows).toBe(1000);
 
     await controls.locator('button.stop').click();
+    await expect(controls.locator('button.run')).toBeEnabled();
     // A trace started over takes its rows with it.
     await timeline.evaluate(async (el: WitgraphTimeline) => {
       const controller = el.controller;
@@ -696,4 +703,35 @@ test.describe('Video pipeline demo', () => {
     const preview = await node.locator('.node-preview').boundingBox();
     expect(preview!.width).toBeGreaterThan(before!.width + 40);
   });
+});
+
+test('a node that spins leaves the page live', async ({ page }) => {
+  await page.goto('/?graph=spin');
+  await expect(page.locator('#status')).toHaveClass(/ready/, { timeout: 30_000 });
+  const canvas = page.locator('witgraph-canvas');
+  await canvas.evaluate((el: WitgraphCanvas) =>
+    el.controller?.injectValue('busy', 'action', 'spin'),
+  );
+  await page.locator('witgraph-controls').locator('button.run').click();
+  await expect(page.locator('witgraph-controls').locator('.badge')).toContainText('Running');
+  // Long enough for the node to be well into its loop.
+  await page.waitForTimeout(500);
+  const frames = await page.evaluate(
+    () =>
+      new Promise<number>((resolve) => {
+        let count = 0;
+        const started = performance.now();
+        const frame = () => {
+          count += 1;
+          if (performance.now() - started < 500) requestAnimationFrame(frame);
+          else resolve(count);
+        };
+        requestAnimationFrame(frame);
+      }),
+  );
+  expect(frames).toBeGreaterThan(5);
+  // And it still answers: choosing nothing, then the node again, shows in the inspector.
+  await canvas.evaluate((el: WitgraphCanvas) => el.controller?.select(null));
+  await canvas.evaluate((el: WitgraphCanvas) => el.controller?.select('busy'));
+  await expect(page.locator('witgraph-inspector').locator('.node-id')).toHaveValue('busy');
 });

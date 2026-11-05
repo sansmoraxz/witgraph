@@ -4,13 +4,12 @@ import {
   describeComponent,
   diagnosticsOf,
   GraphChecker,
+  init,
   type PortValues,
-  Session,
-  type SessionOptions,
+  RemoteSession,
 } from 'witgraph-loader';
 import { NODE_HEADER_HEIGHT } from '../components/styles.ts';
 import { weight } from '../util/weight.ts';
-import { viewerFor } from '../viewers/registry.ts';
 import { autoLayout, type LayoutEdge, type LayoutNode } from './layout.ts';
 import type {
   BreakpointState,
@@ -31,7 +30,7 @@ import type {
   SavedSnapshot,
   TraceEntry,
 } from './types.ts';
-import { describeHandle, nodeSize, nodeVisual, portVisual } from './visual.ts';
+import { nodeSize, nodeVisual, portVisual } from './visual.ts';
 
 const MAX_TRACE_ENTRIES = 1000;
 /**
@@ -73,21 +72,7 @@ interface Observation {
   version: number;
   /** When a value was last pulled from the port, for the preview interval. */
   pulledAt: number;
-  /** Whether `latest` is ours to dispose: a reference a viewer kept. */
-  kept: boolean;
   bytes: number;
-}
-
-/** Disposes what a viewer kept of an output's latest item. */
-function release(seen: Observation): void {
-  if (!seen.kept) return;
-  seen.kept = false;
-  const kept = seen.latest as Partial<Disposable> | null | undefined;
-  try {
-    kept?.[Symbol.dispose]?.();
-  } catch (error) {
-    console.error('disposing what a viewer kept threw:', error);
-  }
 }
 
 /** The most edits undo goes back over. */
@@ -115,7 +100,7 @@ export interface CompatibleOutput {
 }
 
 export class EditorController extends EventTarget {
-  #session: Session | null = null;
+  #session: RemoteSession | null = null;
   #originalOptions: EditorLoadOptions | null = null;
   #graphJson: GraphJson | null = null;
   #dirty = false;
@@ -368,11 +353,6 @@ export class EditorController extends EventTarget {
     return this.observe(node, port).latest;
   }
 
-  /** The resource an output carries, if it carries one. */
-  #resourceOf(node: string, port: string): string | undefined {
-    return this.#nodes.get(node)?.outputs.find((p) => p.name === port)?.handle?.resource;
-  }
-
   /** The record of what `node`'s `port` carried, made on first use. */
   #observation(node: string, port: string): Observation {
     const ports = this.#observed.get(node) ?? new Map<string, Observation>();
@@ -387,7 +367,6 @@ export class EditorController extends EventTarget {
         version: 0,
         pulledAt: Number.NEGATIVE_INFINITY,
         bytes: 0,
-        kept: false,
       };
       ports.set(port, seen);
     }
@@ -405,29 +384,20 @@ export class EditorController extends EventTarget {
   }
 
   /**
-   * Records a handle a stream or future carried. It is its reader's, and may
-   * be gone by the time anything is drawn, so what stays is what the preview's
-   * viewer keeps of it, or else a description. No history: each would hold on
-   * to what the handle holds.
+   * Records what the worker showed of a handle: what the output's view read, or a
+   * description. No history: each would hold on to what it read.
    */
-  #recordHandle(node: string, port: string, item: unknown, resource: string): void {
-    const visual = this.#nodes.get(node);
-    const viewer = visual?.preview?.port === port ? viewerFor(visual.preview.viewer) : undefined;
-    const kept = viewer?.keep?.(item);
+  #recordHandle(node: string, port: string, shown: unknown, count: number): void {
     const seen = this.#observation(node, port);
-    release(seen);
-    seen.latest = kept ?? describeHandle(item, resource);
-    seen.kept = kept !== undefined;
-    seen.recent = [seen.latest];
+    seen.latest = shown;
+    seen.recent = [shown];
     seen.pending = false;
-    seen.count += 1;
+    seen.count += count;
     this.#dispatch('output-changed');
   }
 
-  /** Forgets what outputs carried, disposing what was kept of it. */
+  /** Forgets what outputs carried. */
   #forgetObserved(node?: string): void {
-    const nodes = node === undefined ? [...this.#observed.values()] : [this.#observed.get(node)];
-    for (const ports of nodes) for (const seen of ports?.values() ?? []) release(seen);
     if (node === undefined) this.#observed.clear();
     else this.#observed.delete(node);
   }
@@ -690,6 +660,7 @@ export class EditorController extends EventTarget {
     if (this.#breakpoints.has(oldId)) {
       this.#breakpoints.delete(oldId);
       this.#breakpoints.add(newId);
+      this.#sendHolds();
     }
     // Update output history and the streams' latest items
     const observed = this.#observed.get(oldId);
@@ -971,6 +942,7 @@ export class EditorController extends EventTarget {
   async importBundle(json: string): Promise<void> {
     if (this.#locked()) return;
     const prev = this.#originalOptions;
+    if (!prev) throw new Error('no session loaded');
     const bundle = JSON.parse(json) as {
       version: number;
       graph: GraphJson;
@@ -986,9 +958,9 @@ export class EditorController extends EventTarget {
     await this.load({
       graph: bundle.graph,
       components,
-      wasm: prev?.wasm,
-      capabilities: prev?.capabilities,
-      mocks: prev?.mocks,
+      wasm: prev.wasm,
+      worker: prev.worker,
+      mocks: prev.mocks,
     });
   }
 
@@ -1032,6 +1004,8 @@ export class EditorController extends EventTarget {
         ? (JSON.parse(options.graph) as GraphJson)
         : structuredClone(options.graph);
     this.#graphJson = graphJson;
+    // The checker and the catalog read components on this thread, the session in its worker.
+    await init(options.wasm);
     await this.#createSession(graphJson);
     this.#compileError = null;
     this.#mode = 'idle';
@@ -1102,7 +1076,7 @@ export class EditorController extends EventTarget {
       return;
     }
     if (this.#mode === 'running') return;
-    this.#stepping = false;
+    this.#setStepping(false);
     await this.#startRun('run');
     await this.#runLoop;
   }
@@ -1117,7 +1091,7 @@ export class EditorController extends EventTarget {
     if (this.#mode === 'paused') {
       const held = this.#held.shift();
       if (!held) return;
-      this.#stepping = true;
+      this.#setStepping(true);
       this.#stepRunning = held.node;
       this.#mode = 'running';
       // A run that never returns, reading an endless stream, must not end the stepping.
@@ -1129,7 +1103,7 @@ export class EditorController extends EventTarget {
       await stopped;
       return;
     }
-    this.#stepping = true;
+    this.#setStepping(true);
     const stopped = this.#nextStop();
     await this.#startRun('step');
     await stopped;
@@ -1138,7 +1112,7 @@ export class EditorController extends EventTarget {
   /** Stops holding anything but breakpoints from the next node on, and goes on. */
   resumeBreakpoint(): void {
     if (this.#mode !== 'paused') return;
-    this.#stepping = false;
+    this.#setStepping(false);
     this.#stepRunning = null;
     clearTimeout(this.#stepTimer);
     // The node paused at goes on, as does any only held for a step. Another at a breakpoint
@@ -1156,7 +1130,7 @@ export class EditorController extends EventTarget {
   /** Holds each node from the next on, as a step would. What is running goes on. */
   pause(): void {
     if (this.#mode !== 'running' || !this.#runLoop) return;
-    this.#stepping = true;
+    this.#setStepping(true);
     this.#mode = 'paused';
     this.#showStop();
     this.#dispatch('state-changed');
@@ -1210,6 +1184,41 @@ export class EditorController extends EventTarget {
     if (mode === 'running' || mode === 'paused') this.#mode = 'idle';
     this.#dispatch('state-changed');
     this.#followWhatIsRunning();
+  }
+
+  /** Whether each node is held before it runs, or only those with a breakpoint. */
+  #setStepping(on: boolean): void {
+    this.#stepping = on;
+    this.#sendHolds();
+  }
+
+  /** Tells the worker whose runs wait for this thread: the others do not. */
+  #sendHolds(): void {
+    this.#session?.holdAt(this.#holds());
+  }
+
+  #holds(): string[] | 'all' {
+    return this.#stepping ? 'all' : [...this.#breakpoints];
+  }
+
+  /** The stream and future outputs looked at last told to the worker. */
+  #observedSent = '';
+
+  /** Tells the worker which outputs to send what they carry: nothing else crosses. */
+  #sendObserved(): void {
+    const session = this.#session;
+    if (!session) return;
+    const ports: [string, string][] = [];
+    for (const [id, visual] of this.#nodes) {
+      for (const port of visual.outputs) {
+        if (port.kind !== 'stream' && port.kind !== 'future') continue;
+        if (this.isObserved(id, port.name)) ports.push([id, port.name]);
+      }
+    }
+    const sent = JSON.stringify(ports);
+    if (sent === this.#observedSent) return;
+    this.#observedSent = sent;
+    session.observeOnly(ports);
   }
 
   /** Starts the run loop, once the graph is loaded. */
@@ -1306,7 +1315,7 @@ export class EditorController extends EventTarget {
   }
 
   #endStepping(): void {
-    this.#stepping = false;
+    this.#setStepping(false);
     this.#stepRunning = null;
     clearTimeout(this.#stepTimer);
     this.#settleStopWaiters();
@@ -1426,8 +1435,10 @@ export class EditorController extends EventTarget {
     const slice = new Promise<void>((resolve) => {
       timer = setTimeout(resolve, sliceMs);
     });
+    // Told first, so that the tick's first runs are seen.
+    this.#sendObserved();
     this.#ticking = true;
-    let tick: Awaited<ReturnType<Session['tick']>>;
+    let tick: Awaited<ReturnType<RemoteSession['tick']>>;
     try {
       // Paused at a breakpoint, a tick ends only when resumed or stopped.
       const stop = Promise.race([stopped, slice.then(() => this.#paused())]);
@@ -1474,18 +1485,20 @@ export class EditorController extends EventTarget {
    * Stops a run or step, and whatever it left running: an endless stream
    * stops too. Between ticks, it stops what earlier ticks left running.
    */
-  stop(): void {
+  stop(): Promise<void> {
     this.#stopRequested = true;
     if (!this.#ticking && this.#session) {
       this.#shutdown();
       this.#pollState();
     }
     for (const { resume } of this.#held.splice(0)) resume();
-    this.#stepping = false;
+    this.#setStepping(false);
     if (this.#stopResolve) {
       this.#stopResolve();
       this.#stopResolve = null;
     }
+    // Settled once the worker has said what stopped.
+    return this.#session?.graph.sync().catch(() => {}) ?? Promise.resolve();
   }
 
   // -- Breakpoints ------------------------------------------------------------
@@ -1498,6 +1511,7 @@ export class EditorController extends EventTarget {
     }
     const visual = this.#nodes.get(nodeId);
     if (visual) visual.breakpoint = this.#breakpoints.has(nodeId);
+    this.#sendHolds();
     this.#dispatch('state-changed');
   }
 
@@ -2040,17 +2054,18 @@ export class EditorController extends EventTarget {
     const mocks = { ...attrMocks, ...callerMocks };
 
     // Set once loaded: until then, and once replaced, its hooks are stale.
-    let session: Session | null = null;
-    const sessionOptions: SessionOptions = {
+    let session: RemoteSession | null = null;
+    session = await RemoteSession.load(this.#originalOptions.worker, {
       graph: graph,
       components: this.#originalOptions.components,
       wasm: this.#originalOptions.wasm,
-      capabilities: this.#originalOptions.capabilities,
       mocks: Object.keys(mocks).length > 0 ? mocks : undefined,
+      holds: this.#holds(),
 
-      beforeRun: async (node): Promise<void> => {
+      beforeRun: async (node, held): Promise<void> => {
         const breakpoint = this.#breakpoints.has(node);
-        if (breakpoint || this.#stepping) {
+        // Held, it waits for this. One no longer wanted held just goes on.
+        if (held && (breakpoint || this.#stepping)) {
           // Read when it is hit, as nothing crosses to the host unasked.
           const inputs = (await session?.readInputs(node)) ?? {};
           if (this.#stopRequested) return;
@@ -2075,21 +2090,24 @@ export class EditorController extends EventTarget {
       afterRun: (node): void => this.#stepReturned(node),
 
       onStreamItem: ({ node, port, items }): void => {
-        if (this.#session !== session || !this.isObserved(node, port)) return;
-        const resource = this.#resourceOf(node, port);
-        if (resource === undefined) this.#recordItems(node, port, items);
-        else for (const item of Array.from(items)) this.#recordHandle(node, port, item, resource);
+        if (this.#session === session) this.#recordItems(node, port, items);
       },
 
       onFutureValue: ({ node, port, value }): void => {
-        if (this.#session !== session || !this.isObserved(node, port)) return;
-        const resource = this.#resourceOf(node, port);
-        if (resource === undefined) this.#record(node, port, value);
-        else this.#recordHandle(node, port, value, resource);
+        if (this.#session === session) this.#record(node, port, value);
       },
-    };
 
-    session = await Session.load(sessionOptions);
+      onHandle: ({ node, port, shown, count }): void => {
+        if (this.#session === session) this.#recordHandle(node, port, shown, count);
+      },
+
+      onState: (): void => {
+        if (this.#session !== session) return;
+        this.#pollState();
+        void this.#pullObserved(false);
+        this.#dispatch('state-changed');
+      },
+    });
     this.#session = session;
     this.#compileDiagnostics = [...session.diagnostics];
     // Each once, though every edit loads the graph again.
@@ -2102,6 +2120,8 @@ export class EditorController extends EventTarget {
     this.#streamGroups = session.graph.streamGroups() as string[][];
     this.#dirty = false;
     this.#buildVisuals();
+    this.#observedSent = '';
+    this.#sendObserved();
     await this.#restoreInjections(graph);
     this.#collectCapabilities();
   }
@@ -2109,21 +2129,14 @@ export class EditorController extends EventTarget {
   #collectCapabilities(): void {
     this.#capabilityInfo.clear();
     if (!this.#session) return;
-    const capabilitiesFn = this.#originalOptions?.capabilities;
     for (const [nodeId, contract] of this.#session.contracts) {
       if (!contract.capabilities || contract.capabilities.length === 0) continue;
-      const infos: CapabilityInfo[] = contract.capabilities.map((cap) => {
-        // A capability is satisfied when the capabilities callback exists
-        // and doesn't throw for this node. We can't cheaply test the return
-        // value without instantiating, so mark satisfied when a callback is
-        // provided — the session load would have thrown if it returned undefined.
-        const satisfied = capabilitiesFn !== undefined;
-        return {
-          interface: cap.name,
-          implements: cap.implements,
-          satisfied,
-        };
-      });
+      // Loaded, so each was provided: instantiating throws for one that is not.
+      const infos: CapabilityInfo[] = contract.capabilities.map((cap) => ({
+        interface: cap.name,
+        implements: cap.implements,
+        satisfied: true,
+      }));
       this.#capabilityInfo.set(nodeId, infos);
     }
   }
@@ -2243,6 +2256,17 @@ export class EditorController extends EventTarget {
    * say). `final` ignores the preview interval, as a run ends.
    */
   async #pullObserved(final: boolean): Promise<void> {
+    const pull = this.#pull(final);
+    this.#pulls.add(pull);
+    void pull.finally(() => this.#pulls.delete(pull));
+    // One under way claimed what it reads: done means that is in too.
+    await Promise.all(this.#pulls);
+  }
+
+  /** The reads of outputs under way. */
+  #pulls = new Set<Promise<void>>();
+
+  async #pull(final: boolean): Promise<void> {
     const session = this.#session;
     if (!session) return;
     for (const [id, visual] of this.#nodes) {
@@ -2263,7 +2287,8 @@ export class EditorController extends EventTarget {
               ? await session.graph.readHandle(id, port.name)
               : await session.graph.readOutput(id, port.name);
           if (this.#session !== session || value === undefined) continue;
-          this.#record(id, port.name, value);
+          if (port.kind === 'handle') this.#recordHandle(id, port.name, value, 1);
+          else this.#record(id, port.name, value);
         } catch {}
       }
     }
@@ -2282,6 +2307,8 @@ export class EditorController extends EventTarget {
       this.#dispatchQueued = true;
       queueMicrotask(() => {
         this.#dispatchQueued = false;
+        // Whatever changed may have changed what is looked at.
+        this.#sendObserved();
         this.dispatchEvent(new CustomEvent(type));
       });
     } else if (type === 'output-changed') {

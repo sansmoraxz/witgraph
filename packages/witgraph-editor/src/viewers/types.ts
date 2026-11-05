@@ -26,14 +26,4 @@ export interface PortViewer {
    * no theme.
    */
   mount(host: HTMLElement, port: PortVisual): ViewerInstance;
-  /**
-   * For a stream or future of handles: what to show of `item`. An item is its
-   * reader's, which may dispose it as soon as it is done, so the editor calls
-   * this as the item passes, and shows the viewer what it returns as `latest`
-   * (a reference through the resource's own API, say). The editor disposes
-   * that (`Symbol.dispose`) when the next one replaces it, so a viewer still
-   * using it later needs another reference of its own. Without this, the
-   * viewer is shown the item's description.
-   */
-  keep?(item: unknown): unknown;
 }

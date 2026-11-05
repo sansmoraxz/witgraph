@@ -44,6 +44,7 @@ const GUESTS = [
   'tensor-stream-edge',
   'tensor-stream-sink',
   'camera-source',
+  'busy-loop',
 ];
 
 // Resolve the cargo target directory via `cargo metadata`.
