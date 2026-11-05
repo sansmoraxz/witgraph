@@ -88,6 +88,10 @@ Put them anywhere on your page. They all share one `EditorController`.
   They go together. **Next node** from a line finishes that node and pauses before the next, and
   **Into** from a node about to run stops at its first line. F10 does what is next at the level it
   is stopped at. **Pause** stops at whichever comes first, and **Continue** at the next of either.
+- **Stopping in a stream.** A node's `run` starts its stream's work and often ends long
+  before it does, and it runs again only when its inputs change once the stream has ended.
+  So _Break on node_ stops a stream node once per stream, however many items pass. To stop
+  for each item, click the gutter on a line of the loop that handles them.
 - **Source lines.** Off unless you ask for it, as it **slows guests down significantly**. Load with
   `lines: true`, or `lines: { own: [...] }` to name the paths of what counts as the guest's own, and
   a guest built with debug info can be stopped on a line of its own code, even a node that is

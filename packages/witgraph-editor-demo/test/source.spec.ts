@@ -244,6 +244,40 @@ test('a graph with no `?debug` has no source panel', async ({ page }) => {
   await expect(page.locator('witgraph-controls').locator('button.step-in')).toBeHidden();
 });
 
+test('a breakpoint in a stream loop comes back for each item', async ({ page }) => {
+  await page.goto('/?debug');
+  await expect(page.locator('#status')).toHaveClass(/ready/, { timeout: 30_000 });
+  const canvas = page.locator('witgraph-canvas');
+  // On the line `while let Some(frame) = frames.next().await`, which has many places in the code.
+  await canvas.evaluate(async (el: WitgraphCanvas) => {
+    const controller = el.controller;
+    if (!controller) throw new Error('no controller');
+    const file = controller.lineFiles.find((name) => name.endsWith('video-sink/src/lib.rs'));
+    if (!file) throw new Error('no debug build of the sink');
+    const text = (await controller.sourceOf(file)) ?? '';
+    const line = text.split('\n').findIndex((row) => row.includes('frames.next()')) + 1;
+    controller.toggleLineBreakpoint(file, line);
+  });
+  await page.locator('witgraph-controls').locator('button.run').click();
+  for (let stop = 0; stop < 4; stop++) {
+    await expect
+      .poll(() => canvas.evaluate((el: WitgraphCanvas) => el.controller?.lineStop?.node ?? null))
+      .toBe('video-sink');
+    await canvas.evaluate((el: WitgraphCanvas) => el.controller?.resumeBreakpoint());
+  }
+  await canvas.evaluate((el: WitgraphCanvas) => el.controller?.stop());
+});
+
+test('a node paused at in a stream says it runs once per stream', async ({ page }) => {
+  await page.goto('/');
+  await expect(page.locator('#status')).toHaveClass(/ready/, { timeout: 30_000 });
+  const canvas = page.locator('witgraph-canvas');
+  await canvas.evaluate((el: WitgraphCanvas) => el.controller?.toggleBreakpoint('consumer'));
+  await page.locator('witgraph-controls').locator('button.run').click();
+  await expect(page.locator('#status')).toContainText('It runs once per stream');
+  await page.locator('witgraph-controls').locator('button.stop').click();
+});
+
 test('`?debug` loads debug builds, so any graph has its source to stop in', async ({ page }) => {
   test.setTimeout(90_000);
   await page.goto('/?debug');

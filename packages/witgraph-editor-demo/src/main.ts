@@ -628,7 +628,7 @@ function updateStatus(): void {
     const line = controller.lineStop;
     text = line
       ? `Stopped at line ${line.line}${node ? ` in ${node}` : ''}. Over, Into and Out move through its code; Next node finishes it.`
-      : `Paused before node ${node ?? '?'}. Next node runs it${controller.lineFiles.length > 0 ? ', Into goes into its code' : ''}.`;
+      : `Paused before node ${node ?? '?'}. Next node runs it${controller.lineFiles.length > 0 ? ', Into goes into its code' : ''}.${controller.streamGroups.some((group) => group.includes(controller.pausedNode ?? '')) ? ' It runs once per stream: to stop on each item, stop on a line of its code.' : ''}`;
   } else if (mode === 'error') {
     state = 'error';
     text = 'The run stopped on an error. The timeline says what failed.';
