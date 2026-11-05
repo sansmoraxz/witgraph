@@ -3409,8 +3409,12 @@ dependencies = [
  "libfuzzer-sys",
  "miette",
  "serde_json",
+ "test-components",
+ "tokio",
  "witgraph-host-plane",
  "witgraph-ir",
+ "witgraph-runtime",
+ "witgraph-wit",
 ]
 
 [[package]]

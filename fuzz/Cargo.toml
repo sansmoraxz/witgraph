@@ -28,6 +28,12 @@ serde_json = { workspace = true }
 witgraph-host-plane = { path = "../test-fixtures/host-plane" }
 witgraph-ir = { workspace = true }
 
+[dev-dependencies]
+test-components = { path = "../test-fixtures/test-components" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+witgraph-runtime = { workspace = true }
+witgraph-wit = { workspace = true }
+
 [[bin]]
 name = "graph_model"
 path = "fuzz_targets/graph_model.rs"
