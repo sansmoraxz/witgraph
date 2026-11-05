@@ -199,21 +199,23 @@ export class EditorController extends EventTarget {
     return this.#compileError;
   }
   /**
-   * What compiling says of the graph: errors, when it does not compile, and warnings,
-   * which stop nothing, either way. An input fed only by feedback is left out once it
-   * has a value injected, as that is what the warning asks for, and compiling cannot
-   * see it.
+   * What compiling says of the graph, as it says it: errors, when it does not compile,
+   * and warnings, which stop nothing, either way.
    */
   get compileDiagnostics(): readonly Diagnostic[] {
-    return this.#compileDiagnostics.filter(({ code, location }) => {
-      if (code !== 'witgraph::ir::feedback_only_input') return true;
-      const node = this.#graphJson?.nodes.find((n) => n.id === location.nodes[0]);
-      return node?.attrs?.[`inject.${location.port}`] === undefined;
-    });
+    return this.#compileDiagnostics;
+  }
+  /**
+   * Whether what a warning asks for has been done, since compiling, which cannot see a
+   * running graph: an input fed only by feedback that has a value injected.
+   */
+  isSettled({ code, location }: Diagnostic): boolean {
+    if (code !== 'witgraph::ir::feedback_only_input' || location.port === undefined) return false;
+    return this.getInjectedValue(location.nodes[0], location.port) !== undefined;
   }
   /** What compiling says about a node, or a connection of it. */
   diagnosticsForNode(id: string): readonly Diagnostic[] {
-    return this.compileDiagnostics.filter(({ location }) => {
+    return this.#compileDiagnostics.filter(({ location }) => {
       if (location.nodes.includes(id)) return true;
       const edge = this.#edges.find((e) => e.id === location.connection);
       return edge?.fromNode === id || edge?.toNode === id;
@@ -221,7 +223,7 @@ export class EditorController extends EventTarget {
   }
   /** What compiling says about a connection. */
   diagnosticsForConnection(id: string): readonly Diagnostic[] {
-    return this.compileDiagnostics.filter(({ location }) => location.connection === id);
+    return this.#compileDiagnostics.filter(({ location }) => location.connection === id);
   }
   get compiles(): boolean {
     return this.#compileError === null && this.#session !== null;
@@ -1907,6 +1909,8 @@ export class EditorController extends EventTarget {
 
   async #restoreInjections(graph: GraphJson): Promise<void> {
     if (!this.#session) return;
+    // A new session holds only what is injected into it here.
+    this.#injectedValues.clear();
     for (const node of graph.nodes) {
       if (!node.attrs) continue;
       for (const [key, value] of Object.entries(node.attrs)) {

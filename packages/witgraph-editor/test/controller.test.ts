@@ -828,11 +828,26 @@ test('a warning is said of a graph that compiles, and is not why one does not', 
   await until(() => controller.compiles);
   assert.deepEqual(codes(), ['witgraph::ir::feedback_only_input'], 'the warning stays');
 
-  // Injecting a value is what the warning asks for.
+  // Injecting a value is what the warning asks for: it is settled, and still said.
+  const settled = () => controller.diagnosticsForNode('a').map((d) => controller.isSettled(d));
   await controller.injectValue('a', 'in', '1');
-  assert.deepEqual(codes(), []);
-  await controller.clearInput('a', 'in');
   assert.deepEqual(codes(), ['witgraph::ir::feedback_only_input']);
+  assert.deepEqual(settled(), [true]);
+  await controller.clearInput('a', 'in');
+  assert.deepEqual(settled(), [false]);
+
+  // An attribute is only a request: one that fails to inject settles nothing.
+  const withInject = (value: string) => {
+    const graph = JSON.parse(controller.exportGraph()) as GraphJson;
+    const node = graph.nodes.find((n) => n.id === 'a');
+    if (node) node.attrs = { ...node.attrs, 'inject.in': value };
+    return JSON.stringify(graph);
+  };
+  await controller.importGraph(withInject('"not a number"'));
+  assert.equal(controller.compiles, true);
+  assert.deepEqual(settled(), [false]);
+  await controller.importGraph(withInject('7'));
+  assert.deepEqual(settled(), [true]);
 });
 
 test('what can feed an input is worked out once per graph', async () => {

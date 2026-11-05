@@ -365,8 +365,12 @@ test.describe('WIT Graph Editor Demo', () => {
     const canvas = page.locator('witgraph-canvas');
     const inspector = page.locator('witgraph-inspector');
     const warned = canvas.locator('[data-node-id="relay-a"].has-warning');
-    // `relay-a.in` is fed only by feedback, and has a value injected, as the warning asks.
+    // `relay-a.in` is fed only by feedback, and has a value injected, as the warning asks:
+    // off the canvas, and in the inspector as settled.
     await expect(warned).toHaveCount(0);
+    await canvas.evaluate((el: WitgraphCanvas) => el.controller?.select('relay-a'));
+    await expect(inspector.locator('.settled-bg')).toContainText('Settled');
+    await expect(inspector.locator('.warning-bg')).toHaveCount(0);
 
     await canvas.evaluate((el: WitgraphCanvas) => el.controller?.clearInput('relay-a', 'in'));
     await expect(warned).toHaveCount(1);

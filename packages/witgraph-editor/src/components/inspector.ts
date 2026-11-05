@@ -57,6 +57,7 @@ const EXTRA_CSS = `
   }
   select:focus, input:focus, textarea:focus { border-color: var(--wg-primary); outline: none; }
   input[type="checkbox"] { accent-color: var(--wg-primary); width: 14px; height: 14px; cursor: pointer; padding: 0; }
+  .settled-bg { background: var(--wg-surface); border-left: 2px solid var(--wg-text-muted); }
   .warning-bg { background: color-mix(in srgb, var(--wg-warning) 8%, transparent); border-left: 2px solid var(--wg-warning); }
   .fault-bg { background: color-mix(in srgb, var(--wg-error) 8%, transparent); border-left: 2px solid var(--wg-error); }
   .bp-bg { background: color-mix(in srgb, var(--wg-warning) 8%, transparent); border-left: 2px solid var(--wg-warning); }
@@ -212,8 +213,10 @@ export class WitgraphInspector extends HTMLElement {
     const worstFirst = [...diagnostics].sort(
       (a, b) => Number(b.severity === 'error') - Number(a.severity === 'error'),
     );
-    for (const { severity, message, help } of worstFirst) {
-      const look = severity === 'error' ? 'fault-bg' : 'warning-bg';
+    for (const diagnostic of worstFirst) {
+      const { severity, message, help } = diagnostic;
+      const settled = this.#controller?.isSettled(diagnostic) ?? false;
+      const look = settled ? 'settled-bg' : severity === 'error' ? 'fault-bg' : 'warning-bg';
       const entry = this.#el('div', `${look} rounded-md p-3`);
       entry.appendChild(
         this.#el(
@@ -223,6 +226,11 @@ export class WitgraphInspector extends HTMLElement {
         ),
       );
       if (help) entry.appendChild(this.#el('div', 'text-wg-text-dim text-xs mt-1', help));
+      if (settled) {
+        entry.appendChild(
+          this.#el('div', 'text-wg-text-dim text-xs mt-1', 'Settled: a value is injected.'),
+        );
+      }
       wrap.appendChild(entry);
     }
   }

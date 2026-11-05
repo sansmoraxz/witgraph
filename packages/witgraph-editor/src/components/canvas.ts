@@ -390,7 +390,8 @@ export class WitgraphCanvas extends HTMLElement {
   }
 
   /** Marks what compiling had something to say of, and says it on hovering. */
-  #markDiagnostics(element: SVGElement, diagnostics: readonly Diagnostic[]): void {
+  #markDiagnostics(element: SVGElement, said: readonly Diagnostic[]): void {
+    const diagnostics = said.filter((d) => !this.#controller?.isSettled(d));
     const error = diagnostics.some(({ severity }) => severity === 'error');
     element.classList.toggle('has-error', error);
     element.classList.toggle('has-warning', !error && diagnostics.length > 0);

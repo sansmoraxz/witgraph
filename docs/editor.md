@@ -32,7 +32,10 @@ Put them anywhere on your page. They all share one `EditorController`.
 - **See what's wrong.** A graph that doesn't compile marks the nodes and connections
   at fault in `--wg-error`, and what compiling warns of in `--wg-warning`, and the
   inspector says why. `controller.diagnosticsForNode` and
-  `controller.diagnosticsForConnection` give you the same as data.
+  `controller.diagnosticsForConnection` give you the same as data. A warning whose
+  advice has been taken, like injecting a value into an input fed only by feedback,
+  stays in the inspector marked as settled, and off the canvas
+  (`controller.isSettled`).
 - **Feedback.** Right-click a connection and choose _Mark as Feedback_ to make
   it a feedback edge, which cycles need.
 - **Rename and label** nodes, and set their attributes, in the inspector.
