@@ -1365,7 +1365,6 @@ fn compose(
     mocked: &[NodeId],
     debug: bool,
 ) -> Result<(Composite, Vec<Capability>), JsError> {
-    let mut module_nodes: BTreeMap<String, Vec<NodeId>> = BTreeMap::new();
     let mut capabilities: Vec<Capability> = Vec::new();
     let mut members = Vec::with_capacity(compiled.graph().nodes.len());
     for node in &compiled.graph().nodes {
@@ -1386,14 +1385,6 @@ fn compose(
         };
         if !is_mocked {
             Capability::add_unique(&mut capabilities, imports);
-            if debug {
-                for module in core_modules(bytes).map_err(error)? {
-                    module_nodes
-                        .entry(sha256_hex(module))
-                        .or_default()
-                        .push(node.id.clone());
-                }
-            }
         }
         members.push(HubMember {
             node: &node.id,
@@ -1403,6 +1394,19 @@ fn compose(
         });
     }
     let composed = hub::compose_graph(compiled, &members).map_err(error)?;
+    let mut module_nodes: BTreeMap<String, Vec<NodeId>> = BTreeMap::new();
+    if debug {
+        for node in &composed.instantiated {
+            let member = members.iter().find(|member| member.node == node);
+            let bytes = member.map_or(&[][..], |member| member.bytes);
+            for module in core_modules(bytes).map_err(error)? {
+                module_nodes
+                    .entry(sha256_hex(module))
+                    .or_default()
+                    .push(node.clone());
+            }
+        }
+    }
     let sha256 = sha256_hex(&composed.bytes);
     Ok((
         Composite {

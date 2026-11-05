@@ -31,6 +31,9 @@ pub struct ComposedGraph {
     pub bytes: Vec<u8>,
     /// How many component instances it holds.
     pub components: usize,
+    /// The nodes with an instance, in the order they are instantiated: of two nodes of one
+    /// component, the first here has its core modules' first instances.
+    pub instantiated: Vec<NodeId>,
 }
 
 /// Why a graph could not be made into one component.
@@ -134,5 +137,15 @@ pub fn compose_graph(
             ..EncodeOptions::default()
         })
         .map_err(|e| compose(format!("{e:#}")))?;
-    Ok(ComposedGraph { bytes, components })
+    let instantiated = generated
+        .order
+        .iter()
+        .filter(|member| !member.mocked)
+        .map(|member| member.node.clone())
+        .collect();
+    Ok(ComposedGraph {
+        bytes,
+        components,
+        instantiated,
+    })
 }

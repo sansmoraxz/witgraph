@@ -410,6 +410,32 @@ test('a stop says whose guest it is, whichever order the graph has them in', asy
   }
 });
 
+test('a stop names the right node when connections decide the order', async () => {
+  for (const nodes of [
+    ['a', 'b'],
+    ['b', 'a'],
+  ]) {
+    // Whichever is declared first, `a` feeds `b`.
+    const { session, lines, nextStop, file } = await load(
+      nodes.map((node): [string, string] => [node, 'line-walk']),
+      [['ab', 'a.out', 'b.in']],
+    );
+    lines.setBreakpoint(file, mark('walk-first'));
+    await session.graph.inject('a', 'in', 5);
+    const tick = session.tick();
+    for (const [node, x] of [
+      ['a', '5'],
+      ['b', '8'],
+    ]) {
+      const stop = await nextStop();
+      assert.equal(stop.node, node);
+      assert.equal(variable(stop, 'x').value, x, node);
+      lines.resume();
+    }
+    await tick;
+  }
+});
+
 test('a mocked node has no instance to count', async () => {
   const { session, lines, nextStop, file } = await load(
     [
@@ -523,6 +549,29 @@ test('a page that is not isolated is told why it cannot debug lines', async () =
     );
   } finally {
     delete scope.crossOriginIsolated;
+  }
+});
+
+test('unasked for, a guest with debug info runs as it was built, with no probes', async () => {
+  const seen: Uint8Array[] = [];
+  const compile = WebAssembly.compile;
+  WebAssembly.compile = (bytes: BufferSource) => {
+    seen.push(new Uint8Array(ArrayBuffer.isView(bytes) ? bytes.buffer : bytes));
+    return compile(bytes);
+  };
+  try {
+    const { graph, components } = await options([['a', 'line-walk']]);
+    const session = await Session.load({ graph, components, wasm });
+    const named = (bytes: Uint8Array, text: string) => Buffer.from(bytes).includes(text);
+    assert.ok(
+      seen.some((bytes) => named(bytes, '.debug_line')),
+      'it reached the engine as it was',
+    );
+    assert.ok(!seen.some((bytes) => named(bytes, 'witgraph:debug')), 'with nothing added');
+    assert.deepEqual(session.graph.moduleNodes(), {});
+    session.dispose();
+  } finally {
+    WebAssembly.compile = compile;
   }
 });
 
