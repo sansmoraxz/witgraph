@@ -341,7 +341,7 @@ The rest is opt-in too, so you only compile what you use:
 | `profiling`            | no      | Profiler support.                                    |
 | `wat`                  | no      | Accepting text-format `.wat` input.                  |
 | `coredump`             | no      | Guest core dumps on a trap.                          |
-| `debug`                | no      | Guest debugging support.                             |
+| `debug`                | no      | Stopping on source lines, with `debug_lines`.        |
 | `demangle`             | no      | Demangled names in backtraces.                       |
 | `addr2line`            | no      | Source locations in backtraces.                      |
 
@@ -361,3 +361,42 @@ Pass `Trace` instead of `Perf` to record events such as runs starting and
 returning, stream groups draining, faults and phase changes. Read them back with
 `trace()` or drain them with `take_trace()`. Stream items pass between guests
 unseen on wasmtime, so they aren't traced.
+
+## Stopping on a source line
+
+Debugging is off unless you ask for it, twice over, as **it slows a graph down significantly**: it
+takes the `debug` feature, and `debug_lines` set. Then a guest built with debug info can be stopped
+on a line of its source, with `RuntimeGraph::lines`. This is the `LineDebugger` trait, which the
+[JavaScript host](javascript.md#stopping-on-a-source-line) has too, in its own idiom:
+
+```rust,ignore
+let config = RuntimeConfig { debug_lines: true, ..RuntimeConfig::default() };
+let mut graph = RuntimeGraph::load(compiled, &wasm, config, Perf).await?;
+let lines = graph.lines().expect("loaded to debug");
+
+let file = lines.files().remove(0);
+lines.set_breakpoint(&file, 42); // returns the line it came to
+let (_, ()) = tokio::join!(graph.tick(), async {
+    let stop = lines.next_stop().await;
+    println!("{}:{} in {:?}: {:?}", stop.file, stop.line, stop.node, stop.variables);
+    lines.step_over();
+    lines.next_stop().await;
+    lines.resume();
+});
+```
+
+Hold on to a clone of `lines`, as a stopped guest holds up its tick. What it is told takes effect
+even on a guest in a loop that never returns.
+
+- **It is slow.** Wasmtime keeps every value where it can be looked at, so guests run about 20 times
+  slower, breakpoints or not, and take 3 to 4 times as long to load. Leave it off for anything but
+  debugging: without `debug_lines` nothing is different, and without the feature nothing is there.
+- **Everything stops with it.** A Store runs one thing at a time, so all of the graph waits, and what
+  is asked of it waits, as with any read while a guest spins. `tick_until` still ends the tick, and
+  `shutdown` ends the guest where it is, with its Store.
+- **The engine has to be made for it,** by `RuntimeConfig::new_engine` with this set: a load on any
+  other is refused. Another graph with no `debug_lines` can share one, at the same slowdown.
+- **A precompiled graph** can stop on lines, but a stop does not say which node's it is.
+
+What is shown, and what limits it, is the same as on JavaScript: see
+[there](javascript.md#stopping-on-a-source-line).

@@ -125,6 +125,12 @@ pub struct RuntimeConfig {
     /// reservation moves. Only used when the runtime makes the engine
     /// ([`engine`](Self::engine) is `None` and no prepared graph brings one).
     pub memory_reservation: Option<ByteCount>,
+    /// Lets guests built with debug info be stopped on a line of their source:
+    /// [`RuntimeGraph::lines`]. Wasmtime then keeps every value where it can be looked at, so
+    /// guests run about 20 times slower, breakpoints or not. It needs an engine from
+    /// [`new_engine`](Self::new_engine) with this set, as the default one is.
+    #[cfg(feature = "debug")]
+    pub debug_lines: bool,
     /// The wasmtime engine to load the graph into: one from
     /// [`RuntimeConfig::new_engine`], or another graph's
     /// [`engine`](RuntimeGraph::engine), so several graphs share one. It is
@@ -148,6 +154,8 @@ impl Default for RuntimeConfig {
             // 4 GiB, or all of a 32-bit host's address space.
             hostcall_fuel: usize::try_from(4u64 << 30).unwrap_or(usize::MAX),
             memory_reservation: None,
+            #[cfg(feature = "debug")]
+            debug_lines: false,
             engine: None,
         }
     }
@@ -158,10 +166,17 @@ impl RuntimeConfig {
     /// model's async ABI and value types, fuel metering), with
     /// [`memory_reservation`](Self::memory_reservation).
     pub fn new_engine(&self) -> Result<Engine, RuntimeError> {
-        engine::new_engine(self.memory_reservation.map(|bytes| bytes.0)).map_err(|e| {
-            RuntimeError::InvalidConfig {
-                message: format!("{e:#}"),
-            }
+        let memory_reservation = self.memory_reservation.map(|bytes| bytes.0);
+        #[cfg(feature = "debug")]
+        let made = if self.debug_lines {
+            engine::new_debug_engine(memory_reservation)
+        } else {
+            engine::new_engine(memory_reservation)
+        };
+        #[cfg(not(feature = "debug"))]
+        let made = engine::new_engine(memory_reservation);
+        made.map_err(|e| RuntimeError::InvalidConfig {
+            message: format!("{e:#}"),
         })
     }
 
@@ -684,6 +699,13 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
     /// The runtime mode (for [`Trace`](crate::Trace), its trace).
     pub fn mode(&self) -> &M {
         &self.mode
+    }
+
+    /// What sets breakpoints in the graph's guests and steps through them, if it was loaded
+    /// with [`RuntimeConfig::debug_lines`].
+    #[cfg(feature = "debug")]
+    pub fn lines(&self) -> Option<crate::lines::RuntimeLines> {
+        self.core.plane.blueprint.lines.clone()
     }
 
     /// The wasmtime engine the graph runs on; pass it as

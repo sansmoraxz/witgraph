@@ -30,6 +30,8 @@ wasmtime = { workspace = true, features = [
     "runtime", "component-model", "component-model-async", "task-group-hook", "async", "std", "wave",
 ] }
 
+witgraph-probes = { workspace = true, optional = true }
+
 [features]
 default = ["compile", "parallel-compilation"]
 # Compiling components from their bytes, with Cranelift, and composing their
@@ -48,7 +50,7 @@ wat = ["wasmtime/wat"]
 demangle = ["wasmtime/demangle"]
 addr2line = ["wasmtime/addr2line"]
 coredump = ["wasmtime/coredump"]
-debug = ["wasmtime/debug"]
+debug = ["wasmtime/debug", "dep:witgraph-probes"]
 
 [dev-dependencies]
 wit-parser = { workspace = true }

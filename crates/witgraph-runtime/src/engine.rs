@@ -368,6 +368,19 @@ impl Host for NoCapabilities {
 /// checks but caps a 64-bit process at about 32k memories); a memory that
 /// outgrows its reservation moves instead.
 pub(crate) fn new_engine(memory_reservation: Option<u64>) -> wasmtime::Result<Engine> {
+    Engine::new(&engine_config(memory_reservation)?)
+}
+
+/// As [`new_engine`], for stopping guests on lines (see [`crate::lines`]): each `epoch` is a
+/// chance to take the Store from a running guest.
+#[cfg(feature = "debug")]
+pub(crate) fn new_debug_engine(memory_reservation: Option<u64>) -> wasmtime::Result<Engine> {
+    let mut config = engine_config(memory_reservation)?;
+    config.guest_debug(true).epoch_interruption(true);
+    Engine::new(&config)
+}
+
+fn engine_config(memory_reservation: Option<u64>) -> wasmtime::Result<wasmtime::Config> {
     const PAGE: u64 = 64 * 1024;
     let mut config = wasmtime::Config::new();
     if let Some(bytes) = memory_reservation {
@@ -385,7 +398,7 @@ pub(crate) fn new_engine(memory_reservation: Option<u64>) -> wasmtime::Result<En
         .wasm_component_model_implements(true)
         .concurrency_support(true)
         .consume_fuel(true);
-    Engine::new(&config)
+    Ok(config)
 }
 
 /// A linker for a composed graph: each node's own `witgraph:runtime/host`

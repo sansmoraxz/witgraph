@@ -444,6 +444,18 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// What stops a Store's guests on lines, if anything does.
+#[cfg(feature = "debug")]
+pub(crate) type MaybeLines = Option<crate::lines::RuntimeLines>;
+/// Nothing, without the `debug` feature.
+#[cfg(not(feature = "debug"))]
+pub(crate) type MaybeLines = NoLines;
+
+/// What takes the place of a debugger, without the `debug` feature.
+#[cfg(not(feature = "debug"))]
+#[derive(Clone)]
+pub(crate) struct NoLines;
+
 /// An instance of a composite, with its data set up.
 pub(crate) struct Built<D: 'static> {
     pub(crate) store: Store<D>,
@@ -465,6 +477,7 @@ pub(crate) async fn build<D: StoreData>(
     exports: &Arc<HubExports>,
     data: D,
     settings: StoreSettings,
+    lines: &MaybeLines,
 ) -> Result<Built<D>, BuildFailure> {
     let plain = |e: wasmtime::Error| BuildFailure {
         message: format!("{e:#}"),
@@ -472,6 +485,14 @@ pub(crate) async fn build<D: StoreData>(
     };
     let mut store = Store::new(engine, data);
     store.limiter(|data: &mut D| data.host_state() as &mut dyn wasmtime::ResourceLimiter);
+    #[cfg(feature = "debug")]
+    match lines {
+        Some(lines) => lines.attach(&mut store),
+        // On an engine made to debug, for another graph.
+        None => store.set_epoch_deadline(u64::MAX / 2),
+    }
+    #[cfg(not(feature = "debug"))]
+    let NoLines = lines;
     // Instantiation (a guest's `_initialize`, say) gets a budget of its own, as
     // big as a `run`'s: a spinning start function faults instead of hanging the
     // load. Every `run` resets the fuel again.
@@ -491,6 +512,10 @@ pub(crate) async fn build<D: StoreData>(
     };
     let hub = LiveHub::new(&mut store, instance, exports.clone()).map_err(plain)?;
     store.set_fuel(settings.budget()).map_err(plain)?;
+    #[cfg(feature = "debug")]
+    if let Some(lines) = lines {
+        lines.arm(&mut store);
+    }
     Ok(Built { store, hub })
 }
 
@@ -545,6 +570,7 @@ struct RebuildArgs<D: 'static> {
     pre: InstancePre<D>,
     exports: Arc<HubExports>,
     data: wasmtime::Result<D>,
+    lines: MaybeLines,
 }
 
 /// Serves one instance, until it faults or the scheduler lets go of it.
@@ -586,6 +612,7 @@ async fn serve_hub<D: StoreData>(args: ServerArgs<D>) -> Outcome {
                 &rebuild.exports,
                 data,
                 settings,
+                &rebuild.lines,
             )
             .await
             .map_err(|failure| match failure.fatal {
@@ -846,6 +873,7 @@ pub(crate) struct Blueprint<H: Host> {
     pub(crate) pre: InstancePre<H::Data>,
     pub(crate) exports: Arc<HubExports>,
     pub(crate) settings: StoreSettings,
+    pub(crate) lines: MaybeLines,
     pub(crate) max_memory: Option<usize>,
     pub(crate) components: usize,
     pub(crate) shared_memory: Arc<SharedMemory>,
@@ -900,6 +928,7 @@ impl<H: Host> DataPlane for HubPlane<H> {
                     pre: blueprint.pre.clone(),
                     exports: blueprint.exports.clone(),
                     data,
+                    lines: blueprint.lines.clone(),
                 };
                 (Err(()), Some(rebuild))
             }

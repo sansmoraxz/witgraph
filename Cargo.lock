@@ -3455,6 +3455,7 @@ dependencies = [
  "wasm-encoder",
  "wasmparser",
  "wat",
+ "witgraph-traits",
 ]
 
 [[package]]
@@ -3475,6 +3476,7 @@ dependencies = [
  "wit-component",
  "wit-parser",
  "witgraph-ir",
+ "witgraph-probes",
  "witgraph-sched",
  "witgraph-traits",
  "witgraph-wit",

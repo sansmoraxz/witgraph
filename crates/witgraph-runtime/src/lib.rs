@@ -45,6 +45,8 @@
 pub mod engine;
 pub mod error;
 pub mod graph;
+#[cfg(feature = "debug")]
+pub mod lines;
 pub(crate) mod plane;
 pub mod plugin;
 pub mod shared;
@@ -57,6 +59,8 @@ pub use graph::{
     ByteCount, Fuel, Handle, HandlePort, Input, InputPort, Output, OutputPort, Port, PreparedGraph,
     Preview, RuntimeConfig, RuntimeGraph, ValReader, Value,
 };
+#[cfg(feature = "debug")]
+pub use lines::RuntimeLines;
 pub use plugin::{CapabilityPlugin, Extensions, PluginData, Plugins};
 pub use shared::Shared;
 pub use wasmtime::component::Val;
@@ -64,5 +68,7 @@ pub use witgraph_sched::{
     FaultReport, NodeFault, NodePhase, NodeState, Perf, PortValues, PortVersion, RuntimeError,
     RuntimeMode, Snapshot, SnapshotError, TickResult, Trace, TraceEvent,
 };
+#[cfg(feature = "debug")]
+pub use witgraph_traits::lines::{LineDebugger, LineStop, SourceVariable, StopReason};
 pub use witgraph_traits::{OutputReader, RunningGraph, until};
 pub use {wasmtime, witgraph_ir, witgraph_sched, witgraph_traits};

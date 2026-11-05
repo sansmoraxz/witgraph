@@ -54,6 +54,9 @@ use witgraph_sched::{RuntimeError, RuntimeMode, SchedulerCore};
 pub struct PreparedGraph {
     parts: Parts,
     component: Component,
+    /// By node, the core modules of its component, to tell which node stops on a line.
+    #[cfg(feature = "debug")]
+    node_modules: Vec<(NodeId, Vec<u64>)>,
 }
 
 /// What a [`PreparedGraph`] is besides its compiled code.
@@ -237,6 +240,13 @@ impl PreparedGraph {
                 source: Some(precompiled::source_hash(wasm)),
             },
             component,
+            #[cfg(feature = "debug")]
+            node_modules: crate::lines::node_modules(composed.instantiated.iter().filter_map(
+                |node| {
+                    let (_, at) = of_node.iter().find(|(id, _)| *id == node)?;
+                    Some((node, checked[*at].bytes.as_ref()))
+                },
+            )),
         })
     }
 }
@@ -432,7 +442,26 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
         let components = prepared.parts.components;
         let data = store_data(&host, max_memory, &shared_memory, components)
             .map_err(|e| instantiation(format!("store data: {e:#}")))?;
-        let mut first: Built<H::Data> = build(&engine, &pre, &exports, data, settings)
+        #[cfg(feature = "debug")]
+        let lines = if config.debug_lines {
+            if !crate::lines::RuntimeLines::engine_can(&engine) {
+                return Err(RuntimeError::InvalidConfig {
+                    message: "`debug_lines` needs an engine made by `RuntimeConfig::new_engine` \
+                              with it set"
+                        .to_string(),
+                }
+                .into());
+            }
+            Some(crate::lines::RuntimeLines::new(
+                engine.clone(),
+                prepared.node_modules.clone(),
+            ))
+        } else {
+            None
+        };
+        #[cfg(not(feature = "debug"))]
+        let lines = crate::plane::NoLines;
+        let mut first: Built<H::Data> = build(&engine, &pre, &exports, data, settings, &lines)
             .await
             .map_err(|BuildFailure { message, fatal }| LoadError::Instantiation {
                 node: fatal.map(|(node, _)| node),
@@ -447,6 +476,7 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
             pre,
             exports,
             settings,
+            lines,
             max_memory,
             components,
             shared_memory,
@@ -548,6 +578,11 @@ pub(super) fn validate(config: &RuntimeConfig) -> Result<(), RuntimeError> {
 fn validate_engine(engine: &Engine) -> Result<(), RuntimeError> {
     use wasmtime::WasmFeatures;
     let features = engine.get_wasm_features();
+    // Only an engine made to debug gets a deadline: that is how it reaches a running guest.
+    #[cfg(feature = "debug")]
+    let debugging = crate::lines::RuntimeLines::engine_can(engine);
+    #[cfg(not(feature = "debug"))]
+    let debugging = false;
     let missing = [
         (engine.get_consume_fuel(), "fuel metering (`consume_fuel`)"),
         (
@@ -579,7 +614,7 @@ fn validate_engine(engine: &Engine) -> Result<(), RuntimeError> {
             "the component model's labelled imports (`implements`)",
         ),
         (
-            !engine.get_epoch_interruption(),
+            !engine.get_epoch_interruption() || debugging,
             "no epoch interruption (witgraph sets no deadline)",
         ),
         (

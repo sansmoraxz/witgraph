@@ -118,6 +118,9 @@ impl PreparedGraph {
                 source: saved.source,
             },
             component,
+            // Which module is whose is not kept: a stop says no node.
+            #[cfg(feature = "debug")]
+            node_modules: Vec::new(),
         })
     }
 }
