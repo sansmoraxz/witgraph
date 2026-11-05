@@ -104,6 +104,10 @@ Put them anywhere on your page. They all share one `EditorController`.
   see [Previews](#previews).
 - **Inputs.** Give a node an `inject.<port>` attribute to feed that input a
   fixed value.
+- **Resources.** In the inspector, a node's _Resources_ say how much of a named
+  resource it claims, and with nothing selected, the graph's say how much there is of
+  each and how much is claimed. A node waits to start until its claim is free, and a
+  claim too large for the graph is shown on the node. See [Limits](running.md#limits).
 - **Mock mode.** In the inspector, turn on _Mock Mode_ for a node to skip its
   WebAssembly and give each output a value (written as WAVE text) instead.
   This is useful for trying a graph before every component exists.

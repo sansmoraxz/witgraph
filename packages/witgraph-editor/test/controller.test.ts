@@ -1446,6 +1446,68 @@ test('a refused connection costs an input nothing', async () => {
   assert.equal(controller.connectionForInput('b', 'in')?.id, 'ab');
 });
 
+test('claims and capacities reach the graph, and can be undone', async () => {
+  const controller = await loadController(
+    [
+      ['a', 'relay'],
+      ['b', 'relay'],
+    ],
+    [
+      ['ab', 'a.out', 'b.in'],
+      ['loop', 'a.out', 'a.in', true],
+    ],
+  );
+  const graph = () => controller.graphJson as GraphJson;
+  controller.setNodeClaim('a', 'gpu', 1);
+  controller.setNodeClaim('b', 'gpu', 0.5);
+  assert.deepEqual(graph().nodes[0].resources, { gpu: { amount: 1 } });
+  assert.deepEqual(controller.claimsOf('b'), { gpu: { amount: 0.5 } });
+  assert.deepEqual(controller.resources, [
+    { name: 'gpu', capacity: 1, declared: false, claimed: 1.5 },
+  ]);
+
+  controller.setResourceCapacity('gpu', 2);
+  assert.deepEqual(graph().resources, { gpu: { capacity: 2 } });
+  assert.equal(controller.resources[0].declared, true);
+  controller.undo();
+  assert.equal(graph().resources, undefined, 'none left, none written');
+  controller.redo();
+  assert.deepEqual(graph().resources, { gpu: { capacity: 2 } });
+
+  controller.setNodeClaim('b', 'gpu', null);
+  assert.equal(graph().nodes[1].resources, undefined);
+  controller.undo();
+  assert.deepEqual(controller.claimsOf('b'), { gpu: { amount: 0.5 } });
+});
+
+test('a claim of more than there is says so on the node, until it fits', async () => {
+  const controller = await loadController([['a', 'relay']], [['loop', 'a.out', 'a.in', true]]);
+  controller.setNodeClaim('a', 'gpu', 2);
+  await until(() => controller.compileError !== null);
+  assert.match(controller.compileError ?? '', /claims more than all of resource `gpu`/);
+  const errors = () =>
+    controller
+      .diagnosticsForNode('a')
+      .filter(({ severity }) => severity === 'error')
+      .map(({ code }) => code);
+  assert.deepEqual(errors(), ['witgraph::ir::node_overclaims']);
+
+  controller.setResourceCapacity('gpu', 2);
+  await until(() => controller.compileError === null);
+  assert.deepEqual(errors(), []);
+});
+
+test('a claim or capacity that cannot be one is refused, and changes nothing', async () => {
+  const controller = await loadController([['a', 'relay']], [['loop', 'a.out', 'a.in', true]]);
+  for (const bad of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+    controller.setNodeClaim('a', 'gpu', bad);
+    controller.setResourceCapacity('gpu', bad);
+  }
+  controller.setNodeClaim('a', '  ', 1);
+  assert.deepEqual(controller.claimsOf('a'), {});
+  assert.deepEqual(controller.resources, []);
+});
+
 test('feedback on what cannot have it is downgraded, not refused', async () => {
   const controller = await loadController(
     [

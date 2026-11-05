@@ -31,6 +31,7 @@ import type {
   NodeVisual,
   OutputView,
   PortVisual,
+  ResourceUse,
   SavedSnapshot,
   TraceEntry,
 } from './types.ts';
@@ -938,6 +939,110 @@ export class EditorController extends EventTarget {
     const conn = this.#graphJson?.connections.find((c) => c.id === connId);
     if (conn) conn.feedback = feedback;
     void this.#reloadAfterEdit();
+  }
+
+  // -- Resources ---------------------------------------------------------------
+
+  /** The resources the graph declares or claims, by name. */
+  get resources(): readonly ResourceUse[] {
+    const graph = this.#graphJson;
+    if (!graph) return [];
+    const claimed = new Map<string, number>();
+    for (const name of Object.keys(graph.resources ?? {})) claimed.set(name, 0);
+    for (const node of graph.nodes) {
+      for (const [name, { amount }] of Object.entries(node.resources ?? {})) {
+        claimed.set(name, (claimed.get(name) ?? 0) + amount);
+      }
+    }
+    return [...claimed]
+      .map(([name, sum]) => {
+        const declared = graph.resources?.[name];
+        return {
+          name,
+          capacity: declared?.capacity ?? 1,
+          declared: declared !== undefined,
+          claimed: sum,
+        };
+      })
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  /** How much a node holds of each resource while it runs. */
+  claimsOf(nodeId: string): Readonly<Record<string, { amount: number }>> {
+    return this.#graphJson?.nodes.find((n) => n.id === nodeId)?.resources ?? {};
+  }
+
+  /** How much of a resource a node holds while it runs. `null` claims none of it. */
+  setNodeClaim(nodeId: string, resource: string, amount: number | null): void {
+    if (this.#locked()) return;
+    const name = this.#resourceName(resource);
+    if (name === null || !this.#validResourceSize('A claim', amount)) return;
+    const node = this.#graphJson?.nodes.find((n) => n.id === nodeId);
+    if (!node) return;
+    const before = node.resources?.[name]?.amount ?? null;
+    if (before === amount) return;
+    const apply = (value: number | null) => {
+      // By id, as the node may have been renamed by the time this is undone.
+      const current = this.#graphJson?.nodes.find((n) => n.id === nodeId);
+      if (!current) return;
+      const resources = { ...current.resources };
+      if (value === null) delete resources[name];
+      else resources[name] = { amount: value };
+      if (Object.keys(resources).length > 0) current.resources = resources;
+      else delete current.resources;
+      void this.#reloadAfterEdit();
+    };
+    this.#applyResourceEdit(`Claim ${name} on ${nodeId}`, before, amount, apply);
+  }
+
+  /** How much there is of a resource. `null` leaves it at the default. */
+  setResourceCapacity(resource: string, capacity: number | null): void {
+    if (this.#locked()) return;
+    const name = this.#resourceName(resource);
+    if (name === null || !this.#validResourceSize('A capacity', capacity)) return;
+    if (!this.#graphJson) return;
+    const before = this.#graphJson.resources?.[name]?.capacity ?? null;
+    if (before === capacity) return;
+    const apply = (value: number | null) => {
+      const graph = this.#graphJson;
+      if (!graph) return;
+      const resources = { ...graph.resources };
+      if (value === null) delete resources[name];
+      else resources[name] = { capacity: value };
+      if (Object.keys(resources).length > 0) graph.resources = resources;
+      else delete graph.resources;
+      void this.#reloadAfterEdit();
+    };
+    this.#applyResourceEdit(`Capacity of ${name}`, before, capacity, apply);
+  }
+
+  #resourceName(resource: string): string | null {
+    const name = resource.trim();
+    if (name === '') this.#pushError('A resource needs a name');
+    return name === '' ? null : name;
+  }
+
+  #validResourceSize(what: string, size: number | null): boolean {
+    if (size === null || (Number.isFinite(size) && size > 0)) return true;
+    this.#pushError(`${what} must be above 0`);
+    return false;
+  }
+
+  #applyResourceEdit(
+    description: string,
+    before: number | null,
+    after: number | null,
+    apply: (value: number | null) => void,
+  ): void {
+    apply(after);
+    this.#undoStack.push({
+      description,
+      execute: () => apply(after),
+      undo: () => apply(before),
+    });
+    if (this.#undoStack.length > MAX_UNDO) this.#undoStack.shift();
+    this.#redoStack.length = 0;
+    this.#dispatch('state-changed');
   }
 
   // -- Import / Load -----------------------------------------------------------

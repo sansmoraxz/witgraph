@@ -336,6 +336,8 @@ export class WitgraphInspector extends HTMLElement {
     );
     wrap.appendChild(stats);
 
+    wrap.appendChild(this.#buildResourcesSection());
+
     // Custom attrs
     wrap.appendChild(
       this.#buildAttrsEditor(
@@ -421,6 +423,156 @@ export class WitgraphInspector extends HTMLElement {
       }
     }
 
+    return section;
+  }
+
+  /** A number field for how much of a resource: a bad value is the controller's to refuse. */
+  #sizeInput(value: number | null, placeholder: string, onChange: (size: number) => void) {
+    const input = document.createElement('input');
+    input.type = 'number';
+    input.min = '0';
+    input.step = 'any';
+    input.placeholder = placeholder;
+    input.className =
+      'bg-wg-surface text-wg-text border border-wg-text-dim rounded px-1 py-0.5 font-mono text-xs';
+    input.style.minWidth = '0';
+    input.dataset.structural = '';
+    if (value !== null) input.setAttribute('value', String(value));
+    input.addEventListener('change', () => onChange(input.valueAsNumber));
+    return input;
+  }
+
+  #resourceRow(name: string, ...cells: HTMLElement[]): HTMLElement {
+    const row = document.createElement('div');
+    row.className = 'resource-row';
+    row.dataset.resource = name;
+    row.style.cssText =
+      'display:grid; grid-template-columns:1fr 1fr 4em 20px; gap:4px; margin-bottom:4px; align-items:center;';
+    row.append(this.#el('span', 'text-xs font-mono text-wg-text-dim truncate', name), ...cells);
+    return row;
+  }
+
+  /** A row to name a resource and say how much, with the names the graph has to pick from. */
+  #resourceAdder(what: string, onAdd: (name: string, size: number) => void): HTMLElement {
+    const row = document.createElement('div');
+    row.className = 'resource-add';
+    row.style.cssText =
+      'display:grid; grid-template-columns:1fr 1fr 4em 20px; gap:4px; margin-top:4px; align-items:center;';
+    const name = document.createElement('input');
+    name.type = 'text';
+    name.placeholder = 'resource';
+    name.className =
+      'bg-wg-surface text-wg-text border border-wg-text-dim rounded px-1 py-0.5 font-mono text-xs';
+    name.style.minWidth = '0';
+    name.dataset.structural = '';
+    const names = document.createElement('datalist');
+    names.id = `resource-names-${what}`;
+    for (const { name: known } of this.#controller?.resources ?? []) {
+      const option = document.createElement('option');
+      option.value = known;
+      names.appendChild(option);
+    }
+    name.setAttribute('list', names.id);
+    const size = this.#sizeInput(null, what, () => {});
+    const add = this.#el(
+      'button',
+      'bg-wg-surface text-wg-text border border-wg-text-dim rounded cursor-pointer text-xs',
+      '+',
+    );
+    add.dataset.structural = '';
+    add.setAttribute('aria-label', `Add ${what}`);
+    add.addEventListener('click', () => {
+      if (name.value.trim() === '') return;
+      onAdd(name.value, size.valueAsNumber);
+    });
+    row.append(name, size, document.createElement('span'), add, names);
+    return row;
+  }
+
+  #removeResourceButton(label: string, onRemove: () => void): HTMLElement {
+    const remove = this.#el('button', 'text-wg-error cursor-pointer text-xs', '\u00d7');
+    remove.dataset.structural = '';
+    remove.setAttribute('aria-label', label);
+    remove.addEventListener('click', onRemove);
+    return remove;
+  }
+
+  /** How much a node claims of each resource. */
+  #buildClaimsSection(node: NodeVisual): HTMLElement {
+    const section = this.#el('div', 'resource-claims mb-3');
+    section.appendChild(
+      this.#el(
+        'div',
+        'font-semibold mb-1.5 text-wg-text border-b border-wg-surface pb-1 text-xs',
+        'Resources',
+      ),
+    );
+    section.appendChild(
+      this.#el(
+        'div',
+        'text-2xs text-wg-text-dim mb-1.5',
+        'Waits to start until this much is free. It does not limit what the node uses.',
+      ),
+    );
+    const controller = this.#controller;
+    for (const [name, { amount }] of Object.entries(controller?.claimsOf(node.id) ?? {})) {
+      const capacity = controller?.resources.find((use) => use.name === name)?.capacity ?? 1;
+      section.appendChild(
+        this.#resourceRow(
+          name,
+          this.#sizeInput(amount, 'amount', (size) =>
+            controller?.setNodeClaim(node.id, name, size),
+          ),
+          this.#el('span', 'text-2xs text-wg-text-dim', `of ${capacity}`),
+          this.#removeResourceButton(`Stop claiming ${name}`, () =>
+            controller?.setNodeClaim(node.id, name, null),
+          ),
+        ),
+      );
+    }
+    section.appendChild(
+      this.#resourceAdder('amount', (name, size) => controller?.setNodeClaim(node.id, name, size)),
+    );
+    return section;
+  }
+
+  /** How much there is of each resource of the graph. */
+  #buildResourcesSection(): HTMLElement {
+    const section = this.#el('div', 'resource-capacities mb-3');
+    section.appendChild(
+      this.#el(
+        'div',
+        'font-semibold mb-1.5 text-wg-text border-b border-wg-surface pb-1 text-xs',
+        'Resources',
+      ),
+    );
+    section.appendChild(
+      this.#el(
+        'div',
+        'text-2xs text-wg-text-dim mb-1.5',
+        'How much of each can be held at once. Nodes claim it in the same units.',
+      ),
+    );
+    const controller = this.#controller;
+    for (const { name, capacity, declared, claimed } of controller?.resources ?? []) {
+      section.appendChild(
+        this.#resourceRow(
+          name,
+          this.#sizeInput(capacity, 'capacity', (size) =>
+            controller?.setResourceCapacity(name, size),
+          ),
+          this.#el('span', 'text-2xs text-wg-text-dim', `${claimed} claimed`),
+          declared
+            ? this.#removeResourceButton(`Use the default capacity of ${name}`, () =>
+                controller?.setResourceCapacity(name, null),
+              )
+            : document.createElement('span'),
+        ),
+      );
+    }
+    section.appendChild(
+      this.#resourceAdder('capacity', (name, size) => controller?.setResourceCapacity(name, size)),
+    );
     return section;
   }
 
@@ -637,6 +789,8 @@ export class WitgraphInspector extends HTMLElement {
     if (caps.length > 0) {
       wrap.appendChild(this.#buildCapabilitiesSection(caps));
     }
+
+    wrap.appendChild(this.#buildClaimsSection(node));
 
     // Mock mode
     wrap.appendChild(this.#buildMockSection(node));

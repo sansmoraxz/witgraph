@@ -164,7 +164,8 @@ export interface GraphJsonNode {
   /** The `ComponentRef` this node instantiates (opaque to the editor). */
   component: object;
   label?: string;
-  resources?: Record<string, unknown>;
+  /** How much of each named resource it holds while it runs. */
+  resources?: Record<string, { amount: number }>;
   attrs?: Record<string, string>;
 }
 
@@ -197,6 +198,19 @@ export interface GraphJson {
   nodes: GraphJsonNode[];
   connections: GraphJsonConnection[];
   links?: GraphJsonLink[];
+  /** How much there is of a named resource. One not here has a capacity of 1. */
+  resources?: Record<string, { capacity: number }>;
+}
+
+/** A named resource of a graph, as it is declared and claimed. */
+export interface ResourceUse {
+  name: string;
+  /** How much there is of it. */
+  capacity: number;
+  /** Whether the graph says so, rather than it being the default. */
+  declared: boolean;
+  /** What its nodes claim, added up: more than the capacity is fine, as they take turns. */
+  claimed: number;
 }
 
 // ---------------------------------------------------------------------------

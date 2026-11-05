@@ -19,6 +19,7 @@ export type {
   NodeVisual,
   OutputView,
   PortVisual,
+  ResourceUse,
   SavedSnapshot,
 } from './controller/types.ts';
 

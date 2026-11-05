@@ -38,6 +38,37 @@ test.describe('WIT Graph Editor Demo', () => {
     await expect(inspector.locator('.node-id')).toHaveValue('relay-a');
   });
 
+  test('a claim too large is said on the node, and a capacity makes room for it', async ({
+    page,
+  }) => {
+    const inspector = page.locator('witgraph-inspector');
+    const add = inspector.locator('.resource-claims .resource-add');
+    await add.locator('input[type=text]').fill('gpu');
+    await add.locator('input[type=number]').fill('2');
+    await add.locator('button').click();
+    const claim = inspector.locator('.resource-claims .resource-row');
+    await expect(claim).toContainText('of 1');
+    await expect(inspector).toContainText('claims more than all of resource `gpu`');
+
+    await page
+      .locator('witgraph-canvas')
+      .evaluate((el: WitgraphCanvas) => el.controller?.select(null));
+    const capacity = inspector.locator('.resource-capacities .resource-row');
+    await expect(capacity).toContainText('2 claimed');
+    await capacity.locator('input[type=number]').fill('2');
+    await capacity.locator('input[type=number]').blur();
+    await expect(page.locator('#status')).toHaveClass(/ready/);
+    await expect(inspector).not.toContainText('claims more than all');
+
+    // The node says so too, and undoing takes the capacity back.
+    await page.locator('witgraph-canvas').evaluate((el: WitgraphCanvas) => {
+      el.controller?.select('relay-a');
+    });
+    await expect(claim).toContainText('of 2');
+    await page.locator('witgraph-controls').locator('button.undo').click();
+    await expect(claim).toContainText('of 1');
+  });
+
   test('clicking a node selects it', async ({ page }) => {
     const canvas = page.locator('witgraph-canvas');
     await canvas.locator('[data-node-id="relay-b"]').click({ timeout: 10_000 });
@@ -172,9 +203,11 @@ test.describe('WIT Graph Editor Demo', () => {
       if (tag) root.marked = true;
       return root.marked === true;
     };
-    await inspector.evaluate(panel, true);
     await catalog.evaluate(panel, true);
     await controls.locator('button.run').click();
+    // Its fields that change the graph are disabled, once, and then it is left alone.
+    await expect(inspector.locator('.inspector-root.locked')).toBeAttached();
+    await inspector.evaluate(panel, true);
     await page.waitForTimeout(2_000);
     expect(await inspector.evaluate(panel, false), 'the same inspector').toBe(true);
     expect(await catalog.evaluate(panel, false), 'the same catalog').toBe(true);
