@@ -10,6 +10,7 @@
 pub mod error;
 pub mod executor;
 pub mod graph;
+pub mod holds;
 pub mod lines;
 pub mod mode;
 pub mod node;

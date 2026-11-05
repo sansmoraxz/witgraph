@@ -709,6 +709,13 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
         self.core.plane.blueprint.lines.clone()
     }
 
+    /// What holds this graph's node runs before they start, and lets them go: a debugger's
+    /// node breakpoints and stepping. Clone it to hold on to it while a tick runs. Nothing is
+    /// held until it is asked to.
+    pub fn holds(&self) -> crate::holds::RuntimeHolds {
+        self.core.plane.blueprint.holds.clone()
+    }
+
     /// The wasmtime engine the graph runs on; pass it as
     /// [`RuntimeConfig::engine`] to load another graph on it.
     pub fn engine(&self) -> &Engine {

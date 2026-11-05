@@ -45,6 +45,7 @@
 pub mod engine;
 pub mod error;
 pub mod graph;
+mod holds;
 #[cfg(feature = "debug")]
 pub mod lines;
 pub(crate) mod plane;
@@ -59,6 +60,7 @@ pub use graph::{
     ByteCount, Fuel, Handle, HandlePort, Input, InputPort, Output, OutputPort, Port, PreparedGraph,
     Preview, RuntimeConfig, RuntimeGraph, ValReader, Value,
 };
+pub use holds::RuntimeHolds;
 #[cfg(feature = "debug")]
 pub use lines::RuntimeLines;
 pub use plugin::{CapabilityPlugin, Extensions, PluginData, Plugins};
@@ -68,6 +70,7 @@ pub use witgraph_sched::{
     FaultReport, NodeFault, NodePhase, NodeState, Perf, PortValues, PortVersion, RuntimeError,
     RuntimeMode, Snapshot, SnapshotError, TickResult, Trace, TraceEvent,
 };
+pub use witgraph_traits::holds::{HeldRun, HoldAt, HoldId, NodeHolds};
 #[cfg(feature = "debug")]
 pub use witgraph_traits::lines::{
     LineDebugger, LineStop, OwnLines, SourceVariable, StackFrame, StopReason,

@@ -384,6 +384,26 @@ returning, stream groups draining, faults and phase changes. Read them back with
 `trace()` or drain them with `take_trace()`. Stream items pass between guests
 unseen on wasmtime, so they aren't traced.
 
+## Holding a node before it runs
+
+`RuntimeGraph::holds()` holds node runs before they start, as a debugger's node breakpoints
+and stepping do, with no feature and at no cost until asked. Clone it to use while a tick
+runs:
+
+```rust
+use witgraph_runtime::{HoldAt, NodeHolds};
+
+let holds = rt.holds();
+holds.hold_at(HoldAt::Nodes(["edges".into()].into())); // or `HoldAt::All`
+let held = holds.next_held().await; // while a tick runs
+holds.resume(held.id);
+```
+
+The scheduler takes a held run to have started: what reads its outputs waits, and the tick
+goes on with the rest until it has nothing else to do. `release()` holds nothing more and
+lets go of all held. A run held when the graph is shut down or rebuilt is dropped with its
+instance. It is the `NodeHolds` trait of `witgraph-traits`.
+
 ## Stopping on a source line
 
 Debugging is off unless you ask for it, twice over, as **it slows a graph down significantly**: it

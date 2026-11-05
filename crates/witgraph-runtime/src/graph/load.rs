@@ -478,6 +478,7 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
             exports,
             settings,
             lines,
+            holds: crate::holds::RuntimeHolds::default(),
             max_memory,
             components,
             shared_memory,

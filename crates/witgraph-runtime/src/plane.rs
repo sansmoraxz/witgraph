@@ -560,6 +560,7 @@ struct ServerArgs<D: StoreData> {
     ports: Arc<PortTable>,
     retained: Retained<D>,
     settings: StoreSettings,
+    holds: crate::holds::RuntimeHolds,
     serving: Serving,
     requests: UnboundedReceiver<Request<D>>,
 }
@@ -581,6 +582,7 @@ async fn serve_hub<D: StoreData>(args: ServerArgs<D>) -> Outcome {
         ports,
         retained,
         settings,
+        holds,
         serving,
         requests,
     } = args;
@@ -636,7 +638,11 @@ async fn serve_hub<D: StoreData>(args: ServerArgs<D>) -> Outcome {
                 }
                 send(ControlKind::Built);
             }
-            serve_commands(acc, &hub, &ports, settings, commands, requests, &send).await
+            let starts = RunStarts {
+                settings,
+                holds: &holds,
+            };
+            serve_commands(acc, &hub, &ports, starts, commands, requests, &send).await
         })
         .await;
     match served.and_then(|inner| inner) {
@@ -710,11 +716,17 @@ impl TaskGroupHook for GroupWatch {
 }
 
 /// The server's loop: what is asked, as it is asked.
+/// How a node's run starts: with how much fuel, and whether it is held first.
+struct RunStarts<'a> {
+    settings: StoreSettings,
+    holds: &'a crate::holds::RuntimeHolds,
+}
+
 async fn serve_commands<D: StoreData>(
     acc: &Accessor<D>,
     hub: &LiveHub,
     ports: &PortTable,
-    settings: StoreSettings,
+    starts: RunStarts<'_>,
     mut commands: UnboundedReceiver<Command>,
     mut requests: UnboundedReceiver<Request<D>>,
     send: &(impl Fn(ControlKind) + Send + Sync),
@@ -722,6 +734,9 @@ async fn serve_commands<D: StoreData>(
     type RunFuture<'a> =
         Pin<Box<dyn Future<Output = (NodeIdx, wasmtime::Result<(RawReturned,)>)> + Send + 'a>>;
     let mut runs: FuturesUnordered<RunFuture<'_>> = FuturesUnordered::new();
+    // Runs held before they start, until they are let go.
+    type ParkedFuture = Pin<Box<dyn Future<Output = (NodeIdx, crate::holds::Parked)> + Send>>;
+    let mut parked: FuturesUnordered<ParkedFuture> = FuturesUnordered::new();
     let mut jobs: VecDeque<Job<D>> = VecDeque::new();
     let mut lane: Option<LaneFuture<'_>> = None;
     let mut quiet_at: Option<u64> = None;
@@ -731,6 +746,7 @@ async fn serve_commands<D: StoreData>(
     // By node, its last run; and the stream groups waiting for those to be over.
     let mut last_runs: HashMap<NodeIdx, GroupRun> = HashMap::new();
     let mut drains: Vec<(usize, u64, Box<[NodeIdx]>)> = Vec::new();
+    let RunStarts { settings, holds } = starts;
     let budget = settings.budget();
     let run_fn = hub.run;
     let (latch_fn, drop_fn) = (hub.latch_feedback, hub.drop_feedback);
@@ -758,28 +774,37 @@ async fn serve_commands<D: StoreData>(
             Job::Request(request) => request(acc, hub),
         }
     };
+    // Started here, so its task group is known from now on.
+    let start_run = |node: NodeIdx, last_runs: &mut HashMap<NodeIdx, GroupRun>| -> RunFuture<'_> {
+        let fueled = acc.with(|mut access| access.as_context_mut().set_fuel(budget));
+        let call = u32_of(node.position()).and_then(|at| {
+            fueled?;
+            acc.with(|mut access| run_fn.start_call_concurrent(access.as_context_mut(), (at,)))
+        });
+        if let Ok(call) = &call {
+            last_runs.insert(node, lock(&groups).started(call.group()));
+        }
+        Box::pin(async move {
+            let called = async { run_fn.finish_call_concurrent(acc, call?).await };
+            (node, called.await)
+        })
+    };
     poll_fn(|cx| {
         loop {
             let mut progressed = false;
             loop {
                 match commands.poll_next_unpin(cx) {
                     Poll::Ready(Some(Command::Run(node))) => {
-                        let fueled =
-                            acc.with(|mut access| access.as_context_mut().set_fuel(budget));
-                        // Started here, so its task group is known from now on.
-                        let call = u32_of(node.position()).and_then(|at| {
-                            fueled?;
-                            acc.with(|mut access| {
-                                run_fn.start_call_concurrent(access.as_context_mut(), (at,))
-                            })
-                        });
-                        if let Ok(call) = &call {
-                            last_runs.insert(node, lock(&groups).started(call.group()));
+                        if let Some(mut held) = holds.park(ports.node_id(node)) {
+                            parked.push(Box::pin(async move {
+                                // Let go, or dropped by `release` along with its sender.
+                                let _ = (&mut held.go).await;
+                                (node, held)
+                            }));
+                            progressed = true;
+                            continue;
                         }
-                        runs.push(Box::pin(async move {
-                            let called = async { run_fn.finish_call_concurrent(acc, call?).await };
-                            (node, called.await)
-                        }));
+                        runs.push(start_run(node, &mut last_runs));
                         progressed = true;
                     }
                     Poll::Ready(Some(Command::LatchFeedback(connection))) => {
@@ -796,6 +821,11 @@ async fn serve_commands<D: StoreData>(
                     Poll::Ready(None) => return Poll::Ready(Ok(())),
                     Poll::Pending => break,
                 }
+            }
+            while let Poll::Ready(Some((node, held))) = parked.poll_next_unpin(cx) {
+                drop(held);
+                runs.push(start_run(node, &mut last_runs));
+                progressed = true;
             }
             while let Poll::Ready(Some(request)) = requests.poll_next_unpin(cx) {
                 jobs.push_back(Job::Request(request));
@@ -874,6 +904,7 @@ pub(crate) struct Blueprint<H: Host> {
     pub(crate) exports: Arc<HubExports>,
     pub(crate) settings: StoreSettings,
     pub(crate) lines: MaybeLines,
+    pub(crate) holds: crate::holds::RuntimeHolds,
     pub(crate) max_memory: Option<usize>,
     pub(crate) components: usize,
     pub(crate) shared_memory: Arc<SharedMemory>,
@@ -941,6 +972,7 @@ impl<H: Host> DataPlane for HubPlane<H> {
             ports: self.ports.clone(),
             retained: self.retained.clone(),
             settings: blueprint.settings,
+            holds: blueprint.holds.clone(),
             serving,
             requests,
         }));
