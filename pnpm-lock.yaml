@@ -226,8 +226,8 @@ importers:
   packages/witgraph-loader:
     dependencies:
       '@bytecodealliance/jco-transpile':
-        specifier: git+https://github.com/sansmoraxz/jco.git#3b85f740f8723a5b77cea362c9dcd12cceb48dbe&path:packages/jco-transpile
-        version: https://codeload.github.com/sansmoraxz/jco/tar.gz/3b85f740f8723a5b77cea362c9dcd12cceb48dbe#path:packages/jco-transpile
+        specifier: git+https://github.com/sansmoraxz/jco.git#36511536e7266fae61f4d52395f634f08f47c954&path:packages/jco-transpile
+        version: https://codeload.github.com/sansmoraxz/jco/tar.gz/36511536e7266fae61f4d52395f634f08f47c954#path:packages/jco-transpile
     devDependencies:
       '@bytecodealliance/preview3-shim':
         specifier: ^0.13.0
@@ -363,8 +363,8 @@ packages:
     resolution: {integrity: sha512-yxvqQreNcOQdMsEKZomkSqThtkxrAz3f1Cmy8BsV0UHi9saa2/D1KDB14IAXPYwDq/maS6lCzS+MuMQx6QkUgA==}
     engines: {node: '>=20'}
 
-  '@bytecodealliance/jco-transpile@https://codeload.github.com/sansmoraxz/jco/tar.gz/3b85f740f8723a5b77cea362c9dcd12cceb48dbe#path:packages/jco-transpile':
-    resolution: {gitHosted: true, integrity: sha512-TZMD50WiRD+QpxkcNSvat9To+e6i76zUjoX52fJbworGy3fmkrM6xCUwEqm6twiCPZxJAd+SBn/0mpIPyzVw7Q==, path: packages/jco-transpile, tarball: https://codeload.github.com/sansmoraxz/jco/tar.gz/3b85f740f8723a5b77cea362c9dcd12cceb48dbe}
+  '@bytecodealliance/jco-transpile@https://codeload.github.com/sansmoraxz/jco/tar.gz/36511536e7266fae61f4d52395f634f08f47c954#path:packages/jco-transpile':
+    resolution: {gitHosted: true, integrity: sha512-fW9wyMF0KzgO1+u8M1Z1xxnA9ksG+gvde05leRDQ48EHNw/c63W2qFrKU7LoCxgpWg9pSxdVDlwkeWRK5vEeMA==, path: packages/jco-transpile, tarball: https://codeload.github.com/sansmoraxz/jco/tar.gz/36511536e7266fae61f4d52395f634f08f47c954}
     version: 0.23.0
 
   '@bytecodealliance/preview2-shim@0.31.0':
@@ -1203,7 +1203,7 @@ snapshots:
       '@bytecodealliance/jco-node-fs-win32-arm64-msvc': 0.3.2
       '@bytecodealliance/jco-node-fs-win32-x64-msvc': 0.3.2
 
-  '@bytecodealliance/jco-transpile@https://codeload.github.com/sansmoraxz/jco/tar.gz/3b85f740f8723a5b77cea362c9dcd12cceb48dbe#path:packages/jco-transpile':
+  '@bytecodealliance/jco-transpile@https://codeload.github.com/sansmoraxz/jco/tar.gz/36511536e7266fae61f4d52395f634f08f47c954#path:packages/jco-transpile':
     dependencies:
       '@bytecodealliance/preview2-shim': 0.31.0
       '@bytecodealliance/preview3-shim': 0.13.0
