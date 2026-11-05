@@ -140,6 +140,9 @@ struct GroupEntry {
     /// What is below a member is left out, as it may take this group's start to run.
     before: Box<[NodeIdx]>,
     life: GroupLife,
+    /// The number the last [`Command::AwaitDrained`] of it carried, so an answer meant
+    /// for an earlier drain ends no later one.
+    drain_asked: u64,
 }
 
 /// Proof that no reply to a command is outstanding: a start pass needs one, so
@@ -370,6 +373,7 @@ impl<P: DataPlane> SchedulerCore<P> {
                 before: before_group(members, &preds, &of_groups),
                 members: members.clone(),
                 life: GroupLife::Quiet(Group::fresh()),
+                drain_asked: 0,
             })
             .collect();
         let mut connections = graph.connections.clone();
@@ -767,6 +771,12 @@ impl SchedulerCore<dyn DataPlane> {
                 self.dirty = true;
                 false
             }
+            ControlKind::Drained { group, at } => {
+                if self.groups.get(group).is_some_and(|g| g.drain_asked == at) {
+                    self.end_group_draining(group);
+                }
+                false
+            }
             ControlKind::Quiet(at) => {
                 self.quiet_asked = None;
                 if at == self.runs_started && self.running == 0 {
@@ -800,21 +810,26 @@ impl SchedulerCore<dyn DataPlane> {
     /// No guest work is left: every draining group may run again.
     fn end_draining(&mut self) {
         for at in 0..self.groups.len() {
-            if let GroupLife::Draining(group) = self.groups[at].life {
-                self.groups[at].life = GroupLife::Quiet(group.drained());
-                self.resources.release(self.ports.node_count() + at);
-                let nodes: Vec<NodeId> = self.groups[at]
-                    .members
-                    .iter()
-                    .map(|member| self.ports.node_id(*member).clone())
-                    .collect();
-                for node in &nodes {
-                    self.mode
-                        .on_phase_transition(node, NodePhase::Running, NodePhase::Idle);
-                }
-                self.mode.on_group_drained(&nodes);
-                self.dirty = true;
+            self.end_group_draining(at);
+        }
+    }
+
+    /// No guest work of group `at` is left: if draining, it may run again.
+    fn end_group_draining(&mut self, at: usize) {
+        if let GroupLife::Draining(group) = self.groups[at].life {
+            self.groups[at].life = GroupLife::Quiet(group.drained());
+            self.resources.release(self.ports.node_count() + at);
+            let nodes: Vec<NodeId> = self.groups[at]
+                .members
+                .iter()
+                .map(|member| self.ports.node_id(*member).clone())
+                .collect();
+            for node in &nodes {
+                self.mode
+                    .on_phase_transition(node, NodePhase::Running, NodePhase::Idle);
             }
+            self.mode.on_group_drained(&nodes);
+            self.dirty = true;
         }
     }
 
@@ -851,6 +866,12 @@ impl SchedulerCore<dyn DataPlane> {
             Some(group) => {
                 if let GroupLife::Active(active) = self.groups[group].life {
                     self.groups[group].life = active.returned();
+                    if matches!(self.groups[group].life, GroupLife::Draining(_)) {
+                        let entry = &mut self.groups[group];
+                        entry.drain_asked += 1;
+                        let (at, members) = (entry.drain_asked, entry.members.clone());
+                        self.send(Command::AwaitDrained { group, at, members });
+                    }
                 }
             }
             None => self.resources.release(node.position()),

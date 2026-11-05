@@ -164,6 +164,65 @@ fn what_a_dropped_tick_left_behind_is_handled_first() {
     assert_eq!(core_dyn.node_state(&id).unwrap().phase(), NodePhase::Idle);
 }
 
+/// The question of the group's drain and of the whole instance's quiet, as a group's
+/// last `run` returning asks them: `(the drain's number, the quiet's number)`.
+fn quiet_after_drain(plane: &Scripted) -> (u64, u64) {
+    let commands = plane.commands();
+    let [
+        Command::AwaitDrained { at: drain, .. },
+        Command::AwaitQuiet(quiet),
+    ] = commands[..]
+    else {
+        panic!("expected a drain, then quiet, asked after: {commands:?}");
+    };
+    (drain, quiet)
+}
+
+#[test]
+fn a_group_can_drain_while_the_instance_is_not_quiet() {
+    let (mut core, plane) = stream_group(true);
+    let (p, r, v) = (index(&core, "p"), index(&core, "r"), index(&core, "v"));
+    assert!(poll_tick(&mut core).is_none());
+    assert_eq!(plane.commands(), [Command::Run(p)]);
+    plane.returned(p);
+    assert!(poll_tick(&mut core).is_none());
+    assert_eq!(plane.commands(), [Command::Run(r)]);
+    plane.returned(r);
+    assert!(poll_tick(&mut core).is_none());
+    let (drain, _) = quiet_after_drain(&plane);
+    let core_dyn: &mut SchedulerCore<dyn DataPlane> = &mut core;
+    assert_eq!(
+        core_dyn.node_state(&"p".into()).unwrap().phase(),
+        NodePhase::Running,
+        "its writers may be going on"
+    );
+
+    // An answer for a drain before this one says nothing of this one.
+    plane.report(ControlKind::Drained {
+        group: 0,
+        at: drain + 1,
+    });
+    assert!(poll_tick(&mut core).is_none());
+    assert_eq!(plane.commands(), [], "it is still draining");
+
+    // Quiet never came: guest work goes on somewhere, but this group's is over.
+    plane.report(ControlKind::Drained {
+        group: 0,
+        at: drain,
+    });
+    assert!(poll_tick(&mut core).is_none());
+    assert_eq!(plane.commands(), [Command::Run(v)], "it gave up its claim");
+    let core_dyn: &mut SchedulerCore<dyn DataPlane> = &mut core;
+    assert_eq!(
+        core_dyn.node_state(&"p".into()).unwrap().phase(),
+        NodePhase::Idle
+    );
+    assert_eq!(
+        core_dyn.node_state(&"r".into()).unwrap().phase(),
+        NodePhase::Idle
+    );
+}
+
 #[test]
 fn a_group_re_runs_as_one_only_after_it_has_drained() {
     let (mut core, plane) = stream_group(false);
@@ -177,9 +236,7 @@ fn a_group_re_runs_as_one_only_after_it_has_drained() {
     plane.returned(r);
     plane.returned(v);
     assert!(poll_tick(&mut core).is_none());
-    let [Command::AwaitQuiet(at)] = plane.commands()[..] else {
-        panic!("a tick ends when no guest work is left");
-    };
+    let (_, at) = quiet_after_drain(&plane);
 
     // Writers may be going on, so the group cannot start again yet.
     let core_dyn: &mut SchedulerCore<dyn DataPlane> = &mut core;
@@ -208,9 +265,7 @@ fn a_value_node_beside_a_group_does_not_re_run_with_it() {
     plane.returned(r);
     plane.returned(v);
     assert!(poll_tick(&mut core).is_none());
-    let [Command::AwaitQuiet(at)] = plane.commands()[..] else {
-        panic!("a tick ends when no guest work is left");
-    };
+    let (_, at) = quiet_after_drain(&plane);
     plane.report(ControlKind::Quiet(at));
     assert!(poll_tick(&mut core).is_some(), "the tick is over");
     let core_dyn: &mut SchedulerCore<dyn DataPlane> = &mut core;
@@ -234,9 +289,7 @@ fn a_group_holds_its_claims_until_it_has_drained() {
     assert_eq!(plane.commands(), [Command::Run(r)]);
     plane.returned(r);
     assert!(poll_tick(&mut core).is_none());
-    let [Command::AwaitQuiet(at)] = plane.commands()[..] else {
-        panic!("the group is draining");
-    };
+    let (_, at) = quiet_after_drain(&plane);
     assert!(poll_tick(&mut core).is_none());
     assert_eq!(plane.commands(), [], "its writers may still use the claim");
     plane.report(ControlKind::Quiet(at));

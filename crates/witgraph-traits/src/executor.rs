@@ -102,7 +102,7 @@ impl Incarnation {
 
 /// What the scheduler asks of an instance. They are served in order, but for
 /// [`Run`](Self::Run), whose calls overlap.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     /// Calls a node's `run`, on its latched inputs.
     Run(NodeIdx),
@@ -114,6 +114,18 @@ pub enum Command {
     /// Asks to be told when no guest work is left. Answered, with the number
     /// it carries, by [`ControlKind::Quiet`].
     AwaitQuiet(u64),
+    /// A stream group's `run`s have all returned: tell of when the guest work they left
+    /// is over, by [`ControlKind::Drained`], whatever else goes on beside it. A host that
+    /// cannot tell whose work is whose ignores this, and the group drains at the next
+    /// [`ControlKind::Quiet`], which an endless stream anywhere can put off for good.
+    AwaitDrained {
+        /// Which group, in [`CompiledGraph::stream_groups`](witgraph_ir::CompiledGraph::stream_groups).
+        group: usize,
+        /// The number to answer with.
+        at: u64,
+        /// Its nodes.
+        members: Box<[NodeIdx]>,
+    },
 }
 
 /// A report from an instance.
@@ -146,6 +158,13 @@ pub enum ControlKind {
     },
     /// No guest work was left when a [`Command::AwaitQuiet`] was served.
     Quiet(u64),
+    /// The guest work a [`Command::AwaitDrained`] asked of is over.
+    Drained {
+        /// Its group.
+        group: usize,
+        /// Its number.
+        at: u64,
+    },
     /// A write the scheduler was told of as it started reached the input.
     HostWrote {
         /// The input.

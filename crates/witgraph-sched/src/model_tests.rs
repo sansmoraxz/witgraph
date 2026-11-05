@@ -326,6 +326,8 @@ impl Model {
                     self.pending.buffered.remove(&connection);
                 }
                 Command::AwaitQuiet(at) => self.pending.quiet = Some(at),
+                // A host may leave this unanswered: quiet ends every drain.
+                Command::AwaitDrained { .. } => {}
             }
         }
     }

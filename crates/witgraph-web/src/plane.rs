@@ -46,8 +46,9 @@ pub(crate) struct Callbacks {
     /// `readHandle(name) -> object | undefined`: what the hub lends the host of a
     /// handle output, when its port function `name` is called.
     pub(crate) read_handle: Function,
-    /// `whenIdle() -> Promise<void>`: settled once the live instance has no guest work
-    /// left, what a stream group holds its claims until.
+    /// `whenIdle(nodes?) -> Promise<void>`: settled once the live instance has no guest
+    /// work left, or none left by the last `run` of the nodes with those numbers: what a
+    /// stream group holds its claims until.
     pub(crate) when_idle: Function,
     /// `abandon()`: the instance stopped, whatever was in flight in it: what it
     /// holds and what it still does belong to nothing now.
@@ -117,6 +118,18 @@ async fn settle(value: JsValue) -> Result<JsValue, JsValue> {
         Ok(promise) => JsFuture::from(promise).await,
         Err(value) => Ok(value),
     }
+}
+
+/// `kind`, once what `whenIdle` returned has settled.
+async fn idle_answer(
+    kind: ControlKind,
+    asked: Result<JsValue, JsValue>,
+) -> (ControlKind, Result<JsValue, JsValue>) {
+    let result = match asked {
+        Ok(result) => settle(result).await,
+        Err(error) => Err(error),
+    };
+    (kind, result)
 }
 
 /// Why a read of the hub failed.
@@ -442,9 +455,9 @@ async fn serve(
                 return Err(fault_of(&error, None, false));
             }
             waited = idle.select_next_some() => {
-                let (at, result): (u64, Result<JsValue, JsValue>) = waited;
+                let (kind, result): (ControlKind, Result<JsValue, JsValue>) = waited;
                 result.map_err(|error| fault_of(&error, None, false))?;
-                send(ControlKind::Quiet(at));
+                send(kind);
             }
             command = commands.next() => match command {
                 Some(Command::Run(node)) => {
@@ -481,13 +494,17 @@ async fn serve(
                 }
                 Some(Command::AwaitQuiet(at)) => {
                     let asked = hub.callbacks.when_idle.call0(&JsValue::NULL);
-                    idle.push(async move {
-                        let result = match asked {
-                            Ok(result) => settle(result).await,
-                            Err(error) => Err(error),
-                        };
-                        (at, result)
-                    });
+                    idle.push(idle_answer(ControlKind::Quiet(at), asked).boxed_local());
+                }
+                Some(Command::AwaitDrained { group, at, members }) => {
+                    let numbers: js_sys::Array = members
+                        .iter()
+                        .map(|node| JsValue::from(node.position() as u32))
+                        .collect();
+                    let asked = hub.callbacks.when_idle.call1(&JsValue::NULL, &numbers);
+                    idle.push(
+                        idle_answer(ControlKind::Drained { group, at }, asked).boxed_local(),
+                    );
                 }
                 None => closed = true,
             },

@@ -485,6 +485,8 @@ async fn serve_host<X: Executor>(
                     lock(&latches).feedback[connection] = None;
                 }
                 Some(Command::AwaitQuiet(at)) => send(&events, ControlKind::Quiet(at)),
+                // Quiet is answered at once here, which ends every group's drain.
+                Some(Command::AwaitDrained { .. }) => {}
                 None => closed = true,
             },
             complete => break,

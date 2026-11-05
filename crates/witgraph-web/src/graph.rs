@@ -542,8 +542,9 @@ impl WebGraph {
     ///   if it cannot (with an error marked `witgraphFatal` when a start function
     ///   called `fatal`); `instance()` returns the live instance's exports,
     ///   `{ control, ports }`; `readHandle(name)` has the hub lend it a handle
-    ///   output and returns the object; `whenIdle()` returns a promise settled once the
-    ///   live instance has no guest work left; `abandon()` says the instance stopped, so
+    ///   output and returns the object; `whenIdle(nodes?)` returns a promise settled once
+    ///   the live instance has no guest work left, or none left by the last `run` of the
+    ///   nodes with those numbers; `abandon()` says the instance stopped, so
     ///   whatever it holds and still does belongs to nothing.
     /// - `mocked` names the nodes left out of the composite, which imports each
     ///   as `m<number>` for the host to implement.

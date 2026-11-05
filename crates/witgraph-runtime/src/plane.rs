@@ -690,6 +690,9 @@ async fn serve_commands<D: StoreData>(
                         jobs.push_back(Job::Drop(connection));
                     }
                     Poll::Ready(Some(Command::AwaitQuiet(at))) => quiet_at = Some(at),
+                    // wasmtime says only whether a store has any task left, so a group
+                    // drains when the store is quiet.
+                    Poll::Ready(Some(Command::AwaitDrained { .. })) => {}
                     // Whoever asked is gone, so nothing else matters.
                     Poll::Ready(None) => return Poll::Ready(Ok(())),
                     Poll::Pending => break,
