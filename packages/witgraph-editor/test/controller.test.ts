@@ -8,13 +8,14 @@ import { execFileSync } from 'node:child_process';
 import { readdir, readFile, stat } from 'node:fs/promises';
 import { after, afterEach, test } from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { MessageChannel } from 'node:worker_threads';
+import { MessageChannel, Worker } from 'node:worker_threads';
 import { monotonicClock } from '@bytecodealliance/preview3-shim/clocks';
 import {
   type Capability,
   type ComponentSource,
   type Endpoint,
   type ServeOptions,
+  type SessionWorker,
   serveSession,
 } from 'witgraph-loader';
 import { EditorController } from '../src/controller/editor-controller.ts';
@@ -55,6 +56,7 @@ const wasm = await readFile(
 );
 
 const ids: Record<string, string> = {
+  'busy-loop': 'test:busy-loop/busy-loop@0.1.0',
   echo: 'test:echo/echo@0.1.0',
   relay: 'test:relay/relay@0.1.0',
   'video-source': 'test:video-source/video-source@0.1.0',
@@ -136,7 +138,7 @@ async function loadController(
   };
   const controller = new EditorController();
   const worker = served({ capabilities, views });
-  await controller.load({ graph, components, wasm, worker, ...options });
+  await controller.load({ graph, components, wasm, worker: () => worker, ...options });
   controllers.push(controller);
   return controller;
 }
@@ -446,6 +448,87 @@ test('stepping with nothing held, or stepping while running, does no harm', asyn
     controller.traceEvents.filter((e) => e.event === 'error'),
     [],
   );
+});
+
+/** Makes real workers, counting those made and ended. */
+function realWorkers(): { make: () => SessionWorker; made: number; ended: number } {
+  const counts = {
+    made: 0,
+    ended: 0,
+    make(): SessionWorker {
+      counts.made += 1;
+      const { port1, port2 } = new MessageChannel();
+      ports.push(port1);
+      const worker = new Worker(
+        new URL('../../witgraph-loader/test-support/remote-worker.ts', import.meta.url),
+        { workerData: { port: port2 }, transferList: [port2] },
+      );
+      return Object.assign(port1 as unknown as Endpoint, {
+        terminate() {
+          counts.ended += 1;
+          return worker.terminate();
+        },
+      });
+    },
+  };
+  return counts;
+}
+
+test('stop ends a worker whose node spins, and loads the graph in another', async () => {
+  const workers = realWorkers();
+  const controller = await loadController([['busy', 'busy-loop']], [], { worker: workers.make });
+  await controller.injectValue('busy', 'action', 'spin');
+  const running = controller.run();
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  assert.equal(controller.mode, 'running');
+
+  await controller.stop();
+  await running;
+  assert.equal(controller.mode, 'idle', 'it is no longer running');
+  assert.deepEqual([workers.made, workers.ended], [2, 1]);
+  assert.ok(
+    controller.traceEvents.some(
+      (e) => e.event === 'warning' && /`busy` did not stop/.test(e.message ?? ''),
+    ),
+    'and the timeline says why',
+  );
+
+  // It kept its inputs, so it spins again, and that can be stopped too.
+  const again = controller.run();
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  await controller.stop();
+  await again;
+  assert.deepEqual([workers.made, workers.ended], [3, 2]);
+
+  // Told otherwise, the new worker runs it as any other.
+  await controller.injectValue('busy', 'action', 'finish');
+  await controller.run();
+  assert.equal(controller.mode, 'idle');
+  assert.equal(await controller.readOutput('busy', 'done'), 1);
+
+  controller.dispose();
+  controllers.splice(controllers.indexOf(controller), 1);
+  assert.deepEqual([workers.made, workers.ended], [3, 3], 'none is left behind');
+});
+
+test('stop leaves a worker that answers alone', async () => {
+  const workers = realWorkers();
+  const controller = await loadController(
+    [
+      ['prod', 'stream-producer'],
+      ['take', 'stream-consumer'],
+    ],
+    [['pt', 'prod.items', 'take.items']],
+    { worker: workers.make },
+  );
+  const running = controller.run();
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  await controller.stop();
+  await running;
+  assert.equal(controller.mode, 'idle');
+  assert.deepEqual([workers.made, workers.ended], [1, 0]);
+  controller.dispose();
+  controllers.splice(controllers.indexOf(controller), 1);
 });
 
 test('moveNode updates position', async () => {

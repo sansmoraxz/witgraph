@@ -3,10 +3,12 @@ import {
   type Diagnostic,
   describeComponent,
   diagnosticsOf,
+  endWorker,
   GraphChecker,
   init,
   type PortValues,
   RemoteSession,
+  type SessionWorker,
 } from 'witgraph-loader';
 import { NODE_HEADER_HEIGHT } from '../components/styles.ts';
 import { weight } from '../util/weight.ts';
@@ -40,6 +42,9 @@ const MAX_TRACE_ENTRIES = 1000;
  */
 /** How often phases are brought up to date when no tick is doing so. */
 const FOLLOW_INTERVAL_MS = 100;
+
+/** How long a stopped worker has to answer, before it is taken to be stuck and ended. */
+const STOP_GRACE_MS = 2000;
 
 /** How often phases are brought up to date during a pause. */
 const PAUSED_WATCH_MS = 50;
@@ -101,6 +106,10 @@ export interface CompatibleOutput {
 
 export class EditorController extends EventTarget {
   #session: RemoteSession | null = null;
+  /** What sessions run in: made as the first needs it, and ended with the controller. */
+  #worker: SessionWorker | null = null;
+  /** A stop being seen through, which may take a new worker. */
+  #stopping: Promise<void> | null = null;
   #originalOptions: EditorLoadOptions | null = null;
   #graphJson: GraphJson | null = null;
   #dirty = false;
@@ -997,6 +1006,7 @@ export class EditorController extends EventTarget {
   // -- Session lifecycle ------------------------------------------------------
 
   async load(options: EditorLoadOptions): Promise<void> {
+    if (this.#originalOptions?.worker !== options.worker) this.#endWorker();
     this.#originalOptions = options;
     this.#forgetChecker();
     const graphJson: GraphJson =
@@ -1019,10 +1029,16 @@ export class EditorController extends EventTarget {
     this.#checked = null;
   }
 
+  /** Ends the worker, if it can be: one that cannot is used again. */
+  #endWorker(): void {
+    if (this.#worker && endWorker(this.#worker)) this.#worker = null;
+  }
+
   dispose(): void {
     this.#forgetChecker();
     this.#session?.dispose();
     this.#session = null;
+    this.#endWorker();
     this.#streamGroups = [];
     this.#warned.clear();
     this.#nodes.clear();
@@ -1138,7 +1154,7 @@ export class EditorController extends EventTarget {
 
   /** Stops what is running and runs the graph again from the top, keeping its inputs. */
   async restart(): Promise<void> {
-    this.stop();
+    await this.stop();
     await this.#runLoop;
     await this.run();
   }
@@ -1146,6 +1162,7 @@ export class EditorController extends EventTarget {
   /** One tick, at most a slice long, whatever runs in it: no node is held for a step. */
   async tick(): Promise<void> {
     if (this.#mode === 'running' || this.#mode === 'paused') return;
+    await this.#stopping;
     try {
       if (this.#dirty || !this.#session) await this.#reload();
     } catch (err) {
@@ -1224,6 +1241,7 @@ export class EditorController extends EventTarget {
   /** Starts the run loop, once the graph is loaded. */
   async #startRun(what: 'run' | 'step'): Promise<void> {
     const name = what === 'run' ? 'run' : 'step';
+    await this.#stopping;
     try {
       if (this.#dirty || !this.#session) await this.#reload();
     } catch (err) {
@@ -1443,6 +1461,10 @@ export class EditorController extends EventTarget {
       // Paused at a breakpoint, a tick ends only when resumed or stopped.
       const stop = Promise.race([stopped, slice.then(() => this.#paused())]);
       tick = await session.tick(stop);
+    } catch (error) {
+      // Its worker was ended, for not stopping.
+      if (this.#session !== session) return 'stopped';
+      throw error;
     } finally {
       this.#ticking = false;
       this.#stopResolve = null;
@@ -1497,8 +1519,59 @@ export class EditorController extends EventTarget {
       this.#stopResolve();
       this.#stopResolve = null;
     }
-    // Settled once the worker has said what stopped.
-    return this.#session?.graph.sync().catch(() => {}) ?? Promise.resolve();
+    // Settled once the worker has said what stopped, or has been ended.
+    const session = this.#session;
+    if (session) this.#stopping ??= this.#stoppedOrEnded(session);
+    return this.#stopping ?? Promise.resolve();
+  }
+
+  /**
+   * Sees a stop through. A worker that has not answered in a while is not reading what it
+   * is sent, as a node that spins never returns to it, so it is ended, and the graph
+   * loaded in another, on the inputs it was given.
+   */
+  async #stoppedOrEnded(session: RemoteSession): Promise<void> {
+    try {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const answered = await Promise.race([
+        session.graph.sync().then(
+          () => true,
+          () => true,
+        ),
+        new Promise<boolean>((resolve) => {
+          timer = setTimeout(() => resolve(false), STOP_GRACE_MS);
+        }),
+      ]);
+      clearTimeout(timer);
+      if (!answered && this.#session === session && this.#worker?.terminate) {
+        await this.#replaceWorker();
+      }
+    } finally {
+      this.#stopping = null;
+    }
+  }
+
+  async #replaceWorker(): Promise<void> {
+    const running = [...this.#nodes.values()]
+      .filter((node) => node.phase === 'running')
+      .map((node) => `\`${node.id}\``);
+    this.#session = null;
+    this.#endWorker();
+    this.#traceEvents.push({
+      event: 'warning',
+      message: `${running.join(', ') || 'A node'} did not stop, so its worker was ended and the graph loaded again: what its nodes held is gone`,
+      timestamp: performance.now(),
+    });
+    this.#dispatch('trace-event');
+    try {
+      if (this.#graphJson) await this.#createSession(this.#graphJson);
+      this.#pollState();
+    } catch (error) {
+      this.#dirty = true;
+      const message = error instanceof Error ? error.message : String(error);
+      this.#pushError(`Cannot load the graph again: ${message}`);
+    }
+    this.#dispatch('state-changed');
   }
 
   // -- Breakpoints ------------------------------------------------------------
@@ -2055,7 +2128,8 @@ export class EditorController extends EventTarget {
 
     // Set once loaded: until then, and once replaced, its hooks are stale.
     let session: RemoteSession | null = null;
-    session = await RemoteSession.load(this.#originalOptions.worker, {
+    this.#worker ??= this.#originalOptions.worker();
+    session = await RemoteSession.load(this.#worker, {
       graph: graph,
       components: this.#originalOptions.components,
       wasm: this.#originalOptions.wasm,
@@ -2350,6 +2424,7 @@ export class EditorController extends EventTarget {
   }
 
   async #reload(): Promise<void> {
+    await this.#stopping;
     if (!this.#originalOptions || !this.#graphJson) return;
     const oldSession = this.#session;
     this.#session = null;

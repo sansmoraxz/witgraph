@@ -179,8 +179,9 @@ Functions and resources can't cross, so a few things differ from a `Session`:
   return at once, and stay in order with everything else asked of the session.
 
 A value that can't be cloned rejects the call that asked for it. One worker serves any
-number of sessions. Terminating it is the only way to end a node that spins, since the
-worker never gets to read a `shutdown`, and it ends all of them. A `MessagePort` will do
+number of sessions. `endWorker(worker)` is the only way to end a node that spins, since
+the worker never gets to read a `shutdown`. It ends all of them, and what waits on them
+rejects. A `MessagePort` will do
 for `self` and `worker`, with `serveSession` on either side of it, even on one thread.
 
 ## When a graph does not compile

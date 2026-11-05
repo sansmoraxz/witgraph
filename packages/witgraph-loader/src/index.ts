@@ -932,12 +932,14 @@ export function diagnosticsOf(error: unknown): Diagnostic[] | undefined {
 export {
   describeHandle,
   type Endpoint,
+  endWorker,
   type HandleItem,
   type HandleView,
   RemoteGraph,
   RemoteSession,
   type RemoteSessionOptions,
   type ServeOptions,
+  type SessionWorker,
   serveSession,
 } from './remote.ts';
 export { GraphChecker, WebGraph };

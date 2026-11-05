@@ -1,4 +1,4 @@
-import type { ComponentSource, Endpoint, PortValues, Wasm } from 'witgraph-loader';
+import type { ComponentSource, PortValues, SessionWorker, Wasm } from 'witgraph-loader';
 
 // ---------------------------------------------------------------------------
 // Editor state
@@ -237,10 +237,12 @@ export interface EditorLoadOptions {
   /** The compiled `witgraph-web` WASM module. */
   wasm?: Wasm;
   /**
-   * The worker sessions run in, which calls `serveSession` from `witgraph-loader`:
-   * capabilities are provided there. A `MessagePort` will do, whichever thread serves it.
+   * Makes the worker sessions run in, which calls `serveSession` from `witgraph-loader`:
+   * capabilities are provided there. The controller ends it (`terminate`) when it is
+   * disposed, or when a node will not stop, and asks for another. A `MessagePort` will do,
+   * whichever thread serves it, but with no `terminate` a node that spins cannot be ended.
    */
-  worker: Endpoint;
+  worker: () => SessionWorker;
   /** Mock replacements for nodes, keyed by node id. */
   mocks?: Record<string, (inputs: PortValues) => PortValues | Promise<PortValues>>;
 }

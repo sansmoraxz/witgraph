@@ -18,6 +18,9 @@ import {
   type Wasm,
 } from './index.ts';
 
+/** A worker that can be ended, for what never returns to read another message. */
+export type SessionWorker = Endpoint & { terminate?(): unknown };
+
 /** How a session is reached: a `Worker`, a worker's global scope, or a `MessagePort`. */
 export interface Endpoint {
   postMessage(message: unknown): void;
@@ -603,6 +606,15 @@ class Channel {
     this.endpoint.postMessage({ [TAG]: kind, ...fields });
   }
 
+  /** The worker is gone: nothing it was asked will be answered. */
+  close(): void {
+    for (const session of this.sessions.values()) session.abandon();
+    this.sessions.clear();
+    const replies = [...this.#replies.values()];
+    this.#replies.clear();
+    for (const { reject } of replies) reject(new Error("the session's worker was ended"));
+  }
+
   ask(kind: string, fields: object): Promise<unknown> {
     return this.asked(kind, fields).reply;
   }
@@ -633,6 +645,19 @@ class Channel {
 }
 
 const channels = new WeakMap<Endpoint, Channel>();
+
+/**
+ * Terminates a worker, the only way to end a node that spins, since the worker never gets
+ * to read a `shutdown`. Its sessions go with it, and whatever waits on them rejects. Says
+ * whether it could: an endpoint with no `terminate` is left as it is.
+ */
+export function endWorker(worker: SessionWorker): boolean {
+  if (!worker.terminate) return false;
+  worker.terminate();
+  channels.get(worker)?.close();
+  channels.delete(worker);
+  return true;
+}
 
 /** The scheduler of a session in a worker, as {@link Session.graph} is on this thread. */
 export class RemoteGraph {
@@ -860,6 +885,11 @@ export class RemoteSession {
 
   #post(kind: string, fields: object): void {
     if (!this.#disposed) this.#channel.post(kind, { session: this.#id, ...fields });
+  }
+
+  /** @internal */
+  abandon(): void {
+    this.#disposed = true;
   }
 
   /** @internal */

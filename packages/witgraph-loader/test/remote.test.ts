@@ -11,6 +11,7 @@ import {
   type Capability,
   diagnosticsOf,
   type Endpoint,
+  endWorker,
   type HandleView,
   RemoteSession,
   type RemoteSessionOptions,
@@ -521,6 +522,14 @@ test('a node spinning in a worker leaves this thread free, and the worker can be
     clearInterval(beat);
     assert.ok(beats >= 30, `this thread ran only ${beats} times`);
     assert.equal(ended, false, 'the tick spins on');
+    assert.equal(endWorker(port1 as unknown as Endpoint), false, 'a port alone cannot be ended');
+
+    const endable = Object.assign(port1 as unknown as Endpoint, {
+      terminate: () => worker.terminate(),
+    });
+    assert.equal(endWorker(endable), true);
+    await until(() => ended, 'what waited on it was left waiting');
+    await assert.rejects(session.tick(), /disposed/);
   } finally {
     await worker.terminate();
   }

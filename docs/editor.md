@@ -183,13 +183,15 @@ for (const name of ['canvas', 'catalog', 'inspector', 'controls', 'timeline']) {
   document.querySelector(`witgraph-${name}`).controller = controller;
 }
 
-const worker = new Worker(new URL('./worker.ts', import.meta.url), { type: 'module' });
+const worker = () => new Worker(new URL('./worker.ts', import.meta.url), { type: 'module' });
 await controller.load({ graph, components, wasm, worker });
 await controller.autoLayout();
 ```
 
-The graph runs in `worker`, so a node that spins leaves the editor working, though Stop
-can't end such a node. It calls `serveSession` from [the loader](javascript.md#in-a-worker),
+The graph runs in a worker `worker` makes, so a node that spins leaves the editor working.
+**Stop** gives a worker two seconds to answer. One that doesn't is ended, and the graph loaded
+in a new one on the inputs it was given, so its nodes' outputs and state are gone, and the
+timeline says so. The worker calls `serveSession` from [the loader](javascript.md#in-a-worker),
 with a `capabilities` callback for anything the graph imports, which is asked each time the
 graph is instantiated. `load` takes the graph as JSON, the component bytes and the
 scheduler's `wasm`. The controller emits

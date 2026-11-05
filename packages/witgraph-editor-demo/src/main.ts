@@ -533,12 +533,15 @@ async function loadDemo(): Promise<void> {
     }
     const wasm = new Uint8Array(await wasmResp.arrayBuffer());
 
-    // Named for its demo, which says what its capabilities run on.
-    const worker = new Worker(new URL('./session-worker.ts', import.meta.url), {
-      type: 'module',
-      name,
-    });
-    serveCameraFrames(worker);
+    const worker = () => {
+      // Named for its demo, which says what its capabilities run on.
+      const made = new Worker(new URL('./session-worker.ts', import.meta.url), {
+        type: 'module',
+        name,
+      });
+      serveCameraFrames(made);
+      return made;
+    };
 
     await controller.load({ graph: demo.graph, components, wasm, worker });
 

@@ -734,4 +734,20 @@ test('a node that spins leaves the page live', async ({ page }) => {
   await canvas.evaluate((el: WitgraphCanvas) => el.controller?.select(null));
   await canvas.evaluate((el: WitgraphCanvas) => el.controller?.select('busy'));
   await expect(page.locator('witgraph-inspector').locator('.node-id')).toHaveValue('busy');
+
+  // Stop can't reach it, so it ends the worker, and the graph loads in another.
+  const controls = page.locator('witgraph-controls');
+  await controls.locator('button.stop').click();
+  await expect(controls.locator('button.run')).toBeEnabled({ timeout: 10_000 });
+  await expect(controls.locator('.badge')).not.toContainText('Running');
+  await expect(page.locator('witgraph-timeline')).toContainText('did not stop');
+
+  // Told otherwise, it runs as any node does.
+  await canvas.evaluate((el: WitgraphCanvas) =>
+    el.controller?.injectValue('busy', 'action', 'finish'),
+  );
+  await controls.locator('button.run').click();
+  await expect
+    .poll(() => canvas.evaluate((el: WitgraphCanvas) => el.controller?.readOutput('busy', 'done')))
+    .toBe(1);
 });
