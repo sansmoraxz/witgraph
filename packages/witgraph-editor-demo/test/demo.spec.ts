@@ -412,6 +412,22 @@ test.describe('WIT Graph Editor Demo', () => {
     await expect(inspector.locator('.toggle-track')).toHaveCount(1);
   });
 
+  test('a stream group that has finished shows idle beside one that has not', async ({ page }) => {
+    const controls = page.locator('witgraph-controls');
+    const phase = (id: string) =>
+      page
+        .locator('witgraph-canvas')
+        .evaluate((el: WitgraphCanvas, id) => el.controller?.nodes.get(id)?.phase, id);
+    await controls.locator('button.run').click();
+    // A burst of five, and a future: they end, while the camera never does.
+    for (const finished of ['producer', 'consumer', 'writer', 'reader']) {
+      await expect.poll(() => phase(finished), finished).toBe('idle');
+    }
+    expect(await phase('camera')).toBe('running');
+    expect(await phase('video-sink')).toBe('running');
+    await controls.locator('button.stop').click();
+  });
+
   test('paused at a breakpoint, only resuming or stopping is offered', async ({ page }) => {
     const controls = page.locator('witgraph-controls');
     await page

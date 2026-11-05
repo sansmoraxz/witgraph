@@ -250,7 +250,11 @@ type NodeNumber = number & { readonly brand: 'node' };
 
 /** A live hub's exports, as jco names them. */
 interface HubInstance {
-  _util: { stop: () => void; whenIdle: () => Promise<void> };
+  _util: {
+    stop: () => void;
+    whenIdle: (calls?: object[]) => Promise<void>;
+    lastCall: () => object | undefined;
+  };
   control: {
     run: (node: NodeNumber) => Promise<unknown>;
   } & Record<string, (...args: any[]) => any>;
@@ -336,6 +340,8 @@ export class Session {
   /** The nodes, by the number the hub knows them by. */
   #nodes: string[];
   #instance: HubInstance | undefined;
+  /** By node: its last run in this instance, to tell its guest work from the rest's. */
+  #calls = new Map<NodeNumber, object>();
   /** What the hub lent the host last. */
   #lent: unknown;
   /**
@@ -394,7 +400,7 @@ export class Session {
         rebuild: () => live().#instantiate(),
         instance: () => live().#instance,
         readHandle: (name: string) => live().#readHandle(name),
-        whenIdle: () => live().#instance?._util.whenIdle(),
+        whenIdle: (nodes?: NodeNumber[]) => live().#whenIdle(nodes),
         abandon: () => live().#abandon(),
       },
       mocked.filter((node) => known.has(node)),
@@ -610,6 +616,7 @@ export class Session {
     // have run on its own.
     if (!this.#disposed && this.#epoch === epoch) {
       this.#instance = instance;
+      this.#calls.clear();
     } else {
       ended = true;
       end(instance);
@@ -630,7 +637,11 @@ export class Session {
     const instance = this.#instance!;
     let returned: unknown;
     try {
-      returned = await instance.control.run(number);
+      const running = instance.control.run(number);
+      // In this turn, before anything else can have started.
+      const call = instance._util.lastCall();
+      if (call) this.#calls.set(number, call);
+      returned = await running;
     } catch (error) {
       // Ending the instance ends its calls.
       if (abandoned()) throw new Error(`the run of \`${node}\` was abandoned`);
@@ -640,6 +651,12 @@ export class Session {
     this.#tap(node, instance);
     await options.afterRun?.(node);
     return returned;
+  }
+
+  /** When the instance has no guest work left, or none left by the last run of `nodes`. */
+  #whenIdle(nodes?: NodeNumber[]): Promise<void> | undefined {
+    const calls = nodes?.flatMap((node) => this.#calls.get(node) ?? []);
+    return this.#instance?._util.whenIdle(calls);
   }
 
   /**

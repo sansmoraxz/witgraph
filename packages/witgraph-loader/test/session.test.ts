@@ -2405,3 +2405,36 @@ test('a node stays running until its stream group has drained', async () => {
   assert.deepEqual(phases(), ['idle', 'idle', 'idle']);
   assert.ok(graph.takeTrace().some((e: any) => e.event === 'group-drained'));
 });
+
+test('a finished stream group drains and re-runs beside an endless one', async () => {
+  const session = await load(
+    [
+      ['p', 'stream-producer'],
+      ['c', 'stream-consumer'],
+      ['endless', 'stream-producer'],
+      ['reader', 'stream-consumer'],
+    ],
+    [
+      ['a', 'p.items', 'c.items'],
+      ['b', 'endless.items', 'reader.items'],
+    ],
+  );
+  const graph = session.graph;
+  const until = async (ready: () => boolean | Promise<boolean>) => {
+    for (let at = 0; at < 200 && !(await ready()); at++) {
+      await graph.tick(new Promise((resolve) => setTimeout(resolve, 20)));
+    }
+    assert.ok(await ready());
+  };
+  await graph.inject('p', 'burst-size', 5);
+  await until(() => graph.nodeState('c').phase === 'idle');
+  assert.equal(await graph.readOutput('c', 'count'), 5);
+  assert.equal(graph.nodeState('p').phase, 'idle', 'its group is over');
+  assert.equal(graph.nodeState('endless').phase, 'running', 'the other is not');
+  assert.equal(graph.nodeState('reader').phase, 'running');
+
+  await graph.inject('p', 'burst-size', 3);
+  await until(async () => (await graph.readOutput('c', 'count')) === 3);
+  await until(() => graph.nodeState('p').phase === 'idle');
+  assert.equal(graph.nodeState('endless').phase, 'running');
+});
