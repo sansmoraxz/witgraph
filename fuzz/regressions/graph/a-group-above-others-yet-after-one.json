@@ -1,0 +1,302 @@
+{
+  "metadata": {
+    "name": "fuzz"
+  },
+  "components": [
+    {
+      "package": {
+        "namespace": "fuzz",
+        "name": "nodes",
+        "version": "0.1.0"
+      },
+      "world": "stream-source"
+    },
+    {
+      "package": {
+        "namespace": "fuzz",
+        "name": "nodes",
+        "version": "0.1.0"
+      },
+      "world": "stream-tee"
+    },
+    {
+      "package": {
+        "namespace": "fuzz",
+        "name": "nodes",
+        "version": "0.1.0"
+      },
+      "world": "stream-waits"
+    }
+  ],
+  "nodes": [
+    {
+      "id": "n0",
+      "component": {
+        "package": {
+          "namespace": "fuzz",
+          "name": "nodes",
+          "version": "0.1.0"
+        },
+        "world": "stream-source"
+      }
+    },
+    {
+      "id": "n1",
+      "component": {
+        "package": {
+          "namespace": "fuzz",
+          "name": "nodes",
+          "version": "0.1.0"
+        },
+        "world": "stream-source"
+      }
+    },
+    {
+      "id": "n2",
+      "component": {
+        "package": {
+          "namespace": "fuzz",
+          "name": "nodes",
+          "version": "0.1.0"
+        },
+        "world": "stream-tee"
+      }
+    },
+    {
+      "id": "n3",
+      "component": {
+        "package": {
+          "namespace": "fuzz",
+          "name": "nodes",
+          "version": "0.1.0"
+        },
+        "world": "stream-tee"
+      }
+    },
+    {
+      "id": "n4",
+      "component": {
+        "package": {
+          "namespace": "fuzz",
+          "name": "nodes",
+          "version": "0.1.0"
+        },
+        "world": "stream-tee"
+      }
+    },
+    {
+      "id": "n5",
+      "component": {
+        "package": {
+          "namespace": "fuzz",
+          "name": "nodes",
+          "version": "0.1.0"
+        },
+        "world": "stream-tee"
+      }
+    },
+    {
+      "id": "n6",
+      "component": {
+        "package": {
+          "namespace": "fuzz",
+          "name": "nodes",
+          "version": "0.1.0"
+        },
+        "world": "stream-tee"
+      },
+      "resources": {
+        "disk": {
+          "fraction": 0.3
+        }
+      }
+    },
+    {
+      "id": "n7",
+      "component": {
+        "package": {
+          "namespace": "fuzz",
+          "name": "nodes",
+          "version": "0.1.0"
+        },
+        "world": "stream-waits"
+      },
+      "resources": {
+        "disk": {
+          "fraction": 0.3
+        }
+      }
+    },
+    {
+      "id": "n8",
+      "component": {
+        "package": {
+          "namespace": "fuzz",
+          "name": "nodes",
+          "version": "0.1.0"
+        },
+        "world": "stream-waits"
+      },
+      "resources": {
+        "disk": {
+          "fraction": 0.3
+        }
+      }
+    },
+    {
+      "id": "n9",
+      "component": {
+        "package": {
+          "namespace": "fuzz",
+          "name": "nodes",
+          "version": "0.1.0"
+        },
+        "world": "stream-waits"
+      },
+      "resources": {
+        "disk": {
+          "fraction": 0.3
+        }
+      }
+    },
+    {
+      "id": "n10",
+      "component": {
+        "package": {
+          "namespace": "fuzz",
+          "name": "nodes",
+          "version": "0.1.0"
+        },
+        "world": "stream-waits"
+      },
+      "resources": {
+        "disk": {
+          "fraction": 0.3
+        }
+      }
+    }
+  ],
+  "connections": [
+    {
+      "id": "c0",
+      "from": {
+        "node": "n3",
+        "port": "out"
+      },
+      "to": {
+        "node": "n4",
+        "port": "in"
+      }
+    },
+    {
+      "id": "c1",
+      "from": {
+        "node": "n2",
+        "port": "out"
+      },
+      "to": {
+        "node": "n5",
+        "port": "in"
+      }
+    },
+    {
+      "id": "c2",
+      "from": {
+        "node": "n3",
+        "port": "out"
+      },
+      "to": {
+        "node": "n6",
+        "port": "in"
+      }
+    },
+    {
+      "id": "c3",
+      "from": {
+        "node": "n4",
+        "port": "items"
+      },
+      "to": {
+        "node": "n7",
+        "port": "items"
+      }
+    },
+    {
+      "id": "c4",
+      "from": {
+        "node": "n2",
+        "port": "out"
+      },
+      "to": {
+        "node": "n7",
+        "port": "gate"
+      }
+    },
+    {
+      "id": "c5",
+      "from": {
+        "node": "n3",
+        "port": "items"
+      },
+      "to": {
+        "node": "n8",
+        "port": "items"
+      }
+    },
+    {
+      "id": "c6",
+      "from": {
+        "node": "n4",
+        "port": "out"
+      },
+      "to": {
+        "node": "n8",
+        "port": "gate"
+      }
+    },
+    {
+      "id": "c7",
+      "from": {
+        "node": "n0",
+        "port": "items"
+      },
+      "to": {
+        "node": "n9",
+        "port": "items"
+      }
+    },
+    {
+      "id": "c8",
+      "from": {
+        "node": "n8",
+        "port": "sum"
+      },
+      "to": {
+        "node": "n9",
+        "port": "gate"
+      }
+    },
+    {
+      "id": "c9",
+      "from": {
+        "node": "n6",
+        "port": "items"
+      },
+      "to": {
+        "node": "n10",
+        "port": "items"
+      }
+    },
+    {
+      "id": "c10",
+      "from": {
+        "node": "n2",
+        "port": "out"
+      },
+      "to": {
+        "node": "n10",
+        "port": "gate"
+      }
+    }
+  ]
+}

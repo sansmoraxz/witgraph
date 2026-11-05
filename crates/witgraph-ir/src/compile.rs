@@ -1201,7 +1201,12 @@ fn upstream_of<'g>(graph: &'g Graph, node: &'g NodeId) -> HashSet<&'g NodeId> {
 /// the first waits for must then fit beside the group's claims, and beside
 /// those of every other group that can be holding its own at that moment: each pair
 /// can fit while the groups together leave none of them room for what they wait for.
-fn check_group_claims(graph: &Graph, groups: &StreamGroups, diagnostics: &mut Diagnostics) {
+fn check_group_claims(
+    graph: &Graph,
+    contracts: &HashMap<&NodeId, &ComponentContract>,
+    groups: &StreamGroups,
+    diagnostics: &mut Diagnostics,
+) {
     // Tolerates float rounding in sums of fractions such as 0.1 + 0.2.
     const EPSILON: f64 = 1e-9;
     let mut nodes: HashMap<&NodeId, &Node> = HashMap::new();
@@ -1253,6 +1258,7 @@ fn check_group_claims(graph: &Graph, groups: &StreamGroups, diagnostics: &mut Di
             });
         }
     }
+    let stalls = stallable_units(graph, contracts, groups, &units);
     let mut holders: Vec<Holder<'_>> = Vec::new();
     for (at, members) in groups.groups.iter().enumerate() {
         let upstream: Vec<HashSet<&NodeId>> =
@@ -1269,8 +1275,8 @@ fn check_group_claims(graph: &Graph, groups: &StreamGroups, diagnostics: &mut Di
         for (unit, nodes_of) in units.iter().enumerate().filter(|(unit, _)| *unit != at) {
             let above = |set: &HashSet<&NodeId>| nodes_of.iter().any(|n| set.contains(*n));
             // Above no member, it holds nothing up. Above every one, the group
-            // cannot start before it has run.
-            if !upstream.iter().any(above) || upstream.iter().all(above) {
+            // cannot start before it has run, unless it can stall.
+            if !upstream.iter().any(above) || (upstream.iter().all(above) && !stalls[unit]) {
                 continue;
             }
             let claims = claims_of(
@@ -1358,6 +1364,60 @@ fn check_group_claims(graph: &Graph, groups: &StreamGroups, diagnostics: &mut Di
         }
         stuck.push(holding);
     }
+}
+
+/// By unit: whether what reads it may start before it has run. The scheduler holds a node
+/// back for what above it could run now, and a stream group that lacks a required input
+/// from outside cannot run now, so what reads its other members goes ahead. The same goes
+/// for everything below such a group.
+fn stallable_units(
+    graph: &Graph,
+    contracts: &HashMap<&NodeId, &ComponentContract>,
+    groups: &StreamGroups,
+    units: &[Vec<&NodeId>],
+) -> Vec<bool> {
+    let mut stalled: HashSet<&NodeId> = HashSet::new();
+    for members in &groups.groups {
+        let lacks = members.iter().any(|member| {
+            contracts.get(member).is_some_and(|contract| {
+                contract
+                    .inputs
+                    .iter()
+                    .filter(|input| !input.is_optional())
+                    .any(|input| {
+                        graph.connections.iter().any(|conn| {
+                            !conn.feedback
+                                && conn.to.node == *member
+                                && conn.to.port == input.name
+                                && !members.contains(&conn.from.node)
+                        })
+                    })
+            })
+        });
+        if lacks {
+            stalled.extend(members.iter());
+        }
+    }
+    // One walk down from all of them: this runs on every graph, whatever its size.
+    let mut below: HashMap<&NodeId, Vec<&NodeId>> = HashMap::new();
+    for conn in graph.connections.iter().filter(|conn| !conn.feedback) {
+        below
+            .entry(&conn.from.node)
+            .or_default()
+            .push(&conn.to.node);
+    }
+    let mut waiting: Vec<&NodeId> = stalled.iter().copied().collect();
+    while let Some(next) = waiting.pop() {
+        for node in below.get(next).into_iter().flatten() {
+            if stalled.insert(node) {
+                waiting.push(node);
+            }
+        }
+    }
+    units
+        .iter()
+        .map(|nodes_of| nodes_of.iter().any(|node| stalled.contains(*node)))
+        .collect()
 }
 
 /// How many groups [`check_group_claims`] tries every combination of: past this, it
@@ -1517,7 +1577,7 @@ impl Graph {
         }
         if let Some(groups) = &groups {
             check_group_start(&self, &node_contracts, groups, &mut diagnostics);
-            check_group_claims(&self, groups, &mut diagnostics);
+            check_group_claims(&self, &node_contracts, groups, &mut diagnostics);
         }
 
         // `order` (and with it `groups`) is None only when IllegalCycle
@@ -2661,6 +2721,65 @@ mod tests {
         assert!(two_groups_waiting("u", 0.6, 0.3).compile().is_ok());
         // And with room for it beside both, nothing waits.
         assert!(two_groups_waiting("u", 0.3, 0.3).compile().is_ok());
+    }
+
+    /// Three stream groups: `a`-`b`, which `e` is above; `e`-`f`, whose reader needs a
+    /// value from `a`; and `g`-`h`, which `e` is above too. `e`'s group can start only
+    /// after `a`'s has, so being above `a` and `g` does not put it before them.
+    fn a_group_above_others_yet_after_one(gh: f64) -> TestGraph {
+        let claim = |fraction| ResourceClaim::new(fraction).unwrap();
+        builder("t")
+            .add_component(contract(
+                "head",
+                vec![port("in", PortKind::Value).optional()],
+                vec![port("st", PortKind::Stream), port("out", PortKind::Value)],
+                &[],
+            ))
+            .add_component(contract(
+                "tail",
+                vec![port("st", PortKind::Stream)],
+                vec![],
+                &[],
+            ))
+            .add_component(contract(
+                "gated",
+                vec![port("st", PortKind::Stream), port("gate", PortKind::Value)],
+                vec![],
+                &[],
+            ))
+            .add_node("a", cref("head"))
+            .add_node("b", cref("tail"))
+            .add_node("e", cref("head"))
+            .add_node("f", cref("gated"))
+            .add_node("g", cref("head"))
+            .add_node("h", cref("tail"))
+            .connect("ab", PortRef::new("a", "st"), PortRef::new("b", "st"))
+            .connect("ef", PortRef::new("e", "st"), PortRef::new("f", "st"))
+            .connect("gh", PortRef::new("g", "st"), PortRef::new("h", "st"))
+            .connect("ea", PortRef::new("e", "out"), PortRef::new("a", "in"))
+            .connect("eg", PortRef::new("e", "out"), PortRef::new("g", "in"))
+            .connect("af", PortRef::new("a", "out"), PortRef::new("f", "gate"))
+            .set_resource("a", "disk", claim(0.3))
+            .unwrap()
+            .set_resource("e", "disk", claim(0.3))
+            .unwrap()
+            .set_resource("g", "disk", claim(gh))
+            .unwrap()
+            .build()
+    }
+
+    #[test]
+    fn being_above_a_group_does_not_put_a_stalled_group_before_it() {
+        let found = diags(a_group_above_others_yet_after_one(0.6).compile());
+        assert!(
+            found.iter().any(|d| matches!(
+                d,
+                Diagnostic::ClaimsCanDeadlock { resource, .. } if resource.as_str() == "disk"
+            )),
+            "{found:?}"
+        );
+        // With room for `e`'s group beside the other two, it runs.
+        assert!(a_group_above_others_yet_after_one(0.4).compile().is_ok());
     }
 
     #[test]
