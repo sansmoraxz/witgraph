@@ -376,6 +376,10 @@ test.describe('WIT Graph Editor Demo', () => {
     await expect(warned).toHaveCount(1);
     await expect(page.locator('#status')).toHaveClass(/ready/);
     await expect(warned.locator('title.diagnostics')).toContainText('fed only by feedback');
+    // Its outline has to show against its header.
+    const paint = (selector: string, property: 'fill' | 'stroke') =>
+      warned.locator(selector).evaluate((el, property) => getComputedStyle(el)[property], property);
+    expect(await paint('.node-body', 'stroke')).not.toBe(await paint('.node-header', 'fill'));
     await canvas.evaluate((el: WitgraphCanvas) => el.controller?.select('relay-a'));
     await expect(inspector.locator('.warning-bg')).toContainText('fed only by feedback');
     await expect(inspector.locator('.fault-bg')).toHaveCount(0);

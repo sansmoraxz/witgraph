@@ -92,6 +92,7 @@ const DEFAULT_CSS = `
   .text-wg-success { color: var(--wg-success); }
   .text-wg-warning { color: var(--wg-warning); }
 
+  .bg-wg-warning { background-color: var(--wg-warning); }
   .bg-wg-phase-pending { background-color: var(--wg-phase-pending); }
   .bg-wg-phase-running { background-color: var(--wg-phase-running); }
   .bg-wg-phase-idle { background-color: var(--wg-phase-idle); }

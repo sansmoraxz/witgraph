@@ -29,7 +29,7 @@
   --wg-purple: #cba6f7;
 
   /* ── Node phases ───────────────────────────────────────── */
-  --wg-phase-pending: #fab387;
+  --wg-phase-pending: #a6adc8;
   --wg-phase-running: #89b4fa;
   --wg-phase-idle: #a6e3a1;
   --wg-phase-faulted: #f38ba8;

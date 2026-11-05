@@ -29,7 +29,7 @@ const MODE_LABELS: Record<EditorMode, string> = {
 const MODE_BG: Record<EditorMode, string> = {
   idle: 'bg-wg-phase-idle',
   running: 'bg-wg-phase-running',
-  paused: 'bg-wg-phase-pending',
+  paused: 'bg-wg-warning',
   error: 'bg-wg-phase-faulted',
 };
 

@@ -198,7 +198,8 @@ properties with no fallback, so define them on the page or a parent element:
 - Port kinds: `--wg-port-value`, `--wg-port-stream`, `--wg-port-future`,
   `--wg-port-handle`.
 - Node states: `--wg-phase-pending`, `--wg-phase-running`, `--wg-phase-idle`,
-  `--wg-phase-faulted`, `--wg-phase-cancelled`.
+  `--wg-phase-faulted`, `--wg-phase-cancelled`. A node with a warning is outlined in
+  `--wg-warning`, so keep that apart from the phases.
 - Shape: `--wg-node-radius`, `--wg-port-radius`, `--wg-btn-radius`,
   `--wg-input-radius`, `--wg-group-radius`, `--wg-toggle-radius`,
   `--wg-node-grad-top`, `--wg-node-grad-bottom`.
