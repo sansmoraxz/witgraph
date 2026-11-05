@@ -23,16 +23,36 @@ async function open(page: Page, graph: string): Promise<void> {
   await expect(page.locator('#status')).toHaveClass(/ready/);
 }
 
-/** A node's preview: images drawn, the backend, and its pixels. */
+/** How many images a node's preview has drawn: cheap enough to poll. */
+function frames(page: Page, node: string): Promise<number> {
+  return page.locator('witgraph-canvas').evaluate((el: HTMLElement, node) => {
+    const canvas = el.shadowRoot?.querySelector<HTMLCanvasElement>(
+      `[data-node-id="${node}"] .node-preview canvas`,
+    );
+    return Number(canvas?.dataset.frames ?? 0);
+  }, node);
+}
+
+/**
+ * A node's preview: its backend, and its pixels summed up where they are. A frame is a
+ * million numbers, which take seconds to bring here on a busy machine.
+ */
 function preview(page: Page, node: string) {
   return page.locator('witgraph-canvas').evaluate((el: HTMLElement, node) => {
     const canvas = el.shadowRoot?.querySelector<HTMLCanvasElement>(
       `[data-node-id="${node}"] .node-preview canvas`,
     );
-    const frames = Number(canvas?.dataset.frames ?? 0);
-    if (!canvas || frames === 0) return { frames, backend: undefined, pixels: [] as number[] };
-    const image = canvas.getContext('2d')?.getImageData(0, 0, canvas.width, canvas.height);
-    return { frames, backend: canvas.dataset.backend, pixels: Array.from(image?.data ?? []) };
+    if (!canvas?.width) return { backend: undefined, length: 0, distinct: 0, digest: '' };
+    const data = canvas.getContext('2d')?.getImageData(0, 0, canvas.width, canvas.height).data;
+    // FNV-1a: images that differ have different digests.
+    let digest = 0x811c9dc5;
+    for (const byte of data ?? []) digest = Math.imul(digest ^ byte, 0x01000193) >>> 0;
+    return {
+      backend: canvas.dataset.backend,
+      length: data?.length ?? 0,
+      distinct: new Set(data).size,
+      digest: digest.toString(16),
+    };
   }, node);
 }
 
@@ -58,24 +78,22 @@ for (const { graph, name, backend, everywhere } of BACKENDS) {
 
     // Live: previews keep drawing new frames at every node.
     for (const node of ['camera', 'edges', 'invert']) {
-      await expect
-        .poll(async () => (await preview(page, node)).frames, { timeout: 20_000 })
-        .toBeGreaterThan(3);
+      await expect.poll(() => frames(page, node), { timeout: 20_000 }).toBeGreaterThan(3);
     }
     const [frame, edges, inverted] = await Promise.all(
       ['camera', 'edges', 'invert'].map((node) => preview(page, node)),
     );
     expect(edges.backend).toBe(backend);
-    expect(frame.pixels.length).toBeGreaterThan(0);
-    expect(new Set(frame.pixels).size, 'the frame is an image, not one color').toBeGreaterThan(8);
-    expect(edges.pixels).not.toEqual(frame.pixels);
-    expect(inverted.pixels).not.toEqual(edges.pixels);
+    expect(frame.length).toBeGreaterThan(0);
+    expect(frame.distinct, 'the frame is an image, not one color').toBeGreaterThan(8);
+    expect(edges.digest).not.toBe(frame.digest);
+    expect(inverted.digest).not.toBe(edges.digest);
     const nodes = page.locator('witgraph-canvas');
     await expect(nodes.locator('.node-header.faulted')).toHaveCount(0);
     await page.locator('witgraph-controls').locator('button.stop').click();
-    const stopped = (await preview(page, 'camera')).frames;
+    const stopped = await frames(page, 'camera');
     await page.waitForTimeout(500);
-    const later = (await preview(page, 'camera')).frames;
+    const later = await frames(page, 'camera');
     expect(later - stopped, 'stopped, or as good as').toBeLessThan(3);
   });
 }

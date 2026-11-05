@@ -20,7 +20,20 @@ async function open(page: Page, graph: string): Promise<void> {
   await expect(page.locator('#status')).toHaveClass(/ready/);
 }
 
-/** A node's tensor preview: images drawn, the backend, and its pixels. */
+/** How many images a node's tensor preview has drawn: cheap enough to poll. */
+function frames(page: Page, node: string): Promise<number> {
+  return page.locator('witgraph-canvas').evaluate((el: HTMLElement, node) => {
+    const canvas = el.shadowRoot?.querySelector<HTMLCanvasElement>(
+      `[data-node-id="${node}"] .node-preview canvas`,
+    );
+    return Number(canvas?.dataset.frames ?? 0);
+  }, node);
+}
+
+/**
+ * A node's tensor preview: images drawn, the backend, and its pixels. Read once, not
+ * polled: every pixel crosses to the test, which takes long on a busy machine.
+ */
 function preview(page: Page, node: string) {
   return page.locator('witgraph-canvas').evaluate((el: HTMLElement, node) => {
     const canvas = el.shadowRoot?.querySelector<HTMLCanvasElement>(
@@ -43,9 +56,7 @@ for (const { graph, name, backend, everywhere } of BACKENDS) {
 
       if (everywhere || accelerated()) {
         for (const node of ['image', 'edges', 'invert']) {
-          await expect
-            .poll(async () => (await preview(page, node)).frames, { timeout: 15_000 })
-            .toBeGreaterThan(0);
+          await expect.poll(() => frames(page, node), { timeout: 15_000 }).toBeGreaterThan(0);
         }
         const [image, edges, inverted] = await Promise.all(
           ['image', 'edges', 'invert'].map((node) => preview(page, node)),
