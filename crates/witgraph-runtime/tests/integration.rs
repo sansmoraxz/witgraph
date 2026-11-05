@@ -776,23 +776,19 @@ async fn a_finished_stream_group_drains_and_re_runs_beside_an_endless_one() {
         .await;
     inject(&mut rt, "p", "burst-size", Val::U32(5)).await;
     // No tick ends by itself beside an endless stream, so each is cut short.
-    let ticks_until = async |rt: &mut RuntimeGraph<Trace>, node: &str, count: Option<u32>| {
-        for _ in 0..500 {
+    // Until `c` has run, it has no output to read.
+    let ticks_until = async |rt: &mut RuntimeGraph<Trace>, count: u32| {
+        for _ in 0..1000 {
             let _ = rt
                 .tick_until(tokio::time::sleep(Duration::from_millis(5)))
                 .await;
-            let done = phase(rt, node) == NodePhase::Idle;
-            let counted = match count {
-                Some(count) => read_u32(rt, "c", "count").await == count,
-                None => true,
-            };
-            if done && counted {
+            if phase(rt, "c") == NodePhase::Idle && read_u32(rt, "c", "count").await == count {
                 return;
             }
         }
-        panic!("`{node}` never finished");
+        panic!("`c` never counted {count}");
     };
-    ticks_until(&mut rt, "c", Some(5)).await;
+    ticks_until(&mut rt, 5).await;
     assert_eq!(phase(&rt, "p"), NodePhase::Idle, "its group is over");
     assert_eq!(
         phase(&rt, "endless"),
@@ -802,7 +798,7 @@ async fn a_finished_stream_group_drains_and_re_runs_beside_an_endless_one() {
     assert_eq!(phase(&rt, "reader"), NodePhase::Running);
 
     inject(&mut rt, "p", "burst-size", Val::U32(3)).await;
-    ticks_until(&mut rt, "c", Some(3)).await;
+    ticks_until(&mut rt, 3).await;
     assert_eq!(read_u32(&mut rt, "c", "total").await, 3);
     assert_eq!(phase(&rt, "endless"), NodePhase::Running);
     let drained = rt
