@@ -89,7 +89,7 @@ Put them anywhere on your page. They all share one `EditorController`.
   on. It takes a page that is cross-origin isolated
   ([why](javascript.md#stopping-on-a-source-line)): elsewhere the graph runs as usual, and the
   timeline says so. Without debug info in a graph, the panel and its buttons stay hidden. In the demo, add `?debug` to the
-  address to turn it on, with the _Source lines_ graph for a guest that has debug info.
+  address to turn it on: the page then loads the guests as `setup` built them with debug info.
 - **Values.** Select a node to see the current value of each output port.
 - **Previews.** A node can show one of its outputs inside it, as it changes:
   see [Previews](#previews).

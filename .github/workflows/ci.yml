@@ -97,7 +97,8 @@ jobs:
         if: steps.wbg-cache.outputs.cache-hit != 'true'
         run: cargo install wasm-bindgen-cli --version "${{ steps.wbg.outputs.version }}" --locked
 
-      - run: cargo build -p test-components
+      # The demo's guests with debug info too, for its `?debug`.
+      - run: WITGRAPH_DEBUG_GUESTS="$(node packages/witgraph-editor-demo/setup.mjs --list)" cargo build -p test-components
       - run: pnpm --filter witgraph-loader build:wasm
 
       - name: Collect the outputs
@@ -166,7 +167,7 @@ jobs:
           mkdir -p ../../target/debug/build/test-components-ci/out
           cp ../../wasm-artifacts/guests/*.wasm ../../target/debug/build/test-components-ci/out/
           cp -r ../../wasm-artifacts/pkg ../witgraph-loader/pkg
-      - run: pnpm run setup
+      - run: pnpm run setup --no-build
       - run: pnpm exec vite build
       - run: pnpm exec playwright install --with-deps chromium
       - run: pnpm test

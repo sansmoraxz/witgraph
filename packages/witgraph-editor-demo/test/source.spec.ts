@@ -179,9 +179,35 @@ test('debugging lines takes `?debug`, even for a guest that could be', async ({ 
   expect(files).toBe(0);
 });
 
-test('a graph with no debug info has no source panel', async ({ page }) => {
-  await page.goto('/?debug');
+test('a graph with no `?debug` has no source panel', async ({ page }) => {
+  await page.goto('/');
   await expect(page.locator('#status')).toHaveClass(/ready/, { timeout: 30_000 });
   await expect(page.locator('witgraph-source')).toBeHidden();
   await expect(page.locator('witgraph-controls').locator('button.step-in')).toBeHidden();
+});
+
+test('`?debug` loads debug builds, so any graph has its source to stop in', async ({ page }) => {
+  test.setTimeout(90_000);
+  await page.goto('/?debug');
+  await expect(page.locator('#status')).toHaveClass(/ready/, { timeout: 60_000 });
+  const source = page.locator('witgraph-source');
+  const controls = page.locator('witgraph-controls');
+  await expect(source).toBeVisible();
+
+  // A file for each kind of guest in the graph: `relay` is one that has no debug info otherwise.
+  const files = await source.locator('select.file option').allTextContents();
+  expect(files.length).toBeGreaterThan(3);
+  const relay = files.find((file) => file.includes('relay/src/lib.rs'));
+  expect(relay, files.join()).toBeTruthy();
+  await source.locator('select.file').selectOption({ label: relay as string });
+
+  // `in.wrapping_add` in its `run`.
+  const line = source.locator('.row', { hasText: 'wrapping_add' }).first();
+  await line.locator('.gutter').click();
+  await controls.locator('button.run').click();
+  await expect(source.locator('.row.current')).toBeVisible({ timeout: 30_000 });
+  await expect(source.locator('.where')).toContainText('in relay-');
+  await expect(source.locator('.variables')).toContainText('inputs');
+  await controls.locator('button.stop').click();
+  await expect(controls.locator('button.run')).toBeEnabled({ timeout: 10_000 });
 });

@@ -1,3 +1,4 @@
 node_modules
 components/*.wasm
+components/debug/
 test-results

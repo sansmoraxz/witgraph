@@ -524,12 +524,18 @@ async function sources(file: string): Promise<string | undefined> {
   return response.ok && !type.includes('html') ? response.text() : undefined;
 }
 
-async function fetchWasm(name: string): Promise<Uint8Array> {
-  const url = new URL(`../components/${name}.wasm`, import.meta.url);
+/** A guest, as built with debug info if `debug`: those are big, so left out of a built page. */
+async function fetchWasm(name: string, debug: boolean): Promise<Uint8Array> {
+  const url = debug
+    ? new URL(/* @vite-ignore */ `../components/debug/${name}.wasm`, import.meta.url)
+    : new URL(`../components/${name}.wasm`, import.meta.url);
   const resp = await fetch(url);
-  if (!resp.ok)
-    throw new Error(`Could not fetch ${name}.wasm (${resp.status}). Run \`pnpm setup\`.`);
-  return new Uint8Array(await resp.arrayBuffer());
+  const bytes = new Uint8Array(await resp.arrayBuffer());
+  // A dev server answers for a file it does not have with a page.
+  if (!resp.ok || bytes[0] !== 0 || bytes[1] !== 0x61) {
+    throw new Error(`Could not fetch ${url.pathname} (${resp.status}). Run \`pnpm setup\`.`);
+  }
+  return bytes;
 }
 
 /** The demo the page's `?graph=` names, the port kinds one by default. */
@@ -556,10 +562,14 @@ async function loadDemo(): Promise<void> {
   statusEl.textContent = 'Fetching test components...';
 
   try {
+    // Only with `?debug`: it slows every guest with debug info. An isolated page is what can
+    // stop on a line at all, so only that is worth the debug builds.
+    const debug = new URLSearchParams(location.search).has('debug');
+    const debugBuilds = debug && crossOriginIsolated;
     const components: ComponentSource[] = await Promise.all(
       GUESTS.map(async (guest) => ({
         id: `test:${guest}/${guest}@0.1.0`,
-        bytes: await fetchWasm(guest),
+        bytes: await fetchWasm(guest, debugBuilds),
       })),
     );
 
@@ -585,8 +595,6 @@ async function loadDemo(): Promise<void> {
       return made;
     };
 
-    // Only with `?debug`: it slows every guest with debug info.
-    const debug = new URLSearchParams(location.search).has('debug');
     await controller.load({ graph: demo.graph, components, wasm, worker, lines: debug, sources });
 
     statusEl.textContent = 'Computing layout...';

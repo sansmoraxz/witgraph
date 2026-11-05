@@ -1,5 +1,8 @@
 /**
- * Copies test components into components/ so the demo page can fetch them.
+ * Copies test components into components/ so the demo page can fetch them, and builds each
+ * with debug info too, into components/debug/, for the page's `?debug`. That takes a while the
+ * first time. `--no-build` copies only what was built already, as CI has it from another job,
+ * and `--list` names the guests.
  *
  * Prerequisites:
  *   cargo build -p test-components
@@ -11,7 +14,7 @@
  */
 
 import { execSync } from 'node:child_process';
-import { copyFileSync, existsSync, mkdirSync, readdirSync, statSync } from 'node:fs';
+import { copyFileSync, mkdirSync, readdirSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -47,6 +50,12 @@ const GUESTS = [
   'busy-loop',
   'line-walk',
 ];
+
+// For CI to build these with debug info, in a job of its own.
+if (process.argv.includes('--list')) {
+  console.log(GUESTS.join(','));
+  process.exit(0);
+}
 
 // Resolve the cargo target directory via `cargo metadata`.
 let targetDir;
@@ -92,26 +101,34 @@ function findNewest(root, test) {
   return best.path || null;
 }
 
-mkdirSync('components', { recursive: true });
+const build = !process.argv.includes('--no-build');
+if (build) {
+  console.log('Building the guests with debug info...');
+  execSync('cargo build -p test-components', {
+    stdio: 'inherit',
+    env: { ...process.env, WITGRAPH_DEBUG_GUESTS: GUESTS.join(',') },
+  });
+}
 
-for (const guest of GUESTS) {
+/** Copies the newest build of `file` to `dst`. */
+function copyNewest(file, dst) {
   const buildDir = join(targetDir, 'debug', 'build');
-  const pattern = new RegExp(`test-components-[^/\\\\]+[/\\\\]out[/\\\\]${guest}\\.wasm$`);
+  const escaped = file.replaceAll('.', '\\.');
+  const pattern = new RegExp(`test-components-[^/\\\\]+[/\\\\]out[/\\\\]${escaped}$`);
   const src = findNewest(buildDir, (p) => pattern.test(p));
   if (!src) {
-    console.error(`error: ${guest}.wasm not found in ${buildDir}`);
+    console.error(`error: ${file} not found in ${buildDir}`);
     console.error('       build the guests first:  cargo build -p test-components');
     process.exit(1);
   }
-  const dst = join('components', `${guest}.wasm`);
   copyFileSync(src, dst);
   console.log(`Copied ${src}`);
   console.log(`  -> ${dst}`);
 }
 
-const loaderWasm = join('..', 'witgraph-loader', 'pkg', 'witgraph_web_bg.wasm');
-if (!existsSync(loaderWasm)) {
-  console.log('');
-  console.log(`warning: ${loaderWasm} not found`);
-  console.log('         build it:  cd ../witgraph-loader && pnpm build:wasm');
+mkdirSync(join('components', 'debug'), { recursive: true });
+
+for (const guest of GUESTS) {
+  copyNewest(`${guest}.wasm`, join('components', `${guest}.wasm`));
+  copyNewest(`${guest}.debug.wasm`, join('components', 'debug', `${guest}.wasm`));
 }

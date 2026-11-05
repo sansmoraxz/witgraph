@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::{env, fs};
 
@@ -57,6 +57,9 @@ const GUESTS: [&str; 48] = [
 /// to step to.
 const WITH_DEBUG_INFO: [&str; 1] = ["line-walk"];
 
+/// Names guests, comma-separated, to build with debug info too, as `{name}.debug.wasm`.
+const DEBUG_GUESTS: &str = "WITGRAPH_DEBUG_GUESTS";
+
 /// The doc comment of the first world in `wit`, as the text WIT gives it.
 fn world_docs(wit: &str) -> Option<String> {
     let lines: Vec<&str> = wit.lines().map(str::trim).collect();
@@ -109,72 +112,96 @@ fn main() {
     println!("cargo::rerun-if-changed=guests/Cargo.toml");
     println!("cargo::rerun-if-changed=guests/Cargo.lock");
 
-    for name in GUESTS {
-        let crate_dir = guest_dir.join(name);
+    // What a demo asks for as well, of each guest: a build with debug info, which takes a
+    // while and is big, so nothing else pays for it.
+    println!("cargo::rerun-if-env-changed={DEBUG_GUESTS}");
+    let debug_guests = env::var(DEBUG_GUESTS).unwrap_or_default();
+    let debug_guests: Vec<&str> = debug_guests
+        .split(',')
+        .filter(|name| !name.is_empty())
+        .collect();
+    let debug_dir = target_dir.join("with-debug-info");
 
+    for name in GUESTS {
         // Directories are scanned recursively, so `wit/deps` is covered.
         println!("cargo::rerun-if-changed=guests/{name}/src");
         println!("cargo::rerun-if-changed=guests/{name}/wit");
         println!("cargo::rerun-if-changed=guests/{name}/Cargo.toml");
 
-        let status = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
-            .args(["build", "--release", "--target", "wasm32-unknown-unknown"])
-            .arg("--manifest-path")
-            .arg(crate_dir.join("Cargo.toml"))
-            // Pinned, because the wasm is read from there below: an inherited
-            // `CARGO_TARGET_DIR` would send the build elsewhere.
-            .arg("--target-dir")
-            .arg(&target_dir)
-            // The outer build's flags target the host, not the guest.
-            .env_remove("RUSTFLAGS")
-            .env_remove("CARGO_ENCODED_RUSTFLAGS")
-            .envs(
-                WITH_DEBUG_INFO
-                    .contains(&name)
-                    .then_some([
-                        ("CARGO_PROFILE_RELEASE_DEBUG", "true"),
-                        ("CARGO_PROFILE_RELEASE_STRIP", "false"),
-                        ("CARGO_PROFILE_RELEASE_OPT_LEVEL", "0"),
-                        ("CARGO_PROFILE_RELEASE_LTO", "false"),
-                    ])
-                    .into_iter()
-                    .flatten(),
-            )
-            .status()
-            .unwrap_or_else(|e| panic!("failed to build {name} guest: {e}"));
-        assert!(status.success(), "cargo build failed for {name} guest");
-
-        let lib_name = format!("{}_guest", name.replace('-', "_"));
-        let core_wasm = target_dir
-            .join("wasm32-unknown-unknown/release")
-            .join(format!("{lib_name}.wasm"));
-        let module = fs::read(&core_wasm)
-            .unwrap_or_else(|e| panic!("failed to read {}: {e}", core_wasm.display()));
-
-        let component = wit_component::ComponentEncoder::default()
-            .validate(true)
-            .module(&module)
-            .unwrap_or_else(|e| panic!("failed to encode {name} module: {e:#}"))
-            .encode()
-            .unwrap_or_else(|e| panic!("failed to produce {name} component: {e:#}"));
-
-        // A component's bytes keep no doc comments: the world's go in the
-        // `witgraph-docs` section, for an editor to describe the node by.
-        let wit = fs::read_to_string(crate_dir.join("wit/world.wit"))
-            .unwrap_or_else(|e| panic!("failed to read the WIT of {name}: {e}"));
-        let component = match world_docs(&wit) {
-            Some(docs) => with_section(component, "witgraph-docs", docs.as_bytes()),
-            None => component,
-        };
-
+        let debug = WITH_DEBUG_INFO.contains(&name);
+        let component = build_guest(name, &guest_dir, &target_dir, debug);
         let wasm_dst = out_dir.join(format!("{name}.wasm"));
         fs::write(&wasm_dst, &component)
             .unwrap_or_else(|e| panic!("failed to write {}: {e}", wasm_dst.display()));
+
+        if debug_guests.contains(&name) {
+            let component = if debug {
+                component
+            } else {
+                build_guest(name, &guest_dir, &debug_dir, true)
+            };
+            let debug_dst = out_dir.join(format!("{name}.debug.wasm"));
+            fs::write(&debug_dst, &component)
+                .unwrap_or_else(|e| panic!("failed to write {}: {e}", debug_dst.display()));
+        }
 
         println!(
             "cargo::rustc-env={}_WASM={}",
             name.replace('-', "_").to_uppercase(),
             wasm_dst.display()
         );
+    }
+}
+
+/// Builds a guest in `target_dir`, with debug info and no optimizing if `debug`, as a component.
+fn build_guest(name: &str, guest_dir: &Path, target_dir: &Path, debug: bool) -> Vec<u8> {
+    let crate_dir = guest_dir.join(name);
+    let status = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+        .args(["build", "--release", "--target", "wasm32-unknown-unknown"])
+        .arg("--manifest-path")
+        .arg(crate_dir.join("Cargo.toml"))
+        // Pinned, because the wasm is read from there below: an inherited
+        // `CARGO_TARGET_DIR` would send the build elsewhere.
+        .arg("--target-dir")
+        .arg(target_dir)
+        // The outer build's flags target the host, not the guest.
+        .env_remove("RUSTFLAGS")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .envs(
+            debug
+                .then_some([
+                    ("CARGO_PROFILE_RELEASE_DEBUG", "true"),
+                    ("CARGO_PROFILE_RELEASE_STRIP", "false"),
+                    ("CARGO_PROFILE_RELEASE_OPT_LEVEL", "0"),
+                    ("CARGO_PROFILE_RELEASE_LTO", "false"),
+                ])
+                .into_iter()
+                .flatten(),
+        )
+        .status()
+        .unwrap_or_else(|e| panic!("failed to build {name} guest: {e}"));
+    assert!(status.success(), "cargo build failed for {name} guest");
+
+    let lib_name = format!("{}_guest", name.replace('-', "_"));
+    let core_wasm = target_dir
+        .join("wasm32-unknown-unknown/release")
+        .join(format!("{lib_name}.wasm"));
+    let module = fs::read(&core_wasm)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", core_wasm.display()));
+
+    let component = wit_component::ComponentEncoder::default()
+        .validate(true)
+        .module(&module)
+        .unwrap_or_else(|e| panic!("failed to encode {name} module: {e:#}"))
+        .encode()
+        .unwrap_or_else(|e| panic!("failed to produce {name} component: {e:#}"));
+
+    // A component's bytes keep no doc comments: the world's go in the
+    // `witgraph-docs` section, for an editor to describe the node by.
+    let wit = fs::read_to_string(crate_dir.join("wit/world.wit"))
+        .unwrap_or_else(|e| panic!("failed to read the WIT of {name}: {e}"));
+    match world_docs(&wit) {
+        Some(docs) => with_section(component, "witgraph-docs", docs.as_bytes()),
+        None => component,
     }
 }
