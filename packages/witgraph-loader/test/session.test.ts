@@ -2323,7 +2323,8 @@ test('a session says what compiling warned of its graph', async () => {
   assert.deepEqual(warning.location, { kind: 'port', nodes: ['fed'], port: 'in' });
 });
 
-test('a stream group holds its claims until its guest work is over, not its runs', async () => {
+/** A stream group and a node that together claim 1.2 of a resource. */
+async function groupBesideANode(capacity?: number): Promise<void> {
   // `drain`'s `run` returns before its stream ends, so all of them have returned long
   // before the producer has written everything: `u`, wanting the same resource, waits.
   const burst = 2000;
@@ -2349,11 +2350,12 @@ test('a stream group holds its claims until its guest work is over, not its runs
     graph: {
       metadata: { name: 'test' },
       components: used.map((guest) => componentRef(ids[guest])),
+      ...(capacity === undefined ? {} : { resources: { gpu: { capacity } } }),
       nodes: [
-        node('prod', 'stream-producer', { gpu: { fraction: 0.6 } }),
+        node('prod', 'stream-producer', { gpu: { amount: 0.6 } }),
         node('pass', 'stream-relay'),
         node('drain', 'stream-drain'),
-        node('u', 'relay', { gpu: { fraction: 0.6 } }),
+        node('u', 'relay', { gpu: { amount: 0.6 } }),
       ],
       connections: [
         ends('a', 'prod.items', 'pass.items'),
@@ -2373,8 +2375,17 @@ test('a stream group holds its claims until its guest work is over, not its runs
   await session.graph.inject('prod', 'burst-size', burst);
   for (let tick = 0; tick < 200 && (await session.graph.tick()).result !== 'idle'; tick++);
   assert.equal(seen, burst * 2, 'every item, past each of its two connections');
-  assert.equal(seenWhenUStarted, burst * 2, '`u` waited for all of it');
+  if (capacity === undefined) assert.equal(seenWhenUStarted, burst * 2, '`u` waited for all of it');
+  else assert.ok((seenWhenUStarted ?? burst * 2) < burst * 2, 'there was room for `u` beside it');
   assert.equal(await session.graph.readOutput('u', 'out'), burst);
+}
+
+test('a stream group holds its claims until its guest work is over, not its runs', async () => {
+  await groupBesideANode();
+});
+
+test('a capacity with room for both lets a node start beside a stream group', async () => {
+  await groupBesideANode(1.2);
 });
 
 test('a node stays running until its stream group has drained', async () => {

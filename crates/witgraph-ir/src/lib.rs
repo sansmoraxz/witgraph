@@ -26,8 +26,8 @@ pub use compile::{
 pub use component::{Capability, ComponentContract};
 pub use diagnostics::{Diagnostic, Diagnostics, Location, Severity};
 pub use graph::{
-    Connection, Fraction, Graph, GraphBuilder, GraphMetadata, Link, Node, ResourceClaim,
-    UnknownNodeError,
+    Amount, Capacity, Connection, Graph, GraphBuilder, GraphMetadata, Link, Node, ResourceClaim,
+    ResourceDecl, UnknownNodeError,
 };
 pub use id::{
     ComponentRef, ConnectionId, LinkId, NodeId, PackageRef, ParseComponentRefError, PortName,

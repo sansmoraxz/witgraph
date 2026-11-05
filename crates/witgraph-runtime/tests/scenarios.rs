@@ -62,8 +62,8 @@ async fn load(scenario: &Value) -> RuntimeGraph<Trace> {
         let id = node["id"].as_str().unwrap();
         builder = builder.add_node(id, contract.id);
         if let Some(claims) = node["resources"].as_object() {
-            for (resource, fraction) in claims {
-                let claim = ResourceClaim::new(fraction.as_f64().unwrap()).unwrap();
+            for (resource, amount) in claims {
+                let claim = ResourceClaim::new(amount.as_f64().unwrap()).unwrap();
                 builder = builder.set_resource(id, resource.as_str(), claim).unwrap();
             }
         }

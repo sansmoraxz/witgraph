@@ -253,8 +253,8 @@ fn graph_of(plan: &Plan, kit: &Kit) -> Graph {
     for (id, kind) in &plan.nodes {
         builder = builder.add_node(id.as_str(), kit.refs[name_of(*kind)].clone());
     }
-    for (id, fraction) in &plan.claims {
-        let claim = ResourceClaim::new(*fraction).unwrap();
+    for (id, amount) in &plan.claims {
+        let claim = ResourceClaim::new(*amount).unwrap();
         builder = builder.set_resource(id.as_str(), "gpu", claim).unwrap();
     }
     for (at, (from, to)) in plan.connections.iter().enumerate() {
@@ -394,8 +394,8 @@ fn scenario(seed: u64, plan: &Plan, steps: &[Step]) -> serde_json::Value {
         .iter()
         .map(|(id, kind)| {
             let mut node = json!({ "id": id, "guest": guest(*kind) });
-            if let Some((_, fraction)) = plan.claims.iter().find(|(claimed, _)| claimed == id) {
-                node["resources"] = json!({ "gpu": fraction });
+            if let Some((_, amount)) = plan.claims.iter().find(|(claimed, _)| claimed == id) {
+                node["resources"] = json!({ "gpu": amount });
             }
             node
         })

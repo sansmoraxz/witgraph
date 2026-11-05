@@ -1108,7 +1108,7 @@ fn claims_of<'g>(
     let mut claims: BTreeMap<&ResourceId, f64> = BTreeMap::new();
     for node in members.filter_map(|m| nodes.get(m)) {
         for (resource, claim) in &node.resources {
-            *claims.entry(resource).or_insert(0.0) += claim.fraction.get();
+            *claims.entry(resource).or_insert(0.0) += claim.amount.get();
         }
     }
     claims
@@ -1190,7 +1190,7 @@ fn check_group_start(
 /// what they wait for, together, as each can fit alone while all of them leave none of
 /// them room. Others drain by themselves, so they only delay it.
 fn check_group_claims(graph: &Graph, groups: &StreamGroups, diagnostics: &mut Diagnostics) {
-    // Tolerates float rounding in sums of fractions such as 0.1 + 0.2.
+    // Tolerates float rounding in sums of claims such as 0.1 + 0.2.
     const EPSILON: f64 = 1e-9;
     let mut nodes: HashMap<&NodeId, &Node> = HashMap::new();
     for node in &graph.nodes {
@@ -1201,11 +1201,29 @@ fn check_group_claims(graph: &Graph, groups: &StreamGroups, diagnostics: &mut Di
             &nodes,
             members.iter().filter_map(|m| nodes.get(m).map(|n| &n.id)),
         );
-        for (resource, _) in claims.into_iter().filter(|(_, sum)| *sum > 1.0 + EPSILON) {
+        for (resource, _) in claims
+            .into_iter()
+            .filter(|(resource, sum)| *sum > graph.capacity_of(resource) + EPSILON)
+        {
             diagnostics.push(Diagnostic::GroupOverclaims {
                 nodes: members.clone(),
                 resource: resource.clone(),
             });
+        }
+    }
+    // A group's are summed above; a node by itself can still claim more than there is.
+    for node in graph
+        .nodes
+        .iter()
+        .filter(|node| !groups.in_group.contains_key(&node.id))
+    {
+        for (resource, claim) in &node.resources {
+            if claim.amount.get() > graph.capacity_of(resource) + EPSILON {
+                diagnostics.push(Diagnostic::NodeOverclaims {
+                    node: node.id.clone(),
+                    resource: resource.clone(),
+                });
+            }
         }
     }
     // Joined by what must return before what.
@@ -1230,7 +1248,10 @@ fn check_group_claims(graph: &Graph, groups: &StreamGroups, diagnostics: &mut Di
             &nodes,
             members().filter_map(|m| nodes.get(m).map(|n| &n.id)),
         );
-        for (resource, _) in claims.into_iter().filter(|(_, sum)| *sum > 1.0 + EPSILON) {
+        for (resource, _) in claims
+            .into_iter()
+            .filter(|(resource, sum)| *sum > graph.capacity_of(resource) + EPSILON)
+        {
             let nodes: Vec<NodeId> = members().cloned().collect();
             let mut sorted = nodes.clone();
             sorted.sort();
@@ -1250,7 +1271,11 @@ fn check_group_claims(graph: &Graph, groups: &StreamGroups, diagnostics: &mut Di
         );
         // Over all of a resource it never starts, which is reported above; and a group
         // claiming nothing is in nobody's way.
-        if claims.is_empty() || claims.values().any(|sum| *sum > 1.0 + EPSILON) {
+        if claims.is_empty()
+            || claims
+                .iter()
+                .any(|(resource, sum)| *sum > graph.capacity_of(resource) + EPSILON)
+        {
             continue;
         }
         let above = above_group(members, graph, groups);
@@ -1300,7 +1325,11 @@ fn check_group_claims(graph: &Graph, groups: &StreamGroups, diagnostics: &mut Di
             }
         }
         // Past what can be searched every set is taken to fit, so nothing is missed.
-        if holders.len() <= MOST_HOLDERS_SEARCHED && held.values().any(|sum| *sum > 1.0 + EPSILON) {
+        if holders.len() <= MOST_HOLDERS_SEARCHED
+            && held
+                .iter()
+                .any(|(resource, sum)| *sum > graph.capacity_of(resource) + EPSILON)
+        {
             continue;
         }
         let holds = |unit: usize| holding.iter().any(|at| holders[*at].group == unit);
@@ -1312,7 +1341,7 @@ fn check_group_claims(graph: &Graph, groups: &StreamGroups, diagnostics: &mut Di
             for wait in holder.waits.iter().filter(|wait| !holds(wait.unit)) {
                 for (resource, claim) in &wait.claims {
                     let beside = held.get(resource).copied().unwrap_or(0.0);
-                    if beside + claim > 1.0 + EPSILON && beside > 0.0 {
+                    if beside + claim > graph.capacity_of(resource) + EPSILON && beside > 0.0 {
                         this_one = true;
                         let nodes = blocked.entry(*resource).or_default();
                         for node in wait.nodes {
@@ -1653,7 +1682,7 @@ mod tests {
     use super::*;
     use crate::Type;
     use crate::component::Capability;
-    use crate::graph::{GraphBuilder, ResourceClaim};
+    use crate::graph::{Capacity, GraphBuilder, ResourceClaim, ResourceDecl};
     use crate::id::ComponentRef;
     use crate::port::PortKind;
 
@@ -1702,6 +1731,13 @@ mod tests {
             self.builder = self
                 .builder
                 .link(id, node, import, cref("provider"), "demo:caps/clock");
+            self
+        }
+
+        fn set_capacity(mut self, resource: &str, capacity: f64) -> Self {
+            self.builder = self
+                .builder
+                .set_capacity(resource, Capacity::new(capacity).unwrap());
             self
         }
 
@@ -2622,7 +2658,7 @@ mod tests {
     /// Two stream groups, each a head and a tail, whose heads feed a node of its own that
     /// feeds back to the tail, so each group holds its claims while that waits to run.
     fn two_groups_each_needing_a_node(group: f64, needed: f64) -> TestGraph {
-        let claim = |fraction| ResourceClaim::new(fraction).unwrap();
+        let claim = |amount| ResourceClaim::new(amount).unwrap();
         let mut graph = builder("t")
             .add_component(contract(
                 "head",
@@ -2697,7 +2733,7 @@ mod tests {
     /// value from `a`; and `g`-`h`, which `e` is above too. `e`'s group can start only
     /// after `a`'s has, so being above `a` and `g` does not put it before them.
     fn a_group_above_others_yet_after_one(gh: f64) -> TestGraph {
-        let claim = |fraction| ResourceClaim::new(fraction).unwrap();
+        let claim = |amount| ResourceClaim::new(amount).unwrap();
         builder("t")
             .add_component(contract(
                 "head",
@@ -2741,7 +2777,7 @@ mod tests {
     /// A group `a`-`b` that needs `u`, which is below `a` and above `b`, to reach its
     /// reader; and groups beside it that wait for nothing, each with the claim given.
     fn a_group_needing_a_node_beside(others: &[f64]) -> TestGraph {
-        let claim = |fraction| ResourceClaim::new(fraction).unwrap();
+        let claim = |amount| ResourceClaim::new(amount).unwrap();
         let mut graph = builder("t")
             .add_component(contract(
                 "head",
@@ -2772,7 +2808,7 @@ mod tests {
             .connect("ub", PortRef::new("u", "out"), PortRef::new("b", "in"))
             .set_resource("u", "gpu", claim(0.2))
             .unwrap();
-        for (at, fraction) in others.iter().enumerate() {
+        for (at, amount) in others.iter().enumerate() {
             let (head, tail) = (format!("c{at}"), format!("d{at}"));
             graph = graph
                 .add_node(head.as_str(), cref("head"))
@@ -2782,10 +2818,109 @@ mod tests {
                     PortRef::new(head.as_str(), "st"),
                     PortRef::new(tail.as_str(), "st"),
                 )
-                .set_resource(head.as_str(), "gpu", claim(*fraction))
+                .set_resource(head.as_str(), "gpu", claim(*amount))
                 .unwrap();
         }
         graph.build()
+    }
+
+    #[test]
+    fn a_capacity_makes_room_for_what_sits_between_members() {
+        let graph = |capacity: Option<f64>| {
+            group_and_a_claiming_node(false, |graph| {
+                let graph = u_feeds_b(graph).connect(
+                    "au",
+                    PortRef::new("a", "out"),
+                    PortRef::new("u", "in"),
+                );
+                match capacity {
+                    Some(capacity) => graph.set_capacity("gpu", capacity),
+                    None => graph,
+                }
+            })
+        };
+        assert!(
+            graph(None).compile().is_err(),
+            "0.6 and 0.6 do not fit in 1.0"
+        );
+        assert!(graph(Some(1.0)).compile().is_err(), "the same, said");
+        assert!(graph(Some(1.2)).compile().is_ok(), "they fit exactly");
+    }
+
+    #[test]
+    fn a_group_can_claim_up_to_a_capacity() {
+        let graph = |capacity: f64| {
+            group_and_a_claiming_node(false, |graph| graph.set_capacity("gpu", capacity))
+        };
+        // Its one claim of 0.6, and `u`'s beside it.
+        assert!(graph(0.6).compile().is_ok(), "they take turns");
+        assert_eq!(
+            diags(graph(0.5).compile()),
+            vec![
+                Diagnostic::GroupOverclaims {
+                    nodes: vec!["a".into(), "b".into()],
+                    resource: "gpu".into(),
+                },
+                Diagnostic::NodeOverclaims {
+                    node: "u".into(),
+                    resource: "gpu".into(),
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn a_node_cannot_claim_more_than_a_resource_has() {
+        let graph = |capacity: f64, amount: f64| {
+            builder("t")
+                .add_component(contract("n", vec![], vec![port("o", PortKind::Value)], &[]))
+                .add_node("a", cref("n"))
+                .set_resource("a", "gpu", ResourceClaim::new(amount).unwrap())
+                .unwrap()
+                .set_capacity("gpu", capacity)
+                .build()
+        };
+        assert_eq!(
+            diags(graph(0.5, 0.8).compile()),
+            vec![Diagnostic::NodeOverclaims {
+                node: "a".into(),
+                resource: "gpu".into(),
+            }],
+        );
+        assert!(graph(0.8, 0.8).compile().is_ok());
+        assert!(graph(2.0, 2.0).compile().is_ok(), "both of two");
+    }
+
+    #[test]
+    fn groups_waiting_on_each_other_are_measured_against_a_capacity() {
+        assert!(two_groups_each_needing_a_node(0.6, 0.6).compile().is_err());
+        let mut fits = two_groups_each_needing_a_node(0.6, 0.6);
+        fits.graph.resources.insert(
+            "gpu".into(),
+            ResourceDecl {
+                capacity: Capacity::new(1.8).unwrap(),
+            },
+        );
+        fits.compile()
+            .expect("each group and its node fit beside the other group");
+        // Claiming more than the default is no reason to leave a group out of the search.
+        let mut large = two_groups_each_needing_a_node(1.2, 1.0);
+        large.graph.resources.insert(
+            "gpu".into(),
+            ResourceDecl {
+                capacity: Capacity::new(2.0).unwrap(),
+            },
+        );
+        assert!(large.compile().is_err(), "1.2 and 1.0 do not fit in 2.0");
+    }
+
+    #[test]
+    fn a_capacity_is_positive_and_finite() {
+        assert!(Capacity::new(2.0).is_ok());
+        assert_eq!(Capacity::default().get(), 1.0);
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert!(Capacity::new(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]
@@ -2854,10 +2989,10 @@ mod tests {
 
     /// `{a, b}` and `{c, d}`, joined by `a -> c`, `a -> d` and `d -> b`: `b`
     /// waits for `d`, whose group may not fit while the other holds its claim.
-    #[test]
-    fn groups_waiting_on_each_other_must_fit_their_claims_together() {
+    /// Two stream groups, claiming 0.6 each, each of which waits on the other to finish.
+    fn groups_waiting_on_each_other() -> TestBuilder {
         let claim = || ResourceClaim::new(0.6).unwrap();
-        let graph = builder("t")
+        builder("t")
             .add_component(contract(
                 "head",
                 vec![port("in", PortKind::Value).optional()],
@@ -2886,7 +3021,11 @@ mod tests {
             .unwrap()
             .set_resource("c", "gpu", claim())
             .unwrap()
-            .build();
+    }
+
+    #[test]
+    fn groups_waiting_on_each_other_must_fit_their_claims_together() {
+        let graph = groups_waiting_on_each_other().build();
         let diagnostics = diags(graph.compile());
         assert_eq!(
             diagnostics,
@@ -2895,6 +3034,14 @@ mod tests {
                 resource: "gpu".into(),
             }]
         );
+    }
+
+    #[test]
+    fn a_capacity_makes_room_for_groups_waiting_on_each_other() {
+        let graph = groups_waiting_on_each_other()
+            .set_capacity("gpu", 1.2)
+            .build();
+        graph.compile().expect("0.6 and 0.6 fit in 1.2");
     }
 
     #[test]
@@ -4132,21 +4279,21 @@ mod tests {
 
     #[test]
     fn resource_budget_valid() {
-        use crate::graph::Fraction;
-        assert!(Fraction::new(0.5).is_ok());
-        assert!(Fraction::new(1.0).is_ok());
-        assert!(Fraction::new(0.001).is_ok());
+        use crate::graph::Amount;
+        assert!(Amount::new(0.5).is_ok());
+        assert!(Amount::new(1.0).is_ok());
+        assert!(Amount::new(0.001).is_ok());
+        assert!(Amount::new(1.5).is_ok(), "of a resource with that much");
     }
 
     #[test]
-    fn resource_budget_invalid_rejected_by_fraction() {
-        use crate::graph::Fraction;
-        assert!(Fraction::new(0.0).is_err());
-        assert!(Fraction::new(-0.1).is_err());
-        assert!(Fraction::new(1.5).is_err());
-        assert!(Fraction::new(f64::NAN).is_err());
-        assert!(Fraction::new(f64::INFINITY).is_err());
-        assert!(Fraction::new(f64::NEG_INFINITY).is_err());
+    fn resource_budget_invalid_rejected_by_amount() {
+        use crate::graph::Amount;
+        assert!(Amount::new(0.0).is_err());
+        assert!(Amount::new(-0.1).is_err());
+        assert!(Amount::new(f64::NAN).is_err());
+        assert!(Amount::new(f64::INFINITY).is_err());
+        assert!(Amount::new(f64::NEG_INFINITY).is_err());
     }
 
     #[test]

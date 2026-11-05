@@ -362,12 +362,24 @@ pub enum Diagnostic {
     #[diagnostic(
         code(witgraph::ir::group_overclaims),
         help(
-            "lower the claims, or split the group: its nodes share a stream or future connection"
+            "lower the claims, raise the resource's capacity, or split the group: its nodes share a stream or future connection"
         )
     )]
     GroupOverclaims {
         /// The group's members, in topological order.
         nodes: Vec<NodeId>,
+        /// The overclaimed resource.
+        resource: ResourceId,
+    },
+    /// A node that claims more of a resource than there is, so it could never start.
+    #[error("node `{node}` claims more than all of resource `{resource}`")]
+    #[diagnostic(
+        code(witgraph::ir::node_overclaims),
+        help("lower its claim, or raise the resource's capacity")
+    )]
+    NodeOverclaims {
+        /// The node.
+        node: NodeId,
         /// The overclaimed resource.
         resource: ResourceId,
     },
@@ -453,6 +465,7 @@ impl Diagnostic {
             Diagnostic::UnknownComponent { node, .. } => Location::Node(node.clone()),
             Diagnostic::AmbiguousComponent { nodes, .. } => Location::Nodes(nodes.clone()),
             Diagnostic::DuplicateNodeId(node) => Location::Node(node.clone()),
+            Diagnostic::NodeOverclaims { node, .. } => Location::Node(node.clone()),
             Diagnostic::DuplicateConnectionId(conn)
             | Diagnostic::DuplicateConnection { second: conn, .. }
             | Diagnostic::UnknownNode { conn, .. }

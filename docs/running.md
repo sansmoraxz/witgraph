@@ -273,12 +273,26 @@ does nothing, unless it was written through a typed port, which can't be compare
 one tick may do. The defaults are generous. All values share the hub's one 32-bit
 memory, so a graph holds at most 4 GiB of them, and that memory never shrinks.
 
-Nodes can also claim a fraction of a named resource. A node holds its claims while
+Nodes can also claim an amount of a named resource. A node holds its claims while
 it runs, and a stream group holds its members' from when it starts until it has
-drained. The scheduler won't start what doesn't fit. Compiling rejects a group
-claiming more than all of a resource, groups that wait on each other whose claims
-can't fit together, and a group whose claims leave no room for a node only some of
-its members wait on, since they would deadlock.
+drained. The scheduler won't start what doesn't fit, so a resource's capacity is how
+much can be held at once. It is 1 unless the graph declares otherwise:
+
+```json
+{
+  "resources": { "gpu": { "capacity": 2 } },
+  "nodes": [
+    { "id": "edges", "component": { "...": "..." }, "resources": { "gpu": { "amount": 1 } } }
+  ]
+}
+```
+
+`GraphBuilder::set_capacity` and `set_resource` say the same. Claims decide what runs
+at the same time and nothing else: names mean nothing to witgraph, and a node can use
+more of the real thing than it claims. Compiling rejects a node or group claiming more
+than all of a resource, groups that wait on each other whose claims can't fit
+together, and a group whose claims leave no room for a node only some of its members
+wait on, since they would deadlock.
 
 ## Snapshots
 

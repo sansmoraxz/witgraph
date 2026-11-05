@@ -6,7 +6,7 @@ What a graph should do, written once and run on both hosts: by
 between the hosts fails on one of them.
 
 A scenario is `nodes` (an `id`, a `guest`, as `test-components` names it, and perhaps
-`resources`, each a fraction claimed),
+`resources`, each an amount claimed),
 `connections` (`from` and `to` as `node.port`, and `feedback`), and `steps`, each of
 which `do`es one of these:
 

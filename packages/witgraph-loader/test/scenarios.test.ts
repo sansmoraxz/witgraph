@@ -80,7 +80,7 @@ async function load(scenario: Scenario): Promise<Session> {
       ...(resources
         ? {
             resources: Object.fromEntries(
-              Object.entries(resources).map(([name, fraction]) => [name, { fraction }]),
+              Object.entries(resources).map(([name, amount]) => [name, { amount }]),
             ),
           }
         : {}),

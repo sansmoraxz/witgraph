@@ -93,6 +93,11 @@ impl Scripted {
 /// `p -> r` over a stream, `v` on its own, and `gpu` claims of `p` and `v` that
 /// do not fit together.
 fn stream_group(claims: bool) -> (SchedulerCore<Scripted>, Scripted) {
+    stream_group_with(claims, None)
+}
+
+/// The same, with a capacity declared for the resource they claim.
+fn stream_group_with(claims: bool, capacity: Option<f64>) -> (SchedulerCore<Scripted>, Scripted) {
     let contract = |world: &str, inputs, outputs| ComponentContract {
         id: ComponentRef {
             content_hash: Some("cc".into()),
@@ -131,6 +136,9 @@ fn stream_group(claims: bool) -> (SchedulerCore<Scripted>, Scripted) {
             .set_resource("v", "gpu", claim())
             .unwrap();
     }
+    if let Some(capacity) = capacity {
+        builder = builder.set_capacity("gpu", witgraph_ir::Capacity::new(capacity).unwrap());
+    }
     let compiled = builder.build().compile(&contracts).unwrap();
     let plane = Scripted::default();
     let core = SchedulerCore::new(compiled, Arc::new(Perf), 100, |_, _| plane.clone()).unwrap();
@@ -144,6 +152,17 @@ fn index(core: &SchedulerCore<Scripted>, node: &str) -> NodeIdx {
 /// Polls a tick once, and drops it.
 fn poll_tick(core: &mut SchedulerCore<dyn DataPlane>) -> Option<TickResult> {
     core.tick().now_or_never()
+}
+
+/// What does not fit at the default capacity starts beside it at a larger one.
+#[test]
+fn a_capacity_lets_a_node_start_beside_a_group() {
+    let (mut core, plane) = stream_group_with(true, Some(1.2));
+    let (p, v) = (index(&core, "p"), index(&core, "v"));
+    assert!(poll_tick(&mut core).is_none());
+    let started = plane.commands();
+    assert!(started.contains(&Command::Run(p)), "{started:?}");
+    assert!(started.contains(&Command::Run(v)), "{started:?}");
 }
 
 /// A report the dropped tick never got to is handled before anything else.

@@ -6,16 +6,21 @@
 use std::collections::BTreeMap;
 
 use arbitrary::{Result, Unstructured};
-use witgraph_ir::{Connection, Graph, GraphMetadata, Node, PortRef, ResourceClaim};
+use witgraph_ir::{
+    Capacity, Connection, Graph, GraphMetadata, Node, PortRef, ResourceClaim, ResourceDecl,
+};
 
 use crate::catalog::{COMPONENTS, Component};
 
 const MAX_NODES: usize = 12;
 
 /// The claims nodes make, in thousandths, so the rules can add them exactly.
-const CLAIMS: [u32; 7] = [100, 200, 250, 300, 500, 700, 1000];
+const CLAIMS: [u32; 9] = [100, 200, 250, 300, 500, 700, 1000, 1500, 2000];
 
 const RESOURCES: [&str; 2] = ["gpu", "disk"];
+
+/// In thousandths, as claims are.
+const CAPACITIES: [u32; 5] = [500, 1000, 1500, 2000, 4000];
 
 /// Port names to get wrong with, which include those of other kinds of node.
 const PORT_NAMES: [&str; 8] = ["in", "out", "items", "add", "tensor", "done", "sum", "nope"];
@@ -88,7 +93,7 @@ pub fn graph(u: &mut Unstructured<'_>) -> Result<Graph> {
         if u.ratio(1, 3)? {
             let thousandths = *pick(u, &CLAIMS)?;
             let claim = ResourceClaim::new(f64::from(thousandths) / 1000.0)
-                .expect("every claim here is a fraction");
+                .expect("every claim here is an amount");
             resources.insert((*pick(u, &RESOURCES)?).into(), claim);
         }
         nodes.push(Node {
@@ -121,7 +126,18 @@ pub fn graph(u: &mut Unstructured<'_>) -> Result<Graph> {
         nodes,
         connections: vec![],
         links: vec![],
+        resources: BTreeMap::new(),
     };
+    // Mostly what a resource has by default, but with less and with more too.
+    for resource in RESOURCES {
+        if u.ratio(1, 4)? {
+            let capacity = f64::from(*pick(u, &CAPACITIES)?) / 1000.0;
+            let capacity = Capacity::new(capacity).expect("every one here is a capacity");
+            graph
+                .resources
+                .insert(resource.into(), ResourceDecl { capacity });
+        }
+    }
     damage(u, &mut connections, &mut graph, count)?;
     graph.connections = connections;
     graph.components = components;

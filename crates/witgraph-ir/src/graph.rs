@@ -11,19 +11,17 @@ use std::collections::BTreeMap;
 
 use crate::id::{ComponentRef, ConnectionId, LinkId, NodeId, PortRef, ResourceId};
 
-/// A validated fraction in `(0.0, 1.0]`, representing the share of a
-/// named resource pool a node consumes while active.
+/// How much of a named resource a node claims while active: positive and finite.
 ///
 /// Construction validates the invariant; invalid values cannot exist.
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
-pub struct Fraction(f64);
+pub struct Amount(f64);
 
-impl Fraction {
-    /// Creates a fraction, returning an error if the value is outside
-    /// `(0.0, 1.0]` or is NaN/Infinity.
+impl Amount {
+    /// Creates an amount, returning an error if the value is not above 0.0 and finite.
     pub fn new(value: f64) -> Result<Self, String> {
-        if !(value > 0.0 && value <= 1.0) {
-            return Err(format!("fraction {value} is outside (0.0, 1.0]"));
+        if !(value > 0.0 && value.is_finite()) {
+            return Err(format!("amount {value} is not above 0.0 and finite"));
         }
         Ok(Self(value))
     }
@@ -34,48 +32,100 @@ impl Fraction {
     }
 }
 
-impl core::fmt::Display for Fraction {
+impl core::fmt::Display for Amount {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "{}", self.0)
     }
 }
 
 #[cfg(feature = "serde")]
-impl serde::Serialize for Fraction {
+impl serde::Serialize for Amount {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.0.serialize(serializer)
     }
 }
 
 #[cfg(feature = "serde")]
-impl<'de> serde::Deserialize<'de> for Fraction {
+impl<'de> serde::Deserialize<'de> for Amount {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let value = f64::deserialize(deserializer)?;
-        Fraction::new(value).map_err(serde::de::Error::custom)
+        Amount::new(value).map_err(serde::de::Error::custom)
     }
 }
 
-/// A fractional claim on a named shared resource.
+/// How much of a named resource there is: positive and finite.
 ///
-/// Each named resource pool has an implicit capacity of 1.0. The fraction
-/// is validated when the claim is constructed (or deserialized). The
-/// runtime holds a node's claims for as long as its `run` takes, and a stream
-/// group's together from its first start until it has drained, and defers a
-/// start while the sum of held claims on any resource would exceed 1.0. A group
-/// whose own claims exceed 1.0 is rejected when the graph is compiled.
+/// Construction validates the invariant; invalid values cannot exist.
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+pub struct Capacity(f64);
+
+impl Capacity {
+    /// Creates a capacity, returning an error if the value is not above 0.0 and finite.
+    pub fn new(value: f64) -> Result<Self, String> {
+        if !(value > 0.0 && value.is_finite()) {
+            return Err(format!("capacity {value} is not above 0.0 and finite"));
+        }
+        Ok(Self(value))
+    }
+
+    /// Returns the inner `f64`.
+    pub fn get(self) -> f64 {
+        self.0
+    }
+}
+
+impl Default for Capacity {
+    /// What a resource has that the graph does not declare.
+    fn default() -> Self {
+        Self(1.0)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for Capacity {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize(serializer)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for Capacity {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = f64::deserialize(deserializer)?;
+        Capacity::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// What a graph says of a named resource it declares.
+#[derive(Debug, Clone, PartialEq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
+pub struct ResourceDecl {
+    /// How much of it there is, to claim at once.
+    pub capacity: Capacity,
+}
+
+/// A claim on a named shared resource.
+///
+/// A resource has a capacity of 1.0 unless the graph declares otherwise
+/// ([`Graph::resources`]), and an amount is in the same units: with a capacity of 2.0, a claim
+/// of 1.0 is half of it. The runtime holds a node's claims for as long as its `run` takes, and
+/// a stream group's together from its first start until it has drained, and does not start
+/// what would take the sum of held claims on any resource over its capacity. A node or group
+/// whose own claims exceed it is rejected when the graph is compiled.
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
 pub struct ResourceClaim {
-    /// Fraction of the resource consumed while running.
-    pub fraction: Fraction,
+    /// How much of the resource it holds while running.
+    pub amount: Amount,
 }
 
 impl ResourceClaim {
-    /// A claim on `fraction` of a resource, which must be in `(0.0, 1.0]`.
-    pub fn new(fraction: f64) -> Result<Self, String> {
+    /// A claim on `amount` of a resource, which must be above 0.0 and finite.
+    pub fn new(amount: f64) -> Result<Self, String> {
         Ok(Self {
-            fraction: Fraction::new(fraction)?,
+            amount: Amount::new(amount)?,
         })
     }
 }
@@ -211,9 +261,24 @@ pub struct Graph {
         serde(default, skip_serializing_if = "Vec::is_empty")
     )]
     pub links: Vec<Link>,
+    /// How much there is of the named resources nodes claim. One not here has a capacity of 1.0.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "BTreeMap::is_empty")
+    )]
+    pub resources: BTreeMap<ResourceId, ResourceDecl>,
 }
 
 impl Graph {
+    /// How much there is of `resource`.
+    #[must_use]
+    pub fn capacity_of(&self, resource: &ResourceId) -> f64 {
+        self.resources
+            .get(resource)
+            .map_or(Capacity::default(), |declared| declared.capacity)
+            .get()
+    }
+
     /// Starts a [`GraphBuilder`] for a graph with the given name.
     pub fn builder(name: impl Into<String>) -> GraphBuilder {
         GraphBuilder {
@@ -267,7 +332,15 @@ impl GraphBuilder {
         self
     }
 
-    /// Declares that the named node consumes `claim.fraction` of the
+    /// Says how much there is of a named resource, to claim at once.
+    pub fn set_capacity(mut self, resource: impl Into<ResourceId>, capacity: Capacity) -> Self {
+        self.graph
+            .resources
+            .insert(resource.into(), ResourceDecl { capacity });
+        self
+    }
+
+    /// Declares that the named node consumes `claim.amount` of the
     /// shared resource `resource` while active. Overwrites any previous
     /// claim on the same resource for the same node. Fails, handing the
     /// builder back, when no node has that id yet.
@@ -483,5 +556,28 @@ mod tests {
         )
         .unwrap();
         assert!(!conn.feedback);
+    }
+
+    #[test]
+    fn capacities_are_read_from_a_graph_and_left_out_when_none_are_declared() {
+        let graph = |resources: &str| {
+            serde_json::from_str::<Graph>(&format!(
+                r#"{{"metadata":{{"name":"t"}},"components":[],"nodes":[],"connections":[],
+                    "resources":{resources}}}"#
+            ))
+        };
+        let read = graph(r#"{"gpu":{"capacity":2.0}}"#).unwrap();
+        assert_eq!(read.capacity_of(&"gpu".into()), 2.0);
+        assert_eq!(read.capacity_of(&"disk".into()), 1.0);
+        for bad in [
+            r#"{"gpu":{"capacity":0}}"#,
+            r#"{"gpu":{"capacity":-1}}"#,
+            r#"{"gpu":{}}"#,
+            r#"{"gpu":{"capacity":1,"other":1}}"#,
+        ] {
+            assert!(graph(bad).is_err(), "{bad}");
+        }
+        let empty = serde_json::to_value(Graph::default()).unwrap();
+        assert!(!empty.as_object().unwrap().contains_key("resources"));
     }
 }

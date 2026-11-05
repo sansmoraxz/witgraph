@@ -252,16 +252,27 @@ impl<'g> Model<'g> {
         }
 
         let groups = self.groups();
+        for (at, node) in self.graph.nodes.iter().enumerate() {
+            if groups.iter().any(|group| group.contains(&at)) {
+                continue;
+            }
+            for (resource, claim) in &node.resources {
+                let thousandths = (claim.amount.get() * 1000.0).round() as u64;
+                if thousandths > self.capacity_thousandths(resource.as_str()) {
+                    said.insert(("node_overclaims", resource.to_string()));
+                }
+            }
+        }
         for group in &groups {
             let mut claims: BTreeMap<&str, u64> = BTreeMap::new();
             for at in group {
                 for (resource, claim) in &self.graph.nodes[*at].resources {
                     *claims.entry(resource.as_str()).or_default() +=
-                        (claim.fraction.get() * 1000.0).round() as u64;
+                        (claim.amount.get() * 1000.0).round() as u64;
                 }
             }
             for (resource, thousandths) in claims {
-                if thousandths > 1000 {
+                if thousandths > self.capacity_thousandths(resource) {
                     said.insert(("group_overclaims", resource.to_string()));
                 }
             }
@@ -270,6 +281,11 @@ impl<'g> Model<'g> {
             said.insert(("group_waits_on_itself", String::new()));
         }
         said
+    }
+
+    /// How much there is of a resource, in the thousandths claims are counted in.
+    fn capacity_thousandths(&self, resource: &str) -> u64 {
+        (self.graph.capacity_of(&resource.into()) * 1000.0).round() as u64
     }
 
     /// Nodes joined by stream and future connections, as sets of more than one node.
@@ -392,6 +408,7 @@ pub fn observed(diagnostic: &Diagnostic) -> Option<Said> {
                 .join(","),
         ),
         D::UselessFeedback { conn } => ("useless_feedback", conn.to_string()),
+        D::NodeOverclaims { resource, .. } => ("node_overclaims", resource.to_string()),
         D::GroupOverclaims { resource, .. } => ("group_overclaims", resource.to_string()),
         D::GroupWaitsOnItself { .. } => ("group_waits_on_itself", String::new()),
         _ => return None,
@@ -402,6 +419,10 @@ pub fn observed(diagnostic: &Diagnostic) -> Option<Said> {
 pub fn is_local(kind: &str) -> bool {
     !matches!(
         kind,
-        "illegal_cycle" | "useless_feedback" | "group_overclaims" | "group_waits_on_itself"
+        "illegal_cycle"
+            | "useless_feedback"
+            | "group_overclaims"
+            | "node_overclaims"
+            | "group_waits_on_itself"
     )
 }

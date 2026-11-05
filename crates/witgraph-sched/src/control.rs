@@ -1588,18 +1588,24 @@ pub fn check_resources(compiled: &CompiledGraph) -> Result<(), RuntimeError> {
 }
 
 /// Each unit's summed claims: a node, or a stream group after the nodes.
-/// Compilation already rejects a group whose own claims on a resource exceed all
-/// of it; one could never start, so it stays an error here
+/// Compilation already rejects a node or group whose own claims on a resource exceed
+/// all of it; one could never start, so it stays an error here
 /// ([`RuntimeError::InvalidConfig`]).
 fn register_resources(
     compiled: &CompiledGraph,
     ports: &PortTable,
 ) -> Result<ResourcePool, RuntimeError> {
-    let mut resources = ResourcePool::default();
     let graph = compiled.graph();
+    let mut resources = ResourcePool::with_capacities(
+        graph
+            .resources
+            .iter()
+            .map(|(resource, declared)| (resource.clone(), declared.capacity.get()))
+            .collect(),
+    );
     let invalid = |node: &str, resource: ResourceId| RuntimeError::InvalidConfig {
         message: format!(
-            "the stream group of `{node}` claims more than all of resource `{resource}`"
+            "`{node}` or its stream group claims more than all of resource `{resource}`"
         ),
     };
     let mut groups: Vec<BTreeMap<ResourceId, f64>> =
@@ -1608,12 +1614,12 @@ fn register_resources(
         let claims: BTreeMap<ResourceId, f64> = node
             .resources
             .iter()
-            .map(|(resource, claim)| (resource.clone(), claim.fraction.get()))
+            .map(|(resource, claim)| (resource.clone(), claim.amount.get()))
             .collect();
         match compiled.group_of(&node.id) {
             Some(group) => {
-                for (resource, fraction) in claims {
-                    *groups[group].entry(resource).or_insert(0.0) += fraction;
+                for (resource, amount) in claims {
+                    *groups[group].entry(resource).or_insert(0.0) += amount;
                 }
             }
             None => {

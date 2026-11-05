@@ -28,7 +28,7 @@ fn bytes(seed: u64, len: usize) -> Vec<u8> {
         .collect()
 }
 
-const RULES: [&str; 18] = [
+const RULES: [&str; 19] = [
     "duplicate_node_id",
     "duplicate_connection_id",
     "duplicate_connection",
@@ -46,6 +46,7 @@ const RULES: [&str; 18] = [
     "illegal_cycle",
     "useless_feedback",
     "group_overclaims",
+    "node_overclaims",
     "group_waits_on_itself",
 ];
 
