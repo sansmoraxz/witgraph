@@ -1,0 +1,82 @@
+{
+  "connections": [],
+  "description": "Generated from seed 2 by `fuzz/tests/real.rs`.",
+  "nodes": [
+    {
+      "guest": "maybe",
+      "id": "n0",
+      "resources": {
+        "gpu": 0.2
+      }
+    }
+  ],
+  "steps": [
+    {
+      "at": "n0.x",
+      "do": "inject",
+      "wave": "4"
+    },
+    {
+      "do": "settle"
+    },
+    {
+      "at": "n0.maybe",
+      "do": "output",
+      "expect": "some(4)"
+    },
+    {
+      "do": "snapshot",
+      "expect": {}
+    },
+    {
+      "at": "n0.x",
+      "do": "inject",
+      "wave": "1"
+    },
+    {
+      "do": "settle"
+    },
+    {
+      "at": "n0.maybe",
+      "do": "output",
+      "expect": "some(1)"
+    },
+    {
+      "at": "n0.x",
+      "do": "inject",
+      "wave": "5"
+    },
+    {
+      "do": "settle"
+    },
+    {
+      "at": "n0.maybe",
+      "do": "output",
+      "expect": "some(5)"
+    },
+    {
+      "at": "n0.x",
+      "do": "inject",
+      "wave": "5"
+    },
+    {
+      "do": "settle"
+    },
+    {
+      "at": "n0.maybe",
+      "do": "output",
+      "expect": "some(5)"
+    },
+    {
+      "do": "restore"
+    },
+    {
+      "do": "settle"
+    },
+    {
+      "at": "n0.maybe",
+      "do": "output",
+      "expect": "some(4)"
+    }
+  ]
+}

@@ -24,3 +24,21 @@ cargo +nightly fuzz run --features libfuzzer graph_run -- -fork=8 -max_len=4096 
 
 Keep a graph that found a bug in `regressions/graph/`, as its JSON (a failure prints it), with
 a name saying what it was: raw fuzzer input means nothing once the generator changes.
+
+## Real graphs, on both hosts
+
+`tests/real.rs` makes valid graphs of real components, with feedback and resource claims,
+runs them on wasmtime, and compares every output, through host writes and a snapshot and
+restore. `WITGRAPH_REAL_CASES` runs more, and `WITGRAPH_REAL_SEED` one again.
+
+Each is also a scenario either host can run. A sample is kept in
+`test-fixtures/scenarios/generated`, including a seed that found a bug, so JavaScript is held
+to the same answers. To compare the hosts on many more:
+
+```sh
+export WITGRAPH_SCENARIOS=$HOME/.cache/scenarios
+mkdir -p "$WITGRAPH_SCENARIOS"
+WITGRAPH_REAL_EXPORT=$WITGRAPH_SCENARIOS WITGRAPH_REAL_CASES=500 cargo test -p witgraph-fuzz --test real
+cargo test -p witgraph-runtime --test scenarios
+pnpm --filter witgraph-loader test
+```

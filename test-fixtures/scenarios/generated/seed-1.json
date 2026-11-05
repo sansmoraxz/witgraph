@@ -1,0 +1,186 @@
+{
+  "connections": [
+    {
+      "from": "n1.items",
+      "id": "c0",
+      "to": "n2.items"
+    },
+    {
+      "from": "n2.items",
+      "id": "c1",
+      "to": "d3.items"
+    }
+  ],
+  "description": "Generated from seed 1 by `fuzz/tests/real.rs`.",
+  "nodes": [
+    {
+      "guest": "maybe",
+      "id": "n0",
+      "resources": {
+        "gpu": 0.2
+      }
+    },
+    {
+      "guest": "stream-producer",
+      "id": "n1",
+      "resources": {
+        "gpu": 0.6
+      }
+    },
+    {
+      "guest": "stream-relay",
+      "id": "n2",
+      "resources": {
+        "gpu": 0.2
+      }
+    },
+    {
+      "guest": "stream-consumer",
+      "id": "d3"
+    }
+  ],
+  "steps": [
+    {
+      "at": "n1.burst-size",
+      "do": "inject",
+      "wave": "3"
+    },
+    {
+      "do": "settle"
+    },
+    {
+      "at": "d3.count",
+      "do": "output",
+      "expect": "3"
+    },
+    {
+      "at": "d3.total",
+      "do": "output",
+      "expect": "3"
+    },
+    {
+      "at": "n0.maybe",
+      "do": "output",
+      "expect": "none"
+    },
+    {
+      "at": "n1.limit",
+      "do": "output",
+      "expect": "3"
+    },
+    {
+      "do": "snapshot",
+      "expect": {}
+    },
+    {
+      "at": "n1.burst-size",
+      "do": "inject",
+      "wave": "0"
+    },
+    {
+      "do": "settle"
+    },
+    {
+      "at": "d3.count",
+      "do": "output",
+      "expect": "0"
+    },
+    {
+      "at": "d3.total",
+      "do": "output",
+      "expect": "0"
+    },
+    {
+      "at": "n0.maybe",
+      "do": "output",
+      "expect": "none"
+    },
+    {
+      "at": "n1.limit",
+      "do": "output",
+      "expect": "0"
+    },
+    {
+      "at": "n1.burst-size",
+      "do": "inject",
+      "wave": "3"
+    },
+    {
+      "do": "settle"
+    },
+    {
+      "at": "d3.count",
+      "do": "output",
+      "expect": "3"
+    },
+    {
+      "at": "d3.total",
+      "do": "output",
+      "expect": "3"
+    },
+    {
+      "at": "n0.maybe",
+      "do": "output",
+      "expect": "none"
+    },
+    {
+      "at": "n1.limit",
+      "do": "output",
+      "expect": "3"
+    },
+    {
+      "at": "n1.burst-size",
+      "do": "inject",
+      "wave": "1"
+    },
+    {
+      "do": "settle"
+    },
+    {
+      "at": "d3.count",
+      "do": "output",
+      "expect": "1"
+    },
+    {
+      "at": "d3.total",
+      "do": "output",
+      "expect": "0"
+    },
+    {
+      "at": "n0.maybe",
+      "do": "output",
+      "expect": "none"
+    },
+    {
+      "at": "n1.limit",
+      "do": "output",
+      "expect": "1"
+    },
+    {
+      "do": "restore"
+    },
+    {
+      "do": "settle"
+    },
+    {
+      "at": "d3.count",
+      "do": "output",
+      "expect": "3"
+    },
+    {
+      "at": "d3.total",
+      "do": "output",
+      "expect": "3"
+    },
+    {
+      "at": "n0.maybe",
+      "do": "output",
+      "expect": "none"
+    },
+    {
+      "at": "n1.limit",
+      "do": "output",
+      "expect": "3"
+    }
+  ]
+}

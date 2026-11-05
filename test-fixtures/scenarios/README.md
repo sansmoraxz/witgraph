@@ -5,7 +5,8 @@ What a graph should do, written once and run on both hosts: by
 `packages/witgraph-loader/test/scenarios.test.ts` on JavaScript. A difference
 between the hosts fails on one of them.
 
-A scenario is `nodes` (an `id` and a `guest`, as `test-components` names it),
+A scenario is `nodes` (an `id`, a `guest`, as `test-components` names it, and perhaps
+`resources`, each a fraction claimed),
 `connections` (`from` and `to` as `node.port`, and `feedback`), and `steps`, each of
 which `do`es one of these:
 
@@ -25,3 +26,5 @@ which `do`es one of these:
 | `restore`  | `snapshot`, `patch`, `error` | Restores the snapshot given, or else the last taken, with `patch`. |
 
 `error` says the step fails, with a message holding that text.
+
+Those in `generated/` are written by `fuzz/tests/real.rs`, as `fuzz/README.md` says.

@@ -1,0 +1,64 @@
+{
+  "connections": [
+    {
+      "from": "n0.done",
+      "id": "c0",
+      "to": "n2.data"
+    },
+    {
+      "from": "n2.value",
+      "id": "c1",
+      "to": "n3.in"
+    },
+    {
+      "from": "n1.maybe",
+      "id": "c2",
+      "to": "n3.add"
+    }
+  ],
+  "description": "Generated from seed 6 by `fuzz/tests/real.rs`.",
+  "nodes": [
+    {
+      "guest": "future-writer",
+      "id": "n0"
+    },
+    {
+      "guest": "maybe",
+      "id": "n1"
+    },
+    {
+      "guest": "future-reader",
+      "id": "n2",
+      "resources": {
+        "gpu": 0.3
+      }
+    },
+    {
+      "guest": "relay",
+      "id": "n3",
+      "resources": {
+        "gpu": 0.3
+      }
+    }
+  ],
+  "steps": [
+    {
+      "do": "settle"
+    },
+    {
+      "at": "n1.maybe",
+      "do": "output",
+      "expect": "none"
+    },
+    {
+      "at": "n2.value",
+      "do": "output",
+      "expect": "7"
+    },
+    {
+      "at": "n3.out",
+      "do": "output",
+      "expect": "7"
+    }
+  ]
+}

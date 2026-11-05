@@ -1,0 +1,161 @@
+{
+  "connections": [
+    {
+      "from": "n1.done",
+      "id": "c0",
+      "to": "n2.data"
+    },
+    {
+      "from": "n2.value",
+      "id": "c1",
+      "to": "n3.in"
+    }
+  ],
+  "description": "Generated from seed 19 by `fuzz/tests/real.rs`.",
+  "nodes": [
+    {
+      "guest": "maybe",
+      "id": "n0",
+      "resources": {
+        "gpu": 0.3
+      }
+    },
+    {
+      "guest": "future-writer",
+      "id": "n1",
+      "resources": {
+        "gpu": 0.6
+      }
+    },
+    {
+      "guest": "future-reader",
+      "id": "n2"
+    },
+    {
+      "guest": "relay",
+      "id": "n3",
+      "resources": {
+        "gpu": 0.3
+      }
+    }
+  ],
+  "steps": [
+    {
+      "at": "n3.add",
+      "do": "inject",
+      "wave": "2"
+    },
+    {
+      "do": "settle"
+    },
+    {
+      "at": "n0.maybe",
+      "do": "output",
+      "expect": "none"
+    },
+    {
+      "at": "n2.value",
+      "do": "output",
+      "expect": "7"
+    },
+    {
+      "at": "n3.out",
+      "do": "output",
+      "expect": "9"
+    },
+    {
+      "do": "snapshot",
+      "expect": {}
+    },
+    {
+      "at": "n3.add",
+      "do": "inject",
+      "wave": "0"
+    },
+    {
+      "do": "settle"
+    },
+    {
+      "at": "n0.maybe",
+      "do": "output",
+      "expect": "none"
+    },
+    {
+      "at": "n2.value",
+      "do": "output",
+      "expect": "7"
+    },
+    {
+      "at": "n3.out",
+      "do": "output",
+      "expect": "7"
+    },
+    {
+      "at": "n3.add",
+      "do": "inject",
+      "wave": "0"
+    },
+    {
+      "do": "settle"
+    },
+    {
+      "at": "n0.maybe",
+      "do": "output",
+      "expect": "none"
+    },
+    {
+      "at": "n2.value",
+      "do": "output",
+      "expect": "7"
+    },
+    {
+      "at": "n3.out",
+      "do": "output",
+      "expect": "7"
+    },
+    {
+      "at": "n3.add",
+      "do": "inject",
+      "wave": "1"
+    },
+    {
+      "do": "settle"
+    },
+    {
+      "at": "n0.maybe",
+      "do": "output",
+      "expect": "none"
+    },
+    {
+      "at": "n2.value",
+      "do": "output",
+      "expect": "7"
+    },
+    {
+      "at": "n3.out",
+      "do": "output",
+      "expect": "8"
+    },
+    {
+      "do": "restore"
+    },
+    {
+      "do": "settle"
+    },
+    {
+      "at": "n0.maybe",
+      "do": "output",
+      "expect": "none"
+    },
+    {
+      "at": "n2.value",
+      "do": "output",
+      "expect": "7"
+    },
+    {
+      "at": "n3.out",
+      "do": "output",
+      "expect": "9"
+    }
+  ]
+}

@@ -1,0 +1,243 @@
+{
+  "connections": [
+    {
+      "from": "n1.done",
+      "id": "c0",
+      "to": "n2.data"
+    },
+    {
+      "from": "n2.value",
+      "id": "c1",
+      "to": "n3.in"
+    },
+    {
+      "from": "n2.value",
+      "id": "c2",
+      "to": "n4.x"
+    },
+    {
+      "from": "n2.value",
+      "id": "c3",
+      "to": "n5.in"
+    },
+    {
+      "feedback": true,
+      "from": "n0.maybe",
+      "id": "n0-loop",
+      "to": "n0.x"
+    }
+  ],
+  "description": "Generated from seed 20 by `fuzz/tests/real.rs`.",
+  "nodes": [
+    {
+      "guest": "maybe",
+      "id": "n0",
+      "resources": {
+        "gpu": 0.6
+      }
+    },
+    {
+      "guest": "future-writer",
+      "id": "n1"
+    },
+    {
+      "guest": "future-reader",
+      "id": "n2",
+      "resources": {
+        "gpu": 0.4
+      }
+    },
+    {
+      "guest": "relay",
+      "id": "n3",
+      "resources": {
+        "gpu": 0.3
+      }
+    },
+    {
+      "guest": "maybe",
+      "id": "n4"
+    },
+    {
+      "guest": "relay",
+      "id": "n5",
+      "resources": {
+        "gpu": 0.6
+      }
+    }
+  ],
+  "steps": [
+    {
+      "at": "n0.x",
+      "do": "inject",
+      "wave": "1"
+    },
+    {
+      "at": "n5.add",
+      "do": "inject",
+      "wave": "2"
+    },
+    {
+      "do": "settle"
+    },
+    {
+      "at": "n0.maybe",
+      "do": "output",
+      "expect": "some(1)"
+    },
+    {
+      "at": "n2.value",
+      "do": "output",
+      "expect": "7"
+    },
+    {
+      "at": "n3.out",
+      "do": "output",
+      "expect": "7"
+    },
+    {
+      "at": "n4.maybe",
+      "do": "output",
+      "expect": "some(7)"
+    },
+    {
+      "at": "n5.out",
+      "do": "output",
+      "expect": "9"
+    },
+    {
+      "do": "snapshot",
+      "expect": {}
+    },
+    {
+      "at": "n0.x",
+      "do": "inject",
+      "wave": "4"
+    },
+    {
+      "do": "settle"
+    },
+    {
+      "at": "n0.maybe",
+      "do": "output",
+      "expect": "some(4)"
+    },
+    {
+      "at": "n2.value",
+      "do": "output",
+      "expect": "7"
+    },
+    {
+      "at": "n3.out",
+      "do": "output",
+      "expect": "7"
+    },
+    {
+      "at": "n4.maybe",
+      "do": "output",
+      "expect": "some(7)"
+    },
+    {
+      "at": "n5.out",
+      "do": "output",
+      "expect": "9"
+    },
+    {
+      "at": "n5.add",
+      "do": "inject",
+      "wave": "2"
+    },
+    {
+      "do": "settle"
+    },
+    {
+      "at": "n0.maybe",
+      "do": "output",
+      "expect": "some(4)"
+    },
+    {
+      "at": "n2.value",
+      "do": "output",
+      "expect": "7"
+    },
+    {
+      "at": "n3.out",
+      "do": "output",
+      "expect": "7"
+    },
+    {
+      "at": "n4.maybe",
+      "do": "output",
+      "expect": "some(7)"
+    },
+    {
+      "at": "n5.out",
+      "do": "output",
+      "expect": "9"
+    },
+    {
+      "at": "n5.add",
+      "do": "inject",
+      "wave": "0"
+    },
+    {
+      "do": "settle"
+    },
+    {
+      "at": "n0.maybe",
+      "do": "output",
+      "expect": "some(4)"
+    },
+    {
+      "at": "n2.value",
+      "do": "output",
+      "expect": "7"
+    },
+    {
+      "at": "n3.out",
+      "do": "output",
+      "expect": "7"
+    },
+    {
+      "at": "n4.maybe",
+      "do": "output",
+      "expect": "some(7)"
+    },
+    {
+      "at": "n5.out",
+      "do": "output",
+      "expect": "7"
+    },
+    {
+      "do": "restore"
+    },
+    {
+      "do": "settle"
+    },
+    {
+      "at": "n0.maybe",
+      "do": "output",
+      "expect": "some(1)"
+    },
+    {
+      "at": "n2.value",
+      "do": "output",
+      "expect": "7"
+    },
+    {
+      "at": "n3.out",
+      "do": "output",
+      "expect": "7"
+    },
+    {
+      "at": "n4.maybe",
+      "do": "output",
+      "expect": "some(7)"
+    },
+    {
+      "at": "n5.out",
+      "do": "output",
+      "expect": "9"
+    }
+  ]
+}

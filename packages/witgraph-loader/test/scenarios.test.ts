@@ -49,7 +49,7 @@ interface Step {
 }
 
 interface Scenario {
-  nodes: { id: string; guest: string }[];
+  nodes: { id: string; guest: string; resources?: Record<string, number> }[];
   connections: { id: string; from: string; to: string; feedback?: boolean }[];
   steps: Step[];
 }
@@ -74,7 +74,17 @@ async function load(scenario: Scenario): Promise<Session> {
   const graph = {
     metadata: { name: 'scenario' },
     components: used.map(componentRef),
-    nodes: scenario.nodes.map(({ id, guest }) => ({ id, component: componentRef(guest) })),
+    nodes: scenario.nodes.map(({ id, guest, resources }) => ({
+      id,
+      component: componentRef(guest),
+      ...(resources
+        ? {
+            resources: Object.fromEntries(
+              Object.entries(resources).map(([name, fraction]) => [name, { fraction }]),
+            ),
+          }
+        : {}),
+    })),
     connections: scenario.connections.map(({ id, from, to, feedback }) => ({
       id,
       from: port(from),
@@ -192,8 +202,16 @@ async function run(scenario: Scenario): Promise<void> {
   }
 }
 
-for (const file of (await readdir(directory)).filter((f) => f.endsWith('.json')).sort()) {
-  test(`scenario: ${file}`, async () => {
-    await run(JSON.parse(await readFile(new URL(file, directory), 'utf8')) as Scenario);
-  });
+// Generated ones (see `fuzz/README.md`), and any more a run is pointed at.
+const directories = [
+  directory,
+  new URL('generated/', directory),
+  ...(process.env.WITGRAPH_SCENARIOS ? [pathToFileURL(`${process.env.WITGRAPH_SCENARIOS}/`)] : []),
+];
+for (const from of directories) {
+  for (const file of (await readdir(from)).filter((f) => f.endsWith('.json')).sort()) {
+    test(`scenario: ${file}`, async () => {
+      await run(JSON.parse(await readFile(new URL(file, from), 'utf8')) as Scenario);
+    });
+  }
 }

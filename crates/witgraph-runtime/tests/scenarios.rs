@@ -7,8 +7,11 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 use serde_json::{Value, json};
-use test_components::{BUSY_LOOP, ECHO, Guest, RELAY, STREAM_CONSUMER, STREAM_PRODUCER};
-use witgraph_ir::{ComponentContract, Graph, NodeId, PortName, PortRef};
+use test_components::{
+    BUSY_LOOP, ECHO, FUTURE_READER, FUTURE_WRITER, Guest, MAYBE, RELAY, STREAM_CONSUMER,
+    STREAM_PRODUCER, STREAM_RELAY,
+};
+use witgraph_ir::{ComponentContract, Graph, NodeId, PortName, PortRef, ResourceClaim};
 use witgraph_runtime::{
     NodeFault, RunningGraph, RuntimeConfig, RuntimeGraph, Snapshot, TickResult, Trace, TraceEvent,
 };
@@ -17,9 +20,13 @@ fn guest(name: &str) -> Guest {
     match name {
         "busy-loop" => BUSY_LOOP,
         "echo" => ECHO,
+        "future-reader" => FUTURE_READER,
+        "future-writer" => FUTURE_WRITER,
+        "maybe" => MAYBE,
         "relay" => RELAY,
         "stream-consumer" => STREAM_CONSUMER,
         "stream-producer" => STREAM_PRODUCER,
+        "stream-relay" => STREAM_RELAY,
         other => panic!("add `{other}` to the guests of this test"),
     }
 }
@@ -52,7 +59,14 @@ async fn load(scenario: &Value) -> RuntimeGraph<Trace> {
             wasm.insert(contract.id.clone(), guest.wasm);
             contracts.push(contract.clone());
         }
-        builder = builder.add_node(node["id"].as_str().unwrap(), contract.id);
+        let id = node["id"].as_str().unwrap();
+        builder = builder.add_node(id, contract.id);
+        if let Some(claims) = node["resources"].as_object() {
+            for (resource, fraction) in claims {
+                let claim = ResourceClaim::new(fraction.as_f64().unwrap()).unwrap();
+                builder = builder.set_resource(id, resource.as_str(), claim).unwrap();
+            }
+        }
     }
     for conn in scenario["connections"].as_array().unwrap() {
         let (id, from, to) = (
@@ -213,8 +227,12 @@ async fn run(scenario: &Value) {
 #[tokio::test]
 async fn every_scenario_goes_as_it_says() {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test-fixtures/scenarios");
-    let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
-        .unwrap()
+    // Generated ones (see `fuzz/README.md`), and any more a run is pointed at.
+    let extra = std::env::var_os("WITGRAPH_SCENARIOS").map(PathBuf::from);
+    let mut files: Vec<PathBuf> = [Some(dir.clone()), Some(dir.join("generated")), extra]
+        .into_iter()
+        .flatten()
+        .flat_map(|dir| std::fs::read_dir(dir).unwrap())
         .map(|entry| entry.unwrap().path())
         .filter(|path| path.extension().is_some_and(|e| e == "json"))
         .collect();

@@ -1,0 +1,351 @@
+{
+  "connections": [
+    {
+      "from": "n0.done",
+      "id": "c0",
+      "to": "n3.data"
+    },
+    {
+      "from": "n3.value",
+      "id": "c1",
+      "to": "n4.in"
+    },
+    {
+      "from": "n3.value",
+      "id": "c2",
+      "to": "n5.in"
+    },
+    {
+      "from": "n2.maybe",
+      "id": "c3",
+      "to": "n5.add"
+    },
+    {
+      "from": "n5.out",
+      "id": "c4",
+      "to": "n6.in"
+    },
+    {
+      "from": "n5.out",
+      "id": "c5",
+      "to": "n6.add"
+    },
+    {
+      "from": "n3.value",
+      "id": "c6",
+      "to": "n8.in"
+    },
+    {
+      "from": "n4.out",
+      "id": "c7",
+      "to": "n8.add"
+    },
+    {
+      "from": "n7.done",
+      "id": "c8",
+      "to": "d9.data"
+    }
+  ],
+  "description": "Generated from seed 14 by `fuzz/tests/real.rs`.",
+  "nodes": [
+    {
+      "guest": "future-writer",
+      "id": "n0",
+      "resources": {
+        "gpu": 0.3
+      }
+    },
+    {
+      "guest": "maybe",
+      "id": "n1",
+      "resources": {
+        "gpu": 0.3
+      }
+    },
+    {
+      "guest": "maybe",
+      "id": "n2",
+      "resources": {
+        "gpu": 0.3
+      }
+    },
+    {
+      "guest": "future-reader",
+      "id": "n3"
+    },
+    {
+      "guest": "relay",
+      "id": "n4",
+      "resources": {
+        "gpu": 0.4
+      }
+    },
+    {
+      "guest": "relay",
+      "id": "n5"
+    },
+    {
+      "guest": "relay",
+      "id": "n6",
+      "resources": {
+        "gpu": 0.3
+      }
+    },
+    {
+      "guest": "future-writer",
+      "id": "n7"
+    },
+    {
+      "guest": "relay",
+      "id": "n8"
+    },
+    {
+      "guest": "future-reader",
+      "id": "d9"
+    }
+  ],
+  "steps": [
+    {
+      "at": "n1.x",
+      "do": "inject",
+      "wave": "2"
+    },
+    {
+      "do": "settle"
+    },
+    {
+      "at": "d9.value",
+      "do": "output",
+      "expect": "7"
+    },
+    {
+      "at": "n1.maybe",
+      "do": "output",
+      "expect": "some(2)"
+    },
+    {
+      "at": "n2.maybe",
+      "do": "output",
+      "expect": "none"
+    },
+    {
+      "at": "n3.value",
+      "do": "output",
+      "expect": "7"
+    },
+    {
+      "at": "n4.out",
+      "do": "output",
+      "expect": "7"
+    },
+    {
+      "at": "n5.out",
+      "do": "output",
+      "expect": "7"
+    },
+    {
+      "at": "n6.out",
+      "do": "output",
+      "expect": "14"
+    },
+    {
+      "at": "n8.out",
+      "do": "output",
+      "expect": "14"
+    },
+    {
+      "do": "snapshot",
+      "expect": {}
+    },
+    {
+      "at": "n1.x",
+      "do": "inject",
+      "wave": "5"
+    },
+    {
+      "do": "settle"
+    },
+    {
+      "at": "d9.value",
+      "do": "output",
+      "expect": "7"
+    },
+    {
+      "at": "n1.maybe",
+      "do": "output",
+      "expect": "some(5)"
+    },
+    {
+      "at": "n2.maybe",
+      "do": "output",
+      "expect": "none"
+    },
+    {
+      "at": "n3.value",
+      "do": "output",
+      "expect": "7"
+    },
+    {
+      "at": "n4.out",
+      "do": "output",
+      "expect": "7"
+    },
+    {
+      "at": "n5.out",
+      "do": "output",
+      "expect": "7"
+    },
+    {
+      "at": "n6.out",
+      "do": "output",
+      "expect": "14"
+    },
+    {
+      "at": "n8.out",
+      "do": "output",
+      "expect": "14"
+    },
+    {
+      "at": "n1.x",
+      "do": "inject",
+      "wave": "4"
+    },
+    {
+      "do": "settle"
+    },
+    {
+      "at": "d9.value",
+      "do": "output",
+      "expect": "7"
+    },
+    {
+      "at": "n1.maybe",
+      "do": "output",
+      "expect": "some(4)"
+    },
+    {
+      "at": "n2.maybe",
+      "do": "output",
+      "expect": "none"
+    },
+    {
+      "at": "n3.value",
+      "do": "output",
+      "expect": "7"
+    },
+    {
+      "at": "n4.out",
+      "do": "output",
+      "expect": "7"
+    },
+    {
+      "at": "n5.out",
+      "do": "output",
+      "expect": "7"
+    },
+    {
+      "at": "n6.out",
+      "do": "output",
+      "expect": "14"
+    },
+    {
+      "at": "n8.out",
+      "do": "output",
+      "expect": "14"
+    },
+    {
+      "at": "n1.x",
+      "do": "inject",
+      "wave": "3"
+    },
+    {
+      "do": "settle"
+    },
+    {
+      "at": "d9.value",
+      "do": "output",
+      "expect": "7"
+    },
+    {
+      "at": "n1.maybe",
+      "do": "output",
+      "expect": "some(3)"
+    },
+    {
+      "at": "n2.maybe",
+      "do": "output",
+      "expect": "none"
+    },
+    {
+      "at": "n3.value",
+      "do": "output",
+      "expect": "7"
+    },
+    {
+      "at": "n4.out",
+      "do": "output",
+      "expect": "7"
+    },
+    {
+      "at": "n5.out",
+      "do": "output",
+      "expect": "7"
+    },
+    {
+      "at": "n6.out",
+      "do": "output",
+      "expect": "14"
+    },
+    {
+      "at": "n8.out",
+      "do": "output",
+      "expect": "14"
+    },
+    {
+      "do": "restore"
+    },
+    {
+      "do": "settle"
+    },
+    {
+      "at": "d9.value",
+      "do": "output",
+      "expect": "7"
+    },
+    {
+      "at": "n1.maybe",
+      "do": "output",
+      "expect": "some(2)"
+    },
+    {
+      "at": "n2.maybe",
+      "do": "output",
+      "expect": "none"
+    },
+    {
+      "at": "n3.value",
+      "do": "output",
+      "expect": "7"
+    },
+    {
+      "at": "n4.out",
+      "do": "output",
+      "expect": "7"
+    },
+    {
+      "at": "n5.out",
+      "do": "output",
+      "expect": "7"
+    },
+    {
+      "at": "n6.out",
+      "do": "output",
+      "expect": "14"
+    },
+    {
+      "at": "n8.out",
+      "do": "output",
+      "expect": "14"
+    }
+  ]
+}

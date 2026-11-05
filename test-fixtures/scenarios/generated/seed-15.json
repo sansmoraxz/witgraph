@@ -1,0 +1,400 @@
+{
+  "connections": [
+    {
+      "from": "n0.items",
+      "id": "c0",
+      "to": "n6.items"
+    },
+    {
+      "from": "n5.items",
+      "id": "c1",
+      "to": "n7.items"
+    },
+    {
+      "from": "n0.limit",
+      "id": "c2",
+      "to": "n7.take"
+    },
+    {
+      "from": "n3.done",
+      "id": "c3",
+      "to": "n8.data"
+    },
+    {
+      "from": "n6.items",
+      "id": "c4",
+      "to": "d9.items"
+    },
+    {
+      "from": "n2.done",
+      "id": "c5",
+      "to": "d10.data"
+    },
+    {
+      "feedback": true,
+      "from": "n4.maybe",
+      "id": "n4-loop",
+      "to": "n4.x"
+    }
+  ],
+  "description": "Generated from seed 15 by `fuzz/tests/real.rs`.",
+  "nodes": [
+    {
+      "guest": "stream-producer",
+      "id": "n0"
+    },
+    {
+      "guest": "maybe",
+      "id": "n1",
+      "resources": {
+        "gpu": 0.4
+      }
+    },
+    {
+      "guest": "future-writer",
+      "id": "n2"
+    },
+    {
+      "guest": "future-writer",
+      "id": "n3"
+    },
+    {
+      "guest": "maybe",
+      "id": "n4"
+    },
+    {
+      "guest": "stream-producer",
+      "id": "n5"
+    },
+    {
+      "guest": "stream-relay",
+      "id": "n6",
+      "resources": {
+        "gpu": 0.2
+      }
+    },
+    {
+      "guest": "stream-consumer",
+      "id": "n7"
+    },
+    {
+      "guest": "future-reader",
+      "id": "n8",
+      "resources": {
+        "gpu": 0.2
+      }
+    },
+    {
+      "guest": "stream-consumer",
+      "id": "d9"
+    },
+    {
+      "guest": "future-reader",
+      "id": "d10"
+    }
+  ],
+  "steps": [
+    {
+      "at": "n0.burst-size",
+      "do": "inject",
+      "wave": "5"
+    },
+    {
+      "at": "n1.x",
+      "do": "inject",
+      "wave": "3"
+    },
+    {
+      "at": "n5.burst-size",
+      "do": "inject",
+      "wave": "0"
+    },
+    {
+      "do": "settle"
+    },
+    {
+      "at": "d10.value",
+      "do": "output",
+      "expect": "7"
+    },
+    {
+      "at": "d9.count",
+      "do": "output",
+      "expect": "5"
+    },
+    {
+      "at": "d9.total",
+      "do": "output",
+      "expect": "10"
+    },
+    {
+      "at": "n0.limit",
+      "do": "output",
+      "expect": "5"
+    },
+    {
+      "at": "n1.maybe",
+      "do": "output",
+      "expect": "some(3)"
+    },
+    {
+      "at": "n4.maybe",
+      "do": "output",
+      "expect": "none"
+    },
+    {
+      "at": "n5.limit",
+      "do": "output",
+      "expect": "0"
+    },
+    {
+      "at": "n7.count",
+      "do": "output",
+      "expect": "0"
+    },
+    {
+      "at": "n7.total",
+      "do": "output",
+      "expect": "0"
+    },
+    {
+      "at": "n8.value",
+      "do": "output",
+      "expect": "7"
+    },
+    {
+      "do": "snapshot",
+      "expect": {}
+    },
+    {
+      "at": "n0.burst-size",
+      "do": "inject",
+      "wave": "0"
+    },
+    {
+      "do": "settle"
+    },
+    {
+      "at": "d10.value",
+      "do": "output",
+      "expect": "7"
+    },
+    {
+      "at": "d9.count",
+      "do": "output",
+      "expect": "0"
+    },
+    {
+      "at": "d9.total",
+      "do": "output",
+      "expect": "0"
+    },
+    {
+      "at": "n0.limit",
+      "do": "output",
+      "expect": "0"
+    },
+    {
+      "at": "n1.maybe",
+      "do": "output",
+      "expect": "some(3)"
+    },
+    {
+      "at": "n4.maybe",
+      "do": "output",
+      "expect": "none"
+    },
+    {
+      "at": "n5.limit",
+      "do": "output",
+      "expect": "0"
+    },
+    {
+      "at": "n7.count",
+      "do": "output",
+      "expect": "0"
+    },
+    {
+      "at": "n7.total",
+      "do": "output",
+      "expect": "0"
+    },
+    {
+      "at": "n8.value",
+      "do": "output",
+      "expect": "7"
+    },
+    {
+      "at": "n1.x",
+      "do": "inject",
+      "wave": "1"
+    },
+    {
+      "do": "settle"
+    },
+    {
+      "at": "d10.value",
+      "do": "output",
+      "expect": "7"
+    },
+    {
+      "at": "d9.count",
+      "do": "output",
+      "expect": "0"
+    },
+    {
+      "at": "d9.total",
+      "do": "output",
+      "expect": "0"
+    },
+    {
+      "at": "n0.limit",
+      "do": "output",
+      "expect": "0"
+    },
+    {
+      "at": "n1.maybe",
+      "do": "output",
+      "expect": "some(1)"
+    },
+    {
+      "at": "n4.maybe",
+      "do": "output",
+      "expect": "none"
+    },
+    {
+      "at": "n5.limit",
+      "do": "output",
+      "expect": "0"
+    },
+    {
+      "at": "n7.count",
+      "do": "output",
+      "expect": "0"
+    },
+    {
+      "at": "n7.total",
+      "do": "output",
+      "expect": "0"
+    },
+    {
+      "at": "n8.value",
+      "do": "output",
+      "expect": "7"
+    },
+    {
+      "at": "n0.burst-size",
+      "do": "inject",
+      "wave": "3"
+    },
+    {
+      "do": "settle"
+    },
+    {
+      "at": "d10.value",
+      "do": "output",
+      "expect": "7"
+    },
+    {
+      "at": "d9.count",
+      "do": "output",
+      "expect": "3"
+    },
+    {
+      "at": "d9.total",
+      "do": "output",
+      "expect": "3"
+    },
+    {
+      "at": "n0.limit",
+      "do": "output",
+      "expect": "3"
+    },
+    {
+      "at": "n1.maybe",
+      "do": "output",
+      "expect": "some(1)"
+    },
+    {
+      "at": "n4.maybe",
+      "do": "output",
+      "expect": "none"
+    },
+    {
+      "at": "n5.limit",
+      "do": "output",
+      "expect": "0"
+    },
+    {
+      "at": "n7.count",
+      "do": "output",
+      "expect": "0"
+    },
+    {
+      "at": "n7.total",
+      "do": "output",
+      "expect": "0"
+    },
+    {
+      "at": "n8.value",
+      "do": "output",
+      "expect": "7"
+    },
+    {
+      "do": "restore"
+    },
+    {
+      "do": "settle"
+    },
+    {
+      "at": "d10.value",
+      "do": "output",
+      "expect": "7"
+    },
+    {
+      "at": "d9.count",
+      "do": "output",
+      "expect": "5"
+    },
+    {
+      "at": "d9.total",
+      "do": "output",
+      "expect": "10"
+    },
+    {
+      "at": "n0.limit",
+      "do": "output",
+      "expect": "5"
+    },
+    {
+      "at": "n1.maybe",
+      "do": "output",
+      "expect": "some(3)"
+    },
+    {
+      "at": "n4.maybe",
+      "do": "output",
+      "expect": "none"
+    },
+    {
+      "at": "n5.limit",
+      "do": "output",
+      "expect": "0"
+    },
+    {
+      "at": "n7.count",
+      "do": "output",
+      "expect": "0"
+    },
+    {
+      "at": "n7.total",
+      "do": "output",
+      "expect": "0"
+    },
+    {
+      "at": "n8.value",
+      "do": "output",
+      "expect": "7"
+    }
+  ]
+}

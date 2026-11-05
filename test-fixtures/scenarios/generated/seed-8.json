@@ -1,0 +1,193 @@
+{
+  "connections": [
+    {
+      "from": "n0.limit",
+      "id": "c0",
+      "to": "n1.in"
+    },
+    {
+      "from": "n0.limit",
+      "id": "c1",
+      "to": "n1.add"
+    },
+    {
+      "from": "n0.items",
+      "id": "c2",
+      "to": "n2.items"
+    },
+    {
+      "from": "n2.items",
+      "id": "c3",
+      "to": "d3.items"
+    }
+  ],
+  "description": "Generated from seed 8 by `fuzz/tests/real.rs`.",
+  "nodes": [
+    {
+      "guest": "stream-producer",
+      "id": "n0",
+      "resources": {
+        "gpu": 0.3
+      }
+    },
+    {
+      "guest": "relay",
+      "id": "n1",
+      "resources": {
+        "gpu": 0.4
+      }
+    },
+    {
+      "guest": "stream-relay",
+      "id": "n2"
+    },
+    {
+      "guest": "stream-consumer",
+      "id": "d3"
+    }
+  ],
+  "steps": [
+    {
+      "at": "n0.burst-size",
+      "do": "inject",
+      "wave": "5"
+    },
+    {
+      "do": "settle"
+    },
+    {
+      "at": "d3.count",
+      "do": "output",
+      "expect": "5"
+    },
+    {
+      "at": "d3.total",
+      "do": "output",
+      "expect": "10"
+    },
+    {
+      "at": "n0.limit",
+      "do": "output",
+      "expect": "5"
+    },
+    {
+      "at": "n1.out",
+      "do": "output",
+      "expect": "10"
+    },
+    {
+      "do": "snapshot",
+      "expect": {}
+    },
+    {
+      "at": "n0.burst-size",
+      "do": "inject",
+      "wave": "4"
+    },
+    {
+      "do": "settle"
+    },
+    {
+      "at": "d3.count",
+      "do": "output",
+      "expect": "4"
+    },
+    {
+      "at": "d3.total",
+      "do": "output",
+      "expect": "6"
+    },
+    {
+      "at": "n0.limit",
+      "do": "output",
+      "expect": "4"
+    },
+    {
+      "at": "n1.out",
+      "do": "output",
+      "expect": "8"
+    },
+    {
+      "at": "n0.burst-size",
+      "do": "inject",
+      "wave": "2"
+    },
+    {
+      "do": "settle"
+    },
+    {
+      "at": "d3.count",
+      "do": "output",
+      "expect": "2"
+    },
+    {
+      "at": "d3.total",
+      "do": "output",
+      "expect": "1"
+    },
+    {
+      "at": "n0.limit",
+      "do": "output",
+      "expect": "2"
+    },
+    {
+      "at": "n1.out",
+      "do": "output",
+      "expect": "4"
+    },
+    {
+      "at": "n0.burst-size",
+      "do": "inject",
+      "wave": "5"
+    },
+    {
+      "do": "settle"
+    },
+    {
+      "at": "d3.count",
+      "do": "output",
+      "expect": "5"
+    },
+    {
+      "at": "d3.total",
+      "do": "output",
+      "expect": "10"
+    },
+    {
+      "at": "n0.limit",
+      "do": "output",
+      "expect": "5"
+    },
+    {
+      "at": "n1.out",
+      "do": "output",
+      "expect": "10"
+    },
+    {
+      "do": "restore"
+    },
+    {
+      "do": "settle"
+    },
+    {
+      "at": "d3.count",
+      "do": "output",
+      "expect": "5"
+    },
+    {
+      "at": "d3.total",
+      "do": "output",
+      "expect": "10"
+    },
+    {
+      "at": "n0.limit",
+      "do": "output",
+      "expect": "5"
+    },
+    {
+      "at": "n1.out",
+      "do": "output",
+      "expect": "10"
+    }
+  ]
+}
