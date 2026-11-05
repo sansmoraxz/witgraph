@@ -1,0 +1,53 @@
+[package]
+name = "witgraph-fuzz"
+description = "Generates graphs and holds what witgraph does with them to independent rules"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[lints]
+workspace = true
+
+[features]
+# What `cargo fuzz` builds with, on nightly. Without it the targets don't build, and
+# `cargo test` replays the same checks on stable.
+libfuzzer = ["dep:libfuzzer-sys"]
+
+[dependencies]
+arbitrary = "1"
+futures = "0.3"
+libfuzzer-sys = { version = "0.4", optional = true }
+miette = { workspace = true }
+serde_json = { workspace = true }
+witgraph-host-plane = { path = "../test-fixtures/host-plane" }
+witgraph-ir = { workspace = true }
+
+[[bin]]
+name = "graph_model"
+path = "fuzz_targets/graph_model.rs"
+test = false
+doc = false
+bench = false
+required-features = ["libfuzzer"]
+
+[[bin]]
+name = "graph_json"
+path = "fuzz_targets/graph_json.rs"
+test = false
+doc = false
+bench = false
+required-features = ["libfuzzer"]
+
+[[bin]]
+name = "graph_run"
+path = "fuzz_targets/graph_run.rs"
+test = false
+doc = false
+bench = false
+required-features = ["libfuzzer"]
