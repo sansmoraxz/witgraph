@@ -27,7 +27,7 @@ sha2 = { workspace = true, optional = true }
 hex = { workspace = true, optional = true }
 # The features the runtime cannot work without. Everything else is opt-in below.
 wasmtime = { workspace = true, features = [
-    "runtime", "component-model", "component-model-async", "async", "std", "wave",
+    "runtime", "component-model", "component-model-async", "task-group-hook", "async", "std", "wave",
 ] }
 
 [features]

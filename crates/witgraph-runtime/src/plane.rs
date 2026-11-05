@@ -10,11 +10,11 @@
 //! it in a tick, and a host waiting on a pull polls it too, so a pull is answered
 //! with no tick running, and every poller is woken.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::future::{Future, poll_fn};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::task::Poll;
+use std::task::{Poll, Waker};
 
 use futures::FutureExt;
 use futures::channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -23,7 +23,7 @@ use futures::future::{Either, Shared as SharedFuture};
 use futures::stream::{FuturesUnordered, StreamExt};
 use wasmtime::component::{
     Accessor, Component, ComponentExportIndex, ComponentType, Func, Instance, InstancePre, Lift,
-    Type, TypedFunc, Val,
+    TaskGroupHook, TaskGroupId, Type, TypedFunc, Val,
 };
 use wasmtime::{AsContextMut, Engine, Store};
 use witgraph_ir::{FeedbackIdx, Idx, IndexVec, InputIdx, NodeId, NodeIdx, OutputIdx, PortTable};
@@ -621,6 +621,67 @@ async fn serve_hub<D: StoreData>(args: ServerArgs<D>) -> Outcome {
     }
 }
 
+/// Which host calls still have guest work under them, as wasmtime reports it: a call's task
+/// group lasts until every task it led to has exited, however long after returning.
+#[derive(Default)]
+struct TaskGroups {
+    /// Each live group, with the number of its start: an id can be used again.
+    live: HashMap<TaskGroupId, u64>,
+    starts: u64,
+    /// What to wake when a group finishes.
+    waker: Option<Waker>,
+}
+
+/// A call as [`TaskGroups`] knows it.
+#[derive(Clone, Copy)]
+struct GroupRun {
+    group: TaskGroupId,
+    start: Option<u64>,
+}
+
+impl TaskGroups {
+    fn started(&self, group: TaskGroupId) -> GroupRun {
+        GroupRun {
+            group,
+            start: self.live.get(&group).copied(),
+        }
+    }
+
+    fn is_live(&self, run: &GroupRun) -> bool {
+        run.start.is_some() && self.live.get(&run.group).copied() == run.start
+    }
+}
+
+/// Keeps [`TaskGroups`] up to date for a store.
+struct GroupWatch(Arc<Mutex<TaskGroups>>);
+
+impl TaskGroupHook for GroupWatch {
+    fn handle_start(&mut self, id: TaskGroupId) -> wasmtime::Result<()> {
+        let mut groups = lock(&self.0);
+        groups.starts += 1;
+        let start = groups.starts;
+        groups.live.insert(id, start);
+        Ok(())
+    }
+
+    fn handle_enter(&mut self, _: TaskGroupId) -> wasmtime::Result<()> {
+        Ok(())
+    }
+
+    fn handle_exit(&mut self, _: TaskGroupId) -> wasmtime::Result<()> {
+        Ok(())
+    }
+
+    fn handle_finish(&mut self, id: TaskGroupId) -> wasmtime::Result<()> {
+        let mut groups = lock(&self.0);
+        groups.live.remove(&id);
+        if let Some(waker) = groups.waker.take() {
+            waker.wake();
+        }
+        Ok(())
+    }
+}
+
 /// The server's loop: what is asked, as it is asked.
 async fn serve_commands<D: StoreData>(
     acc: &Accessor<D>,
@@ -637,6 +698,12 @@ async fn serve_commands<D: StoreData>(
     let mut jobs: VecDeque<Job<D>> = VecDeque::new();
     let mut lane: Option<LaneFuture<'_>> = None;
     let mut quiet_at: Option<u64> = None;
+    let groups = Arc::new(Mutex::new(TaskGroups::default()));
+    let watch = GroupWatch(groups.clone());
+    acc.with(|mut access| access.as_context_mut().task_group_hook(watch));
+    // By node, its last run; and the stream groups waiting for those to be over.
+    let mut last_runs: HashMap<NodeIdx, GroupRun> = HashMap::new();
+    let mut drains: Vec<(usize, u64, Box<[NodeIdx]>)> = Vec::new();
     let budget = settings.budget();
     let run_fn = hub.run;
     let (latch_fn, drop_fn) = (hub.latch_feedback, hub.drop_feedback);
@@ -670,15 +737,20 @@ async fn serve_commands<D: StoreData>(
             loop {
                 match commands.poll_next_unpin(cx) {
                     Poll::Ready(Some(Command::Run(node))) => {
-                        let at = u32_of(node.position());
                         let fueled =
                             acc.with(|mut access| access.as_context_mut().set_fuel(budget));
+                        // Started here, so its task group is known from now on.
+                        let call = u32_of(node.position()).and_then(|at| {
+                            fueled?;
+                            acc.with(|mut access| {
+                                run_fn.start_call_concurrent(access.as_context_mut(), (at,))
+                            })
+                        });
+                        if let Ok(call) = &call {
+                            last_runs.insert(node, lock(&groups).started(call.group()));
+                        }
                         runs.push(Box::pin(async move {
-                            let called = async {
-                                let at = at?;
-                                fueled?;
-                                run_fn.call_concurrent(acc, (at,)).await
-                            };
+                            let called = async { run_fn.finish_call_concurrent(acc, call?).await };
                             (node, called.await)
                         }));
                         progressed = true;
@@ -690,9 +762,9 @@ async fn serve_commands<D: StoreData>(
                         jobs.push_back(Job::Drop(connection));
                     }
                     Poll::Ready(Some(Command::AwaitQuiet(at))) => quiet_at = Some(at),
-                    // wasmtime says only whether a store has any task left, so a group
-                    // drains when the store is quiet.
-                    Poll::Ready(Some(Command::AwaitDrained { .. })) => {}
+                    Poll::Ready(Some(Command::AwaitDrained { group, at, members })) => {
+                        drains.push((group, at, members));
+                    }
                     // Whoever asked is gone, so nothing else matters.
                     Poll::Ready(None) => return Poll::Ready(Ok(())),
                     Poll::Pending => break,
@@ -732,6 +804,23 @@ async fn serve_commands<D: StoreData>(
                 };
                 send(ControlKind::RunReturned { node, returned });
                 progressed = true;
+            }
+            if !drains.is_empty() {
+                // Under the lock: a group finishing now wakes this after it, or is seen.
+                let mut groups = lock(&groups);
+                drains.retain(|(group, at, members)| {
+                    let over = members
+                        .iter()
+                        .all(|member| last_runs.get(member).is_none_or(|run| !groups.is_live(run)));
+                    if over {
+                        send(ControlKind::Drained {
+                            group: *group,
+                            at: *at,
+                        });
+                    }
+                    !over
+                });
+                groups.waker = (!drains.is_empty()).then(|| cx.waker().clone());
             }
             if let Some(at) = quiet_at
                 && runs.is_empty()

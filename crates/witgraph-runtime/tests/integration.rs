@@ -760,6 +760,61 @@ async fn a_node_stays_running_until_its_stream_group_has_drained() {
 }
 
 #[tokio::test]
+async fn a_finished_stream_group_drains_and_re_runs_beside_an_endless_one() {
+    let kit = Kit::new(&[STREAM_PRODUCER, STREAM_CONSUMER]);
+    let graph = kit
+        .builder("beside")
+        .add_node("p", kit.get(STREAM_PRODUCER))
+        .add_node("c", kit.get(STREAM_CONSUMER))
+        .add_node("endless", kit.get(STREAM_PRODUCER))
+        .add_node("reader", kit.get(STREAM_CONSUMER))
+        .connect("a", port("p", "items"), port("c", "items"))
+        .connect("b", port("endless", "items"), port("reader", "items"))
+        .build();
+    let mut rt = kit
+        .load(graph, RuntimeConfig::default(), Trace::new())
+        .await;
+    inject(&mut rt, "p", "burst-size", Val::U32(5)).await;
+    // No tick ends by itself beside an endless stream, so each is cut short.
+    let ticks_until = async |rt: &mut RuntimeGraph<Trace>, node: &str, count: Option<u32>| {
+        for _ in 0..500 {
+            let _ = rt
+                .tick_until(tokio::time::sleep(Duration::from_millis(5)))
+                .await;
+            let done = phase(rt, node) == NodePhase::Idle;
+            let counted = match count {
+                Some(count) => read_u32(rt, "c", "count").await == count,
+                None => true,
+            };
+            if done && counted {
+                return;
+            }
+        }
+        panic!("`{node}` never finished");
+    };
+    ticks_until(&mut rt, "c", Some(5)).await;
+    assert_eq!(phase(&rt, "p"), NodePhase::Idle, "its group is over");
+    assert_eq!(
+        phase(&rt, "endless"),
+        NodePhase::Running,
+        "the other is not"
+    );
+    assert_eq!(phase(&rt, "reader"), NodePhase::Running);
+
+    inject(&mut rt, "p", "burst-size", Val::U32(3)).await;
+    ticks_until(&mut rt, "c", Some(3)).await;
+    assert_eq!(read_u32(&mut rt, "c", "total").await, 3);
+    assert_eq!(phase(&rt, "endless"), NodePhase::Running);
+    let drained = rt
+        .mode()
+        .trace()
+        .iter()
+        .filter(|e| matches!(e, TraceEvent::GroupDrained { .. }))
+        .count();
+    assert_eq!(drained, 2, "the one group, twice");
+}
+
+#[tokio::test]
 async fn a_reader_dropping_a_passed_through_stream_stops_its_producer() {
     let kit = Kit::new(&[STREAM_PRODUCER, STREAM_RELAY, STREAM_CONSUMER]);
     for _ in 0..10 {
