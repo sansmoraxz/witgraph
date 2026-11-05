@@ -14,9 +14,16 @@ export default defineConfig({
     fs: {
       allow: ['../..'],
     },
+    // Debugging source lines needs shared memory, which only an isolated page has.
+    headers: {
+      'Cross-Origin-Opener-Policy': 'same-origin',
+      'Cross-Origin-Embedder-Policy': 'require-corp',
+    },
   },
 
   optimizeDeps: {
     exclude: ['witgraph-loader', 'witgraph-editor'],
+    // Found only as they start otherwise, which then reloads the page under what is running.
+    entries: ['**/*.html', 'src/session-worker.ts', 'test/lines/worker.ts'],
   },
 });

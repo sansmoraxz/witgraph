@@ -1,0 +1,70 @@
+// A page for `lines.spec.ts`: a session in a worker, driven from here.
+import { type LineDebugger, type LineStop, RemoteSession } from 'witgraph-loader';
+
+let frames = 0;
+const frame = () => {
+  frames += 1;
+  requestAnimationFrame(frame);
+};
+requestAnimationFrame(frame);
+const live = document.querySelector('#live') as HTMLButtonElement;
+live.onclick = () => {
+  live.textContent = String(Number(live.textContent) + 1);
+};
+
+const fetched = async (url: URL) => new Uint8Array(await (await fetch(url)).arrayBuffer());
+const stops: LineStop[] = [];
+const ref = {
+  package: { namespace: 'test', name: 'line-walk', version: '0.1.0' },
+  world: 'line-walk',
+};
+const session = await RemoteSession.load(
+  new Worker(new URL('./worker.ts', import.meta.url), { type: 'module' }),
+  {
+    graph: {
+      metadata: { name: 'lines' },
+      components: [ref],
+      nodes: [{ id: 'walker', component: ref }],
+      connections: [],
+    },
+    components: [
+      {
+        id: 'test:line-walk/line-walk@0.1.0',
+        bytes: await fetched(new URL('../../components/line-walk.wasm', import.meta.url)),
+      },
+    ],
+    wasm: await fetched(
+      new URL('../../../witgraph-loader/pkg/witgraph_web_bg.wasm', import.meta.url),
+    ),
+    lines: { onStop: (stop) => stops.push(stop) },
+  },
+);
+const lines = session.lines as LineDebugger;
+const file = lines.files.find((name) => name.endsWith('line-walk/src/lib.rs')) as string;
+let ticked: unknown;
+
+Object.assign(window, {
+  ready: true,
+  dbg: {
+    isolated: () => crossOriginIsolated,
+    frames: () => frames,
+    stops: () => stops,
+    file: () => file,
+    set: (line: number) => lines.setBreakpoint(file, line),
+    clear: (line: number) => lines.clearBreakpoint(file, line),
+    inject: (port: string, value: number) => session.graph.inject('walker', port, value),
+    tick: () => {
+      ticked = undefined;
+      void session.tick().then((result) => {
+        ticked = result;
+      });
+    },
+    ticked: () => ticked,
+    pause: () => lines.pause(),
+    resume: () => lines.resume(),
+    stepOver: () => lines.stepOver(),
+    stepIn: () => lines.stepIn(),
+    stepOut: () => lines.stepOut(),
+    output: () => session.graph.readOutput('walker', 'out'),
+  },
+});

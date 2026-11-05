@@ -31,6 +31,7 @@ witgraph-ir = { workspace = true }
 witgraph-traits = { workspace = true }
 witgraph-wit = { workspace = true, features = ["compose"] }
 witgraph-sched = { workspace = true }
+witgraph-probes = { workspace = true }
 futures = "0.3"
 serde = { workspace = true }
 serde_json = { workspace = true }

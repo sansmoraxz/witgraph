@@ -17,6 +17,7 @@ import {
   type TickResult,
   type Wasm,
 } from './index.ts';
+import { LineDebugger, LineProbes, type LineStop, type LinesInfo } from './lines.ts';
 
 /** A worker that can be ended, for what never returns to read another message. */
 export type SessionWorker = Endpoint & { terminate?(): unknown };
@@ -89,6 +90,12 @@ export interface RemoteSessionOptions {
   onHandle?: (item: HandleItem) => void;
   /** The worker reported state: {@link RemoteGraph.nodeState} and the rest may have moved. */
   onState?: () => void;
+  /**
+   * Debugs source lines: {@link RemoteSession.lines} sets breakpoints and steps, and `onStop`
+   * says where a guest has stopped. It needs shared memory, so a page that is
+   * cross-origin isolated, and a real worker, as a stop blocks the thread.
+   */
+  lines?: { all?: boolean; onStop: (stop: LineStop) => void };
 }
 
 /** The state a worker reports. */
@@ -113,6 +120,7 @@ interface Loaded {
   diagnostics: Diagnostic[];
   streamGroups: string[][];
   state: State;
+  lines?: LinesInfo;
 }
 
 /** Marks this protocol's messages: a host may send a worker others of its own. */
@@ -205,6 +213,7 @@ class Served {
   #every: ReturnType<typeof setInterval> | undefined;
   #soon: ReturnType<typeof setTimeout> | undefined;
   #disposed = false;
+  #lines: LineProbes | undefined;
 
   constructor(send: (message: object) => void, id: number, options: ServeOptions) {
     this.#send = send;
@@ -242,12 +251,20 @@ class Served {
       mocked: string[];
       holds: readonly string[] | 'all';
       observed: readonly (readonly [string, string])[];
+      lines?: { all?: boolean };
     },
     ask: (kind: string, fields: object) => Promise<unknown>,
   ): Promise<Loaded> {
     this.holdAt(message.holds);
     this.observeOnly(message.observed);
     const wasm = message.wasm;
+    if (message.lines) {
+      this.#lines = new LineProbes(
+        (kind, fields) => this.#post(kind, fields),
+        () => this.report(),
+        message.lines.all,
+      );
+    }
     const mocks = Object.fromEntries(
       message.mocked.map((node) => [
         node,
@@ -262,6 +279,7 @@ class Served {
         ? {}
         : { wasm: 'url' in wasm ? new URL((wasm as { url: string }).url) : (wasm as Wasm) }),
       capabilities: this.#options.capabilities,
+      lines: this.#lines,
       mocks,
       beforeRun: (node) => this.#beforeRun(node),
       afterRun: (node) => {
@@ -293,6 +311,7 @@ class Served {
       diagnostics: [...this.session.diagnostics],
       streamGroups: this.session.graph.streamGroups() as string[][],
       state: this.#state(),
+      lines: this.#lines?.info(),
     };
   }
 
@@ -766,6 +785,8 @@ export class RemoteSession {
   readonly contracts: Map<string, Contract>;
   readonly warnings: readonly string[];
   readonly diagnostics: readonly Diagnostic[];
+  /** Sets breakpoints and steps, in a session loaded with `lines`. */
+  readonly lines: LineDebugger | undefined;
   /** @internal */
   state: State;
   #channel: Channel;
@@ -782,10 +803,21 @@ export class RemoteSession {
     this.warnings = loaded.warnings;
     this.diagnostics = loaded.diagnostics;
     this.graph = new RemoteGraph(this, loaded.streamGroups);
+    this.lines =
+      loaded.lines && options.lines && new LineDebugger(loaded.lines, options.lines.onStop);
   }
 
   /** Loads the graph in the worker `endpoint` serves. */
   static async load(endpoint: Endpoint, options: RemoteSessionOptions): Promise<RemoteSession> {
+    if (
+      options.lines &&
+      (globalThis as { crossOriginIsolated?: boolean }).crossOriginIsolated === false
+    ) {
+      throw new Error(
+        'debugging source lines needs shared memory: serve the page with the headers ' +
+          '`Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp`',
+      );
+    }
     let channel = channels.get(endpoint);
     if (!channel) {
       channel = new Channel(endpoint);
@@ -810,6 +842,7 @@ export class RemoteSession {
         mocked: Object.keys(mocks).filter((node) => typeof mocks[node] === 'function'),
         holds: options.holds ?? [],
         observed: options.observed ?? [],
+        ...(options.lines ? { lines: { all: options.lines.all } } : {}),
       })) as Loaded;
     } catch (error) {
       channel.sessions.delete(id);
@@ -831,6 +864,10 @@ export class RemoteSession {
   // biome-ignore lint/suspicious/noExplicitAny: a message is checked by its tag.
   received(kind: string, data: any): void {
     if (this.#disposed) return;
+    if (kind.startsWith('lines-')) {
+      this.lines?.received(kind, data);
+      return;
+    }
     const options = this.#options;
     switch (kind) {
       case 'state': {
@@ -945,6 +982,8 @@ export class RemoteSession {
   /** As {@link Session.dispose}. The worker goes on, for the next session. */
   dispose(): void {
     if (this.#disposed) return;
+    // A guest stopped on a line holds up the worker, and so what this asks of it.
+    this.lines?.release();
     this.#post('dispose', {});
     this.#disposed = true;
     this.#channel.sessions.delete(this.#id);

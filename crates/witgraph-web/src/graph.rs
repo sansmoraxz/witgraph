@@ -1,7 +1,7 @@
 //! `WebGraph`: a graph loaded on a JavaScript host.
 
 use std::cell::{Ref, RefCell, RefMut};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -18,6 +18,7 @@ use witgraph_ir::{
     Capability, CompiledGraph, ComponentContract, ComponentRef, Graph, IndexVec, InputIdx, NodeId,
     OutputIdx, PortDirection, PortKind, PortName, PortTable,
 };
+use witgraph_probes::{Lines, core_modules, instrument};
 use witgraph_sched::{
     DataPlane, NodeFault, PortVersions, RuntimeError, SchedulerCore, Snapshot, TickResult,
     TraceEvent, latched_output, not_a_value_output,
@@ -489,6 +490,50 @@ struct Composite {
     bytes: Vec<u8>,
     /// Its SHA-256, in hex.
     sha256: String,
+    /// When asked for: by each core module's SHA-256, the nodes with an instance of it, in
+    /// the order they are instantiated.
+    module_nodes: BTreeMap<String, Vec<NodeId>>,
+}
+
+/// The SHA-256 of `bytes`, in hex.
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest: [u8; 32] = Sha256::digest(bytes).into();
+    hex(&digest)
+}
+
+/// What a debugger needs of a core module of the composite: its `bytes` with a probe on
+/// each source line, or `null` if there is nothing to probe.
+///
+/// Returns `{ bytes, sha256, probes }`: `sha256` is the module's as given, to find its nodes
+/// by ([`WebGraph::module_nodes`]), and `probes` lists `{ offset, function, file, line, column }`,
+/// each at the index its probe calls the `witgraph:debug` import `probe` with, and its flag
+/// is at in the shared memory the module exports as `witgraph:debug/flags`. `allLines` reaches
+/// into the standard library and dependencies, which a guest's own lines leave out.
+#[wasm_bindgen(js_name = instrumentModule)]
+pub fn instrument_module(bytes: &[u8], all_lines: bool) -> Result<JsValue, JsError> {
+    let lines = if all_lines { Lines::All } else { Lines::Own };
+    let Some(instrumented) = instrument(bytes, lines).map_err(error)? else {
+        return Ok(JsValue::NULL);
+    };
+    let probes = Array::new();
+    for probe in &instrumented.probes {
+        let object = Object::new();
+        set(&object, "offset", &JsValue::from(probe.offset.0));
+        set(&object, "function", &JsValue::from(probe.function));
+        set(&object, "file", &text(&probe.file));
+        set(&object, "line", &JsValue::from(probe.line));
+        set(&object, "column", &JsValue::from(probe.column));
+        probes.push(&object);
+    }
+    let object = Object::new();
+    set(
+        &object,
+        "bytes",
+        &Uint8Array::from(instrumented.module.as_slice()),
+    );
+    set(&object, "sha256", &text(&sha256_hex(bytes)));
+    set(&object, "probes", &probes);
+    Ok(object.into())
 }
 
 /// A compiled graph running on this JavaScript host.
@@ -556,6 +601,7 @@ impl WebGraph {
         components: Array,
         callbacks: JsValue,
         mocked: Vec<String>,
+        debug: Option<bool>,
     ) -> Result<WebGraph, JsValue> {
         let graph: Graph = serde_json::from_str(graph).map_err(error)?;
         let required = |name: &str, key: &str| -> Result<Function, JsError> {
@@ -632,6 +678,7 @@ impl WebGraph {
             &linked.composed,
             &linked.of_node,
             &mocked,
+            debug.unwrap_or(false),
         )?;
 
         let ports = Rc::new(PortTable::new(&compiled));
@@ -751,6 +798,22 @@ impl WebGraph {
     /// The scheduler to read from, unless a tick has it.
     fn readable(&self) -> Option<Ref<'_, WebRuntime>> {
         Ref::filter_map(self.sched.try_borrow().ok()?, Option::as_ref).ok()
+    }
+
+    /// For a graph loaded with `debug`: by each core module's SHA-256, the nodes with an
+    /// instance of it, in the order those are instantiated. Its first instance is the first
+    /// node's, and so on: core modules are instantiated as their nodes are composed.
+    #[wasm_bindgen(js_name = moduleNodes)]
+    pub fn module_nodes(&self) -> Object {
+        let object = Object::new();
+        for (module, nodes) in &self.composite.module_nodes {
+            let names = Array::new();
+            for node in nodes {
+                names.push(&text(node.as_str()));
+            }
+            set(&object, module, &names);
+        }
+        object
     }
 
     /// The graph as one component: `{ bytes, sha256 }`.
@@ -1201,7 +1264,9 @@ fn compose(
     composed: &[Composed],
     composed_of: &HashMap<NodeId, usize>,
     mocked: &[NodeId],
+    debug: bool,
 ) -> Result<(Composite, Vec<Capability>), JsError> {
+    let mut module_nodes: BTreeMap<String, Vec<NodeId>> = BTreeMap::new();
     let mut capabilities: Vec<Capability> = Vec::new();
     let mut members = Vec::with_capacity(compiled.graph().nodes.len());
     for node in &compiled.graph().nodes {
@@ -1222,6 +1287,14 @@ fn compose(
         };
         if !is_mocked {
             Capability::add_unique(&mut capabilities, imports);
+            if debug {
+                for module in core_modules(bytes).map_err(error)? {
+                    module_nodes
+                        .entry(sha256_hex(module))
+                        .or_default()
+                        .push(node.id.clone());
+                }
+            }
         }
         members.push(HubMember {
             node: &node.id,
@@ -1231,11 +1304,12 @@ fn compose(
         });
     }
     let composed = hub::compose_graph(compiled, &members).map_err(error)?;
-    let digest: [u8; 32] = Sha256::digest(&composed.bytes).into();
+    let sha256 = sha256_hex(&composed.bytes);
     Ok((
         Composite {
             bytes: composed.bytes,
-            sha256: hex(&digest),
+            sha256,
+            module_nodes,
         },
         capabilities,
     ))

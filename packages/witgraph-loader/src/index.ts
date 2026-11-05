@@ -10,13 +10,14 @@
 // replaces a node with a function. A value reaches the host only when it asks.
 
 import { $init, generate } from '@bytecodealliance/jco-transpile/component';
-
 import initModule, {
   describeComponent as describeRaw,
   GraphChecker,
+  instrumentModule,
   jsName as jsNameRaw,
   WebGraph,
 } from '../pkg/witgraph_web.js';
+import type { SessionLines, SourceProbe } from './lines.ts';
 
 /** A port of a component, as the editor catalog describes one. */
 export interface Port {
@@ -170,6 +171,12 @@ export interface SessionOptions {
    * console.
    */
   onFutureValue?: (item: FutureItem) => void;
+  /**
+   * Puts a probe on each source line of the guests with debug info, and calls this at those
+   * whose flags are set. A debugger is {@link RemoteSession.lines}: it blocks in a probe, which
+   * only a worker can.
+   */
+  lines?: SessionLines;
 }
 
 /**
@@ -230,12 +237,26 @@ interface Transpiled {
   instantiate: (
     getCoreModule: (path: string) => Promise<WebAssembly.Module>,
     imports: Record<string, object>,
-    instantiateCore: undefined,
+    instantiateCore:
+      | ((
+          module: WebAssembly.Module,
+          imports: WebAssembly.Imports,
+        ) => Promise<WebAssembly.Instance>)
+      | undefined,
     options: { onTrap: (error: unknown) => void },
   ) => Promise<Record<string, any>>;
   modules: Map<string, Promise<WebAssembly.Module>>;
   /** Its imports, as jco names them. */
   imports: string[];
+  /** The core modules with probes in them. */
+  probed: { module: WebAssembly.Module; probes: SourceProbe[]; sha256: string }[];
+}
+
+/** What `instrumentModule` makes of a core module. */
+interface InstrumentedModule {
+  bytes: Uint8Array;
+  sha256: string;
+  probes: SourceProbe[];
 }
 
 /** What one of the composite's imports is. */
@@ -404,12 +425,17 @@ export class Session {
         abandon: () => live().#abandon(),
       },
       mocked.filter((node) => known.has(node)),
+      options.lines !== undefined,
     );
     try {
       const nodes = web.nodes() as string[];
       const composite = web.composite() as { bytes: Uint8Array; sha256: string };
-      const transpiled = await transpileCached(composite.sha256, composite.bytes);
+      const transpiled = await transpileCached(composite.sha256, composite.bytes, options.lines);
       const imports = web.imports(transpiled.imports) as ImportKind[];
+      const ofModule = web.moduleNodes() as Record<string, string[]>;
+      options.lines?.modules?.(
+        transpiled.probed.map(({ probes, sha256 }) => ({ probes, nodes: ofModule[sha256] ?? [] })),
+      );
       session = new Session(web, options, transpiled, imports, nodes);
       await session.#instantiate();
       return session;
@@ -604,14 +630,19 @@ export class Session {
     }
     const { instantiate, modules } = this.#transpiled;
     let ended = false;
-    const instance = (await instantiate((path: string) => modules.get(path)!, provided, undefined, {
-      // A call of `run` the trap ends rejects first, which names its node.
-      onTrap: (error: unknown) => {
-        setTimeout(() => {
-          if (!ended && this.#instance === instance) this.graph.reportTrap(error);
-        }, 0);
+    const instance = (await instantiate(
+      (path: string) => modules.get(path)!,
+      provided,
+      this.#instantiateCore(),
+      {
+        // A call of `run` the trap ends rejects first, which names its node.
+        onTrap: (error: unknown) => {
+          setTimeout(() => {
+            if (!ended && this.#instance === instance) this.graph.reportTrap(error);
+          }, 0);
+        },
       },
-    })) as HubInstance;
+    )) as HubInstance;
     // An instance abandoned meanwhile is nobody's: a newer rebuild may already
     // have run on its own.
     if (!this.#disposed && this.#epoch === epoch) {
@@ -621,6 +652,29 @@ export class Session {
       ended = true;
       end(instance);
     }
+  }
+
+  /** What instantiates each core module, with the import its probes call, if it has any. */
+  #instantiateCore():
+    | ((module: WebAssembly.Module, imports: WebAssembly.Imports) => Promise<WebAssembly.Instance>)
+    | undefined {
+    const lines = this.#options.lines;
+    const { probed } = this.#transpiled;
+    if (!lines || probed.length === 0) return undefined;
+    lines.instantiating?.();
+    const instances = probed.map(() => 0);
+    return async (module, imports) => {
+      const at = probed.findIndex((entry) => entry.module === module);
+      if (at < 0) return WebAssembly.instantiate(module, imports);
+      const instance = instances[at]++;
+      const made = await WebAssembly.instantiate(module, {
+        ...imports,
+        'witgraph:debug': { probe: (id: number) => lines.probe(at, instance, id) },
+      });
+      const flags = made.exports['witgraph:debug/flags'] as WebAssembly.Memory;
+      lines.instance?.(at, instance, flags.buffer);
+      return made;
+    };
   }
 
   /** One call of the hub's `run` of a node, with the hooks around it. */
@@ -839,16 +893,22 @@ const CACHED = 32;
  * `transpileComposite`, done once per distinct bytes (`sha256` being
  * theirs): an editor reloading a graph it has seen reuses the work.
  */
-function transpileCached(sha256: string, bytes: Uint8Array): Promise<Transpiled> {
-  let transpiled = transpileCache.get(sha256);
+function transpileCached(
+  sha256: string,
+  bytes: Uint8Array,
+  lines: SessionLines | undefined,
+): Promise<Transpiled> {
+  // Probes make other modules of the same bytes.
+  const key = lines ? `${sha256}:lines:${lines.all ?? false}` : sha256;
+  let transpiled = transpileCache.get(key);
   if (transpiled === undefined) {
-    transpiled = transpileComposite(bytes);
+    transpiled = transpileComposite(bytes, lines);
     // A failed transpile is not kept.
-    transpiled.catch(() => transpileCache.delete(sha256));
+    transpiled.catch(() => transpileCache.delete(key));
   } else {
-    transpileCache.delete(sha256);
+    transpileCache.delete(key);
   }
-  transpileCache.set(sha256, transpiled);
+  transpileCache.set(key, transpiled);
   while (transpileCache.size > CACHED) {
     transpileCache.delete(transpileCache.keys().next().value!);
   }
@@ -867,20 +927,37 @@ export const TRANSPILE_OPTIONS = {
   multiMemory: true,
 } as const;
 
-async function transpileComposite(bytes: Uint8Array): Promise<Transpiled> {
+async function transpileComposite(
+  bytes: Uint8Array,
+  lines: SessionLines | undefined,
+): Promise<Transpiled> {
   await $init;
   const { files, imports } = generate(bytes, TRANSPILE_OPTIONS);
   const modules = new Map<string, Promise<WebAssembly.Module>>();
+  const probed: Transpiled['probed'] = [];
   let source: string | undefined;
   // jco makes each file's bytes itself, over an `ArrayBuffer`.
   for (const [name, contents] of files as [string, Uint8Array<ArrayBuffer>][]) {
-    if (name.endsWith('.wasm')) modules.set(name, WebAssembly.compile(contents));
-    else if (name.endsWith('.js')) source = new TextDecoder().decode(contents);
+    if (name.endsWith('.wasm')) {
+      const rewritten =
+        lines && (instrumentModule(contents, lines.all ?? false) as InstrumentedModule | null);
+      const compiling = WebAssembly.compile(
+        rewritten ? (rewritten.bytes as Uint8Array<ArrayBuffer>) : contents,
+      );
+      modules.set(name, compiling);
+      if (rewritten) {
+        probed.push({
+          module: await compiling,
+          probes: rewritten.probes,
+          sha256: rewritten.sha256,
+        });
+      }
+    } else if (name.endsWith('.js')) source = new TextDecoder().decode(contents);
   }
   if (source === undefined) throw new Error('the composite transpiled to no JavaScript');
   const url = `data:text/javascript;base64,${base64(new TextEncoder().encode(source))}`;
   const { instantiate } = await import(/* @vite-ignore */ url);
-  return { instantiate, modules, imports };
+  return { instantiate, modules, imports, probed };
 }
 
 function base64(bytes: Uint8Array): string {
@@ -929,6 +1006,13 @@ export function diagnosticsOf(error: unknown): Diagnostic[] | undefined {
   return Array.isArray(diagnostics) ? (diagnostics as Diagnostic[]) : undefined;
 }
 
+export {
+  LineDebugger,
+  type LineModule,
+  type LineStop,
+  type SessionLines,
+  type SourceProbe,
+} from './lines.ts';
 export {
   describeHandle,
   type Endpoint,

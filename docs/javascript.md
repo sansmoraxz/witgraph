@@ -184,6 +184,49 @@ the worker never gets to read a `shutdown`. It ends all of them, and what waits 
 rejects. A `MessagePort` will do
 for `self` and `worker`, with `serveSession` on either side of it, even on one thread.
 
+### Stopping on a source line
+
+Load with `lines`, and a guest built with debug info can be stopped on any line of its
+source. A browser lets a page set no breakpoint in WebAssembly, so each line gets a probe
+as the graph loads, which checks a flag and carries on, so a guest not stopped is barely
+slowed: a tight loop by up to half, other work by a few percent.
+
+```ts
+const session = await RemoteSession.load(worker, {
+  graph,
+  components,
+  wasm,
+  lines: { onStop: (stop) => show(stop.file, stop.line, stop.node, stop.frames) },
+});
+const { lines } = session;
+lines.setBreakpoint(file, 42); // from `lines.files`; returns the line it came to
+void session.tick();
+// ... `onStop` says where it stopped; then one of:
+lines.stepOver();
+lines.stepIn();
+lines.stepOut();
+lines.resume();
+```
+
+`pause()` stops at the next line any guest reaches. It and `setBreakpoint` take effect at
+once, even on a guest in a loop that never returns to its worker. A breakpoint on a line
+with no code comes to the next that has some, and stops every node running that code. A step
+stays with its guest: others run on past their probes.
+
+- **The page must be cross-origin isolated**, for the shared memory this goes through: serve
+  it with `Cross-Origin-Opener-Policy: same-origin` and
+  `Cross-Origin-Embedder-Policy: require-corp`. It must be a real worker too, as a stop blocks
+  its thread.
+- **Stopped, the worker answers nothing.** All its guests are stopped with it, as on wasmtime,
+  and what you ask of the session waits, until `resume()` or a step. `dispose()` lets the guest
+  go first, and `endWorker` ends it where it is.
+- **Build the guest with debug info**, and `opt-level = 0` for exact lines: optimizing leaves
+  some lines with no code of their own. A guest with none has no lines, and runs as usual.
+- **Only the guest's own lines** have probes, by the path the debug info gives: not the
+  standard library's, or a dependency's. Stepping stays out of those, and so does their cost.
+  `lines: { all: true }` puts them on every line, at about twice the time. Macros count as the
+  line they are written on, so stepping can pass through a Rust guest's `generate!` line.
+
 ## When a graph does not compile
 
 `Session.load` throws an error listing what is wrong. `diagnosticsOf(error)` gets the
