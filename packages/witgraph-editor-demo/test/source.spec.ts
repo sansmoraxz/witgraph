@@ -84,6 +84,72 @@ test.describe('the source panel', () => {
     expect(output).toBe(11);
   });
 
+  test('variables show what they hold, and mark what changed', async ({ page }) => {
+    const source = page.locator('witgraph-source');
+    const controls = page.locator('witgraph-controls');
+    const variables = source.locator('.variables');
+    const named = (path: string) => variables.locator(`[data-path="${path}"]`);
+
+    await expect(variables).toBeHidden();
+    await source.locator(`.row[data-line="${mark('walk-first')}"] .gutter`).click();
+    await controls.locator('button.run').click();
+    await expect(source.locator('.row.current')).toBeVisible();
+    await expect(variables).toBeInViewport();
+    await expect(named('x')).toContainText('x: 5');
+    await expect(named('x')).toContainText('u32');
+    await expect(named('a')).toHaveCount(0);
+
+    await page.keyboard.press('F10');
+    await expect(named('a')).toContainText('a: 6');
+    await expect(named('x')).not.toHaveClass(/changed/);
+    await expect(variables).not.toHaveClass(/stale/);
+    // Into another function: its `a` is not the one before.
+    await page.keyboard.press('F11');
+    await expect(named('a')).toContainText('a: 6');
+    await expect(source.locator('.frames')).toHaveText(/^[^←]*add/);
+    await expect(named('a')).not.toHaveClass(/changed/);
+    await page.keyboard.press('Shift+F11');
+    await expect(source.locator('.frames')).toHaveText(/^[^←]*walk/);
+    await expect(controls.locator('.badge')).toContainText('Paused');
+    await page.keyboard.press('F5');
+    await expect(source.locator('.where')).toContainText('in second');
+    // `second` reads what `first` made of it.
+    await expect(named('x')).toContainText('x: 8');
+    await expect(named('x')).toHaveClass(/changed/);
+    await page.keyboard.press('F5');
+    await expect(controls.locator('button.run')).toBeEnabled();
+    await expect(variables).toBeHidden();
+  });
+
+  test('a variable with parts opens, and stays open through a step', async ({ page }) => {
+    const source = page.locator('witgraph-source');
+    const controls = page.locator('witgraph-controls');
+    const variables = source.locator('.variables');
+    await page
+      .locator('witgraph-canvas')
+      .evaluate((el: WitgraphCanvas) => el.controller?.injectValue('first', 'kinds', '4'));
+    await source.locator(`.row[data-line="${mark('kinds-used')}"] .gutter`).click();
+    await controls.locator('button.run').click();
+    await expect(source.locator('.row.current')).toBeVisible();
+
+    const rect = variables.locator('[data-path="rect"]');
+    await expect(rect).toContainText('Rect { w: 4, h: 5 }');
+    await expect(variables.locator('[data-path="text"]')).toContainText('"hello"');
+    await expect(variables.locator('[data-path="owned"]')).toContainText('"owned"');
+    await expect(variables.locator('[data-path="list"]')).toContainText('[10, 20, 30]');
+    await expect(variables.locator('[data-path="rect.w"]')).toBeHidden();
+    await rect.locator('summary').click();
+    await expect(variables.locator('[data-path="rect.w"]')).toContainText('w: 4');
+
+    await page.keyboard.press('F10');
+    await expect(source.locator('.row.current')).toHaveAttribute(
+      'data-line',
+      String(mark('kinds-used') + 1),
+    );
+    await expect(variables.locator('[data-path="rect.w"]')).toBeVisible();
+    await controls.locator('button.stop').click();
+  });
+
   test('stop ends a guest stopped on a line, and leaves its breakpoints set', async ({ page }) => {
     const source = page.locator('witgraph-source');
     const controls = page.locator('witgraph-controls');

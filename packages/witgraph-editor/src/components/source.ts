@@ -1,3 +1,4 @@
+import type { LineStop, SourceVariable } from 'witgraph-loader';
 import type { EditorController } from '../controller/editor-controller.ts';
 import { adoptStyles } from './shared-styles.ts';
 
@@ -9,7 +10,21 @@ const EXTRA_CSS = `
   .title { font-weight: 600; }
   .file { background: var(--wg-bg); color: var(--wg-text); border: 1px solid var(--wg-surface-hover); border-radius: 4px; max-width: 40ch; }
   .where { color: var(--wg-warning); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .rows { flex: 1 1 0; min-height: 0; overflow: auto; font-family: monospace; white-space: pre; }
+  .body { flex: 1 1 0; min-height: 0; display: flex; }
+  .rows { flex: 3 1 0; min-width: 0; overflow: auto; font-family: monospace; white-space: pre; }
+  .variables { flex: 2 1 0; min-width: 0; overflow: auto; border-left: 1px solid var(--wg-surface-hover); padding: 2px 0; }
+  .variables[hidden] { display: none; }
+  .variables.stale { opacity: 0.5; }
+  .variables-title { padding: 2px 8px; font-weight: 600; }
+  .variable { padding-left: 14px; font-family: monospace; white-space: nowrap; }
+  .variable > summary { cursor: pointer; margin-left: -12px; }
+  .variable-line { display: inline; }
+  .variable-name { color: var(--wg-primary); }
+  .variable-value { color: var(--wg-text); }
+  .variable-type { color: var(--wg-text-dim); margin-left: 1ch; }
+  .variable.changed > .variable-line .variable-value,
+  .variable.changed > summary .variable-value { color: var(--wg-warning); font-weight: 600; }
+  .no-variables { padding: 2px 8px; color: var(--wg-text-dim); }
   .row { display: flex; min-width: max-content; }
   .row.current { background: color-mix(in srgb, var(--wg-warning) 22%, transparent); }
   .gutter { flex: none; width: 1.4em; display: flex; align-items: center; justify-content: center; cursor: pointer; }
@@ -40,6 +55,15 @@ export class WitgraphSource extends HTMLElement {
   #where!: HTMLSpanElement;
   #frames!: HTMLDivElement;
   #scroller!: HTMLDivElement;
+  #variables!: HTMLDivElement;
+  /** The stop whose variables are on show. */
+  #variablesOf: LineStop | null = null;
+  /** What each variable held at the stop before, by its path, to mark what has changed. */
+  #before = new Map<string, string>();
+  /** The function that stop was in. */
+  #beforeIn: string | undefined;
+  /** The paths left open, so that a step leaves them so. */
+  #open = new Set<string>();
   #rows = new Map<number, HTMLDivElement>();
   /** The file on show, and what it was drawn from. */
   #file: string | null = null;
@@ -83,7 +107,15 @@ export class WitgraphSource extends HTMLElement {
     this.#scroller = document.createElement('div');
     this.#scroller.className = 'rows';
 
-    panel.append(header, this.#frames, this.#scroller);
+    this.#variables = document.createElement('div');
+    this.#variables.className = 'variables';
+    this.#variables.hidden = true;
+
+    const body = document.createElement('div');
+    body.className = 'body';
+    body.append(this.#scroller, this.#variables);
+
+    panel.append(header, this.#frames, body);
     shadow.appendChild(panel);
     this.#controller?.addEventListener('state-changed', this.#onStateChanged);
     this.#sync();
@@ -138,9 +170,92 @@ export class WitgraphSource extends HTMLElement {
     this.#frames.hidden = !stop;
     this.#frames.textContent = stop ? stop.frames.join('  ←  ') : '';
     this.#frames.title = stop ? stop.frames.join('\n') : '';
+    this.#showVariables(stop);
 
     if (this.#drawn !== this.#file) void this.#draw(this.#file);
     else this.#mark();
+  }
+
+  /**
+   * Shows the variables of a stop, once, and marks what has changed since the one before. Going
+   * on from a stop leaves them, dimmed, until the next or until the run is over.
+   */
+  #showVariables(stop: LineStop | null): void {
+    const running = this.#controller?.mode === 'running' || this.#controller?.mode === 'paused';
+    this.#variables.classList.toggle('stale', stop === null);
+    if (stop === null && !running) {
+      // Over: the next run has nothing to differ from.
+      this.#variablesOf = null;
+      this.#variables.hidden = true;
+      this.#before.clear();
+      this.#beforeIn = undefined;
+      this.#variables.replaceChildren();
+      return;
+    }
+    if (stop === this.#variablesOf) return;
+    this.#variablesOf = stop;
+    if (stop === null) return;
+    const { variables } = stop;
+    this.#variables.hidden = false;
+    // Another function's variables are others, whatever their names.
+    if (stop.frames[0] !== this.#beforeIn) this.#before.clear();
+    this.#beforeIn = stop.frames[0];
+    const title = document.createElement('div');
+    title.className = 'variables-title';
+    title.textContent = 'Variables';
+    const now = new Map<string, string>();
+    const shown: HTMLElement[] = [title];
+    if (variables.length === 0) {
+      const none = document.createElement('div');
+      none.className = 'no-variables';
+      none.textContent = 'None in scope here.';
+      shown.push(none);
+    }
+    for (const variable of variables) shown.push(this.#variableRow(variable, variable.name, now));
+    this.#variables.replaceChildren(...shown);
+    this.#before = now;
+  }
+
+  #variableRow(variable: SourceVariable, path: string, now: Map<string, string>): HTMLElement {
+    now.set(path, variable.value);
+    const earlier = this.#before.get(path);
+    const changed = this.#before.size > 0 && earlier !== undefined && earlier !== variable.value;
+
+    const line = document.createElement('span');
+    line.className = 'variable-line';
+    const name = document.createElement('span');
+    name.className = 'variable-name';
+    name.textContent = `${variable.name}: `;
+    const value = document.createElement('span');
+    value.className = 'variable-value';
+    value.textContent = variable.value;
+    const type = document.createElement('span');
+    type.className = 'variable-type';
+    type.textContent = variable.type;
+    line.append(name, value, type);
+
+    if (variable.children.length === 0) {
+      const row = document.createElement('div');
+      row.className = changed ? 'variable changed' : 'variable';
+      row.dataset.path = path;
+      row.appendChild(line);
+      return row;
+    }
+    const row = document.createElement('details');
+    row.className = changed ? 'variable changed' : 'variable';
+    row.dataset.path = path;
+    row.open = this.#open.has(path);
+    row.addEventListener('toggle', () => {
+      if (row.open) this.#open.add(path);
+      else this.#open.delete(path);
+    });
+    const summary = document.createElement('summary');
+    summary.appendChild(line);
+    row.appendChild(summary);
+    for (const child of variable.children) {
+      row.appendChild(this.#variableRow(child, `${path}.${child.name}`, now));
+    }
+    return row;
   }
 
   /** Draws a file's rows: its text if the host can say, or else only the lines with code. */

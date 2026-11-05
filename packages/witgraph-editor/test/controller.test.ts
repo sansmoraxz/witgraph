@@ -579,6 +579,11 @@ test('a run stops on a line, shows it, and goes on from it by step or continue',
 
   await controller.step();
   assert.equal(lineOf(controller), mark('walk-second'), 'step goes over the call');
+  assert.equal(
+    controller.lineStop?.variables.find(({ name }) => name === 'a')?.value,
+    '6',
+    'and shows what it came to',
+  );
   await controller.stepIn();
   assert.match(controller.lineStop?.frames[0] ?? '', /add/);
   await controller.stepOut();

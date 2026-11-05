@@ -83,7 +83,8 @@ Put them anywhere on your page. They all share one `EditorController`.
   to the next line, over any call, **In** (F11) into a call, and **Out** (Shift+F11) out of the
   function. **Pause** stops at the next line of what is running, even a node that is spinning,
   and from a node about to run, **In** stops at its first line. The panel shows the functions on
-  the stack and follows each stop. All of the graph stops with it, so previews wait until it goes
+  the stack, follows each stop, and lists the variables in scope, marking what changed since the
+  last stop in that function. All of the graph stops with it, so previews wait until it goes
   on. It takes a page that is cross-origin isolated
   ([why](javascript.md#stopping-on-a-source-line)): elsewhere the graph runs as usual, and the
   timeline says so. Without debug info in a graph, the panel and its buttons stay hidden.
