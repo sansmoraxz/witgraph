@@ -788,6 +788,62 @@ export class RemoteGraph {
 }
 
 /** A graph loaded in a worker: a {@link Session}, from another thread. */
+/** What a debugger's page needs of a graph's session: a worker's, or one attached elsewhere. */
+export type DebugGraph = Pick<
+  RemoteGraph,
+  | 'injectWave'
+  | 'clearInput'
+  | 'readOutput'
+  | 'readOutputWave'
+  | 'readHandle'
+  | 'snapshot'
+  | 'restore'
+  | 'nodeState'
+  | 'outputVersion'
+  | 'takeTrace'
+  | 'takeFaults'
+  | 'streamGroups'
+  | 'rerun'
+  | 'shutdown'
+  | 'catchUp'
+  | 'sync'
+>;
+
+/** The lines of a debugger's session. */
+export type DebugLines = Pick<
+  LineDebugger,
+  | 'files'
+  | 'lines'
+  | 'stopped'
+  | 'setBreakpoint'
+  | 'clearBreakpoint'
+  | 'pause'
+  | 'cancelPause'
+  | 'holdNodes'
+  | 'resume'
+  | 'stepIn'
+  | 'stepOver'
+  | 'stepOut'
+  | 'release'
+>;
+
+/** A graph's session, as a debugger's page uses it. */
+export interface DebugSession
+  extends Pick<
+    RemoteSession,
+    | 'contracts'
+    | 'warnings'
+    | 'diagnostics'
+    | 'holdAt'
+    | 'observeOnly'
+    | 'readInputs'
+    | 'tick'
+    | 'dispose'
+  > {
+  readonly graph: DebugGraph;
+  readonly lines: DebugLines | undefined;
+}
+
 export class RemoteSession {
   readonly graph: RemoteGraph;
   readonly contracts: Map<string, Contract>;

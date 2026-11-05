@@ -1036,6 +1036,7 @@ export function diagnosticsOf(error: unknown): Diagnostic[] | undefined {
   return Array.isArray(diagnostics) ? (diagnostics as Diagnostic[]) : undefined;
 }
 
+export { AttachedSession, type AttachOptions } from './attach/session.ts';
 export {
   LineDebugger,
   type LineModule,
@@ -1046,6 +1047,9 @@ export {
   type StackFrame,
 } from './lines.ts';
 export {
+  type DebugGraph,
+  type DebugLines,
+  type DebugSession,
   describeHandle,
   type Endpoint,
   endWorker,

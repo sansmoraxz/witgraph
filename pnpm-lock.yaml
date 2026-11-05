@@ -228,6 +228,9 @@ importers:
       '@bytecodealliance/jco-transpile':
         specifier: git+https://github.com/sansmoraxz/jco.git#484de59a374db14a02fcb99c32dfe80005110bba&path:packages/jco-transpile
         version: https://codeload.github.com/sansmoraxz/jco/tar.gz/484de59a374db14a02fcb99c32dfe80005110bba#path:packages/jco-transpile
+      '@bytecodealliance/wrpc':
+        specifier: git+https://github.com/sansmoraxz/wrpc.git#d536f195fb5a25bb2df59f875c19f2ca6921b503&path:js
+        version: https://codeload.github.com/sansmoraxz/wrpc/tar.gz/d536f195fb5a25bb2df59f875c19f2ca6921b503#path:js
     devDependencies:
       '@bytecodealliance/preview3-shim':
         specifier: ^0.13.0
@@ -372,6 +375,12 @@ packages:
 
   '@bytecodealliance/preview3-shim@0.13.0':
     resolution: {integrity: sha512-XcpvwlsjlVqzV1NeHItgdWCQMPq/imPSoCsB/6vh1eLnB/GjsbApEHXPoAH5h7mdkug2RPlmA+DWI5PEtg8cBg==}
+
+  '@bytecodealliance/wrpc@https://codeload.github.com/sansmoraxz/wrpc/tar.gz/d536f195fb5a25bb2df59f875c19f2ca6921b503#path:js':
+    resolution: {gitHosted: true, integrity: sha512-rSUmxLml0Kv4UcHsjK2pqan3Yc27aqKlH+ILXycNxj+cgyA8su3+7aRw5noUPQvY3uUjlIe9ncpj8hZsSaUWMg==, path: js, tarball: https://codeload.github.com/sansmoraxz/wrpc/tar.gz/d536f195fb5a25bb2df59f875c19f2ca6921b503}
+    version: 0.4.1
+    engines: {node: '>=24'}
+    hasBin: true
 
   '@jridgewell/gen-mapping@0.3.13':
     resolution: {integrity: sha512-2kkt/7niJ6MgEPxF0bYdQ6etZaA+fQvDcLKckhy1yIQOzaoKjBBjSj63/aLVjYE3qhRt5dvM+uUyfCg6UKCBbA==}
@@ -1218,6 +1227,8 @@ snapshots:
     dependencies:
       '@bytecodealliance/jco-node-fs': 0.3.2
       '@bytecodealliance/preview2-shim': 0.31.0
+
+  '@bytecodealliance/wrpc@https://codeload.github.com/sansmoraxz/wrpc/tar.gz/d536f195fb5a25bb2df59f875c19f2ca6921b503#path:js': {}
 
   '@jridgewell/gen-mapping@0.3.13':
     dependencies:
