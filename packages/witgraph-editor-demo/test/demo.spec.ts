@@ -562,6 +562,8 @@ test.describe('Video pipeline demo', () => {
     // Nothing here is wrong, so nothing should read as though it were.
     const inspector = page.locator('witgraph-inspector');
     await canvas.evaluate((el: WitgraphCanvas) => el.controller?.select('gray'));
+    await expect(inspector).toContainText('streaming, latest:');
+    await expect(inspector).not.toContainText('is not an output port');
     await expect(inspector).not.toContainText('feedback connection');
 
     // The step is over and the stream is not, so it can still be stopped.
@@ -570,6 +572,7 @@ test.describe('Video pipeline demo', () => {
     await expect.poll(() => phase('camera')).toBe('cancelled');
     await expect(stop).toBeDisabled();
     await expect(controls.locator('.badge')).toContainText('Idle');
+    await expect(inspector).toContainText('stream ended');
   });
 
   test('every filter previews the frames it streams', async ({ page }) => {

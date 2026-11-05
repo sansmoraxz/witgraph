@@ -199,8 +199,24 @@ export class WitgraphInspector extends HTMLElement {
    */
   #outputText(node: string, port: string): string {
     const value = this.#controller?.latestOutput(node, port);
+    const visual = this.#controller?.nodes.get(node);
+    const output = visual?.outputs.find((p) => p.name === port);
+    // What moves to its reader has no value to read: say what it is doing instead.
+    if (output?.kind === 'stream' || output?.kind === 'future') {
+      if (visual?.phase === 'pending') return '-';
+      const running = visual?.phase === 'running';
+      const doing =
+        output.kind === 'stream'
+          ? running
+            ? 'streaming'
+            : 'stream ended'
+          : running
+            ? 'waiting'
+            : 'settled';
+      return value === undefined ? doing : `${doing}, latest: ${summarize(value)}`;
+    }
     if (value === undefined) return '-';
-    const handle = this.#controller?.nodes.get(node)?.outputs.find((p) => p.name === port)?.handle;
+    const handle = output?.handle;
     // A handle has no text: its object may describe itself.
     if (handle) return describeHandle(value, handle.resource);
     if (weight(value) > MAX_WAVE_BYTES) return `${summarize(value)} (too large to show as WAVE)`;
