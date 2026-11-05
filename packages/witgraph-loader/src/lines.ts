@@ -107,6 +107,8 @@ export class LineProbes implements SessionLines {
   #control = new Int32Array(new SharedArrayBuffer(Control.Count * 4));
   #modules: readonly LineModule[] = [];
   #breakpoints: Uint8Array<SharedArrayBuffer>[] = [];
+  /** By module, the functions all on one line: what a macro generated, usually. */
+  #oneLine: Set<number>[] = [];
   #post: (kind: string, fields: object) => void;
   #report: () => void;
 
@@ -131,6 +133,14 @@ export class LineProbes implements SessionLines {
     this.#breakpoints = modules.map(
       (module) => new Uint8Array(new SharedArrayBuffer(Math.max(1, module.probes.length))),
     );
+    this.#oneLine = modules.map(({ probes }) => {
+      const lineOf = new Map<number, number | null>();
+      for (const { function: inFunction, line } of probes) {
+        const seen = lineOf.get(inFunction);
+        lineOf.set(inFunction, seen === undefined || seen === line ? line : null);
+      }
+      return new Set([...lineOf].filter(([, line]) => line !== null).map(([at]) => at));
+    });
   }
 
   instantiating(): void {
@@ -169,6 +179,8 @@ export class LineProbes implements SessionLines {
     }
     const from = this.#modules[module].probes[Atomics.load(control, Control.StepProbe)];
     const here = this.#modules[module].probes[id];
+    // A step does not stop in what has no lines to step through, as with what a macro made.
+    if (this.#oneLine[module].has(here.function)) return false;
     const fromDepth = Atomics.load(control, Control.StepDepth);
     const depth = ownFrames().length;
     const otherLine = here.file !== from.file || here.line !== from.line;
@@ -300,6 +312,13 @@ export class LineDebugger {
     for (const instances of this.#flags) {
       for (const flags of instances) flags?.fill(1);
     }
+  }
+
+  /** Takes back a {@link pause} no guest has reached yet. */
+  cancelPause(): void {
+    if (this.#stopped) return;
+    Atomics.store(this.#control, Control.Pause, 0);
+    this.#restore();
   }
 
   /** Goes on, to the next breakpoint. */

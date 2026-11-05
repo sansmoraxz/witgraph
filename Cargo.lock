@@ -3449,6 +3449,7 @@ name = "witgraph-probes"
 version = "0.1.0"
 dependencies = [
  "gimli",
+ "rustc-demangle",
  "test-components",
  "thiserror 2.0.21",
  "wasm-encoder",

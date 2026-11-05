@@ -224,8 +224,9 @@ stays with its guest: others run on past their probes.
   some lines with no code of their own. A guest with none has no lines, and runs as usual.
 - **Only the guest's own lines** have probes, by the path the debug info gives: not the
   standard library's, or a dependency's. Stepping stays out of those, and so does their cost.
-  `lines: { all: true }` puts them on every line, at about twice the time. Macros count as the
-  line they are written on, so stepping can pass through a Rust guest's `generate!` line.
+  `lines: { all: true }` puts them on every line, at about twice the time. A step does not stop
+  in a function all on one line, which is what a macro usually generates, though a breakpoint
+  there does.
 
 ## When a graph does not compile
 

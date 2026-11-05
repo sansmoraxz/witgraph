@@ -462,6 +462,30 @@ impl Reencode for Rewriter<'_> {
         Ok(())
     }
 
+    /// Names as a person reads them, for a stack trace to show: with no module name to
+    /// come before each, and Rust's demangled.
+    fn parse_custom_name_subsection(
+        &mut self,
+        names: &mut wasm_encoder::NameSection,
+        section: wasmparser::Name<'_>,
+    ) -> Rewritten {
+        match section {
+            wasmparser::Name::Module { .. } => Ok(()),
+            wasmparser::Name::Function(map) => {
+                let mut functions = wasm_encoder::NameMap::new();
+                for naming in map {
+                    let naming = naming?;
+                    let index = self.function_index(naming.index)?;
+                    let readable = format!("{:#}", rustc_demangle::demangle(naming.name));
+                    functions.append(index, &readable);
+                }
+                names.functions(&functions);
+                Ok(())
+            }
+            other => reencode::utils::parse_custom_name_subsection(self, names, other),
+        }
+    }
+
     fn parse_custom_section(
         &mut self,
         module: &mut wasm_encoder::Module,
@@ -681,7 +705,10 @@ mod tests {
             }
         }
         let named = named.expect("its function has a name");
-        assert!(named.contains("walk"), "{named}");
+        assert_eq!(
+            named, "line_walk_guest::walk",
+            "a name as a person reads it"
+        );
 
         for payload in Parser::new(0).parse_all(&instrumented.module) {
             if let Payload::CustomSection(section) = payload.unwrap() {

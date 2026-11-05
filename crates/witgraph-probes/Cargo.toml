@@ -15,6 +15,7 @@ workspace = true
 
 [dependencies]
 gimli = { workspace = true }
+rustc-demangle = "0.1"
 thiserror = { workspace = true, features = ["std"] }
 wasm-encoder = { workspace = true, features = ["wasmparser"] }
 wasmparser = { workspace = true, features = ["std", "validate"] }

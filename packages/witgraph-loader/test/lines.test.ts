@@ -155,7 +155,7 @@ test('a breakpoint stops on its line, naming the node, and resuming goes on', as
   assert.equal(stop.file, file);
   assert.equal(stop.line, mark('walk-first'));
   assert.equal(stop.node, 'a');
-  assert.match(stop.frames[0], /walk/, `innermost of ${stop.frames}`);
+  assert.equal(stop.frames[0], 'line_walk_guest::walk', `innermost of ${stop.frames}`);
   assert.deepEqual(lines.stopped?.line, stop.line);
 
   // This thread goes on, for as long as the guest is held.
