@@ -585,7 +585,9 @@ async function loadDemo(): Promise<void> {
       return made;
     };
 
-    await controller.load({ graph: demo.graph, components, wasm, worker, lines: true, sources });
+    // Only with `?debug`: it slows every guest with debug info.
+    const debug = new URLSearchParams(location.search).has('debug');
+    await controller.load({ graph: demo.graph, components, wasm, worker, lines: debug, sources });
 
     statusEl.textContent = 'Computing layout...';
     await controller.autoLayout();

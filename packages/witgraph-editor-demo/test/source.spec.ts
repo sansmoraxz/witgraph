@@ -16,7 +16,7 @@ function mark(name: string): number {
 
 test.describe('the source panel', () => {
   test.beforeEach(async ({ page }) => {
-    await page.goto('/?graph=lines');
+    await page.goto('/?graph=lines&debug');
     await expect(page.locator('#status')).toHaveClass(/ready/, { timeout: 30_000 });
   });
 
@@ -168,8 +168,19 @@ test.describe('the source panel', () => {
   });
 });
 
+test('debugging lines takes `?debug`, even for a guest that could be', async ({ page }) => {
+  await page.goto('/?graph=lines');
+  await expect(page.locator('#status')).toHaveClass(/ready/, { timeout: 30_000 });
+  await expect(page.locator('witgraph-source')).toBeHidden();
+  await expect(page.locator('witgraph-controls').locator('button.step-in')).toBeHidden();
+  const files = await page
+    .locator('witgraph-canvas')
+    .evaluate((el: WitgraphCanvas) => el.controller?.lineFiles.length);
+  expect(files).toBe(0);
+});
+
 test('a graph with no debug info has no source panel', async ({ page }) => {
-  await page.goto('/');
+  await page.goto('/?debug');
   await expect(page.locator('#status')).toHaveClass(/ready/, { timeout: 30_000 });
   await expect(page.locator('witgraph-source')).toBeHidden();
   await expect(page.locator('witgraph-controls').locator('button.step-in')).toBeHidden();

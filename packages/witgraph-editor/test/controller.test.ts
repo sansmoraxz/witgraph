@@ -682,6 +682,16 @@ test('breakpoints stay through a reload, and a step in goes from a node into its
   await controller.stop();
 });
 
+test('lines are off unless asked for, even of a guest with debug info', async () => {
+  const controller = await loadController([['a', 'line-walk']]);
+  assert.deepEqual(controller.lineFiles, []);
+  assert.deepEqual(controller.linesOf('anything'), []);
+  await controller.injectValue('a', 'in', '5');
+  await controller.run();
+  assert.equal(controller.lineStop, null);
+  assert.equal(await controller.readOutput('a', 'out'), 8);
+});
+
 test('with no debug info or no way to stop, a graph has no lines, and runs', async () => {
   const none = await loadController([['e', 'echo']], [], { lines: true });
   assert.deepEqual(none.lineFiles, []);

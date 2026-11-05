@@ -78,7 +78,8 @@ Put them anywhere on your page. They all share one `EditorController`.
   is known, which node caused it. The next change or run starts every node again.
 - **Breakpoints.** Toggle one on a node (toolbar _BP_ button, right-click, or F9).
   The run pauses before that node's next run.
-- **Source lines.** Load with `lines: true`, and a guest built with debug info can be stopped
+- **Source lines.** Off unless you ask for it, as it **slows guests down significantly**. Load
+  with `lines: true`, and a guest built with debug info can be stopped
   on a line of its own code: click in the gutter of the source panel. **Step** (F10) then goes
   to the next line, over any call, **In** (F11) into a call, and **Out** (Shift+F11) out of the
   function. **Pause** stops at the next line of what is running, even a node that is spinning,
@@ -87,7 +88,8 @@ Put them anywhere on your page. They all share one `EditorController`.
   last stop in that function. All of the graph stops with it, so previews wait until it goes
   on. It takes a page that is cross-origin isolated
   ([why](javascript.md#stopping-on-a-source-line)): elsewhere the graph runs as usual, and the
-  timeline says so. Without debug info in a graph, the panel and its buttons stay hidden.
+  timeline says so. Without debug info in a graph, the panel and its buttons stay hidden. In the demo, add `?debug` to the
+  address to turn it on, with the _Source lines_ graph for a guest that has debug info.
 - **Values.** Select a node to see the current value of each output port.
 - **Previews.** A node can show one of its outputs inside it, as it changes:
   see [Previews](#previews).

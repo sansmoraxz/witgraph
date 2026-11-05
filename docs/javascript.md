@@ -186,10 +186,12 @@ for `self` and `worker`, with `serveSession` on either side of it, even on one t
 
 ### Stopping on a source line
 
-Load with `lines`, and a guest built with debug info can be stopped on any line of its
-source. A browser lets a page set no breakpoint in WebAssembly, so each line gets a probe
-as the graph loads, which checks a flag and carries on, so a guest not stopped is barely
-slowed: a tight loop by up to half, other work by a few percent.
+Debugging is off unless you ask for it, as **it slows a graph down significantly**. Load with
+`lines`, and a guest built with debug info can be stopped on any line of its source. A browser
+lets a page set no breakpoint in WebAssembly, so each line gets a probe as the graph loads, which
+checks a flag and carries on. That can slow a tight loop by half, even with no breakpoint set, and
+the unoptimized build it wants is slower still. Leave it off for anything but debugging: without
+`lines`, guests run as they were built, with nothing added.
 
 ```ts
 const session = await RemoteSession.load(worker, {
