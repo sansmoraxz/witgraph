@@ -31,7 +31,7 @@
     "typecheck": "tsc -p ."
   },
   "dependencies": {
-    "@bytecodealliance/jco-transpile": "git+https://github.com/sansmoraxz/jco.git#36511536e7266fae61f4d52395f634f08f47c954&path:packages/jco-transpile"
+    "@bytecodealliance/jco-transpile": "git+https://github.com/sansmoraxz/jco.git#8c983e5b833e0d009815a2778a6b7222da5e7133&path:packages/jco-transpile"
   },
   "devDependencies": {
     "@bytecodealliance/preview3-shim": "^0.13.0",
