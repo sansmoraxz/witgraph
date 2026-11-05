@@ -615,7 +615,7 @@ impl SchedulerCore<dyn DataPlane> {
                 }
                 StopCause::Shutdown => (NodePhase::Cancelled, None, None),
             },
-            _ => (self.nodes[index].life.phase(), None, None),
+            _ => (self.phase_of(index), None, None),
         };
         Ok(NodeState::new(
             node.clone(),
@@ -796,16 +796,30 @@ impl SchedulerCore<dyn DataPlane> {
                     .iter()
                     .map(|member| self.ports.node_id(*member).clone())
                     .collect();
+                for node in &nodes {
+                    self.mode
+                        .on_phase_transition(node, NodePhase::Running, NodePhase::Idle);
+                }
                 self.mode.on_group_drained(&nodes);
                 self.dirty = true;
             }
         }
     }
 
+    /// What `node` is doing. A member of a stream group that has yet to drain is still
+    /// at work after its `run` returned: a `run` often only hands over a stream, and
+    /// its writer goes on.
+    fn phase_of(&self, node: NodeIdx) -> NodePhase {
+        match self.nodes[node].life.phase() {
+            NodePhase::Idle if !self.group_is_quiet(node) => NodePhase::Running,
+            phase => phase,
+        }
+    }
+
     fn set_life(&mut self, node: NodeIdx, life: NodeLife) {
-        let from = self.nodes[node].life.phase();
+        let from = self.phase_of(node);
         self.nodes[node].life = life;
-        let to = life.phase();
+        let to = self.phase_of(node);
         if from != to {
             self.mode
                 .on_phase_transition(self.ports.node_id(node), from, to);
@@ -1038,13 +1052,13 @@ impl SchedulerCore<dyn DataPlane> {
             return;
         };
         let members = self.groups[group].members.clone();
-        self.groups[group].life = GroupLife::Active(quiet.start(members.len()));
-        for member in members {
-            self.owed.remove(member);
-            if let NodeLife::Waiting(waiting) = self.nodes[member].life {
-                self.set_life(member, NodeLife::Scheduled(waiting.schedule()));
+        for member in &members {
+            self.owed.remove(*member);
+            if let NodeLife::Waiting(waiting) = self.nodes[*member].life {
+                self.set_life(*member, NodeLife::Scheduled(waiting.schedule()));
             }
         }
+        self.groups[group].life = GroupLife::Active(quiet.start(members.len()));
     }
 
     /// What holds `node`'s claims: itself, or its group.

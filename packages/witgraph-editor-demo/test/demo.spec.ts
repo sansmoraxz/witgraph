@@ -547,6 +547,23 @@ test.describe('Video pipeline demo', () => {
       return { frames, rgb: [r, g, b] };
     }, node);
 
+  test('after a step, what still streams shows as running', async ({ page }) => {
+    await page.locator('witgraph-controls').locator('button.step').click();
+    const canvas = page.locator('witgraph-canvas');
+    const phase = (id: string) =>
+      canvas.evaluate((el: WitgraphCanvas, id) => el.controller?.nodes.get(id)?.phase, id);
+    await expect.poll(() => phase('camera')).toBe('running');
+    // Not only the last of the chain, whose `run` is the one still in flight.
+    for (const id of ['gray', 'gray-invert', 'gray-sink', 'camera-b', 'invert', 'sink']) {
+      expect(await phase(id), id).toBe('running');
+    }
+    // The step is over and the stream is not, so it can still be stopped.
+    const stop = page.locator('witgraph-controls').locator('button.stop');
+    await stop.click();
+    await expect.poll(() => phase('camera')).toBe('cancelled');
+    await expect(stop).toBeDisabled();
+  });
+
   test('every filter previews the frames it streams', async ({ page }) => {
     const canvas = page.locator('witgraph-canvas');
     await expect(page.locator('#status')).toHaveClass(/ready/);

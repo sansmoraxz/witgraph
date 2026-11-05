@@ -63,7 +63,8 @@ Put them anywhere on your page. They all share one `EditorController`.
 - A tick lasts at most a tenth of a second, or one interval of the rate if
   that is shorter: work still running then (an endless stream, say) carries
   on into the next tick, so the rest of the graph keeps advancing beside it.
-- Each node shows its state: pending, running, idle, faulted or cancelled. A
+- Each node shows its state: pending, running, idle, faulted or cancelled, and a
+  node in a stream group stays running until the group's streams have ended. A
   fault stops the whole graph, so every node shows it, with its cause and, when it
   is known, which node caused it. The next change or run starts every node again.
 - **Breakpoints.** Toggle one on a node (toolbar _BP_ button or right-click).

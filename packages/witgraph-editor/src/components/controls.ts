@@ -300,7 +300,11 @@ export class WitgraphControls extends HTMLElement {
 
     this.#btnRun.disabled = mode === 'running';
     this.#btnStep.disabled = mode === 'running';
-    this.#btnStop.disabled = mode === 'idle' || mode === 'error';
+    // A step can leave a stream going: stopping is for that too.
+    const anyRunning = [...(this.#controller?.nodes.values() ?? [])].some(
+      (node) => node.phase === 'running',
+    );
+    this.#btnStop.disabled = !anyRunning && (mode === 'idle' || mode === 'error');
     // What changes the graph waits while it runs.
     const editable = this.#controller?.editable ?? true;
     this.#btnReset.disabled = !editable;

@@ -3,8 +3,8 @@
 //! | node                            | phase                               |
 //! |---------------------------------|-------------------------------------|
 //! | not run since the graph was built | [`Pending`](NodePhase::Pending)   |
-//! | its `run` is in flight          | [`Running`](NodePhase::Running)     |
-//! | its `run` returned              | [`Idle`](NodePhase::Idle)           |
+//! | its `run` is in flight, or its stream group has yet to drain | [`Running`](NodePhase::Running) |
+//! | it is done | [`Idle`](NodePhase::Idle) |
 //! | the graph was stopped by a fault | [`Faulted`](NodePhase::Faulted)    |
 //! | the graph was shut down         | [`Cancelled`](NodePhase::Cancelled) |
 //!
@@ -22,10 +22,10 @@ pub enum NodePhase {
     /// It has not run since the graph was loaded, or since a
     /// restore.
     Pending,
-    /// Its `run` is in flight.
+    /// Its `run` is in flight, or it is in a stream group that has yet to drain, whose
+    /// `run`s can return long before their streams end.
     Running,
-    /// Its `run` returned; it runs again when an
-    /// input changes.
+    /// It is done; it runs again when an input changes.
     Idle,
     /// The graph faulted. Restartable: new input, or
     /// `rerun`, rebuilds the graph.

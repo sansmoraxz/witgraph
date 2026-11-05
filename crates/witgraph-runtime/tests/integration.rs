@@ -732,6 +732,34 @@ async fn a_passed_through_stream_is_forwarded_after_its_reader_returned() {
 }
 
 #[tokio::test]
+async fn a_node_stays_running_until_its_stream_group_has_drained() {
+    let kit = Kit::new(&[STREAM_PRODUCER, STREAM_RELAY, STREAM_DRAIN]);
+    let graph = kit
+        .builder("phases")
+        .add_node("prod", kit.get(STREAM_PRODUCER))
+        .add_node("relay", kit.get(STREAM_RELAY))
+        .add_node("drain", kit.get(STREAM_DRAIN))
+        .connect("a", port("prod", "items"), port("relay", "items"))
+        .connect("b", port("relay", "items"), port("drain", "items"))
+        .build();
+    let mut rt = kit
+        .load(graph, RuntimeConfig::default(), Trace::new())
+        .await;
+    inject(&mut rt, "prod", "burst-size", Val::U32(100_000)).await;
+    // Cut short, every `run` may have returned while the stream goes on.
+    let stop = tokio::time::sleep(Duration::from_millis(1));
+    let result = rt.tick_until(stop).await;
+    assert!(matches!(result, TickResult::Interrupted), "{result:?}");
+    for node in ["prod", "relay", "drain"] {
+        assert_ne!(phase(&rt, node), NodePhase::Idle, "{node} in mid-stream");
+    }
+    settle(&mut rt).await;
+    for node in ["prod", "relay", "drain"] {
+        assert_eq!(phase(&rt, node), NodePhase::Idle, "{node}");
+    }
+}
+
+#[tokio::test]
 async fn a_reader_dropping_a_passed_through_stream_stops_its_producer() {
     let kit = Kit::new(&[STREAM_PRODUCER, STREAM_RELAY, STREAM_CONSUMER]);
     for _ in 0..10 {
