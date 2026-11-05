@@ -134,6 +134,11 @@ struct NodeEntry {
 
 struct GroupEntry {
     members: Box<[NodeIdx]>,
+    /// What is above a member and not below any: the group does not start while one
+    /// of these could still run. Its producers would hold its claims, and block on
+    /// readers yet to start, and with them every group waiting to count as drained.
+    /// What is below a member is left out, as it may take this group's start to run.
+    before: Box<[NodeIdx]>,
     life: GroupLife,
 }
 
@@ -244,6 +249,43 @@ impl Drop for TickGuard<'_> {
     }
 }
 
+/// What is above any of `members` and below none, by `preds`. One member of another
+/// group below makes all of it below: that group may need this one to start, so holding
+/// this one back for it could leave each waiting for the other.
+fn before_group(
+    members: &[NodeIdx],
+    preds: &[BTreeSet<NodeIdx>],
+    groups: &[Box<[NodeIdx]>],
+) -> Box<[NodeIdx]> {
+    let mut above: BTreeSet<NodeIdx> = BTreeSet::new();
+    let mut waiting: Vec<NodeIdx> = members.to_vec();
+    while let Some(node) = waiting.pop() {
+        for pred in &preds[node.position()] {
+            if above.insert(*pred) {
+                waiting.push(*pred);
+            }
+        }
+    }
+    let mut below: BTreeSet<NodeIdx> = members.iter().copied().collect();
+    loop {
+        let before = below.len();
+        // Nodes are numbered in topological order, so one pass follows the connections.
+        for (at, of_node) in preds.iter().enumerate() {
+            if of_node.iter().any(|pred| below.contains(pred)) {
+                below.insert(NodeIdx::from_position(at));
+            }
+        }
+        for group in groups {
+            if group.iter().any(|member| below.contains(member)) {
+                below.extend(group.iter().copied());
+            }
+        }
+        if below.len() == before {
+            return above.difference(&below).copied().collect();
+        }
+    }
+}
+
 impl<P: DataPlane> SchedulerCore<P> {
     /// A scheduler over a compiled graph, with the data plane `make_plane` makes
     /// from its numbered ports. Every node owes its first run. An instance
@@ -317,11 +359,16 @@ impl<P: DataPlane> SchedulerCore<P> {
                 }
             })
             .collect();
-        let groups = compiled
+        let of_groups: Vec<Box<[NodeIdx]>> = compiled
             .stream_groups()
             .iter()
+            .map(|members| members.iter().filter_map(node_of).collect())
+            .collect();
+        let groups = of_groups
+            .iter()
             .map(|members| GroupEntry {
-                members: members.iter().filter_map(node_of).collect(),
+                before: before_group(members, &preds, &of_groups),
+                members: members.clone(),
                 life: GroupLife::Quiet(Group::fresh()),
             })
             .collect();
@@ -846,32 +893,54 @@ impl SchedulerCore<dyn DataPlane> {
     /// those upstream, which must not start yet. A node waits while what it
     /// reads could change, which keeps it from running on half-updated inputs,
     /// while a Value latched by a stream group that never finishes still wakes
-    /// what is downstream of it. Linear in the size of the graph.
+    /// what is downstream of it. A group whose `before` could still run counts as
+    /// able to change too, and does not start. Each pass is linear in the size of
+    /// the graph, and only such a group takes another.
     fn unsettled(&self) -> (PortSet<NodeIdx>, PortSet<NodeIdx>) {
         let count = self.ports.node_count();
         let mut unsettled = PortSet::new(count);
         let mut blocked = PortSet::new(count);
-        // Nodes are numbered in topological order.
-        for at in 0..count {
-            let node = NodeIdx::from_position(at);
-            let entry = &self.nodes[node];
-            let upstream = entry.preds.iter().any(|pred| unsettled.contains(*pred));
-            if upstream {
-                blocked.insert(node);
-            }
-            let own = match entry.life {
-                NodeLife::Running(_) | NodeLife::Scheduled(_) => true,
-                // A member owing a run of a group that has yet to drain cannot
-                // run until its group's readers have, so they must not wait.
-                NodeLife::Waiting(_) => {
-                    self.owed.contains(node) && self.ready(node) && self.group_is_quiet(node)
+        loop {
+            let mut grew = false;
+            // Nodes are numbered in topological order.
+            for at in 0..count {
+                let node = NodeIdx::from_position(at);
+                let entry = &self.nodes[node];
+                let upstream = entry.preds.iter().any(|pred| unsettled.contains(*pred));
+                if upstream {
+                    blocked.insert(node);
                 }
-            };
-            if own || upstream {
-                unsettled.insert(node);
+                let own = match entry.life {
+                    NodeLife::Running(_) | NodeLife::Scheduled(_) => true,
+                    // A member owing a run of a group that has yet to drain cannot
+                    // run until its group's readers have, so they must not wait.
+                    NodeLife::Waiting(_) => {
+                        self.group_is_quiet(node)
+                            && ((self.owed.contains(node) && self.ready(node))
+                                || self.group_is_held_back(node, &unsettled))
+                    }
+                };
+                if (own || upstream) && unsettled.insert(node) {
+                    grew = true;
+                }
+            }
+            if !grew {
+                return (unsettled, blocked);
             }
         }
-        (unsettled, blocked)
+    }
+
+    /// Whether `node` is in a group owing a run with something in its `before` that
+    /// could still run.
+    fn group_is_held_back(&self, node: NodeIdx, unsettled: &PortSet<NodeIdx>) -> bool {
+        self.nodes[node].group.is_some_and(|group| {
+            let entry = &self.groups[group];
+            entry
+                .members
+                .iter()
+                .any(|member| self.owed.contains(*member))
+                && entry.before.iter().any(|up| unsettled.contains(*up))
+        })
     }
 
     /// Builds a new instance, if work is owed that could start. Every node owes
@@ -918,7 +987,7 @@ impl SchedulerCore<dyn DataPlane> {
         if !self.is_live() && !self.rebuild_if_owed() {
             return Started::Nothing;
         }
-        let (_, blocked) = self.unsettled();
+        let (unsettled, blocked) = self.unsettled();
         let mut started = Started::Nothing;
         for at in 0..self.ports.node_count() {
             let node = NodeIdx::from_position(at);
@@ -933,8 +1002,8 @@ impl SchedulerCore<dyn DataPlane> {
                         continue;
                     }
                     // A group runs as one: its members start together, or not
-                    // until it has drained.
-                    if !self.group_is_quiet(node) {
+                    // until it has drained, or while what it reads could change.
+                    if !self.group_is_quiet(node) || self.group_is_held_back(node, &unsettled) {
                         continue;
                     }
                     if !self.resources.can_acquire(self.unit(node)) {
