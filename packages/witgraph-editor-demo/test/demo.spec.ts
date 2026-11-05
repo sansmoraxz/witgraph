@@ -33,6 +33,30 @@ test.describe('WIT Graph Editor Demo', () => {
     await expect(canvas.locator('svg path.edge')).toHaveCount(10);
   });
 
+  test('a value injected while the graph runs is written', async ({ page }) => {
+    const canvas = page.locator('witgraph-canvas');
+    await page.locator('witgraph-controls').locator('button.run').click();
+    await expect(page.locator('#status')).toHaveClass(/running/);
+    // Each lands between ticks: the run goes on ticking all the while.
+    const outcomes = await canvas.evaluate(async (el: WitgraphCanvas) => {
+      const controller = el.controller;
+      const results: string[] = [];
+      for (const value of ['2', '3', '4']) {
+        results.push(
+          await controller
+            ?.injectValue('relay-a', 'add', value)
+            .then(() => 'ok')
+            .catch((error: unknown) => String(error)),
+        );
+      }
+      return results;
+    });
+    expect(outcomes).toEqual(['ok', 'ok', 'ok']);
+    await expect(page.locator('#status')).toHaveClass(/running/);
+    await expect(page.locator('witgraph-inspector')).toContainText(/Injected:\s*4/);
+    await page.locator('witgraph-controls').locator('button.stop').click();
+  });
+
   test('relay-a is pre-selected in inspector', async ({ page }) => {
     const inspector = page.locator('witgraph-inspector');
     await expect(inspector.locator('.node-id')).toHaveValue('relay-a');

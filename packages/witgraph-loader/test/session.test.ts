@@ -705,10 +705,13 @@ test('a paused tick can be inspected', async () => {
   assert.ok(
     session.graph.takeTrace().some((e: any) => e.event === 'run-started' && e.node === 'b'),
   );
-  await assert.rejects(() => session.graph.inject('a', 'in', 1), /a tick is in progress/);
+  // A write waits for the tick to end.
+  const written = session.graph.inject('a', 'in', 1);
   resume();
   await tick;
+  await written;
   assert.equal(await session.graph.readOutput('b', 'out'), 7);
+  assert.equal(await session.graph.readInput('a', 'in'), 1);
 });
 
 test('with its WIT source, a component resolves against the source contract', async () => {
@@ -2427,6 +2430,46 @@ test('a stream group claiming more than there is runs all the same', async () =>
 
 test('a capacity with room for both lets a node start beside a stream group', async () => {
   await groupBesideANode(1.2);
+});
+
+test('a value written while a tick runs is written once it is over, in order', async () => {
+  let release = () => {};
+  let holding = true;
+  const reached = Promise.withResolvers<void>();
+  const session = await load(
+    [
+      ['a', 'echo'],
+      ['b', 'echo'],
+    ],
+    [['c', 'a.out', 'b.in']],
+    {
+      beforeRun: (node) => {
+        if (!holding || node !== 'b') return;
+        reached.resolve();
+        return new Promise<void>((resolve) => {
+          release = resolve;
+        });
+      },
+    },
+  );
+  await session.graph.inject('a', 'in', 1);
+  const tick = session.tick();
+  await reached.promise;
+
+  // Held in `beforeRun`, the tick has the scheduler.
+  const written: string[] = [];
+  const first = session.graph.inject('a', 'in', 5).then(() => written.push('first'));
+  const second = session.graph.injectWave('a', 'in', '7').then(() => written.push('second'));
+  await assert.rejects(session.graph.tick(), /a tick is in progress/, 'one tick at a time');
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.deepEqual(written, [], 'they wait for the tick');
+
+  holding = false;
+  release();
+  await tick;
+  await Promise.all([first, second]);
+  assert.deepEqual(written, ['first', 'second']);
+  assert.equal(await session.graph.readInput('a', 'in'), 7, 'the last one written');
 });
 
 test('a node stays running until its stream group has drained', async () => {

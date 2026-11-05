@@ -100,7 +100,10 @@ the TypeScript and let `init` fetch the module from beside the script.
 - **The same calls as on wasmtime.** `inject`, `injectWave`, `clearInput`,
   `readOutput`, `readOutputWave`, `readHandle`, `snapshot` and `restore` return
   promises, on both hosts, and `tick` too. A handle output is read with
-  `readHandle`. Reads work while a tick runs. Writes reject while one does.
+  `readHandle`. Reads work while a tick runs. Writes made while one does wait
+  for it to end, and land in the order they were made, so one made while
+  paused at a breakpoint lands once you go on. On wasmtime, as here, a write
+  lands between ticks. A second tick rejects while one runs.
 - **Reading only what's new.** `outputVersion` says which value of an output is
   latched: a number that moves on each time the node writes it, or a snapshot
   is restored. It costs nothing to ask, so a host previewing an output on its

@@ -1,9 +1,9 @@
 //! `WebGraph`: a graph loaded on a JavaScript host.
 
-use std::cell::{Ref, RefCell, RefMut};
-use std::collections::{BTreeMap, HashMap};
+use std::cell::{Cell, Ref, RefCell, RefMut};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future::Future;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::Arc;
 
 use futures::FutureExt;
@@ -652,11 +652,67 @@ impl ModuleVariables {
     }
 }
 
+/// Where the scheduler is, between the methods that take it.
+#[derive(Default)]
+struct Slot {
+    /// The scheduler, while nothing has it.
+    sched: RefCell<Option<WebRuntime>>,
+    /// What waits for it, in the order it asked: it is handed to each in turn, so nothing
+    /// asking later gets it first.
+    waiting: RefCell<VecDeque<oneshot::Sender<WebRuntime>>>,
+    /// Whether a tick has it, or waits for it.
+    ticking: Cell<bool>,
+}
+
+impl Slot {
+    /// The scheduler now, or once what has it, and what asked for it first, are done.
+    fn take(&self) -> Either<WebRuntime, oneshot::Receiver<WebRuntime>> {
+        if let Some(sched) = self.sched.borrow_mut().take() {
+            return Either::Left(sched);
+        }
+        let (turn, waiting) = oneshot::channel();
+        self.waiting.borrow_mut().push_back(turn);
+        Either::Right(waiting)
+    }
+}
+
+/// The scheduler from `taken`, waiting its turn if it must. Fails if the graph was freed.
+async fn turn(
+    taken: Either<WebRuntime, oneshot::Receiver<WebRuntime>>,
+) -> Result<WebRuntime, JsError> {
+    match taken {
+        Either::Left(sched) => Ok(sched),
+        Either::Right(waiting) => waiting.await.map_err(|_| error("the graph was freed")),
+    }
+}
+
+/// Hands the scheduler to what waits for it first, or puts it back. Dropped if the graph was
+/// freed meanwhile.
+fn give_back(slot: &Weak<Slot>, mut sched: WebRuntime) {
+    let Some(slot) = slot.upgrade() else {
+        return;
+    };
+    loop {
+        let next = slot.waiting.borrow_mut().pop_front();
+        match next {
+            Some(waiting) => match waiting.send(sched) {
+                Ok(()) => return,
+                // What waited is gone: the next one, then.
+                Err(back) => sched = back,
+            },
+            None => {
+                *slot.sched.borrow_mut() = Some(sched);
+                return;
+            }
+        }
+    }
+}
+
 /// A compiled graph running on this JavaScript host.
 #[wasm_bindgen]
 pub struct WebGraph {
-    /// The scheduler; `None` while a tick has it.
-    sched: Rc<RefCell<Option<WebRuntime>>>,
+    /// The scheduler, while no tick or write has it.
+    sched: Rc<Slot>,
     /// Reads the latched outputs, while a tick holds the scheduler too.
     reader: WebReader,
     /// What the read methods report while a tick has `sched`.
@@ -827,7 +883,10 @@ impl WebGraph {
         refresh(&sched, &live);
         let (alive, freed) = oneshot::channel();
         Ok(Self {
-            sched: Rc::new(RefCell::new(Some(sched))),
+            sched: Rc::new(Slot {
+                sched: RefCell::new(Some(sched)),
+                ..Slot::default()
+            }),
             reader,
             live,
             composite,
@@ -849,7 +908,9 @@ impl WebGraph {
     /// One tick runs at a time: while one does (paused in a `run`
     /// callback, say), another rejects at once. `readOutput`,
     /// `readOutputWave`, `nodeState`, `takeTrace` and `component` report
-    /// what the tick has done so far; the other methods throw.
+    /// what the tick has done so far. `inject`, `injectWave`, `clearInput`,
+    /// `snapshot` and `restore` wait for it to end, in the order they were
+    /// called; the other methods throw.
     pub fn tick(&self, stop: JsValue) -> Promise {
         self.start_tick(&stop)
             .unwrap_or_else(|e| Promise::reject(&JsValue::from(e)))
@@ -866,26 +927,28 @@ impl WebGraph {
             let stop = resolve(stop).map_err(|_| error("`stop` is not a promise"))?;
             Some(JsFuture::from(stop))
         };
-        let mut sched = self
-            .sched
-            .try_borrow_mut()
-            .ok()
-            .and_then(|mut slot| slot.take())
-            .ok_or_else(busy)?;
-        let slot = self.sched.clone();
+        if self.sched.ticking.replace(true) {
+            return Err(busy());
+        }
+        let taken = self.sched.take();
+        let slot = Rc::downgrade(&self.sched);
         let live = self.live.clone();
         let freed = self.freed.clone().map(|_| ());
         Ok(future_to_promise(async move {
+            let mut sched = match turn(taken).await {
+                Ok(sched) => sched,
+                Err(freed) => return Err(JsValue::from(freed)),
+            };
             let stop = match stop {
                 Some(stop) => Either::Left(futures::future::select(stop, freed).map(|_| ())),
                 None => Either::Right(freed),
             };
             let result = sched.tick_until(stop).await;
             reconcile(&sched, &live);
-            // Back for the other methods (dropped here if the graph was
-            // freed meanwhile). Nothing borrows the slot across a turn of
-            // the event loop, so it is free.
-            slot.replace(Some(sched));
+            if let Some(slot) = slot.upgrade() {
+                slot.ticking.set(false);
+            }
+            give_back(&slot, sched);
             let object = Object::new();
             let name = match &result {
                 TickResult::Progress => "progress",
@@ -907,13 +970,13 @@ impl WebGraph {
 
     /// The scheduler, unless a tick has it.
     fn idle(&self) -> Result<RefMut<'_, WebRuntime>, JsError> {
-        let slot = self.sched.try_borrow_mut().map_err(|_| busy())?;
+        let slot = self.sched.sched.try_borrow_mut().map_err(|_| busy())?;
         RefMut::filter_map(slot, Option::as_mut).map_err(|_| busy())
     }
 
     /// The scheduler to read from, unless a tick has it.
     fn readable(&self) -> Option<Ref<'_, WebRuntime>> {
-        Ref::filter_map(self.sched.try_borrow().ok()?, Option::as_ref).ok()
+        Ref::filter_map(self.sched.sched.try_borrow().ok()?, Option::as_ref).ok()
     }
 
     /// For a graph loaded with `debug`: by each core module's SHA-256, the nodes with an
@@ -1079,27 +1142,19 @@ impl WebGraph {
         self.mocked.iter().map(|node| text(node.as_str())).collect()
     }
 
-    /// Runs `work` on the scheduler, unless a tick has it. As a JavaScript
-    /// `async` function does, it runs at once up to its first wait, so calls
-    /// keep their order, and what fails rejects the promise.
+    /// Runs `work` on the scheduler, once a tick or another write that has it is done. As a
+    /// JavaScript `async` function does, it runs at once up to its first wait if nothing has
+    /// it, and calls keep their order either way. What fails rejects the promise.
     fn on_idle(
         &self,
         work: impl AsyncFnOnce(&mut WebRuntime) -> Result<JsValue, JsError> + 'static,
     ) -> Promise {
-        let taken = self
-            .sched
-            .try_borrow_mut()
-            .ok()
-            .and_then(|mut slot| slot.take());
-        let Some(mut sched) = taken else {
-            return Promise::reject(&JsValue::from(busy()));
-        };
-        let slot = self.sched.clone();
+        let taken = self.sched.take();
+        let slot = Rc::downgrade(&self.sched);
         settled(async move {
+            let mut sched = turn(taken).await?;
             let result = work(&mut sched).await;
-            // Back for the other methods (dropped here if the graph was
-            // freed meanwhile).
-            slot.replace(Some(sched));
+            give_back(&slot, sched);
             result
         })
     }
