@@ -42,6 +42,12 @@ const MAX_TRACE_ENTRIES = 1000;
 /** How often phases are brought up to date when no tick is doing so. */
 const FOLLOW_INTERVAL_MS = 100;
 
+/** How often phases are brought up to date during a pause. */
+const PAUSED_WATCH_MS = 50;
+
+/** How long a step waits for its node's `run`, before leaving it running. */
+const STEP_GRACE_MS = 250;
+
 const TICK_SLICE_MS = 100;
 
 /** Waits for the next frame, so a run that never settles leaves the page time to draw. */
@@ -123,8 +129,20 @@ export class EditorController extends EventTarget {
 
   #breakpoints = new Set<string>();
   #stopResolve: (() => void) | null = null;
-  /** The nodes at a breakpoint, in the order they reached it: several can at once. */
-  #held: (BreakpointState & { resume: () => void })[] = [];
+  /**
+   * The nodes waiting to run, in the order they reached that point: several can at once.
+   * Each is at a breakpoint, or held for the next step.
+   */
+  #held: (BreakpointState & { resume: () => void; breakpoint: boolean })[] = [];
+  /** Whether nodes are held before they run, one step at a time, or only at breakpoints. */
+  #stepping = false;
+  /** The node a step let go of, until it has returned or is left running. */
+  #stepRunning: string | null = null;
+  #stepTimer: ReturnType<typeof setTimeout> | undefined;
+  /** What `step` waits on: settled at the next pause, or when the run ends. */
+  #stopWaiters: (() => void)[] = [];
+  /** The run under way, of `run`, `step` or `restart`. */
+  #runLoop: Promise<void> | null = null;
 
   #tickCount = 0;
   #previewIntervalMs = 0;
@@ -151,6 +169,8 @@ export class EditorController extends EventTarget {
   #compileDiagnostics: Diagnostic[] = [];
   /** Compiles what the graph would be, by the rules a load goes by. */
   #checker: GraphChecker | null = null;
+  /** Whether phases are being kept true during a pause (`#watchWhilePaused`). */
+  #watchingPause = false;
   /** Whether something is keeping phases true between ticks (`#followWhatIsRunning`). */
   #following = false;
   /**
@@ -1041,6 +1061,7 @@ export class EditorController extends EventTarget {
     this.#dirty = false;
     this.#stopResolve = null;
     this.#held = [];
+    this.#endStepping();
     this.#tickCount = 0;
     this.#forgetObserved();
     this.#injectedValues.clear();
@@ -1074,69 +1095,82 @@ export class EditorController extends EventTarget {
 
   // -- Execution --------------------------------------------------------------
 
+  /** Runs until a breakpoint, or until the graph settles or is stopped. Paused, continues. */
   async run(): Promise<void> {
-    // Paused, a tick is still under way: what continues it is `resumeBreakpoint`.
-    if (this.#mode === 'running' || this.#mode === 'paused') return;
-    try {
-      if (this.#dirty || !this.#session) await this.#reload();
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      this.#pushError(`Cannot run: ${msg}`);
-      this.#mode = 'error';
-      this.#dispatch('state-changed');
+    if (this.#mode === 'paused') {
+      this.resumeBreakpoint();
       return;
     }
-    if (!this.#session) {
-      this.#pushError('Cannot run: graph does not compile');
-      this.#mode = 'error';
-      this.#dispatch('state-changed');
-      return;
-    }
-
-    this.#mode = 'running';
-    this.#lastRunDurationMs = null;
-    this.#lastRunTicks = 0;
-    this.#stopRequested = false;
-    this.#rerunCancelled();
-    this.#dispatch('state-changed');
-
-    const startTime = performance.now();
-    let ticks = 0;
-    try {
-      // Until the graph settles or is stopped: a graph with an endless
-      // stream or a feedback loop runs until it is stopped.
-      for (;;) {
-        const started = performance.now();
-        const result = await this.#tick();
-        ticks++;
-        if (result === 'idle' || result === 'stopped') break;
-        if (result === 'aborted') {
-          this.#mode = 'error';
-          break;
-        }
-        // The next tick starts a frame later at the soonest, and no sooner
-        // than the tick rate allows (read each frame: it may change).
-        do await nextFrame();
-        while (!this.#stopRequested && performance.now() - started < this.#tickInterval);
-        // Stopped between two ticks: `stop` already shut the graph down.
-        if (this.#stopRequested) break;
-      }
-    } catch (err) {
-      this.#mode = 'error';
-      const msg = err instanceof Error ? err.message : String(err);
-      this.#pushError(`Run failed: ${msg}`);
-    } finally {
-      const mode = this.#mode as EditorMode;
-      if (mode === 'running' || mode === 'paused') this.#mode = 'idle';
-      await this.#pullObserved(true);
-      this.#lastRunDurationMs = performance.now() - startTime;
-      this.#lastRunTicks = ticks;
-      this.#dispatch('state-changed');
-    }
+    if (this.#mode === 'running') return;
+    this.#stepping = false;
+    await this.#startRun('run');
+    await this.#runLoop;
   }
 
+  /**
+   * Runs one node, and pauses before the next. From a stopped graph this pauses before its
+   * first; past the last node, the next step starts over from the top. Resolves at the
+   * next pause, or once the run is over.
+   */
   async step(): Promise<void> {
-    // Paused, a tick is still under way: what continues it is `resumeBreakpoint`.
+    if (this.#mode === 'running') return;
+    if (this.#mode === 'paused') {
+      const held = this.#held.shift();
+      if (!held) return;
+      this.#stepping = true;
+      this.#stepRunning = held.node;
+      this.#mode = 'running';
+      // A run that never returns, reading an endless stream, must not end the stepping.
+      clearTimeout(this.#stepTimer);
+      this.#stepTimer = setTimeout(() => this.#stepReturned(held.node), STEP_GRACE_MS);
+      const stopped = this.#nextStop();
+      held.resume();
+      this.#dispatch('state-changed');
+      await stopped;
+      return;
+    }
+    this.#stepping = true;
+    const stopped = this.#nextStop();
+    await this.#startRun('step');
+    await stopped;
+  }
+
+  /** Stops holding anything but breakpoints from the next node on, and goes on. */
+  resumeBreakpoint(): void {
+    if (this.#mode !== 'paused') return;
+    this.#stepping = false;
+    this.#stepRunning = null;
+    clearTimeout(this.#stepTimer);
+    // The node paused at goes on, as does any only held for a step. Another at a breakpoint
+    // of its own is the next stop.
+    const [first, ...rest] = this.#held;
+    const staying = rest.filter((held) => held.breakpoint);
+    const going = [first, ...rest.filter((held) => !held.breakpoint)];
+    this.#held = staying;
+    for (const held of going) held?.resume();
+    this.#mode = staying.length > 0 ? 'paused' : 'running';
+    this.#showStop();
+    this.#dispatch('state-changed');
+  }
+
+  /** Holds each node from the next on, as a step would. What is running goes on. */
+  pause(): void {
+    if (this.#mode !== 'running' || !this.#runLoop) return;
+    this.#stepping = true;
+    this.#mode = 'paused';
+    this.#showStop();
+    this.#dispatch('state-changed');
+  }
+
+  /** Stops what is running and runs the graph again from the top, keeping its inputs. */
+  async restart(): Promise<void> {
+    this.stop();
+    await this.#runLoop;
+    await this.run();
+  }
+
+  /** One tick, at most a slice long, whatever runs in it: no node is held for a step. */
+  async tick(): Promise<void> {
     if (this.#mode === 'running' || this.#mode === 'paused') return;
     try {
       if (this.#dirty || !this.#session) await this.#reload();
@@ -1161,8 +1195,7 @@ export class EditorController extends EventTarget {
 
     const startTime = performance.now();
     try {
-      // One tick, at most a slice long: what is still running carries on
-      // until the next tick, or until Stop.
+      // What is still running carries on until the next tick, or until Stop.
       if ((await this.#tick()) === 'aborted') this.#mode = 'error';
     } catch (err) {
       this.#mode = 'error';
@@ -1177,6 +1210,164 @@ export class EditorController extends EventTarget {
     if (mode === 'running' || mode === 'paused') this.#mode = 'idle';
     this.#dispatch('state-changed');
     this.#followWhatIsRunning();
+  }
+
+  /** Starts the run loop, once the graph is loaded. */
+  async #startRun(what: 'run' | 'step'): Promise<void> {
+    const name = what === 'run' ? 'run' : 'step';
+    try {
+      if (this.#dirty || !this.#session) await this.#reload();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.#pushError(`Cannot ${name}: ${msg}`);
+      this.#mode = 'error';
+      this.#endStepping();
+      this.#dispatch('state-changed');
+      return;
+    }
+    if (!this.#session) {
+      this.#pushError(`Cannot ${name}: graph does not compile`);
+      this.#mode = 'error';
+      this.#endStepping();
+      this.#dispatch('state-changed');
+      return;
+    }
+
+    this.#mode = 'running';
+    this.#lastRunDurationMs = null;
+    this.#lastRunTicks = 0;
+    this.#stopRequested = false;
+    this.#rerunCancelled();
+    this.#dispatch('state-changed');
+    this.#runLoop = this.#runTicks(name).finally(() => {
+      this.#runLoop = null;
+    });
+  }
+
+  async #runTicks(name: string): Promise<void> {
+    const startTime = performance.now();
+    let ticks = 0;
+    try {
+      // Until the graph settles or is stopped: a graph with an endless
+      // stream or a feedback loop runs until it is stopped.
+      for (;;) {
+        const started = performance.now();
+        const result = await this.#tick();
+        ticks++;
+        if (result === 'idle' && ticks === 1 && !this.#stopRequested) {
+          // Nothing was owed, so the graph had finished: this starts it again, as running
+          // a finished program would, or breakpoints and steps would have nothing to stop at.
+          this.#rerunAll();
+          continue;
+        }
+        if (result === 'idle' || result === 'stopped') break;
+        if (result === 'aborted') {
+          this.#mode = 'error';
+          break;
+        }
+        // The next tick starts a frame later at the soonest, and no sooner
+        // than the tick rate allows (read each frame: it may change).
+        do await nextFrame();
+        while (!this.#stopRequested && performance.now() - started < this.#tickInterval);
+        // Stopped between two ticks: `stop` already shut the graph down.
+        if (this.#stopRequested) break;
+      }
+    } catch (err) {
+      this.#mode = 'error';
+      const msg = err instanceof Error ? err.message : String(err);
+      this.#pushError(`${name === 'run' ? 'Run' : 'Step'} failed: ${msg}`);
+    } finally {
+      const mode = this.#mode as EditorMode;
+      if (mode === 'running' || mode === 'paused') this.#mode = 'idle';
+      this.#endStepping();
+      await this.#pullObserved(true);
+      this.#lastRunDurationMs = performance.now() - startTime;
+      this.#lastRunTicks = ticks;
+      this.#dispatch('state-changed');
+    }
+  }
+
+  /** Every node owes a run, on the inputs it has. */
+  #rerunAll(): void {
+    for (const id of this.#nodes.keys()) {
+      try {
+        this.#session?.graph.rerun(id);
+      } catch {}
+    }
+  }
+
+  /** Settled at the next pause, or when the run is over. */
+  #nextStop(): Promise<void> {
+    return new Promise((resolve) => this.#stopWaiters.push(resolve));
+  }
+
+  #settleStopWaiters(): void {
+    for (const resolve of this.#stopWaiters.splice(0)) resolve();
+  }
+
+  #endStepping(): void {
+    this.#stepping = false;
+    this.#stepRunning = null;
+    clearTimeout(this.#stepTimer);
+    this.#settleStopWaiters();
+  }
+
+  /** The node a step let go of has returned, or is left running. */
+  #stepReturned(node: string): void {
+    if (this.#stepRunning !== node) return;
+    this.#stepRunning = null;
+    clearTimeout(this.#stepTimer);
+    this.#showStop();
+    // The scheduler starts what comes next just after this. If nothing does, as with only
+    // streams left running, the step is over all the same.
+    if (this.#held.length === 0) {
+      this.#pollState();
+      this.#dispatch('state-changed');
+      this.#stepTimer = setTimeout(() => this.#settleStopWaiters(), STEP_GRACE_MS);
+    }
+  }
+
+  /** If a node waits to run and no step is under way, pauses there, and shows it. */
+  #showStop(): void {
+    if (this.#stepRunning !== null) return;
+    const [first] = this.#held;
+    if (!first) return;
+    clearTimeout(this.#stepTimer);
+    this.#mode = 'paused';
+    this.#selectedNode = first.node;
+    this.#selectedEdge = null;
+    this.#pollState();
+    this.#pullSoon();
+    this.#settleStopWaiters();
+    this.#dispatch('state-changed');
+    this.#watchWhilePaused();
+  }
+
+  /**
+   * Paused, a tick is held open, and no tick ending brings phases up to date, though what is
+   * not held goes on and finishes: keeps them true until the pause is over.
+   */
+  #watchWhilePaused(): void {
+    const session = this.#session;
+    if (this.#watchingPause || !session) return;
+    this.#watchingPause = true;
+    const watch = () => {
+      if (session !== this.#session || this.#mode !== 'paused') {
+        this.#watchingPause = false;
+        return;
+      }
+      const phases = () => [...this.#nodes.values()].map((node) => node.phase).join();
+      const before = phases();
+      this.#pollState();
+      if (phases() !== before) {
+        this.#pullSoon();
+        this.#dispatch('state-changed');
+      }
+      const timer = setTimeout(watch, PAUSED_WATCH_MS) as { unref?: () => void };
+      timer.unref?.();
+    };
+    const timer = setTimeout(watch, 0) as { unref?: () => void };
+    timer.unref?.();
   }
 
   /**
@@ -1290,6 +1481,7 @@ export class EditorController extends EventTarget {
       this.#pollState();
     }
     for (const { resume } of this.#held.splice(0)) resume();
+    this.#stepping = false;
     if (this.#stopResolve) {
       this.#stopResolve();
       this.#stopResolve = null;
@@ -1413,16 +1605,6 @@ export class EditorController extends EventTarget {
       y += 30;
     }
     void this.#reloadAfterEdit();
-  }
-
-  resumeBreakpoint(): void {
-    const held = this.#held.shift();
-    if (!held) return;
-    held.resume();
-    // Another stays paused, and is now the one shown.
-    if (this.#held.length === 0) this.#mode = 'running';
-    this.#pullSoon();
-    this.#dispatch('state-changed');
   }
 
   // -- Inspection / Injection -------------------------------------------------
@@ -1867,15 +2049,14 @@ export class EditorController extends EventTarget {
       mocks: Object.keys(mocks).length > 0 ? mocks : undefined,
 
       beforeRun: async (node): Promise<void> => {
-        if (this.#breakpoints.has(node)) {
+        const breakpoint = this.#breakpoints.has(node);
+        if (breakpoint || this.#stepping) {
           // Read when it is hit, as nothing crosses to the host unasked.
           const inputs = (await session?.readInputs(node)) ?? {};
           if (this.#stopRequested) return;
           return new Promise<void>((resume) => {
-            this.#held.push({ node, inputs, resume });
-            this.#mode = 'paused';
-            this.#pullSoon();
-            this.#dispatch('state-changed');
+            this.#held.push({ node, inputs, resume, breakpoint });
+            this.#showStop();
           });
         }
         // Shown running until the tick ends, however long its run takes
@@ -1890,6 +2071,8 @@ export class EditorController extends EventTarget {
           if (port.kind === 'future') this.#observation(node, port.name).pending = true;
         }
       },
+
+      afterRun: (node): void => this.#stepReturned(node),
 
       onStreamItem: ({ node, port, items }): void => {
         if (this.#session !== session || !this.isObserved(node, port)) return;
@@ -2022,7 +2205,8 @@ export class EditorController extends EventTarget {
       this.#dispatch('trace-event');
     }
 
-    const faults = this.#session.graph.takeFaults() as FaultReport[];
+    // A tick reports its own, and has the scheduler until it ends.
+    const faults = this.#ticking ? [] : (this.#session.graph.takeFaults() as FaultReport[]);
     for (const fault of faults) {
       // A fault stops the whole graph.
       for (const node of this.#nodes.values()) {
@@ -2035,7 +2219,8 @@ export class EditorController extends EventTarget {
     for (const [id, visual] of this.#nodes) {
       try {
         const state = this.#session.graph.nodeState(id) as NodeState;
-        visual.phase = state.phase;
+        // Held before its run, it has not started, whatever the scheduler has sent it.
+        visual.phase = this.#held.some((held) => held.node === id) ? 'pending' : state.phase;
         visual.fault = state.fault;
         visual.culprit = state.culprit;
       } catch {}

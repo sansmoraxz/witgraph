@@ -159,7 +159,7 @@ test('the catalog describes a component by the docs it carries', async () => {
 test('step and read output', async () => {
   const controller = await loadController([['a', 'echo']]);
   await controller.injectValue('a', 'in', '5');
-  await controller.step();
+  await controller.tick();
   assert.equal(await controller.readOutputWave('a', 'out'), '5');
 });
 
@@ -248,23 +248,180 @@ test('stopping releases every node at a breakpoint', async () => {
   assert.notEqual(controller.mode, 'paused');
 });
 
-test('running or stepping while paused leaves the pause alone', async () => {
-  const controller = await loadController([['a', 'echo']]);
-  controller.toggleBreakpoint('a');
-  const running = controller.run();
-  for (let at = 0; at < 200 && controller.pausedNode === null; at++) {
+/** Waits until `ready`, which something else makes so. */
+async function eventually(ready: () => boolean): Promise<void> {
+  for (let at = 0; at < 400 && !ready(); at++) {
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
+  assert.ok(ready(), 'it never happened');
+}
+
+test('steps walk a graph one node at a time, then start over', async () => {
+  const controller = await loadController(
+    [
+      ['a', 'echo'],
+      ['b', 'echo'],
+      ['c', 'echo'],
+    ],
+    [
+      ['ab', 'a.out', 'b.in'],
+      ['bc', 'b.out', 'c.in'],
+    ],
+  );
+  const phases = () => [...controller.nodes.values()].map((node) => node.phase);
+  await controller.injectValue('a', 'in', '5');
+
   await controller.step();
-  await controller.run();
-  assert.equal(controller.mode, 'paused', 'not `error`: a tick is under way, not failed');
+  assert.equal(controller.mode, 'paused');
+  assert.equal(controller.pausedNode, 'a', 'stopped before anything has run');
+  assert.equal(controller.selectedNode, 'a', 'and shown');
+  assert.deepEqual(phases(), ['pending', 'pending', 'pending']);
+  assert.deepEqual(controller.breakpointState?.inputs, { in: 5 });
+
+  await controller.step();
+  assert.equal(controller.pausedNode, 'b');
+  assert.deepEqual(phases(), ['idle', 'pending', 'pending']);
+  assert.deepEqual(controller.breakpointState?.inputs, { in: 5 });
+
+  await controller.step();
+  assert.equal(controller.pausedNode, 'c');
+  assert.deepEqual(phases(), ['idle', 'idle', 'pending']);
+
+  await controller.step();
+  await eventually(() => controller.mode === 'idle');
+  assert.equal(controller.pausedNode, null);
+  assert.deepEqual(phases(), ['idle', 'idle', 'idle']);
+
+  // Past the end, the next step starts over, as stepping a finished program would.
+  await controller.step();
+  assert.equal(controller.mode, 'paused');
+  assert.equal(controller.pausedNode, 'a');
   assert.deepEqual(
     controller.traceEvents.filter((e) => e.event === 'error'),
     [],
   );
+  controller.stop();
+});
+
+test('a step goes on from a breakpoint, and continue goes on to the next', async () => {
+  const controller = await loadController(
+    [
+      ['a', 'echo'],
+      ['b', 'echo'],
+      ['c', 'echo'],
+    ],
+    [
+      ['ab', 'a.out', 'b.in'],
+      ['bc', 'b.out', 'c.in'],
+    ],
+  );
+  controller.toggleBreakpoint('a');
+  controller.toggleBreakpoint('c');
+  const running = controller.run();
+  await eventually(() => controller.pausedNode === 'a');
+  assert.equal(controller.mode, 'paused');
+
+  await controller.step();
+  assert.equal(controller.pausedNode, 'b', 'held for the step, with no breakpoint of its own');
+
+  // Continue stops at the next breakpoint.
+  await controller.run();
+  await eventually(() => controller.pausedNode === 'c');
+  assert.equal(controller.nodes.get('b')?.phase, 'idle');
+
   controller.resumeBreakpoint();
   await running;
   assert.equal(controller.mode, 'idle');
+});
+
+test('what finishes during a pause does not go on showing as running', async () => {
+  // Started in one pass: when `a` returns, `b` is already waiting to be stepped to.
+  const controller = await loadController([
+    ['a', 'echo'],
+    ['b', 'echo'],
+  ]);
+  await controller.step();
+  assert.equal(controller.pausedNode, 'a');
+  await controller.step();
+  assert.equal(controller.pausedNode, 'b');
+  await eventually(() => controller.nodes.get('a')?.phase === 'idle');
+  assert.equal(controller.nodes.get('b')?.phase, 'pending');
+
+  // Nor what a breakpoint does not hold, which runs on beside it.
+  controller.stop();
+  await eventually(() => controller.mode === 'idle');
+  controller.toggleBreakpoint('a');
+  const running = controller.run();
+  await eventually(() => controller.pausedNode === 'a');
+  await eventually(() => controller.nodes.get('b')?.phase === 'idle');
+  assert.equal(controller.nodes.get('a')?.phase, 'pending');
+  controller.resumeBreakpoint();
+  await running;
+  assert.equal(controller.mode, 'idle');
+});
+
+test('a breakpoint fires when running a graph that has finished', async () => {
+  const controller = await loadController([['a', 'echo']]);
+  await controller.run();
+  assert.equal(controller.mode, 'idle');
+  controller.toggleBreakpoint('a');
+  const running = controller.run();
+  await eventually(() => controller.pausedNode === 'a');
+  controller.resumeBreakpoint();
+  await running;
+  assert.equal(controller.mode, 'idle');
+});
+
+test('pausing a run holds what would start next', async () => {
+  const controller = await loadController(
+    [
+      ['a', 'relay'],
+      ['b', 'relay'],
+    ],
+    [
+      ['loop', 'a.out', 'a.in', true],
+      ['ab', 'a.out', 'b.in'],
+    ],
+  );
+  await controller.injectValue('a', 'in', '1');
+  // Adding one each time round, it never settles.
+  await controller.injectValue('a', 'add', '1');
+  const running = controller.run();
+  await eventually(() => controller.mode === 'running');
+  controller.pause();
+  assert.equal(controller.mode, 'paused');
+  await eventually(() => controller.pausedNode !== null);
+  await controller.step();
+  assert.ok(controller.pausedNode !== null, 'the loop goes on, a node at a time');
+  controller.resumeBreakpoint();
+  assert.equal(controller.mode, 'running');
+  controller.stop();
+  await running;
+});
+
+test('restarting runs the graph again from the top', async () => {
+  const controller = await loadController([['a', 'echo']]);
+  await controller.run();
+  const started = () => controller.traceEvents.filter((e) => e.event === 'run-started').length;
+  const before = started();
+  await controller.restart();
+  assert.equal(controller.mode, 'idle');
+  assert.ok(started() > before, 'it ran again');
+});
+
+test('stepping with nothing held, or stepping while running, does no harm', async () => {
+  const controller = await loadController([['a', 'echo']]);
+  controller.toggleBreakpoint('a');
+  const running = controller.run();
+  await eventually(() => controller.pausedNode === 'a');
+  await controller.tick();
+  assert.equal(controller.mode, 'paused', 'a tick waits, as one is under way');
+  controller.resumeBreakpoint();
+  await running;
+  assert.deepEqual(
+    controller.traceEvents.filter((e) => e.event === 'error'),
+    [],
+  );
 });
 
 test('moveNode updates position', async () => {
@@ -487,13 +644,13 @@ test('a stream output keeps its recent items and their count', async () => {
   );
   assert.equal(controller.nodes.get('prod')?.preview?.viewer, 'series');
   await controller.injectValue('prod', 'burst-size', '5');
-  await controller.step();
+  await controller.tick();
   const items = controller.observe('prod', 'items');
   assert.deepEqual([items.kind, items.count, items.latest], ['stream', 5, 4]);
   assert.deepEqual(items.recent, [0, 1, 2, 3, 4]);
 
   await controller.injectValue('prod', 'burst-size', '3');
-  await controller.step();
+  await controller.tick();
   const more = controller.observe('prod', 'items');
   assert.equal(more.count, 8, 'counted across runs');
   assert.deepEqual(more.recent, [0, 1, 2, 3, 4, 0, 1, 2]);
@@ -522,7 +679,7 @@ test('a future output is pending until it resolves', async () => {
     count: 0,
     pending: false,
   });
-  await controller.step();
+  await controller.tick();
   for (let i = 0; i < 50 && controller.observe('w', 'done').count === 0; i++) await pause(10);
   const done = controller.observe('w', 'done');
   assert.deepEqual([done.latest, done.count, done.pending], [7, 1, false]);
@@ -534,7 +691,7 @@ test('a Value output keeps each new value', async () => {
   assert.equal(controller.nodes.get('n')?.preview?.viewer, 'series');
   await controller.injectValue('n', 'in', '1');
   await controller.injectValue('n', 'add', '2');
-  for (let i = 0; i < 3; i++) await controller.step();
+  for (let i = 0; i < 3; i++) await controller.tick();
   const out = controller.observe('n', 'out');
   assert.equal(out.kind, 'value');
   assert.deepEqual(out.recent, [3, 5, 7]);
@@ -565,7 +722,7 @@ test('a step is one bounded tick; what it left running stops on stop', async () 
   const controller = await loadVideo();
   await controller.injectValue('source', 'fps', '100');
   const started = performance.now();
-  await controller.step();
+  await controller.tick();
   assert.ok(performance.now() - started < 2000, 'the endless stream does not hold the step');
   assert.equal(controller.mode, 'idle');
   // The stream carries on after the step...
@@ -609,8 +766,8 @@ test('only what is previewed or selected is recorded', async () => {
   controller.setPreview('n', 'none');
   controller.select(null);
   assert.equal(controller.isObserved('n', 'out'), false);
-  await controller.step();
-  await controller.step();
+  await controller.tick();
+  await controller.tick();
   assert.equal(controller.observe('n', 'out').count, 0, 'nothing recorded');
   // Its latest value is still read when asked for.
   assert.equal(await controller.readOutput('n', 'out'), 2);
@@ -620,7 +777,7 @@ test('only what is previewed or selected is recorded', async () => {
   assert.equal(controller.isObserved('n', 'out'), true);
   await pause(0);
   assert.equal(controller.observe('n', 'out').count, 1, 'what it holds now');
-  await controller.step();
+  await controller.tick();
   assert.equal(controller.observe('n', 'out').count, 2);
 });
 
@@ -675,7 +832,7 @@ const streamOfTensors: [[string, string][], Connection[]] = [
 ];
 
 const settled = async (controller: EditorController) => {
-  for (let i = 0; i < 20; i++) await controller.step();
+  for (let i = 0; i < 20; i++) await controller.tick();
 };
 
 test('a stream of handles connects only to a stream of that resource', async () => {
@@ -1025,7 +1182,7 @@ test('after a step, phases say what is still running, until it has ended', async
   const phases = () => [...controller.nodes.values()].map((node) => node.phase);
   // Long enough to outlast a step, which is one short tick.
   await controller.injectValue('prod', 'burst-size', '2000');
-  await controller.step();
+  await controller.tick();
   assert.equal(controller.mode, 'idle', 'the step is over');
   assert.deepEqual(phases(), ['running', 'running', 'running'], 'the stream is not');
   const ticks = controller.tickCount;
