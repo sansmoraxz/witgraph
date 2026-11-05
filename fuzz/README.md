@@ -12,7 +12,7 @@ Each generated graph is held to rules worked out here apart from the code they c
   what every output holds, including after host writes.
 
 `cargo test -p witgraph-fuzz` runs these checks on stable, over seeded inputs and
-everything in `regressions/`. It fails if a rule was never reached, as agreement on a rule
+every graph in `regressions/graph/`. It fails if a rule was never reached, as agreement on a rule
 never reached means nothing. `WITGRAPH_FUZZ_CASES` runs more.
 
 To search with coverage guidance, which needs nightly and `cargo install cargo-fuzz`:
@@ -22,4 +22,5 @@ cd fuzz
 cargo +nightly fuzz run --features libfuzzer graph_run -- -fork=8 -max_len=4096 -len_control=20
 ```
 
-Keep an input that found a bug in `regressions/<target>/`, with a name saying what it was.
+Keep a graph that found a bug in `regressions/graph/`, as its JSON (a failure prints it), with
+a name saying what it was: raw fuzzer input means nothing once the generator changes.

@@ -158,6 +158,60 @@ fn must_run(compiled: &CompiledGraph, injected: &BTreeMap<PortRef, u32>) -> Hash
     }
 }
 
+/// The nodes that may run more than once for one change. A node may run on an absent
+/// optional input before running again with its value when something above it is in a
+/// stream group that has yet to start, for a required input from outside the group: the
+/// scheduler counts only what can start now as able to change, so what reads that member
+/// does not wait. Some graphs need that very run to bootstrap (`GroupWaitsOnItself` says to
+/// make an input on the path optional). A second run then reaches what is below it, and
+/// the rest of its stream group, as a group re-runs together.
+fn may_run_again(compiled: &CompiledGraph) -> HashSet<NodeId> {
+    let graph = compiled.graph();
+    let plain: Vec<_> = graph.connections.iter().filter(|c| !c.feedback).collect();
+    let mut found: HashSet<NodeId> = HashSet::new();
+    for group in compiled.stream_groups() {
+        let waits_outside = group.iter().any(|member| {
+            let contract = compiled.contract_for(member).expect("a compiled node");
+            contract
+                .inputs
+                .iter()
+                .filter(|p| !p.is_optional())
+                .any(|input| {
+                    plain.iter().any(|c| {
+                        c.to.node == *member
+                            && c.to.port == input.name
+                            && !group.contains(&c.from.node)
+                    })
+                })
+        });
+        if waits_outside {
+            // What reads a member, not the group itself.
+            found.extend(
+                plain
+                    .iter()
+                    .filter(|c| group.contains(&c.from.node) && !group.contains(&c.to.node))
+                    .map(|c| c.to.node.clone()),
+            );
+        }
+    }
+    loop {
+        let before = found.len();
+        for connection in &plain {
+            if found.contains(&connection.from.node) {
+                found.insert(connection.to.node.clone());
+            }
+        }
+        for group in compiled.stream_groups() {
+            if group.iter().any(|member| found.contains(member)) {
+                found.extend(group.iter().cloned());
+            }
+        }
+        if found.len() == before {
+            return found;
+        }
+    }
+}
+
 /// What each Value output holds, in a graph with no feedback, where all nodes run.
 fn outputs_of(
     compiled: &CompiledGraph,
@@ -351,16 +405,16 @@ fn settle(
 
     // Everything ran once, in order, or not at all: no glitches.
     let now: HashMap<NodeId, usize> = runs.lock().unwrap().clone();
+    let again = may_run_again(compiled);
     let more = |node: &NodeId| {
         now.get(node).copied().unwrap_or(0) - before.get(node).copied().unwrap_or(0)
     };
     for node in &graph.nodes {
-        if more(&node.id) > 1 {
-            let grouped = compiled.group_of(&node.id).is_some();
+        if more(&node.id) > 1 && !again.contains(&node.id) {
             fail(
                 "a node ran twice for one change",
                 graph,
-                (&node.id, more(&node.id), grouped),
+                (&node.id, more(&node.id)),
             );
         }
         if first_or_same && !before.is_empty() && more(&node.id) > 0 {

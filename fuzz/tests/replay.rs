@@ -7,7 +7,7 @@ use std::fs;
 use std::path::Path;
 use std::sync::atomic::Ordering;
 
-use witgraph_fuzz::{REACHED, graph_json, graph_model, graph_run};
+use witgraph_fuzz::{REACHED, graph_model, graph_run, regression};
 
 fn cases() -> u64 {
     std::env::var("WITGRAPH_FUZZ_CASES")
@@ -94,20 +94,29 @@ fn seeded_graphs_run_as_they_should() {
 }
 
 #[test]
-fn inputs_that_once_failed() {
-    type Target = fn(&[u8]);
-    let targets: [(&str, Target); 3] = [
-        ("graph_model", graph_model),
-        ("graph_json", graph_json),
-        ("graph_run", graph_run),
-    ];
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("regressions");
-    for (name, target) in targets {
-        let Ok(entries) = fs::read_dir(root.join(name)) else {
-            continue;
-        };
-        for entry in entries {
-            target(&fs::read(entry.unwrap().path()).unwrap());
-        }
+fn graphs_that_once_failed() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("regressions/graph");
+    for entry in fs::read_dir(root).unwrap() {
+        regression(&fs::read(entry.unwrap().path()).unwrap());
+    }
+}
+
+/// Writes generated graphs as JSON, for `graph_json` to start from:
+/// `WITGRAPH_FUZZ_SEEDS=fuzz/corpus/graph_json cargo test -p witgraph-fuzz write_seeds`.
+#[test]
+fn write_seeds() {
+    let Ok(directory) = std::env::var("WITGRAPH_FUZZ_SEEDS") else {
+        return;
+    };
+    fs::create_dir_all(&directory).unwrap();
+    for seed in 0..2000 {
+        let data = bytes(seed + 1, 300);
+        let mut u = arbitrary::Unstructured::new(&data);
+        let graph = witgraph_fuzz::generate::graph(&mut u).unwrap();
+        fs::write(
+            Path::new(&directory).join(format!("{seed}.json")),
+            serde_json::to_vec(&graph).unwrap(),
+        )
+        .unwrap();
     }
 }

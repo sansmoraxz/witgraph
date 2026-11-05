@@ -1,6 +1,6 @@
 //! Fuzzes what witgraph does with a graph. `cargo fuzz` looks for inputs with coverage
 //! guidance, and `cargo test` runs the same checks on stable, over seeded inputs and every
-//! input that once failed (`fuzz/regressions`). See `fuzz/README.md`.
+//! graph that once failed (`fuzz/regressions`). See `fuzz/README.md`.
 //!
 //! "It didn't panic" says little: each graph here is also held to rules worked out
 //! apart from the compiler, and to what must hold whatever the rules are.
@@ -75,6 +75,15 @@ pub fn graph_run(data: &[u8]) {
     if let Ok(compiled) = graph.clone().compile(contracts().as_slice()) {
         count(&REACHED.compiled);
         run::run(&graph, compiled, &mut u);
+    }
+}
+
+/// A graph's JSON that once failed: everything is checked, and it runs if it compiles.
+pub fn regression(json: &[u8]) {
+    let graph: Graph = serde_json::from_slice(json).expect("a regression is a graph");
+    check(&graph);
+    if let Ok(compiled) = graph.clone().compile(contracts().as_slice()) {
+        run::run(&graph, compiled, &mut Unstructured::new(&[]));
     }
 }
 
