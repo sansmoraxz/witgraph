@@ -405,7 +405,7 @@ test.describe('WIT Graph Editor Demo', () => {
     const inspector = page.locator('witgraph-inspector');
     const canvas = page.locator('witgraph-canvas');
     await canvas.evaluate((el: WitgraphCanvas) => el.controller?.selectEdge('stream'));
-    await expect(inspector).toContainText('carries a stream port');
+    await expect(inspector).toContainText('A stream connection cannot be feedback.');
     await expect(inspector.locator('.toggle-track')).toHaveCount(0);
 
     await canvas.evaluate((el: WitgraphCanvas) => el.controller?.selectEdge('a-to-b'));
@@ -562,6 +562,7 @@ test.describe('Video pipeline demo', () => {
     // Nothing here is wrong, so nothing should read as though it were.
     const inspector = page.locator('witgraph-inspector');
     await canvas.evaluate((el: WitgraphCanvas) => el.controller?.select('gray'));
+    await expect(inspector).not.toContainText('feedback connection');
 
     // The step is over and the stream is not, so it can still be stopped.
     const stop = page.locator('witgraph-controls').locator('button.stop');

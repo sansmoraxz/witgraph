@@ -899,8 +899,6 @@ export class WitgraphInspector extends HTMLElement {
       fbLabel.textContent = 'Feedback (unit delay)';
       fbRow.append(fbCheck, fbLabel);
       wrap.appendChild(fbRow);
-    } else if (connected?.reason) {
-      wrap.appendChild(this.#el('div', 'text-2xs text-wg-text-dim mt-1 italic', connected.reason));
     }
 
     select.dataset.structural = '';
@@ -1012,6 +1010,9 @@ export class WitgraphInspector extends HTMLElement {
     wrap.appendChild(flow);
 
     // Feedback toggle (Value ports only)
+    const srcPort = this.#controller?.nodes
+      .get(edge.fromNode)
+      ?.outputs.find((p) => p.name === edge.fromPort);
     const asFeedback = this.#controller?.canBeFeedback(
       edge.fromNode,
       edge.fromPort,
@@ -1040,7 +1041,7 @@ export class WitgraphInspector extends HTMLElement {
         this.#el(
           'div',
           'text-xs text-wg-text-dim italic p-2 bg-wg-surface rounded-md',
-          asFeedback?.reason ?? '',
+          `A ${srcPort?.kind ?? 'connection'} connection cannot be feedback.`,
         ),
       );
     }
