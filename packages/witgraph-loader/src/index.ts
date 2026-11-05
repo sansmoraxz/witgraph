@@ -252,8 +252,8 @@ type NodeNumber = number & { readonly brand: 'node' };
 interface HubInstance {
   _util: {
     stop: () => void;
-    whenIdle: (calls?: object[]) => Promise<void>;
-    lastCall: () => object | undefined;
+    whenIdle: (groups?: object[]) => Promise<void>;
+    lastTaskGroup: () => object | undefined;
   };
   control: {
     run: (node: NodeNumber) => Promise<unknown>;
@@ -341,7 +341,7 @@ export class Session {
   #nodes: string[];
   #instance: HubInstance | undefined;
   /** By node: its last run in this instance, to tell its guest work from the rest's. */
-  #calls = new Map<NodeNumber, object>();
+  #taskGroups = new Map<NodeNumber, object>();
   /** What the hub lent the host last. */
   #lent: unknown;
   /**
@@ -616,7 +616,7 @@ export class Session {
     // have run on its own.
     if (!this.#disposed && this.#epoch === epoch) {
       this.#instance = instance;
-      this.#calls.clear();
+      this.#taskGroups.clear();
     } else {
       ended = true;
       end(instance);
@@ -639,8 +639,8 @@ export class Session {
     try {
       const running = instance.control.run(number);
       // In this turn, before anything else can have started.
-      const call = instance._util.lastCall();
-      if (call) this.#calls.set(number, call);
+      const group = instance._util.lastTaskGroup();
+      if (group) this.#taskGroups.set(number, group);
       returned = await running;
     } catch (error) {
       // Ending the instance ends its calls.
@@ -655,8 +655,8 @@ export class Session {
 
   /** When the instance has no guest work left, or none left by the last run of `nodes`. */
   #whenIdle(nodes?: NodeNumber[]): Promise<void> | undefined {
-    const calls = nodes?.flatMap((node) => this.#calls.get(node) ?? []);
-    return this.#instance?._util.whenIdle(calls);
+    const groups = nodes?.flatMap((node) => this.#taskGroups.get(node) ?? []);
+    return this.#instance?._util.whenIdle(groups);
   }
 
   /**

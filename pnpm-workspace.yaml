@@ -2,7 +2,7 @@ packages:
   - packages/*
 
 allowBuilds:
-  '@bytecodealliance/jco-transpile@https://codeload.github.com/sansmoraxz/jco/tar.gz/8c983e5b833e0d009815a2778a6b7222da5e7133#path:packages/jco-transpile': true
+  '@bytecodealliance/jco-transpile@https://codeload.github.com/sansmoraxz/jco/tar.gz/484de59a374db14a02fcb99c32dfe80005110bba#path:packages/jco-transpile': true
 
 minimumReleaseAgeExclude:
   - minimatch@11.0.4
