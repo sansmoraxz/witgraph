@@ -200,6 +200,73 @@ test('breakpoint pauses execution', async () => {
   assert.equal(controller.mode, 'idle');
 });
 
+test('several nodes at breakpoints at once each wait for their own resume', async () => {
+  const controller = await loadController([
+    ['a', 'echo'],
+    ['b', 'echo'],
+  ]);
+  controller.toggleBreakpoint('a');
+  controller.toggleBreakpoint('b');
+  const running = controller.run();
+  const held = () => controller.pausedNode;
+  for (let at = 0; at < 200 && held() === null; at++) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  const first = held();
+  assert.ok(first === 'a' || first === 'b', `paused at ${first}`);
+  assert.equal(controller.mode, 'paused');
+  assert.equal(controller.breakpointState?.node, first);
+
+  // Both reach theirs in one pass, and the second must not take the place of the first.
+  for (let at = 0; at < 20; at++) await new Promise((resolve) => setTimeout(resolve, 5));
+  controller.resumeBreakpoint();
+  assert.equal(controller.mode, 'paused', 'the other is still held');
+  assert.equal(held(), first === 'a' ? 'b' : 'a');
+  controller.resumeBreakpoint();
+  await running;
+  assert.equal(controller.mode, 'idle');
+  assert.equal(held(), null);
+  assert.equal(controller.nodes.get('a')?.phase, 'idle');
+  assert.equal(controller.nodes.get('b')?.phase, 'idle');
+});
+
+test('stopping releases every node at a breakpoint', async () => {
+  const controller = await loadController([
+    ['a', 'echo'],
+    ['b', 'echo'],
+  ]);
+  controller.toggleBreakpoint('a');
+  controller.toggleBreakpoint('b');
+  const running = controller.run();
+  for (let at = 0; at < 200 && controller.pausedNode === null; at++) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  for (let at = 0; at < 20; at++) await new Promise((resolve) => setTimeout(resolve, 5));
+  controller.stop();
+  await running;
+  assert.equal(controller.pausedNode, null);
+  assert.notEqual(controller.mode, 'paused');
+});
+
+test('running or stepping while paused leaves the pause alone', async () => {
+  const controller = await loadController([['a', 'echo']]);
+  controller.toggleBreakpoint('a');
+  const running = controller.run();
+  for (let at = 0; at < 200 && controller.pausedNode === null; at++) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  await controller.step();
+  await controller.run();
+  assert.equal(controller.mode, 'paused', 'not `error`: a tick is under way, not failed');
+  assert.deepEqual(
+    controller.traceEvents.filter((e) => e.event === 'error'),
+    [],
+  );
+  controller.resumeBreakpoint();
+  await running;
+  assert.equal(controller.mode, 'idle');
+});
+
 test('moveNode updates position', async () => {
   const controller = await loadController([['a', 'echo']]);
   controller.moveNode('a', 100, 200);

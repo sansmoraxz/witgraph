@@ -123,9 +123,8 @@ export class EditorController extends EventTarget {
 
   #breakpoints = new Set<string>();
   #stopResolve: (() => void) | null = null;
-  #breakpointResolve: (() => void) | null = null;
-  #pausedNode: string | null = null;
-  #breakpointState: BreakpointState | null = null;
+  /** The nodes at a breakpoint, in the order they reached it: several can at once. */
+  #held: (BreakpointState & { resume: () => void })[] = [];
 
   #tickCount = 0;
   #previewIntervalMs = 0;
@@ -192,10 +191,11 @@ export class EditorController extends EventTarget {
     return this.#graphJson ?? {};
   }
   get pausedNode(): string | null {
-    return this.#pausedNode;
+    return this.#held[0]?.node ?? null;
   }
   get breakpointState(): BreakpointState | null {
-    return this.#breakpointState;
+    const [first] = this.#held;
+    return first ? { node: first.node, inputs: first.inputs } : null;
   }
   get lastRunDurationMs(): number | null {
     return this.#lastRunDurationMs;
@@ -1040,9 +1040,7 @@ export class EditorController extends EventTarget {
     this.#graphJson = null;
     this.#dirty = false;
     this.#stopResolve = null;
-    this.#breakpointResolve = null;
-    this.#pausedNode = null;
-    this.#breakpointState = null;
+    this.#held = [];
     this.#tickCount = 0;
     this.#forgetObserved();
     this.#injectedValues.clear();
@@ -1077,6 +1075,8 @@ export class EditorController extends EventTarget {
   // -- Execution --------------------------------------------------------------
 
   async run(): Promise<void> {
+    // Paused, a tick is still under way: what continues it is `resumeBreakpoint`.
+    if (this.#mode === 'running' || this.#mode === 'paused') return;
     try {
       if (this.#dirty || !this.#session) await this.#reload();
     } catch (err) {
@@ -1136,6 +1136,8 @@ export class EditorController extends EventTarget {
   }
 
   async step(): Promise<void> {
+    // Paused, a tick is still under way: what continues it is `resumeBreakpoint`.
+    if (this.#mode === 'running' || this.#mode === 'paused') return;
     try {
       if (this.#dirty || !this.#session) await this.#reload();
     } catch (err) {
@@ -1257,7 +1259,7 @@ export class EditorController extends EventTarget {
 
   /** Resolves once no node is held at a breakpoint. */
   async #paused(): Promise<void> {
-    while (this.#breakpointResolve && !this.#stopRequested) await nextFrame();
+    while (this.#held.length > 0 && !this.#stopRequested) await nextFrame();
   }
 
   /** Stops the graph: what is still running ends, streams included. */
@@ -1287,12 +1289,7 @@ export class EditorController extends EventTarget {
       this.#shutdown();
       this.#pollState();
     }
-    if (this.#breakpointResolve) {
-      this.#breakpointResolve();
-      this.#breakpointResolve = null;
-      this.#pausedNode = null;
-      this.#breakpointState = null;
-    }
+    for (const { resume } of this.#held.splice(0)) resume();
     if (this.#stopResolve) {
       this.#stopResolve();
       this.#stopResolve = null;
@@ -1419,14 +1416,13 @@ export class EditorController extends EventTarget {
   }
 
   resumeBreakpoint(): void {
-    if (this.#breakpointResolve) {
-      this.#breakpointResolve();
-      this.#breakpointResolve = null;
-      this.#pausedNode = null;
-      this.#breakpointState = null;
-      this.#mode = 'running';
-      this.#dispatch('state-changed');
-    }
+    const held = this.#held.shift();
+    if (!held) return;
+    held.resume();
+    // Another stays paused, and is now the one shown.
+    if (this.#held.length === 0) this.#mode = 'running';
+    this.#pullSoon();
+    this.#dispatch('state-changed');
   }
 
   // -- Inspection / Injection -------------------------------------------------
@@ -1874,13 +1870,12 @@ export class EditorController extends EventTarget {
         if (this.#breakpoints.has(node)) {
           // Read when it is hit, as nothing crosses to the host unasked.
           const inputs = (await session?.readInputs(node)) ?? {};
-          this.#pausedNode = node;
-          this.#breakpointState = { node, inputs };
-          this.#mode = 'paused';
-          this.#pullSoon();
-          this.#dispatch('state-changed');
-          return new Promise<void>((resolve) => {
-            this.#breakpointResolve = resolve;
+          if (this.#stopRequested) return;
+          return new Promise<void>((resume) => {
+            this.#held.push({ node, inputs, resume });
+            this.#mode = 'paused';
+            this.#pullSoon();
+            this.#dispatch('state-changed');
           });
         }
         // Shown running until the tick ends, however long its run takes

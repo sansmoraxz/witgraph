@@ -412,6 +412,20 @@ test.describe('WIT Graph Editor Demo', () => {
     await expect(inspector.locator('.toggle-track')).toHaveCount(1);
   });
 
+  test('paused at a breakpoint, only resuming or stopping is offered', async ({ page }) => {
+    const controls = page.locator('witgraph-controls');
+    await page
+      .locator('witgraph-canvas')
+      .evaluate((el: WitgraphCanvas) => el.controller?.toggleBreakpoint('relay-b'));
+    await controls.locator('button.run').click();
+    await expect(controls.locator('.badge')).toContainText('Paused');
+    await expect(controls.locator('button.step')).toBeDisabled();
+    await expect(controls.locator('button.run')).toBeDisabled();
+    await expect(controls.locator('button.stop')).toBeEnabled();
+    await controls.locator('button.stop').click();
+    await expect(controls.locator('.badge')).not.toContainText('Paused');
+  });
+
   test('the inspector describes the selected node by its component', async ({ page }) => {
     await page.locator('witgraph-canvas').locator('[data-node-id="relay-a"]').click();
     await expect(page.locator('witgraph-inspector').locator('.node-docs')).toContainText(

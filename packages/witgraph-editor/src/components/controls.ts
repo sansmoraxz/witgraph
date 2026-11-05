@@ -298,8 +298,9 @@ export class WitgraphControls extends HTMLElement {
     const mode = this.#controller?.mode ?? 'idle';
     const hasSelection = !!this.#controller?.selectedNode;
 
-    this.#btnRun.disabled = mode === 'running';
-    this.#btnStep.disabled = mode === 'running';
+    // Paused, a tick is still under way: Resume is what continues it.
+    this.#btnRun.disabled = mode === 'running' || mode === 'paused';
+    this.#btnStep.disabled = mode === 'running' || mode === 'paused';
     // A step can leave a stream going: stopping is for that too.
     const anyRunning = [...(this.#controller?.nodes.values() ?? [])].some(
       (node) => node.phase === 'running',
