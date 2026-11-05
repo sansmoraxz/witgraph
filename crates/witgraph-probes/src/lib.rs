@@ -8,6 +8,11 @@
 //!
 //! The module's memories keep their indices, as engines reach the first one fastest, so
 //! the flags come after them.
+//!
+//! A probe that fires first writes out, after the flags, the locals and globals the debug
+//! info reads variables from, as nothing outside a function can read its locals:
+//! [`ModuleDebug`] finds its variables from there. Only those: reading a local at all keeps it
+//! alive across each probe, which slows a loop even though no probe fires.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -18,7 +23,11 @@ use wasm_encoder::{
     BlockType, CodeSection, EntityType, ExportKind, ExportSection, Function, ImportSection,
     Instruction, MemArg, MemArgTarget, MemorySection, MemoryType, TypeSection, ValType,
 };
-use wasmparser::{FunctionBody, Parser, Payload, TypeRef};
+use wasmparser::{CompositeInnerType, FunctionBody, Parser, Payload, TypeRef};
+
+mod variables;
+use variables::ReadFrom;
+pub use variables::{Frame, ModuleDebug, Variable};
 
 /// The module of the import a probe calls.
 pub const IMPORT_MODULE: &str = "witgraph:debug";
@@ -90,7 +99,44 @@ pub struct Instrumented {
     pub module: Vec<u8>,
     /// The probes, each at its [`ProbeId`].
     pub probes: Vec<Probe>,
+    /// Where a firing probe writes out what it can see, in the memory of flags.
+    pub spill: Spill,
 }
+
+/// Where a firing probe writes out locals and globals: 8 bytes for each, little-endian, the
+/// globals first, each at its own index whether or not it is written. Those that are not
+/// numbers are left out, as are locals past [`MOST_SPILLED_LOCALS`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Spill {
+    /// The offset of the first, after the flags.
+    pub base: u32,
+    /// How many slots the globals take.
+    pub globals: u32,
+}
+
+impl Spill {
+    /// The bytes of `local`, in `spilled`, the memory from [`Spill::base`] on.
+    #[must_use]
+    pub fn local(&self, spilled: &[u8], local: u32) -> Option<[u8; 8]> {
+        slot(spilled, u64::from(self.globals) + u64::from(local))
+    }
+
+    /// The bytes of `global`, in `spilled`, the memory from [`Spill::base`] on.
+    #[must_use]
+    pub fn global(&self, spilled: &[u8], global: u32) -> Option<[u8; 8]> {
+        (global < self.globals)
+            .then(|| slot(spilled, u64::from(global)))
+            .flatten()
+    }
+}
+
+fn slot(spilled: &[u8], at: u64) -> Option<[u8; 8]> {
+    let start = usize::try_from(at.checked_mul(8)?).ok()?;
+    spilled.get(start..start.checked_add(8)?)?.try_into().ok()
+}
+
+/// How many of a function's locals a probe writes out.
+pub const MOST_SPILLED_LOCALS: u32 = 2048;
 
 /// What a line table says of one address.
 struct Row {
@@ -209,6 +255,16 @@ struct Shape {
     imported_functions: u32,
     imported_memories: u32,
     defined_memories: u32,
+    /// By type, a function's parameters.
+    params: Vec<Vec<wasmparser::ValType>>,
+    /// By defined function, its type.
+    function_types: Vec<u32>,
+    /// By global, its type.
+    globals: Vec<wasmparser::ValType>,
+    /// The most locals of any function, parameters included.
+    most_locals: u32,
+    /// How many function bodies have been looked at.
+    seen_bodies: usize,
     has_types: bool,
     has_imports: bool,
     has_memories: bool,
@@ -222,8 +278,13 @@ fn shape_of(module: &[u8]) -> Result<Shape, ProbeError> {
             Payload::TypeSection(section) => {
                 shape.has_types = true;
                 for group in section {
-                    let count = group?.types().len();
-                    shape.types += u32::try_from(count).unwrap_or(u32::MAX);
+                    for ty in group?.types() {
+                        shape.types += 1;
+                        shape.params.push(match &ty.composite_type.inner {
+                            CompositeInnerType::Func(function) => function.params().to_vec(),
+                            _ => Vec::new(),
+                        });
+                    }
                 }
             }
             Payload::ImportSection(section) => {
@@ -232,6 +293,7 @@ fn shape_of(module: &[u8]) -> Result<Shape, ProbeError> {
                     match import?.ty {
                         TypeRef::Func(_) | TypeRef::FuncExact(_) => shape.imported_functions += 1,
                         TypeRef::Memory(_) => shape.imported_memories += 1,
+                        TypeRef::Global(global) => shape.globals.push(global.content_type),
                         _ => {}
                     }
                 }
@@ -241,6 +303,31 @@ fn shape_of(module: &[u8]) -> Result<Shape, ProbeError> {
                 shape.defined_memories = section.count();
             }
             Payload::ExportSection(_) => shape.has_exports = true,
+            Payload::FunctionSection(section) => {
+                for ty in section {
+                    shape.function_types.push(ty?);
+                }
+            }
+            Payload::GlobalSection(section) => {
+                for global in section {
+                    shape.globals.push(global?.ty.content_type);
+                }
+            }
+            Payload::CodeSectionEntry(body) => {
+                let at = shape.seen_bodies;
+                shape.seen_bodies += 1;
+                let params = shape
+                    .function_types
+                    .get(at)
+                    .and_then(|ty| shape.params.get(*ty as usize))
+                    .map_or(0, Vec::len);
+                let mut count = u64::try_from(params).unwrap_or(u64::MAX);
+                for locals in body.get_locals_reader()? {
+                    count += u64::from(locals?.0);
+                }
+                let count = u32::try_from(count).unwrap_or(u32::MAX);
+                shape.most_locals = shape.most_locals.max(count.min(MOST_SPILLED_LOCALS));
+            }
             Payload::CodeSectionStart {
                 unchecked_range, ..
             } => shape.code_start = Some(unchecked_range.start),
@@ -273,6 +360,8 @@ fn section_rank(id: wasm_encoder::SectionId) -> u8 {
 
 struct Rewriter<'a> {
     shape: Shape,
+    /// What to write out. With no debug info to say, as when testing, nothing.
+    read_from: ReadFrom,
     /// Offsets in the original module to put a probe at, sorted.
     sites: &'a [u32],
     /// The next of `sites` to place.
@@ -299,6 +388,33 @@ impl Rewriter<'_> {
         self.shape.imported_memories + self.shape.defined_memories
     }
 
+    /// The locals of a function a probe writes out.
+    fn locals_of(
+        &self,
+        function: u32,
+        body: &FunctionBody<'_>,
+    ) -> Rewritten<Vec<(u32, wasmparser::ValType)>> {
+        let defined = function - self.shape.imported_functions;
+        let mut locals: Vec<wasmparser::ValType> = self
+            .shape
+            .function_types
+            .get(defined as usize)
+            .and_then(|ty| self.shape.params.get(*ty as usize))
+            .cloned()
+            .unwrap_or_default();
+        for declared in body.get_locals_reader()? {
+            let (count, ty) = declared?;
+            let room = (MOST_SPILLED_LOCALS as usize).saturating_sub(locals.len());
+            locals.extend(std::iter::repeat_n(ty, room.min(count as usize)));
+        }
+        locals.truncate(MOST_SPILLED_LOCALS as usize);
+        let read = self.read_from.locals_in(body.range());
+        Ok(read
+            .into_iter()
+            .filter_map(|index| locals.get(index as usize).map(|ty| (index, *ty)))
+            .collect())
+    }
+
     fn add_probe_type(&self, types: &mut TypeSection) {
         types.ty().function([ValType::I32], []);
     }
@@ -311,11 +427,19 @@ impl Rewriter<'_> {
         );
     }
 
+    /// Where a firing probe writes out what it can see: on a boundary, after the flags.
+    fn spill(&self) -> Spill {
+        let flags = u32::try_from(self.sites.len()).unwrap_or(u32::MAX);
+        Spill {
+            base: flags.div_ceil(8).saturating_mul(8),
+            globals: u32::try_from(self.shape.globals.len()).unwrap_or(u32::MAX),
+        }
+    }
+
     fn add_flags(&self, memories: &mut MemorySection) {
-        let pages = u64::try_from(self.sites.len())
-            .unwrap_or(u64::MAX)
-            .div_ceil(65536)
-            .max(1);
+        let spill = self.spill();
+        let slots = u64::from(spill.globals) + u64::from(self.shape.most_locals);
+        let pages = (u64::from(spill.base) + slots * 8).div_ceil(65536).max(1);
         memories.memory(MemoryType {
             minimum: pages,
             maximum: Some(pages),
@@ -329,8 +453,36 @@ impl Rewriter<'_> {
         exports.export(EXPORT_FLAGS, ExportKind::Memory, self.flags_index());
     }
 
-    /// `if (flags[id]) probe(id)`, which leaves the stack as it was.
-    fn emit_probe(&self, function: &mut Function, id: u32) {
+    /// Stores a value in a slot of the spill, if it is a number. Leaves the stack as it was.
+    fn emit_store(
+        &self,
+        function: &mut Function,
+        slot: u64,
+        ty: wasmparser::ValType,
+        value: Instruction<'_>,
+    ) {
+        use wasmparser::ValType as V;
+        let argument = MemArg {
+            offset: u64::from(self.spill().base) + slot * 8,
+            align: 0,
+            target: MemArgTarget::Memory(self.flags_index()),
+            ordering: Default::default(),
+        };
+        let store = match ty {
+            V::I32 => Instruction::I32Store(argument),
+            V::I64 => Instruction::I64Store(argument),
+            V::F32 => Instruction::F32Store(argument),
+            V::F64 => Instruction::F64Store(argument),
+            _ => return,
+        };
+        function.instruction(&Instruction::I32Const(0));
+        function.instruction(&value);
+        function.instruction(&store);
+    }
+
+    /// `if (flags[id]) { write out locals and globals; probe(id) }`, which leaves the stack as
+    /// it was.
+    fn emit_probe(&self, function: &mut Function, id: u32, locals: &[(u32, wasmparser::ValType)]) {
         let id = i32::try_from(id).unwrap_or(i32::MAX);
         // Atomic, or an engine could read it once and hoist that out of a loop.
         function.instruction(&Instruction::I32Const(id));
@@ -341,6 +493,21 @@ impl Rewriter<'_> {
             ordering: Default::default(),
         }));
         function.instruction(&Instruction::If(BlockType::Empty));
+        let globals = self.shape.globals.len();
+        for index in &self.read_from.globals {
+            if let Some(ty) = self.shape.globals.get(*index as usize) {
+                self.emit_store(
+                    function,
+                    u64::from(*index),
+                    *ty,
+                    Instruction::GlobalGet(*index),
+                );
+            }
+        }
+        for (index, ty) in locals {
+            let slot = u64::try_from(globals).unwrap_or(u64::MAX) + u64::from(*index);
+            self.emit_store(function, slot, *ty, Instruction::LocalGet(*index));
+        }
         function.instruction(&Instruction::I32Const(id));
         function.instruction(&Instruction::Call(self.probe_index()));
         function.instruction(&Instruction::End);
@@ -441,6 +608,7 @@ impl Reencode for Rewriter<'_> {
         let this_function = self.next_function;
         self.next_function += 1;
         let mut function = self.new_function_with_parsed_locals(&body)?;
+        let locals = self.locals_of(this_function, &body)?;
         let mut reader = body.get_operators_reader()?;
         while !reader.eof() {
             let at = u32::try_from(reader.original_position()).unwrap_or(u32::MAX);
@@ -452,6 +620,7 @@ impl Reencode for Rewriter<'_> {
                 self.emit_probe(
                     &mut function,
                     u32::try_from(self.next_site).unwrap_or(u32::MAX),
+                    &locals,
                 );
                 self.functions.push(this_function);
                 self.next_site += 1;
@@ -501,10 +670,16 @@ impl Reencode for Rewriter<'_> {
 
 /// Puts a probe before the operators at `sites`, offsets in `module`, sorted. Returns the new
 /// module, and by site the function it went in.
-fn rewrite(module: &[u8], shape: Shape, sites: &[u32]) -> Result<(Vec<u8>, Vec<u32>), ProbeError> {
+fn rewrite(
+    module: &[u8],
+    shape: Shape,
+    read_from: ReadFrom,
+    sites: &[u32],
+) -> Result<(Vec<u8>, Vec<u32>, Spill), ProbeError> {
     let first_function = shape.imported_functions;
     let mut rewriter = Rewriter {
         shape,
+        read_from,
         sites,
         next_site: 0,
         next_function: first_function,
@@ -524,7 +699,8 @@ fn rewrite(module: &[u8], shape: Shape, sites: &[u32]) -> Result<(Vec<u8>, Vec<u
             sites: sites.len(),
         });
     }
-    Ok((out.finish(), rewriter.functions))
+    let spill = rewriter.spill();
+    Ok((out.finish(), rewriter.functions, spill))
 }
 
 /// Puts a probe on each of `lines` in `module`. `None` if it has none: it has no debug info,
@@ -543,7 +719,11 @@ pub fn instrument(module: &[u8], lines: Lines) -> Result<Option<Instrumented>, P
     }
     let offset = |row: &Row| u32::try_from(row.address + code_start).unwrap_or(u32::MAX);
     let sites: Vec<u32> = rows.iter().map(offset).collect();
-    let (module, functions) = rewrite(module, shape, &sites)?;
+    let read_from = match ModuleDebug::new(module)? {
+        Some(debug) => debug.read_from()?,
+        None => ReadFrom::default(),
+    };
+    let (module, functions, spill) = rewrite(module, shape, read_from, &sites)?;
     let probes = rows
         .into_iter()
         .zip(functions)
@@ -556,7 +736,11 @@ pub fn instrument(module: &[u8], lines: Lines) -> Result<Option<Instrumented>, P
             column: row.column,
         })
         .collect();
-    Ok(Some(Instrumented { module, probes }))
+    Ok(Some(Instrumented {
+        module,
+        probes,
+        spill,
+    }))
 }
 
 /// The core modules inside a component, nested ones too, as their bytes.
@@ -718,6 +902,33 @@ mod tests {
     }
 
     #[test]
+    fn only_what_the_debug_info_reads_is_written_out() {
+        let module = line_walk();
+        let debug = ModuleDebug::new(&module).unwrap().unwrap();
+        let read = debug.read_from().unwrap();
+        // Rust keeps each variable in memory, behind a frame pointer, at this level.
+        let mut body = None;
+        let walk = instrument(&module, Lines::Own)
+            .unwrap()
+            .unwrap()
+            .probes
+            .into_iter()
+            .find(|probe| probe.line == marked("walk-first"))
+            .unwrap();
+        for payload in Parser::new(0).parse_all(&module) {
+            if let Payload::CodeSectionEntry(entry) = payload.unwrap() {
+                let range = entry.range();
+                if range.contains(&u64::from(walk.offset.0)) {
+                    body = Some(range);
+                }
+            }
+        }
+        let body = body.unwrap();
+        let locals = read.locals_in(body);
+        assert_eq!(locals.len(), 1, "only its frame pointer: {locals:?}");
+    }
+
+    #[test]
     fn a_module_with_no_debug_info_runs_as_it_is() {
         let module = wat::parse_str("(module (func (export \"f\")))").unwrap();
         assert!(instrument(&module, Lines::All).unwrap().is_none());
@@ -753,8 +964,13 @@ mod tests {
         // Between the two constants, with one on the stack, and at the end.
         let operators = operator_offsets(&module);
         let shape = shape_of(&module).unwrap();
-        let (rewritten, functions) =
-            rewrite(&module, shape, &[operators[1], operators[3]]).unwrap();
+        let (rewritten, functions, _) = rewrite(
+            &module,
+            shape,
+            ReadFrom::default(),
+            &[operators[1], operators[3]],
+        )
+        .unwrap();
         validate(&rewritten);
         assert_eq!(functions, [0, 0]);
         let found = exports(&rewritten);
@@ -782,7 +998,8 @@ mod tests {
         let operators = operator_offsets(&module);
         let shape = shape_of(&module).unwrap();
         assert_eq!(shape.types, 2, "a recursion group's types each count");
-        let (rewritten, _) = rewrite(&module, shape, &[operators[0]]).unwrap();
+        let (rewritten, ..) =
+            rewrite(&module, shape, ReadFrom::default(), &[operators[0]]).unwrap();
         validate(&rewritten);
         let found = exports(&rewritten);
         let g = found.iter().find(|(name, ..)| name == "g").unwrap();

@@ -15,9 +15,11 @@ import initModule, {
   GraphChecker,
   instrumentModule,
   jsName as jsNameRaw,
+  type ModuleVariables,
+  moduleVariables,
   WebGraph,
 } from '../pkg/witgraph_web.js';
-import type { SessionLines, SourceProbe } from './lines.ts';
+import type { SessionLines, SourceProbe, SourceVariable } from './lines.ts';
 
 /** A port of a component, as the editor catalog describes one. */
 export interface Port {
@@ -249,7 +251,12 @@ interface Transpiled {
   /** Its imports, as jco names them. */
   imports: string[];
   /** The core modules with probes in them. */
-  probed: { module: WebAssembly.Module; probes: SourceProbe[]; sha256: string }[];
+  probed: {
+    module: WebAssembly.Module;
+    probes: SourceProbe[];
+    sha256: string;
+    variables?: ModuleVariables;
+  }[];
 }
 
 /** What `instrumentModule` makes of a core module. */
@@ -257,6 +264,7 @@ interface InstrumentedModule {
   bytes: Uint8Array;
   sha256: string;
   probes: SourceProbe[];
+  spill: { base: number; globals: number };
 }
 
 /** What one of the composite's imports is. */
@@ -434,7 +442,12 @@ export class Session {
       const imports = web.imports(transpiled.imports) as ImportKind[];
       const ofModule = web.moduleNodes() as Record<string, string[]>;
       options.lines?.modules?.(
-        transpiled.probed.map(({ probes, sha256 }) => ({ probes, nodes: ofModule[sha256] ?? [] })),
+        transpiled.probed.map(({ probes, sha256, variables }) => ({
+          probes,
+          nodes: ofModule[sha256] ?? [],
+          variablesAt: (offset, flags, memory) =>
+            (variables?.at(offset, flags, memory) ?? []) as SourceVariable[],
+        })),
       );
       session = new Session(web, options, transpiled, imports, nodes);
       await session.#instantiate();
@@ -672,7 +685,11 @@ export class Session {
         'witgraph:debug': { probe: (id: number) => lines.probe(at, instance, id) },
       });
       const flags = made.exports['witgraph:debug/flags'] as WebAssembly.Memory;
-      lines.instance?.(at, instance, flags.buffer);
+      const memory = Object.values(made.exports).find(
+        (exported): exported is WebAssembly.Memory =>
+          exported instanceof WebAssembly.Memory && exported !== flags,
+      );
+      lines.instance?.(at, instance, flags.buffer, memory);
       return made;
     };
   }
@@ -950,6 +967,8 @@ async function transpileComposite(
           module: await compiling,
           probes: rewritten.probes,
           sha256: rewritten.sha256,
+          variables:
+            moduleVariables(contents, rewritten.spill.base, rewritten.spill.globals) ?? undefined,
         });
       }
     } else if (name.endsWith('.js')) source = new TextDecoder().decode(contents);
@@ -1012,6 +1031,7 @@ export {
   type LineStop,
   type SessionLines,
   type SourceProbe,
+  type SourceVariable,
 } from './lines.ts';
 export {
   describeHandle,

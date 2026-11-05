@@ -172,6 +172,128 @@ test('a breakpoint stops on its line, naming the node, and resuming goes on', as
   assert.equal(await session.graph.readOutput('a', 'out'), 8);
 });
 
+/** One of a stop's variables, by name. */
+function variable(stop: LineStop, name: string) {
+  const found = stop.variables.find((candidate) => candidate.name === name);
+  assert.ok(found, `no \`${name}\` in ${stop.variables.map((other) => other.name)}`);
+  return found;
+}
+
+test('a stop says what its variables hold, and which are in scope', async () => {
+  const { session, lines, nextStop, file } = await load([['a', 'line-walk']]);
+  lines.setBreakpoint(file, mark('walk-first'));
+  await session.graph.inject('a', 'in', 5);
+  const tick = session.tick();
+
+  const first = await nextStop();
+  assert.equal(variable(first, 'x').value, '5');
+  assert.equal(variable(first, 'x').type, 'u32');
+  assert.ok(!first.variables.some(({ name }) => name === 'a'), 'not yet');
+
+  lines.stepOver();
+  const second = await nextStop();
+  assert.equal(second.line, mark('walk-second'));
+  assert.equal(variable(second, 'a').value, '6', 'its value, now it has one');
+
+  lines.stepIn();
+  const body = await nextStop();
+  assert.equal(body.line, mark('add-body'), 'past its opening line, to where its parameters are');
+  assert.match(body.frames[0], /add/);
+  assert.equal(variable(body, 'a').value, '6', "the callee's own `a`");
+  assert.equal(variable(body, 'b').value, '2');
+  assert.ok(!body.variables.some(({ name }) => name === 'x'), "its caller's is out of scope");
+
+  lines.clearBreakpoint(file, mark('walk-first'));
+  lines.resume();
+  await tick;
+});
+
+test('a variable of each kind reads as its source would write it', async () => {
+  const { session, lines, nextStop, file } = await load([['a', 'line-walk']]);
+  lines.setBreakpoint(file, mark('kinds-end'));
+  await session.graph.inject('a', 'kinds', 4);
+  const tick = session.tick();
+  const stop = await nextStop();
+  assert.equal(stop.line, mark('kinds-end'));
+
+  const values = Object.fromEntries(stop.variables.map(({ name, value }) => [name, value]));
+  assert.deepEqual(
+    {
+      seed: values.seed,
+      count: values.count,
+      negative: values.negative,
+      ratio: values.ratio,
+      flag: values.flag,
+      letter: values.letter,
+      point: values.point,
+      text: values.text,
+      owned: values.owned,
+      list: values.list,
+      slice: values.slice,
+      array: values.array,
+      some: values.some,
+      none: values.none,
+      dot: values.dot,
+      circle: values.circle,
+      rect: values.rect,
+      pair: values.pair,
+      reference: values.reference,
+      boxed: values.boxed,
+    },
+    {
+      seed: '4',
+      count: '5',
+      negative: '-11',
+      ratio: '1.5',
+      flag: 'true',
+      letter: "'x'",
+      point: 'Point { x: 3, y: 2.5 }',
+      text: '"hello"',
+      owned: '"owned"',
+      list: '[10, 20, 30]',
+      slice: '[10, 20, 30]',
+      array: '[1, 2, 3]',
+      some: 'Some(7)',
+      none: 'None',
+      dot: 'Dot',
+      circle: 'Circle(0.5)',
+      rect: 'Rect { w: 4, h: 5 }',
+      pair: '(1, 2)',
+      reference: '→ Point { x: 3, y: 2.5 }',
+      boxed: '→ 9',
+    },
+  );
+
+  // Their parts, to look into.
+  assert.deepEqual(
+    variable(stop, 'point').children.map(({ name, type, value }) => [name, type, value]),
+    [
+      ['x', 'i32', '3'],
+      ['y', 'f64', '2.5'],
+    ],
+  );
+  assert.deepEqual(
+    variable(stop, 'list').children.map(({ name, value }) => [name, value]),
+    [
+      ['0', '10'],
+      ['1', '20'],
+      ['2', '30'],
+    ],
+  );
+  assert.deepEqual(
+    variable(stop, 'rect').children.map(({ name, value }) => [name, value]),
+    [
+      ['w', '4'],
+      ['h', '5'],
+    ],
+  );
+  assert.equal(variable(stop, 'reference').children[0].value, '3');
+
+  lines.resume();
+  await tick;
+  await session.settle();
+});
+
 test('a line with no code comes to the next that has it', async () => {
   const { session, lines, nextStop, file } = await load([['a', 'line-walk']]);
   const asked = mark('above-walk');

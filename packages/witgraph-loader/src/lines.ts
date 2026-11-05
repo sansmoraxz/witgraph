@@ -15,11 +15,28 @@ export interface SourceProbe {
   column: number;
 }
 
+/** A variable, or part of one, of a guest stopped on a line. */
+export interface SourceVariable {
+  /** Its name: a field's, or an item's index. */
+  name: string;
+  /** Its type, as the source has it. */
+  type: string;
+  /** What it holds, on one line. */
+  value: string;
+  /** What it is made of, to look into. */
+  children: SourceVariable[];
+}
+
 /** A core module with probes in it, as the graph's session knows it. */
 export interface LineModule {
   probes: SourceProbe[];
   /** The node of each of its instances, in order. A module of a link has none. */
   nodes: string[];
+  /**
+   * The variables at an offset in the module, of an instance stopped there: `flags` and
+   * `memory` are its own, as {@link SessionLines.instance} gave them.
+   */
+  variablesAt?(offset: number, flags: Uint8Array, memory: Uint8Array): SourceVariable[];
 }
 
 /** What a session calls on the thread its guests run on. */
@@ -30,8 +47,13 @@ export interface SessionLines {
   modules?(modules: readonly LineModule[]): void;
   /** The graph is being instantiated: the instances before this one are gone. */
   instantiating?(): void;
-  /** An instance of a module, and the flags of its probes. */
-  instance?(module: number, instance: number, flags: ArrayBufferLike): void;
+  /** An instance of a module, the flags of its probes, and its own memory, if it exports one. */
+  instance?(
+    module: number,
+    instance: number,
+    flags: ArrayBufferLike,
+    memory?: WebAssembly.Memory,
+  ): void;
   /** A probe whose flag is set was reached. It holds the guest for as long as it runs. */
   probe(module: number, instance: number, id: number): void;
 }
@@ -47,6 +69,12 @@ export interface LineStop {
   node?: string;
   /** The functions on its stack, innermost first, as the module names them. */
   frames: string[];
+  /**
+   * The variables in scope where it stopped, innermost scope first, of the innermost function
+   * only: nothing outside a function can read its locals, so those of its callers are out of
+   * reach.
+   */
+  variables: SourceVariable[];
   /** @internal */
   module: number;
   /** @internal */
@@ -60,7 +88,7 @@ export interface LineStop {
 /** What the page needs to control the probes of a worker's session. */
 export interface LinesInfo {
   control: ArrayBufferLike;
-  modules: (LineModule & { breakpoints: ArrayBufferLike })[];
+  modules: (Pick<LineModule, 'probes' | 'nodes'> & { breakpoints: ArrayBufferLike })[];
 }
 
 /** The slots of the shared control words. */
@@ -109,6 +137,10 @@ export class LineProbes implements SessionLines {
   #breakpoints: Uint8Array<SharedArrayBuffer>[] = [];
   /** By module, the functions all on one line: what a macro generated, usually. */
   #oneLine: Set<number>[] = [];
+  /** By module, the probe a function starts at: before it has stored its parameters. */
+  #opening: Set<number>[] = [];
+  /** By module and instance, what its variables are read from. */
+  #instances: { flags: Uint8Array; memory?: WebAssembly.Memory }[][] = [];
   #post: (kind: string, fields: object) => void;
   #report: () => void;
 
@@ -121,8 +153,9 @@ export class LineProbes implements SessionLines {
   info(): LinesInfo {
     return {
       control: this.#control.buffer,
-      modules: this.#modules.map((module, at) => ({
-        ...module,
+      modules: this.#modules.map(({ probes, nodes }, at) => ({
+        probes,
+        nodes,
         breakpoints: this.#breakpoints[at].buffer,
       })),
     };
@@ -133,6 +166,13 @@ export class LineProbes implements SessionLines {
     this.#breakpoints = modules.map(
       (module) => new Uint8Array(new SharedArrayBuffer(Math.max(1, module.probes.length))),
     );
+    this.#opening = modules.map(({ probes }) => {
+      const first = new Map<number, number>();
+      for (const [id, { function: inFunction }] of probes.entries()) {
+        if (!first.has(inFunction)) first.set(inFunction, id);
+      }
+      return new Set(first.values());
+    });
     this.#oneLine = modules.map(({ probes }) => {
       const lineOf = new Map<number, number | null>();
       for (const { function: inFunction, line } of probes) {
@@ -144,10 +184,18 @@ export class LineProbes implements SessionLines {
   }
 
   instantiating(): void {
+    this.#instances = this.#modules.map(() => []);
     this.#post('lines-instantiating', {});
   }
 
-  instance(module: number, instance: number, flags: ArrayBufferLike): void {
+  instance(
+    module: number,
+    instance: number,
+    flags: ArrayBufferLike,
+    memory?: WebAssembly.Memory,
+  ): void {
+    this.#instances[module] ??= [];
+    this.#instances[module][instance] = { flags: new Uint8Array(flags), memory };
     // Set here as well, as the page may be a while seeing this, if the guest goes on to spin.
     const bytes = new Uint8Array(flags);
     if (Atomics.load(this.#control, Control.Pause)) bytes.fill(1);
@@ -181,12 +229,28 @@ export class LineProbes implements SessionLines {
     const here = this.#modules[module].probes[id];
     // A step does not stop in what has no lines to step through, as with what a macro made.
     if (this.#oneLine[module].has(here.function)) return false;
+    // Nor on a function's opening line, where its parameters are not yet what they will be.
+    if (this.#opening[module].has(id)) return false;
     const fromDepth = Atomics.load(control, Control.StepDepth);
     const depth = ownFrames().length;
     const otherLine = here.file !== from.file || here.line !== from.line;
     if (step === Step.Into) return depth > fromDepth || otherLine;
     if (step === Step.Over) return depth < fromDepth || (depth === fromDepth && otherLine);
     return depth < fromDepth;
+  }
+
+  /** Read now: stopped, this thread can be asked nothing. A failure costs only the variables. */
+  #variables(module: number, instance: number, id: number): SourceVariable[] {
+    const { offset } = this.#modules[module].probes[id];
+    const held = this.#instances[module]?.[instance];
+    if (!held?.memory) return [];
+    try {
+      const memory = new Uint8Array(held.memory.buffer);
+      return this.#modules[module].variablesAt?.(offset, held.flags, memory) ?? [];
+    } catch (error) {
+      console.warn('witgraph: reading the variables of a stopped guest failed:', error);
+      return [];
+    }
   }
 
   #stop(
@@ -208,6 +272,7 @@ export class LineProbes implements SessionLines {
       column,
       node: this.#modules[module].nodes[instance],
       frames: frames.map(frameName),
+      variables: this.#variables(module, instance, id),
       module,
       instance,
       probe: id,

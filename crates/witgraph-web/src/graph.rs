@@ -18,7 +18,9 @@ use witgraph_ir::{
     Capability, CompiledGraph, ComponentContract, ComponentRef, Graph, IndexVec, InputIdx, NodeId,
     OutputIdx, PortDirection, PortKind, PortName, PortTable,
 };
-use witgraph_probes::{Lines, core_modules, instrument};
+use witgraph_probes::{
+    Frame, Lines, ModuleDebug, ModuleOffset, Spill, Variable, core_modules, instrument,
+};
 use witgraph_sched::{
     DataPlane, NodeFault, PortVersions, RuntimeError, SchedulerCore, Snapshot, TickResult,
     TraceEvent, latched_output, not_a_value_output,
@@ -504,7 +506,8 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// What a debugger needs of a core module of the composite: its `bytes` with a probe on
 /// each source line, or `null` if there is nothing to probe.
 ///
-/// Returns `{ bytes, sha256, probes }`: `sha256` is the module's as given, to find its nodes
+/// Returns `{ bytes, sha256, probes, spill }`: `spill` is `{ base, globals }`, for
+/// [`module_variables`], and `sha256` is the module's as given, to find its nodes
 /// by ([`WebGraph::module_nodes`]), and `probes` lists `{ offset, function, file, line, column }`,
 /// each at the index its probe calls the `witgraph:debug` import `probe` with, and its flag
 /// is at in the shared memory the module exports as `witgraph:debug/flags`. `allLines` reaches
@@ -533,7 +536,103 @@ pub fn instrument_module(bytes: &[u8], all_lines: bool) -> Result<JsValue, JsErr
     );
     set(&object, "sha256", &text(&sha256_hex(bytes)));
     set(&object, "probes", &probes);
+    let spill = Object::new();
+    set(&spill, "base", &JsValue::from(instrumented.spill.base));
+    set(
+        &spill,
+        "globals",
+        &JsValue::from(instrumented.spill.globals),
+    );
+    set(&object, "spill", &spill);
     Ok(object.into())
+}
+
+/// What a module's debug info says of its variables, kept for when it stops.
+#[wasm_bindgen]
+pub struct ModuleVariables {
+    debug: ModuleDebug,
+    spill: Spill,
+}
+
+/// Keeps what a core module says of its variables: `bytes` are the original, and `spill` what
+/// [`instrument_module`] made of it. `undefined` if it says nothing.
+#[wasm_bindgen(js_name = moduleVariables)]
+pub fn module_variables(
+    bytes: &[u8],
+    spill_base: u32,
+    spill_globals: u32,
+) -> Result<Option<ModuleVariables>, JsError> {
+    let spill = Spill {
+        base: spill_base,
+        globals: spill_globals,
+    };
+    Ok(ModuleDebug::new(bytes)
+        .map_err(error)?
+        .map(|debug| ModuleVariables { debug, spill }))
+}
+
+/// A stopped guest: what its probe wrote out, and its memory.
+struct StoppedFrame<'a> {
+    spill: Spill,
+    spilled: Vec<u8>,
+    memory: &'a Uint8Array,
+}
+
+impl Frame for StoppedFrame<'_> {
+    fn local(&self, index: u32) -> Option<[u8; 8]> {
+        self.spill.local(&self.spilled, index)
+    }
+
+    fn global(&self, index: u32) -> Option<[u8; 8]> {
+        self.spill.global(&self.spilled, index)
+    }
+
+    fn read(&self, address: u32, len: u32) -> Option<Vec<u8>> {
+        let end = address.checked_add(len)?;
+        (end <= self.memory.length()).then(|| self.memory.subarray(address, end).to_vec())
+    }
+}
+
+fn variable_object(variable: &Variable) -> Object {
+    let object = Object::new();
+    set(&object, "name", &text(&variable.name));
+    set(&object, "type", &text(&variable.type_name));
+    set(&object, "value", &text(&variable.value));
+    let children = Array::new();
+    for child in &variable.children {
+        children.push(&variable_object(child));
+    }
+    set(&object, "children", &children);
+    object
+}
+
+#[wasm_bindgen]
+impl ModuleVariables {
+    /// The variables in scope at `offset` in the original module, for a guest stopped there:
+    /// `flags` is the memory it exports as `witgraph:debug/flags`, and `memory` its own. Each is
+    /// `{ name, type, value, children }`, `value` on one line and `children` to look into.
+    pub fn at(
+        &self,
+        offset: u32,
+        flags: &Uint8Array,
+        memory: &Uint8Array,
+    ) -> Result<Array, JsError> {
+        let spilled = flags.subarray(self.spill.base, flags.length()).to_vec();
+        let frame = StoppedFrame {
+            spill: self.spill,
+            spilled,
+            memory,
+        };
+        let variables = self
+            .debug
+            .variables_at(ModuleOffset(offset), &frame)
+            .map_err(error)?;
+        let found = Array::new();
+        for variable in &variables {
+            found.push(&variable_object(variable));
+        }
+        Ok(found)
+    }
 }
 
 /// A compiled graph running on this JavaScript host.

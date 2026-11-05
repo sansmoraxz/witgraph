@@ -201,7 +201,7 @@ const session = await RemoteSession.load(worker, {
 const { lines } = session;
 lines.setBreakpoint(file, 42); // from `lines.files`; returns the line it came to
 void session.tick();
-// ... `onStop` says where it stopped; then one of:
+// ... `onStop` says where it stopped, and what its variables hold; then one of:
 lines.stepOver();
 lines.stepIn();
 lines.stepOut();
@@ -217,6 +217,14 @@ stays with its guest: others run on past their probes.
   it with `Cross-Origin-Opener-Policy: same-origin` and
   `Cross-Origin-Embedder-Policy: require-corp`. It must be a real worker too, as a stop blocks
   its thread.
+- **Variables come with the stop**, in `stop.variables`: `{ name, type, value, children }`,
+  with `value` on one line and `children` to look into, read as the guest stopped since it
+  cannot be asked later. They are those in scope at that line of the innermost function: its
+  callers' locals are out of reach from outside them. Rust's `String`, `Vec`, slices, enums and
+  `Option` read as their source would write them, and anything else field by field. Text, lists
+  and nesting are cut off past a limit. A function's parameters hold nonsense on its opening line, before it has stored them, so a step
+  goes past that line, though a breakpoint set on it stops there. Optimizing leaves few variables to read: at `opt-level = 0` you get them all, and
+  above that most show as `<optimized out>`, or are not listed at all.
 - **Stopped, the worker answers nothing.** All its guests are stopped with it, as on wasmtime,
   and what you ask of the session waits, until `resume()` or a step. `dispose()` lets the guest
   go first, and `endWorker` ends it where it is.
