@@ -14,7 +14,7 @@
 //! [`ModuleDebug`] finds its variables from there. Only those: reading a local at all keeps it
 //! alive across each probe, which slows a loop even though no probe fires.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::convert::Infallible;
 
 use gimli::{ColumnType, Dwarf, EndianSlice, LittleEndian, SectionId};
@@ -23,11 +23,12 @@ use wasm_encoder::{
     BlockType, CodeSection, EntityType, ExportKind, ExportSection, Function, ImportSection,
     Instruction, MemArg, MemArgTarget, MemorySection, MemoryType, TypeSection, ValType,
 };
-use wasmparser::{CompositeInnerType, FunctionBody, Parser, Payload, TypeRef};
+use wasmparser::{CompositeInnerType, FunctionBody, KnownCustom, Name, Parser, Payload, TypeRef};
 
 mod variables;
 use variables::ReadFrom;
-pub use variables::{Frame, ModuleDebug, Variable};
+pub use variables::{Frame, ModuleDebug};
+pub use witgraph_traits::lines::SourceVariable as Variable;
 
 /// The module of the import a probe calls.
 pub const IMPORT_MODULE: &str = "witgraph:debug";
@@ -743,6 +744,198 @@ pub fn instrument(module: &[u8], lines: Lines) -> Result<Option<Instrumented>, P
     }))
 }
 
+/// `module`'s source lines, with no change to it, for a host that can set breakpoints itself:
+/// each [`Probe`] says where it stands, moved up to the operator a breakpoint can be set on.
+pub fn source_lines(module: &[u8], lines: Lines) -> Result<Vec<Probe>, ProbeError> {
+    let shape = shape_of(module)?;
+    let Some(code_start) = shape.code_start else {
+        return Ok(Vec::new());
+    };
+    let mut rows = line_rows(module)?;
+    if lines == Lines::Own {
+        rows.retain(|row| is_own(&row.file));
+    }
+    let mut rows = rows.into_iter().peekable();
+    let mut function = shape.imported_functions;
+    let mut probes = Vec::new();
+    for payload in Parser::new(0).parse_all(module) {
+        if let Payload::CodeSectionEntry(body) = payload? {
+            let mut reader = body.get_operators_reader()?;
+            while !reader.eof() {
+                let at = reader.original_position();
+                reader.read()?;
+                while let Some(row) = rows.next_if(|row| row.address + code_start <= at) {
+                    probes.push(Probe {
+                        offset: ModuleOffset(u32::try_from(at).unwrap_or(u32::MAX)),
+                        function,
+                        file: row.file,
+                        line: row.line,
+                        column: row.column,
+                    });
+                }
+            }
+            function += 1;
+        }
+    }
+    Ok(probes)
+}
+
+/// By a defined function's index among those a module defines, its name as a person reads it.
+pub fn defined_function_names(module: &[u8]) -> Result<HashMap<u32, String>, ProbeError> {
+    let shape = shape_of(module)?;
+    let mut names = HashMap::new();
+    for payload in Parser::new(0).parse_all(module) {
+        if let Payload::CustomSection(section) = payload?
+            && let KnownCustom::Name(subsections) = section.as_known()
+        {
+            for subsection in subsections {
+                if let Name::Function(map) = subsection? {
+                    for naming in map {
+                        let naming = naming?;
+                        if let Some(index) = naming.index.checked_sub(shape.imported_functions) {
+                            let readable = format!("{:#}", rustc_demangle::demangle(naming.name));
+                            names.insert(index, readable);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(names)
+}
+
+/// How a step is to end.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StepKind {
+    /// At another line, in a call this one makes if it makes one.
+    Into,
+    /// At another line of this function, or of its caller if it returns.
+    Over,
+    /// Once this function has returned to one with a line to stop on.
+    Out,
+}
+
+/// A module's lines, to go between them, their code and what a step should do.
+#[derive(Clone, Debug, Default)]
+pub struct LineIndex {
+    probes: Vec<Probe>,
+    by_offset: HashMap<u32, ProbeId>,
+    /// By file and line, where stopping on it stops: the first place in each function.
+    sites: BTreeMap<String, BTreeMap<u32, Vec<ProbeId>>>,
+    /// The functions all on one line: what a macro generated, usually.
+    one_line: HashSet<u32>,
+    /// The probe each function starts at: before it has stored its parameters.
+    opening: HashSet<ProbeId>,
+}
+
+impl LineIndex {
+    /// Indexes `probes`, each at its [`ProbeId`].
+    #[must_use]
+    pub fn new(probes: Vec<Probe>) -> Self {
+        let mut index = Self::default();
+        let mut line_of: HashMap<u32, Option<u32>> = HashMap::new();
+        let mut opened = HashSet::new();
+        let mut seen = HashSet::new();
+        for (at, probe) in probes.iter().enumerate() {
+            let id = ProbeId(u32::try_from(at).unwrap_or(u32::MAX));
+            index.by_offset.entry(probe.offset.0).or_insert(id);
+            if seen.insert((probe.function, probe.file.clone(), probe.line)) {
+                index
+                    .sites
+                    .entry(probe.file.clone())
+                    .or_default()
+                    .entry(probe.line)
+                    .or_default()
+                    .push(id);
+            }
+            if opened.insert(probe.function) {
+                index.opening.insert(id);
+            }
+            line_of
+                .entry(probe.function)
+                .and_modify(|line| {
+                    if *line != Some(probe.line) {
+                        *line = None;
+                    }
+                })
+                .or_insert(Some(probe.line));
+        }
+        index.one_line = line_of
+            .into_iter()
+            .filter_map(|(function, line)| line.map(|_| function))
+            .collect();
+        index.probes = probes;
+        index
+    }
+
+    /// Whether there are no lines at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.probes.is_empty()
+    }
+
+    /// The source files with lines.
+    pub fn files(&self) -> impl Iterator<Item = &str> {
+        self.sites.keys().map(String::as_str)
+    }
+
+    /// The lines of `file` with code, in order.
+    pub fn lines(&self, file: &str) -> impl Iterator<Item = u32> {
+        self.sites
+            .get(file)
+            .into_iter()
+            .flat_map(BTreeMap::keys)
+            .copied()
+    }
+
+    /// Where stopping on a line of a file stops.
+    #[must_use]
+    pub fn sites(&self, file: &str, line: u32) -> &[ProbeId] {
+        self.sites
+            .get(file)
+            .and_then(|lines| lines.get(&line))
+            .map_or(&[], Vec::as_slice)
+    }
+
+    /// The line a module offset starts, if one does.
+    #[must_use]
+    pub fn at(&self, offset: u32) -> Option<ProbeId> {
+        self.by_offset.get(&offset).copied()
+    }
+
+    /// A line, by its id.
+    #[must_use]
+    pub fn probe(&self, id: ProbeId) -> Option<&Probe> {
+        self.probes.get(id.0 as usize)
+    }
+
+    /// Whether a step from `from`, at a stack depth of `from_depth`, ends at `here`, at `depth`.
+    /// It does not end in what has no lines to step through, nor on a function's opening line,
+    /// where its parameters are not yet what they will be.
+    #[must_use]
+    pub fn step_ends(
+        &self,
+        how: StepKind,
+        from: ProbeId,
+        from_depth: usize,
+        here: ProbeId,
+        depth: usize,
+    ) -> bool {
+        let (Some(from), Some(probe)) = (self.probe(from), self.probe(here)) else {
+            return false;
+        };
+        if self.one_line.contains(&probe.function) || self.opening.contains(&here) {
+            return false;
+        }
+        let other_line = probe.file != from.file || probe.line != from.line;
+        match how {
+            StepKind::Into => depth > from_depth || other_line,
+            StepKind::Over => depth < from_depth || (depth == from_depth && other_line),
+            StepKind::Out => depth < from_depth,
+        }
+    }
+}
+
 /// The core modules inside a component, nested ones too, as their bytes.
 pub fn core_modules(component: &[u8]) -> Result<Vec<&[u8]>, ProbeError> {
     let mut modules = Vec::new();
@@ -764,7 +957,7 @@ pub fn core_modules(component: &[u8]) -> Result<Vec<&[u8]>, ProbeError> {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use wasmparser::{KnownCustom, Name, Validator};
+    use wasmparser::Validator;
 
     fn validate(module: &[u8]) {
         Validator::new()
@@ -899,6 +1092,55 @@ mod tests {
                 assert!(!section.name().starts_with(".debug_"), "{}", section.name());
             }
         }
+    }
+
+    #[test]
+    fn lines_stand_on_operators_and_say_how_a_step_ends() {
+        let module = line_walk();
+        let index = LineIndex::new(source_lines(&module, Lines::Own).unwrap());
+        let [file] = index.files().collect::<Vec<_>>()[..] else {
+            panic!("one file of its own");
+        };
+        let first = index.sites(file, marked("walk-first"))[0];
+        let second = index.sites(file, marked("walk-second"))[0];
+        let body = index.sites(file, marked("add-body"))[0];
+        assert_eq!(index.at(index.probe(first).unwrap().offset.0), Some(first));
+
+        // At a depth of 3 in `walk`, say.
+        assert!(index.step_ends(StepKind::Over, first, 3, second, 3));
+        assert!(
+            !index.step_ends(StepKind::Over, first, 3, body, 4),
+            "over the call"
+        );
+        assert!(index.step_ends(StepKind::Into, second, 3, body, 4));
+        assert!(!index.step_ends(StepKind::Out, body, 4, body, 4));
+        assert!(index.step_ends(StepKind::Out, body, 4, second, 3));
+
+        // `fn add`'s opening line is not stopped at, nor is what a macro generated.
+        let opening = index.sites(file, marked("add-body") - 1)[0];
+        assert!(!index.step_ends(StepKind::Into, second, 3, opening, 4));
+        let generated = index.sites(file, 1)[0];
+        assert!(!index.step_ends(StepKind::Into, second, 3, generated, 4));
+    }
+
+    #[test]
+    fn names_are_found_by_a_functions_place_among_those_defined() {
+        let module = line_walk();
+        let shape = shape_of(&module).unwrap();
+        let names = defined_function_names(&module).unwrap();
+        let index = LineIndex::new(source_lines(&module, Lines::Own).unwrap());
+        let [file] = index.files().collect::<Vec<_>>()[..] else {
+            panic!("one file of its own");
+        };
+        let first = index
+            .probe(index.sites(file, marked("walk-first"))[0])
+            .unwrap();
+        assert_eq!(
+            names
+                .get(&(first.function - shape.imported_functions))
+                .map(String::as_str),
+            Some("line_walk_guest::walk"),
+        );
     }
 
     #[test]

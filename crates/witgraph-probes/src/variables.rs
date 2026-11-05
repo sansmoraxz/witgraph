@@ -2,7 +2,7 @@
 //! what the probe wrote out and from its memory.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::rc::Rc;
+use std::sync::Arc;
 
 use gimli::Reader as _;
 use gimli::{
@@ -15,14 +15,15 @@ use gimli::{
     DW_TAG_reference_type, DW_TAG_restrict_type, DW_TAG_rvalue_reference_type,
     DW_TAG_structure_type, DW_TAG_subprogram, DW_TAG_subrange_type, DW_TAG_template_type_parameter,
     DW_TAG_typedef, DW_TAG_union_type, DW_TAG_variable, DW_TAG_variant, DW_TAG_variant_part,
-    DW_TAG_volatile_type, Dwarf, EndianRcSlice, LittleEndian, Operation, SectionId, Unit,
+    DW_TAG_volatile_type, Dwarf, EndianArcSlice, LittleEndian, Operation, SectionId, Unit,
     UnitOffset,
 };
 use wasmparser::{Parser, Payload};
+use witgraph_traits::lines::SourceVariable as Variable;
 
 use crate::{ModuleOffset, ProbeError};
 
-type Reader = EndianRcSlice<LittleEndian>;
+type Reader = EndianArcSlice<LittleEndian>;
 type Entry<'a> = gimli::DebuggingInformationEntry<Reader>;
 
 /// How many nested values are read of a variable.
@@ -44,19 +45,6 @@ pub trait Frame {
     fn global(&self, index: u32) -> Option<[u8; 8]>;
     /// `len` bytes of its linear memory, if they are all there.
     fn read(&self, address: u32, len: u32) -> Option<Vec<u8>>;
-}
-
-/// A variable, or part of one.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Variable {
-    /// Its name: a field's, or an item's index.
-    pub name: String,
-    /// Its type, as the source has it.
-    pub type_name: String,
-    /// What it holds, on one line.
-    pub value: String,
-    /// What it is made of, to look into.
-    pub children: Vec<Variable>,
 }
 
 /// A module's debug info, kept for reading its variables.
@@ -136,7 +124,7 @@ impl ModuleDebug {
         }
         let load = |id: SectionId| -> Result<Reader, gimli::Error> {
             let data = sections.get(id.name()).copied().unwrap_or(&[]);
-            Ok(EndianRcSlice::new(Rc::from(data), LittleEndian))
+            Ok(EndianArcSlice::new(Arc::from(data), LittleEndian))
         };
         Ok(Some(Self {
             dwarf: Dwarf::load(load)?,
