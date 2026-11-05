@@ -158,41 +158,51 @@ fn must_run(compiled: &CompiledGraph, injected: &BTreeMap<PortRef, u32>) -> Hash
     }
 }
 
-/// The nodes that may run more than once for one change. A node may run on an absent
-/// optional input before running again with its value when something above it is in a
-/// stream group that has yet to start, for a required input from outside the group: the
-/// scheduler counts only what can start now as able to change, so what reads that member
-/// does not wait. Some graphs need that very run to bootstrap (`GroupWaitsOnItself` says to
-/// make an input on the path optional). A second run then reaches what is below it, and
-/// the rest of its stream group, as a group re-runs together.
+/// The nodes that may run more than once for one change. A group does not start while
+/// what is above it from outside could still run, so nothing reads half-updated inputs,
+/// but what is below a member and above another, counting a group as one, cannot wait for
+/// it: the group may need it to start (`GroupWaitsOnItself` says to make an input on such a path optional). That
+/// runs on an absent input, then again, and reaches what is below it, and the rest of its
+/// stream group, as a group re-runs together.
 fn may_run_again(compiled: &CompiledGraph) -> HashSet<NodeId> {
     let graph = compiled.graph();
     let plain: Vec<_> = graph.connections.iter().filter(|c| !c.feedback).collect();
+    let spread = |start: Vec<&NodeId>, down: bool| -> HashSet<NodeId> {
+        let mut seen: HashSet<NodeId> = start.into_iter().cloned().collect();
+        loop {
+            let before = seen.len();
+            for connection in &plain {
+                let (from, to) = if down {
+                    (&connection.from.node, &connection.to.node)
+                } else {
+                    (&connection.to.node, &connection.from.node)
+                };
+                if seen.contains(from) {
+                    seen.insert(to.clone());
+                }
+            }
+            // A group is one thing to wait on, as the scheduler sees it.
+            for group in compiled.stream_groups() {
+                if group.iter().any(|member| seen.contains(member)) {
+                    seen.extend(group.iter().cloned());
+                }
+            }
+            if seen.len() == before {
+                return seen;
+            }
+        }
+    };
     let mut found: HashSet<NodeId> = HashSet::new();
     for group in compiled.stream_groups() {
-        let waits_outside = group.iter().any(|member| {
-            let contract = compiled.contract_for(member).expect("a compiled node");
-            contract
-                .inputs
-                .iter()
-                .filter(|p| !p.is_optional())
-                .any(|input| {
-                    plain.iter().any(|c| {
-                        c.to.node == *member
-                            && c.to.port == input.name
-                            && !group.contains(&c.from.node)
-                    })
-                })
-        });
-        if waits_outside {
-            // What reads a member, not the group itself.
-            found.extend(
-                plain
-                    .iter()
-                    .filter(|c| group.contains(&c.from.node) && !group.contains(&c.to.node))
-                    .map(|c| c.to.node.clone()),
-            );
-        }
+        let members: Vec<&NodeId> = group.iter().collect();
+        let below = spread(members.clone(), true);
+        let above = spread(members, false);
+        found.extend(
+            below
+                .intersection(&above)
+                .filter(|node| !group.contains(node))
+                .cloned(),
+        );
     }
     loop {
         let before = found.len();

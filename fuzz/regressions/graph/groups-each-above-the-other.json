@@ -1,0 +1,240 @@
+{
+  "metadata": {
+    "name": "fuzz"
+  },
+  "components": [
+    {
+      "package": {
+        "namespace": "fuzz",
+        "name": "nodes",
+        "version": "0.1.0"
+      },
+      "world": "stream-tee"
+    },
+    {
+      "package": {
+        "namespace": "fuzz",
+        "name": "nodes",
+        "version": "0.1.0"
+      },
+      "world": "future-source"
+    },
+    {
+      "package": {
+        "namespace": "fuzz",
+        "name": "nodes",
+        "version": "0.1.0"
+      },
+      "world": "stream-waits"
+    },
+    {
+      "package": {
+        "namespace": "fuzz",
+        "name": "nodes",
+        "version": "0.1.0"
+      },
+      "world": "stream-pass"
+    },
+    {
+      "package": {
+        "namespace": "fuzz",
+        "name": "nodes",
+        "version": "0.1.0"
+      },
+      "world": "relay"
+    },
+    {
+      "package": {
+        "namespace": "fuzz",
+        "name": "nodes",
+        "version": "0.1.0"
+      },
+      "world": "stream-sink"
+    }
+  ],
+  "nodes": [
+    {
+      "id": "n0",
+      "component": {
+        "package": {
+          "namespace": "fuzz",
+          "name": "nodes",
+          "version": "0.1.0"
+        },
+        "world": "stream-tee"
+      }
+    },
+    {
+      "id": "n1",
+      "component": {
+        "package": {
+          "namespace": "fuzz",
+          "name": "nodes",
+          "version": "0.1.0"
+        },
+        "world": "future-source"
+      },
+      "resources": {
+        "gpu": {
+          "fraction": 1.0
+        }
+      }
+    },
+    {
+      "id": "n2",
+      "component": {
+        "package": {
+          "namespace": "fuzz",
+          "name": "nodes",
+          "version": "0.1.0"
+        },
+        "world": "stream-waits"
+      }
+    },
+    {
+      "id": "n3",
+      "component": {
+        "package": {
+          "namespace": "fuzz",
+          "name": "nodes",
+          "version": "0.1.0"
+        },
+        "world": "stream-tee"
+      }
+    },
+    {
+      "id": "n4",
+      "component": {
+        "package": {
+          "namespace": "fuzz",
+          "name": "nodes",
+          "version": "0.1.0"
+        },
+        "world": "stream-pass"
+      },
+      "resources": {
+        "gpu": {
+          "fraction": 0.25
+        }
+      }
+    },
+    {
+      "id": "n5",
+      "component": {
+        "package": {
+          "namespace": "fuzz",
+          "name": "nodes",
+          "version": "0.1.0"
+        },
+        "world": "future-source"
+      },
+      "resources": {
+        "gpu": {
+          "fraction": 1.0
+        }
+      }
+    },
+    {
+      "id": "n6",
+      "component": {
+        "package": {
+          "namespace": "fuzz",
+          "name": "nodes",
+          "version": "0.1.0"
+        },
+        "world": "relay"
+      }
+    },
+    {
+      "id": "n7",
+      "component": {
+        "package": {
+          "namespace": "fuzz",
+          "name": "nodes",
+          "version": "0.1.0"
+        },
+        "world": "stream-sink"
+      }
+    }
+  ],
+  "connections": [
+    {
+      "id": "c0",
+      "from": {
+        "node": "n3",
+        "port": "items"
+      },
+      "to": {
+        "node": "n2",
+        "port": "items"
+      }
+    },
+    {
+      "id": "c1",
+      "from": {
+        "node": "n0",
+        "port": "out"
+      },
+      "to": {
+        "node": "n2",
+        "port": "gate"
+      }
+    },
+    {
+      "id": "c2",
+      "from": {
+        "node": "n0",
+        "port": "items"
+      },
+      "to": {
+        "node": "n4",
+        "port": "in"
+      }
+    },
+    {
+      "id": "c3",
+      "from": {
+        "node": "n2",
+        "port": "sum"
+      },
+      "to": {
+        "node": "n6",
+        "port": "in"
+      }
+    },
+    {
+      "id": "c4",
+      "from": {
+        "node": "n6",
+        "port": "out"
+      },
+      "to": {
+        "node": "n6",
+        "port": "add"
+      },
+      "feedback": true
+    },
+    {
+      "id": "c5",
+      "from": {
+        "node": "n4",
+        "port": "out"
+      },
+      "to": {
+        "node": "n7",
+        "port": "items"
+      }
+    },
+    {
+      "id": "c6",
+      "from": {
+        "node": "n2",
+        "port": "sum"
+      },
+      "to": {
+        "node": "n7",
+        "port": "gate"
+      }
+    }
+  ]
+}
