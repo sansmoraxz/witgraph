@@ -863,6 +863,7 @@ const ASYNC_CALLS = new Set([
   'injectWave',
   'clearInput',
   'readInput',
+  'readInputWave',
   'readOutput',
   'readHandle',
   'readOutputWave',

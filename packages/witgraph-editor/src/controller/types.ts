@@ -145,7 +145,11 @@ export interface EditorCommand {
 /** Breakpoint state: what node is paused and its input values. */
 export interface BreakpointState {
   node: string;
-  inputs: Record<string, unknown>;
+  /**
+   * Its Value inputs by port name, as WAVE text as outputs are shown: `undefined` for one
+   * with no value, or none that can be shown.
+   */
+  inputs: Record<string, string | undefined>;
 }
 
 // ---------------------------------------------------------------------------

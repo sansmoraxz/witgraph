@@ -143,6 +143,9 @@ test('a session across a channel loads, ticks, and reads as one here does', asyn
   assert.equal(await looped.graph.readOutput('b', 'out'), 5);
   assert.equal(await looped.graph.readOutputWave('b', 'out'), '5');
   assert.deepEqual(await looped.readInputs('b'), { in: 5, add: undefined });
+  assert.equal(await looped.graph.readInputWave('b', 'in'), '5');
+  assert.equal(await looped.graph.readInputWave('b', 'add'), undefined);
+  await assert.rejects(looped.graph.readInputWave('b', 'out'), /input/);
   await looped.settle();
   assert.equal((looped.graph.nodeState('b') as { phase: string }).phase, 'idle');
   assert.ok(looped.graph.outputVersion('b', 'out') > 0);

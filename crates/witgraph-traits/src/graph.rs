@@ -80,6 +80,22 @@ pub trait OutputReader {
         port: &PortName,
     ) -> impl Future<Output = Result<Option<Self::Handle>, RuntimeError>> + MaybeSend;
 
+    /// The latched value of a Value input port: what its node runs on next, or
+    /// `None` while it has none. What a node breakpoint shows of a held run. A
+    /// port that is no Value input is [`RuntimeError::NotAValuePort`].
+    fn read_input(
+        &self,
+        node: &NodeId,
+        port: &PortName,
+    ) -> impl Future<Output = Result<Option<Self::Value>, RuntimeError>> + MaybeSend;
+
+    /// [`read_input`](Self::read_input), as WAVE text.
+    fn read_input_wave(
+        &self,
+        node: &NodeId,
+        port: &PortName,
+    ) -> impl Future<Output = Result<Option<String>, RuntimeError>> + MaybeSend;
+
     /// Which value of a Value or handle output port is latched. It asks no
     /// guest anything, so it costs next to nothing. The same errors as
     /// [`read_output`](Self::read_output).

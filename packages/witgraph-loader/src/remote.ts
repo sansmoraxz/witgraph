@@ -181,6 +181,7 @@ const GRAPH_CALLS = new Set([
   'injectWave',
   'clearInput',
   'readInput',
+  'readInputWave',
   'readOutput',
   'readOutputWave',
   'snapshot',
@@ -717,6 +718,10 @@ export class RemoteGraph {
     return this.#call('readInput', node, port);
   }
 
+  readInputWave(node: string, port: string): Promise<string | undefined> {
+    return this.#call('readInputWave', node, port);
+  }
+
   readOutput(node: string, port: string): Promise<unknown> {
     return this.#call('readOutput', node, port);
   }
@@ -787,12 +792,12 @@ export class RemoteGraph {
   }
 }
 
-/** A graph loaded in a worker: a {@link Session}, from another thread. */
 /** What a debugger's page needs of a graph's session: a worker's, or one attached elsewhere. */
 export type DebugGraph = Pick<
   RemoteGraph,
   | 'injectWave'
   | 'clearInput'
+  | 'readInputWave'
   | 'readOutput'
   | 'readOutputWave'
   | 'readHandle'
@@ -844,6 +849,7 @@ export interface DebugSession
   readonly lines: DebugLines | undefined;
 }
 
+/** A graph loaded in a worker: a {@link Session}, from another thread. */
 export class RemoteSession {
   readonly graph: RemoteGraph;
   readonly contracts: Map<string, Contract>;

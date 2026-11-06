@@ -34,6 +34,7 @@ pub use control::{
 };
 pub use hub::{
     HubPorts, PortSlot, ReturnedNumbers, decode_returned, latched_output, not_a_value_output,
+    value_input,
 };
 pub use witgraph_ir;
 pub use witgraph_traits::*;

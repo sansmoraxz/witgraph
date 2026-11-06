@@ -33,7 +33,7 @@ use witgraph_ir::{
 };
 use witgraph_sched::{
     DataPlane, FaultReport, Incarnation, NodeState, Perf, PortVersion, PortVersions, RuntimeError,
-    RuntimeMode, SchedulerCore, TickResult, latched_output, not_a_value_output,
+    RuntimeMode, SchedulerCore, TickResult, latched_output, not_a_value_output, value_input,
 };
 use witgraph_traits::{OutputReader, RunningGraph, Snapshot, SnapshotError};
 
@@ -303,6 +303,7 @@ pub enum Preview {
 /// What reads a graph's outputs, whatever its Store's data.
 trait ReadOutputs: Send + Sync + 'static {
     fn read_val(&self, output: OutputIdx) -> BoxFuture<'static, Result<Option<Val>, RuntimeError>>;
+    fn read_input(&self, input: InputIdx) -> BoxFuture<'static, Result<Option<Val>, RuntimeError>>;
     fn read_shared(
         &self,
         output: OutputIdx,
@@ -320,6 +321,19 @@ impl<D: StoreData> ReadOutputs for Outputs<D> {
             };
             let read = client.call(move |acc, hub| {
                 Box::pin(async move { call_get(acc, hub.get_output(acc, output)?).await })
+            });
+            stopped_is_none(read.await)
+        })
+    }
+
+    fn read_input(&self, input: InputIdx) -> BoxFuture<'static, Result<Option<Val>, RuntimeError>> {
+        let client = lock(&self.0).clone();
+        Box::pin(async move {
+            let Some(client) = client else {
+                return Ok(None);
+            };
+            let read = client.call(move |acc, hub| {
+                Box::pin(async move { call_get(acc, hub.get_input(acc, input)?).await })
             });
             stopped_is_none(read.await)
         })
@@ -388,16 +402,8 @@ impl OutputReader for ValReader {
         node: &NodeId,
         port: &PortName,
     ) -> Result<Option<String>, RuntimeError> {
-        let Some(val) = self.read_output(node, port).await? else {
-            return Ok(None);
-        };
-        val.to_wave()
-            .map(Some)
-            .map_err(|e| RuntimeError::ValueType {
-                node: node.clone(),
-                port: port.clone(),
-                message: e.to_string(),
-            })
+        let val = self.read_output(node, port).await?;
+        wave_of(node, port, val)
     }
 
     async fn read_handle(
@@ -411,10 +417,43 @@ impl OutputReader for ValReader {
         }
     }
 
+    async fn read_input(
+        &self,
+        node: &NodeId,
+        port: &PortName,
+    ) -> Result<Option<Val>, RuntimeError> {
+        let input = value_input(&self.ports, node, port)?;
+        self.outputs.read_input(input).await
+    }
+
+    async fn read_input_wave(
+        &self,
+        node: &NodeId,
+        port: &PortName,
+    ) -> Result<Option<String>, RuntimeError> {
+        let val = self.read_input(node, port).await?;
+        wave_of(node, port, val)
+    }
+
     fn output_version(&self, node: &NodeId, port: &PortName) -> Result<PortVersion, RuntimeError> {
         self.latched(node, port)
             .map(|(output, _)| self.versions.get(output))
     }
+}
+
+/// A value of `node.port`, as WAVE text.
+fn wave_of(
+    node: &NodeId,
+    port: &PortName,
+    val: Option<Val>,
+) -> Result<Option<String>, RuntimeError> {
+    val.map(|val| val.to_wave())
+        .transpose()
+        .map_err(|e| RuntimeError::ValueType {
+            node: node.clone(),
+            port: port.clone(),
+            message: e.to_string(),
+        })
 }
 
 impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {

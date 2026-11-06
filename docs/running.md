@@ -178,9 +178,10 @@ pushed to you: you read an output when you choose.
 - `clear_input` removes an injected value.
 - `read_output` returns the last value a node produced, `read_output_wave` the
   same as text, and `read_handle` the object behind a handle output. `reader()`
-  gives you something that reads them while a tick is running too. They return
-  `None` while the graph is stopped. `shared_memory()` is what the graph's
-  shared objects take.
+  gives you something that reads them while a tick is running too, and a value
+  input's latched value with `read_input` and `read_input_wave`: what its node
+  runs on next. They return `None` while the graph is stopped.
+  `shared_memory()` is what the graph's shared objects take.
 - `output_version` says which value of an output is latched, a number that moves
   on each time the node writes it, so you can tell it is new without reading it.
   It asks no guest anything.

@@ -23,7 +23,7 @@ use witgraph_probes::{
 };
 use witgraph_sched::{
     DataPlane, NodeFault, PortVersions, RuntimeError, SchedulerCore, Snapshot, TickResult,
-    TraceEvent, latched_output, not_a_value_output,
+    TraceEvent, latched_output, not_a_value_output, value_input,
 };
 use witgraph_traits::{
     FaultReport, NodeState, OutputReader, PortVersion, RunningGraph, SnapshotError,
@@ -72,29 +72,34 @@ impl WebReader {
     }
 
     /// The latched value of a Value input port.
-    fn input(&self, node: &NodeId, port: &PortName) -> Result<Option<JsValue>, RuntimeError> {
-        let input =
-            self.hub
-                .ports
-                .input(node, port)
-                .ok_or_else(|| RuntimeError::NotAValuePort {
-                    node: node.clone(),
-                    port: port.clone(),
-                    direction: PortDirection::Input,
-                })?;
+    fn input(&self, node: &NodeId, port: &PortName) -> Result<Option<Rc<Data>>, RuntimeError> {
+        let input = value_input(&self.hub.ports, node, port)?;
         if !self.hub.live.get() || self.hub.input_types[input].is_none() {
             return Ok(None);
         }
-        let data = self
-            .hub
+        self.hub
             .host_read(self.hub.get_input(input))
             .map_err(|message| RuntimeError::ValueType {
                 node: node.clone(),
                 port: port.clone(),
                 message,
-            })?;
-        Ok(data.map(|data| data.js().clone()))
+            })
     }
+}
+
+/// A value of `node.port`, as WAVE text.
+fn wave_of(
+    node: &NodeId,
+    port: &PortName,
+    data: Option<Rc<Data>>,
+) -> Result<Option<String>, RuntimeError> {
+    data.map(|data| data.wave())
+        .transpose()
+        .map_err(|message| RuntimeError::ValueType {
+            node: node.clone(),
+            port: port.clone(),
+            message,
+        })
 }
 
 impl OutputReader for WebReader {
@@ -114,14 +119,7 @@ impl OutputReader for WebReader {
         node: &NodeId,
         port: &PortName,
     ) -> Result<Option<String>, RuntimeError> {
-        self.value(node, port)?
-            .map(|data| data.wave())
-            .transpose()
-            .map_err(|message| RuntimeError::ValueType {
-                node: node.clone(),
-                port: port.clone(),
-                message,
-            })
+        wave_of(node, port, self.value(node, port)?)
     }
 
     async fn read_handle(
@@ -143,6 +141,22 @@ impl OutputReader for WebReader {
                 port: port.clone(),
                 message,
             })
+    }
+
+    async fn read_input(
+        &self,
+        node: &NodeId,
+        port: &PortName,
+    ) -> Result<Option<JsValue>, RuntimeError> {
+        Ok(self.input(node, port)?.map(|data| data.js().clone()))
+    }
+
+    async fn read_input_wave(
+        &self,
+        node: &NodeId,
+        port: &PortName,
+    ) -> Result<Option<String>, RuntimeError> {
+        wave_of(node, port, self.input(node, port)?)
     }
 
     fn output_version(&self, node: &NodeId, port: &PortName) -> Result<PortVersion, RuntimeError> {
@@ -1244,8 +1258,20 @@ impl WebGraph {
         let reader = self.reader.clone();
         let (node, port) = (NodeId::from(node), PortName::from(port));
         settled(async move {
-            let value = reader.input(&node, &port).map_err(error)?;
+            let value = reader.read_input(&node, &port).await.map_err(error)?;
             Ok(value.unwrap_or(JsValue::UNDEFINED))
+        })
+    }
+
+    /// The latched value of a Value input port as WAVE text; `undefined` while
+    /// it has none. Rejects, naming the port, for a value too large to convert.
+    #[wasm_bindgen(js_name = readInputWave)]
+    pub fn read_input_wave(&self, node: &str, port: &str) -> Promise {
+        let reader = self.reader.clone();
+        let (node, port) = (NodeId::from(node), PortName::from(port));
+        settled(async move {
+            let text = reader.read_input_wave(&node, &port).await.map_err(error)?;
+            Ok(text.map_or(JsValue::UNDEFINED, |text| text.into()))
         })
     }
 
@@ -1562,14 +1588,7 @@ fn phase(phase: witgraph_sched::NodePhase) -> JsValue {
 
 /// A fault as `{ kind, message }`.
 fn fault_object(fault: &NodeFault) -> JsValue {
-    let kind = match fault {
-        NodeFault::WasmTrap { .. } => "trap",
-        NodeFault::MemoryLimit { .. } => "memory-limit",
-        NodeFault::HostcallFuelExhausted => "hostcall-fuel",
-        NodeFault::FuelExhausted => "fuel",
-        NodeFault::Fatal { .. } => "fatal",
-        NodeFault::Restart { .. } => "restart",
-    };
+    let kind = fault.kind();
     let object = Object::new();
     set(&object, "kind", &text(kind));
     set(&object, "message", &text(&fault.to_string()));

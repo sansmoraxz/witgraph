@@ -154,6 +154,25 @@ pub fn latched_output(
         .ok_or_else(|| not_a_value_output(node, port))
 }
 
+/// That `node` exists and `port` is a Value input of it, and which.
+pub fn value_input(
+    ports: &PortTable,
+    node: &NodeId,
+    port: &PortName,
+) -> Result<InputIdx, RuntimeError> {
+    ports
+        .node(node)
+        .ok_or_else(|| RuntimeError::UnknownNode { node: node.clone() })?;
+    ports
+        .input(node, port)
+        .filter(|input| ports.inputs()[*input].kind == PortKind::Value)
+        .ok_or_else(|| RuntimeError::NotAValuePort {
+            node: node.clone(),
+            port: port.clone(),
+            direction: PortDirection::Input,
+        })
+}
+
 /// What asking `node.port` for a value it does not have is.
 pub fn not_a_value_output(node: &NodeId, port: &PortName) -> RuntimeError {
     RuntimeError::NotAValuePort {

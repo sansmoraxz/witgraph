@@ -303,12 +303,12 @@ test('steps walk a graph one node at a time, then start over', async () => {
   assert.equal(controller.pausedNode, 'a', 'stopped before anything has run');
   assert.equal(controller.selectedNode, 'a', 'and shown');
   assert.deepEqual(phases(), ['pending', 'pending', 'pending']);
-  assert.deepEqual(controller.breakpointState?.inputs, { in: 5 });
+  assert.deepEqual(controller.breakpointState?.inputs, { in: '5' });
 
   await controller.step();
   assert.equal(controller.pausedNode, 'b');
   assert.deepEqual(phases(), ['idle', 'pending', 'pending']);
-  assert.deepEqual(controller.breakpointState?.inputs, { in: 5 });
+  assert.deepEqual(controller.breakpointState?.inputs, { in: '5' });
 
   await controller.step();
   assert.equal(controller.pausedNode, 'c');

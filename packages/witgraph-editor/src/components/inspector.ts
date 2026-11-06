@@ -741,11 +741,18 @@ export class WitgraphInspector extends HTMLElement {
       for (const [key, val] of Object.entries(bp.inputs)) {
         const entry = this.#el('div', 'flex items-center gap-2 font-mono text-xs py-0.5');
         entry.appendChild(this.#el('span', 'text-wg-text font-semibold', key));
+        // As an output with no value, or one too large, is shown.
+        const shown =
+          val === undefined
+            ? '-'
+            : val.length > MAX_WAVE_BYTES
+              ? `${val.slice(0, 80)}… (too large to show whole)`
+              : val;
         entry.appendChild(
           this.#el(
             'span',
-            'text-wg-primary bg-wg-primary-5 px-1.5 py-0.5 rounded',
-            JSON.stringify(val),
+            'text-wg-primary bg-wg-primary-5 px-1.5 py-0.5 rounded wrap-anywhere',
+            shown,
           ),
         );
         section.appendChild(entry);

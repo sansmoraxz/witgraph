@@ -150,3 +150,18 @@ pub enum NodeFault {
         message: String,
     },
 }
+
+impl NodeFault {
+    /// What kind of fault it is, as both hosts name it to JavaScript: `trap`,
+    /// `memory-limit`, `hostcall-fuel`, `fuel`, `fatal` or `restart`.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::WasmTrap { .. } => "trap",
+            Self::MemoryLimit { .. } => "memory-limit",
+            Self::HostcallFuelExhausted => "hostcall-fuel",
+            Self::FuelExhausted => "fuel",
+            Self::Fatal { .. } => "fatal",
+            Self::Restart { .. } => "restart",
+        }
+    }
+}

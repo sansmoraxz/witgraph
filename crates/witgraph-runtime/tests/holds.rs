@@ -93,6 +93,35 @@ async fn a_held_node_waits_to_run_until_let_go_and_the_rest_runs() {
 }
 
 #[tokio::test]
+async fn what_a_held_run_will_run_on_can_be_read() {
+    let mut rt = a_feeds_b().await;
+    let (holds, reader) = (rt.holds(), rt.reader());
+    holds.hold_at(nodes(&["b"]));
+    inject(&mut rt, "a", "6").await;
+    let input = |node: &str, port: &str| {
+        let reader = reader.clone();
+        let (node, port) = (NodeId::from(node), PortName::from(port));
+        async move { reader.read_input_wave(&node, &port).await }
+    };
+    settling(&mut rt, async {
+        let held = holds.next_held().await;
+        // Fed by `a`, and written by the host.
+        assert_eq!(input("b", "in").await.unwrap().as_deref(), Some("6"));
+        assert_eq!(input("a", "in").await.unwrap().as_deref(), Some("6"));
+        assert!(matches!(
+            input("b", "out").await,
+            Err(witgraph_runtime::RuntimeError::NotAValuePort { .. })
+        ));
+        assert!(matches!(
+            input("c", "in").await,
+            Err(witgraph_runtime::RuntimeError::UnknownNode { .. })
+        ));
+        holds.resume(held.id);
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn holding_every_node_holds_each_in_turn() {
     let mut rt = a_feeds_b().await;
     let holds = rt.holds();
