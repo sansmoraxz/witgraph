@@ -631,12 +631,12 @@ test('a host can say which lines are its own', async () => {
   const workers = realWorkers();
   const under = await loadController([['a', 'line-walk']], [], {
     worker: workers.make,
-    lines: { own: [directory] },
+    lines: { include: [`${directory}**`], exclude: ['**'] },
   });
   assert.deepEqual(under.lineFiles, [file]);
   const nowhere = await loadController([['a', 'line-walk']], [], {
     worker: realWorkers().make,
-    lines: { own: ['/nowhere/'] },
+    lines: { include: ['/nowhere/**'], exclude: ['**'] },
   });
   assert.deepEqual(nowhere.lineFiles, []);
 });

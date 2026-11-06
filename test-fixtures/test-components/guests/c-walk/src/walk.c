@@ -3,6 +3,7 @@
 // `node_run_return`, and says it is done.
 
 #include "c_walk.h"
+#include "clamp.h"
 
 static uint32_t add(uint32_t a, uint32_t b) {
   uint32_t sum = a + b; // mark: add-body
@@ -51,6 +52,7 @@ c_walk_callback_code_t node_run(node_inputs_t *inputs) {
   if (inputs->kinds.is_some) {
     out += kinds(inputs->kinds.val); // mark: run-kinds
   }
+  out = clamp_u32(out, 1, UINT32_MAX); // mark: run-clamp
   node_run_return((node_outputs_t){.out = out}); // mark: run-end
   return C_WALK_CALLBACK_CODE_EXIT;
 }

@@ -19,7 +19,8 @@ use witgraph_ir::{
     OutputIdx, PortDirection, PortKind, PortName, PortTable,
 };
 use witgraph_probes::{
-    Frame, ModuleDebug, ModuleOffset, OwnLines, Spill, Variable, core_modules, instrument,
+    Frame, ModuleDebug, ModuleOffset, OwnLines, OwnRules, PathPattern, Spill, Variable,
+    core_modules, instrument,
 };
 use witgraph_sched::{
     DataPlane, NodeFault, PortVersions, RuntimeError, SchedulerCore, Snapshot, TickResult,
@@ -347,6 +348,37 @@ fn busy() -> JsError {
     error("a tick is in progress")
 }
 
+/// Which lines are a guest's own, from `{ all, include, exclude, anchor, known }`.
+fn own_lines(own: &JsValue) -> Result<OwnLines, JsError> {
+    let field = |name: &str| Reflect::get(own, &text(name)).unwrap_or(JsValue::UNDEFINED);
+    if field("all").as_bool() == Some(true) {
+        return Ok(OwnLines::All);
+    }
+    let patterns = |name: &str| -> Result<Vec<PathPattern>, JsError> {
+        let value = field(name);
+        if value.is_undefined() || value.is_null() {
+            return Ok(Vec::new());
+        }
+        let list = value
+            .dyn_into::<Array>()
+            .map_err(|_| error(format!("`{name}` is not a list of patterns")))?;
+        list.iter()
+            .map(|pattern| {
+                pattern
+                    .as_string()
+                    .map(PathPattern::new)
+                    .ok_or_else(|| error(format!("`{name}` has a pattern that is not text")))
+            })
+            .collect()
+    };
+    Ok(OwnLines::Rules(OwnRules {
+        include: patterns("include")?,
+        exclude: patterns("exclude")?,
+        anchor: field("anchor").as_bool() != Some(false),
+        known: field("known").as_bool() != Some(false),
+    }))
+}
+
 /// An optional function property of `object`.
 fn function(object: &JsValue, name: &str) -> Result<Option<Function>, JsError> {
     let value = Reflect::get(object, &text(name)).unwrap_or(JsValue::UNDEFINED);
@@ -526,20 +558,12 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// [`module_variables`], and `sha256` is the module's as given, to find its nodes
 /// by ([`WebGraph::module_nodes`]), and `probes` lists `{ offset, function, file, line, column }`,
 /// each at the index its probe calls the `witgraph:debug` import `probe` with, and its flag
-/// is at in the shared memory the module exports as `witgraph:debug/flags`. `allLines` reaches
-/// into the standard library and dependencies, which a guest's own lines leave out, as a guess
-/// from their paths, or `own` says which they are: the files under these paths.
+/// is at in the shared memory the module exports as `witgraph:debug/flags`. `own` says which
+/// lines are the guest's own, as `OwnLines` does on wasmtime: `{ all, include, exclude,
+/// anchor, known }`, the last two `true` unless `false`.
 #[wasm_bindgen(js_name = instrumentModule)]
-pub fn instrument_module(
-    bytes: &[u8],
-    all_lines: bool,
-    own: Option<Vec<String>>,
-) -> Result<JsValue, JsError> {
-    let lines = match (all_lines, own) {
-        (true, _) => OwnLines::All,
-        (false, Some(paths)) => OwnLines::Under(paths),
-        (false, None) => OwnLines::Guess,
-    };
+pub fn instrument_module(bytes: &[u8], own: &JsValue) -> Result<JsValue, JsError> {
+    let lines = own_lines(own)?;
     let Some(instrumented) = instrument(bytes, &lines).map_err(error)? else {
         return Ok(JsValue::NULL);
     };

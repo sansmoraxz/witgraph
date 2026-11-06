@@ -1,4 +1,10 @@
-import type { ComponentSource, PortValues, SessionWorker, Wasm } from 'witgraph-loader';
+import type {
+  ComponentSource,
+  OwnLinesOptions,
+  PortValues,
+  SessionWorker,
+  Wasm,
+} from 'witgraph-loader';
 
 // ---------------------------------------------------------------------------
 // Editor state
@@ -265,7 +271,7 @@ export interface EditorLoadOptions {
    * Lets a guest built with debug info be stopped on a line of its source. It needs a page
    * that is cross-origin isolated: elsewhere the graph runs, and the timeline says why not.
    */
-  lines?: boolean | { all?: boolean; own?: readonly string[] };
+  lines?: boolean | OwnLinesOptions;
   /** The text of a source file, by the path the debug info gives, for showing where it stops. */
   sources?: (file: string) => string | undefined | Promise<string | undefined>;
   /** Mock replacements for nodes, keyed by node id. */

@@ -440,12 +440,12 @@ sees in even while a held node keeps the tick from ending. The interface is
 
 Debugging is off unless you ask for it, twice over, as **it slows a graph down significantly**: it
 takes the `debug` feature, and `debug_lines` set to which of a guest's lines count as its own
-(`OwnLines`: `Guess`, by Rust's paths, `Under` paths you name, or `All`). Then a guest built with debug info can be stopped
+([`OwnLines`](#which-lines-are-a-guests-own)). Then a guest built with debug info can be stopped
 on a line of its source, with `RuntimeGraph::lines`. This is the `LineDebugger` trait, which the
 [JavaScript host](javascript.md#stopping-on-a-source-line) has too, in its own idiom:
 
 ```rust,ignore
-let config = RuntimeConfig { debug_lines: Some(OwnLines::Guess), ..RuntimeConfig::default() };
+let config = RuntimeConfig { debug_lines: Some(OwnLines::default()), ..RuntimeConfig::default() };
 let mut graph = RuntimeGraph::load(compiled, &wasm, config, Perf).await?;
 let lines = graph.lines().expect("loaded to debug");
 
@@ -462,6 +462,34 @@ let (_, ()) = tokio::join!(graph.tick(), async {
 
 Hold on to a clone of `lines`, as a stopped guest holds up its tick. What it is told takes effect
 even on a guest in a loop that never returns.
+
+### Which lines are a guest's own
+
+Only a guest's own lines can be stopped on and stepped through, and are listed: not those of the
+standard library or its dependencies, which are most of what the debug info has. Stepping goes
+through the rest without stopping, and they cost nothing. `OwnLines::All` takes every line, at
+about twice the cost; otherwise `OwnLines::Rules(OwnRules { include, exclude, anchor, known })`
+decides each file, the first that says anything deciding:
+
+1. **`include`**, patterns of paths that are the guest's own, whatever else says.
+2. **`exclude`**, patterns of paths that are not.
+3. **`known`**, the libraries witgraph knows of are not: Rust's standard library and Cargo's
+   dependencies, and clang's and wasi-sdk's headers, each only in code of its language.
+4. **`anchor`**, only what is under the guest's project is: the directory its `run` was compiled
+   in, as the debug info has it, with that of `run`'s file. A dependency is compiled where it
+   is, and the standard library where its toolchain was built, so this works for any language
+   without a list of where its libraries are. A C guest's `run` is in its bindings, which may
+   have no debug info: the first function `run` calls that has some anchors it.
+
+What none of them says anything of is the guest's own. `OwnLines::default()` is no patterns,
+`known` and `anchor`. A pattern matches a whole path: `**` is anything, `*` anything but a `/`
+and `?` one character but a `/`, as `**/bindings/**` or `/home/me/project/**`.
+`OwnLines::under(paths)` is only the files under those paths.
+
+What the guess cannot tell apart is code under the project that is not the guest's own: a
+library kept in its repository, or bindings generated into it. Exclude it by a pattern, or
+build it without debug info, as [a node in C](components.md#writing-a-node-in-c) does its
+bindings: what has none, a debugger never stops in.
 
 - **It is slow.** Wasmtime keeps every value where it can be looked at, so guests run about 20 times
   slower, breakpoints or not, and take 3 to 4 times as long to load. Leave it off for anything but

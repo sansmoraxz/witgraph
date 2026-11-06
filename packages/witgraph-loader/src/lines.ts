@@ -51,15 +51,48 @@ export interface LineModule {
   variablesAt?(offset: number, flags: Uint8Array, memory: Uint8Array): SourceVariable[];
 }
 
-/** What a session calls on the thread its guests run on. */
-export interface SessionLines {
-  /** Probes reach into the standard library and dependencies too. */
+/**
+ * Which of a guest's lines count as its own, to probe, list and step through: what `OwnLines`
+ * says on wasmtime. Of a file, the first that says decides: what `include` matches is, what
+ * `exclude` matches is not, with `known` a library witgraph knows of is not, and with `anchor`
+ * it is if it is under the guest's project, and is not otherwise. By default, a guess for any
+ * language: the guest's project, less the libraries witgraph knows of.
+ */
+export interface OwnLinesOptions {
+  /** Every line, the standard library's and dependencies' too, at about twice the cost. */
   all?: boolean;
   /**
-   * The files whose lines count as the guest's own, by what their paths start with. Otherwise
-   * it is a guess from Rust's paths, so another language's libraries count as its own.
+   * Patterns of the files that are the guest's own, whatever else says: `**` is anything, `*`
+   * anything but a `/`, and a pattern matches a whole path, as `/home/me/project/**`.
    */
-  own?: readonly string[];
+  include?: readonly string[];
+  /** Patterns of the files that are not, unless included: those of any `bindings` directory, say. */
+  exclude?: readonly string[];
+  /**
+   * Only the files under the guest's project are its own: the directory its `run` was
+   * compiled in, as its debug info says. `true` unless `false`.
+   */
+  anchor?: boolean;
+  /**
+   * The libraries witgraph knows of are not: Rust's standard library and Cargo's
+   * dependencies, clang's and wasi-sdk's headers. `true` unless `false`.
+   */
+  known?: boolean;
+}
+
+/** Which lines are a guest's own, of options that may say more: those options alone. */
+export function ownLines({
+  all,
+  include,
+  exclude,
+  anchor,
+  known,
+}: OwnLinesOptions): OwnLinesOptions {
+  return { all, include, exclude, anchor, known };
+}
+
+/** What a session calls on the thread its guests run on. */
+export interface SessionLines extends OwnLinesOptions {
   /** The modules with probes, before any is instantiated. */
   modules?(modules: readonly LineModule[]): void;
   /** The graph is being instantiated: the instances before this one are gone. */
@@ -166,7 +199,10 @@ interface Leaving {
 /** Where a guest's lines are probed, on its thread. Blocks there, so never on a page's. */
 export class LineProbes implements SessionLines {
   readonly all?: boolean;
-  readonly own?: readonly string[];
+  readonly include?: readonly string[];
+  readonly exclude?: readonly string[];
+  readonly anchor?: boolean;
+  readonly known?: boolean;
   #control = new Int32Array(new SharedArrayBuffer(Control.Count * 4));
   #modules: readonly LineModule[] = [];
   #breakpoints: Uint8Array<SharedArrayBuffer>[] = [];
@@ -186,12 +222,15 @@ export class LineProbes implements SessionLines {
   constructor(
     post: (kind: string, fields: object) => void,
     report: () => void,
-    { all, own }: { all?: boolean; own?: readonly string[] },
+    { all, include, exclude, anchor, known }: OwnLinesOptions,
   ) {
     this.#post = post;
     this.#report = report;
     this.all = all;
-    this.own = own;
+    this.include = include;
+    this.exclude = exclude;
+    this.anchor = anchor;
+    this.known = known;
   }
 
   /** Whether every node's run is to wait: said here, as a stopped worker reads no message. */

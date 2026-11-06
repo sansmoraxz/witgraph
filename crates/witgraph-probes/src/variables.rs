@@ -1307,7 +1307,7 @@ mod tests {
     fn names_at(mark: &str) -> Vec<String> {
         let modules = core_modules(test_components::LINE_WALK.wasm).unwrap();
         let module = modules.iter().max_by_key(|module| module.len()).unwrap();
-        let instrumented = instrument(module, &OwnLines::Guess).unwrap().unwrap();
+        let instrumented = instrument(module, &OwnLines::default()).unwrap().unwrap();
         let line = marked(mark);
         let probe = instrumented
             .probes

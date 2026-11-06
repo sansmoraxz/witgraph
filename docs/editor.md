@@ -93,7 +93,8 @@ Put them anywhere on your page. They all share one `EditorController`.
   So _Break on node_ stops a stream node once per stream, however many items pass. To stop
   for each item, click the gutter on a line of the loop that handles them.
 - **Source lines.** Off unless you ask for it, as it **slows guests down significantly**. Load with
-  `lines: true`, or `lines: { own: [...] }` to name the paths of what counts as the guest's own, and
+  `lines: true`, or `lines: { include, exclude, anchor, known }` to say what counts as the guest's
+  own ([which lines are a guest's own](running.md#which-lines-are-a-guests-own)), and
   a guest built with debug info can be stopped on a line of its own code, even a node that is
   spinning. The source panel follows each stop, and lists the call stack, where choosing a caller
   shows the line it is waiting on, and the variables in scope, marking what changed since the last

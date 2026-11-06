@@ -240,13 +240,14 @@ stays with its guest: others run on past their probes.
   go first, and `endWorker` ends it where it is.
 - **Build the guest with debug info**, and `opt-level = 0` for exact lines: optimizing leaves
   some lines with no code of their own. A guest with none has no lines, and runs as usual.
-- **Only the guest's own lines** have probes, by the path the debug info gives: not the
-  standard library's, or a dependency's. Stepping stays out of those, and so does their cost.
-  That is a guess from Rust's paths, so another language's libraries count as the guest's own (build
-  them without debug info, as [a node in C](components.md#writing-a-node-in-c) does its bindings), and
-  so does a dependency kept in your repository: `lines: { own: ['/home/me/project/'] }` says which
-  they are instead, by what their paths start with. `lines: { all: true }` puts them on every line,
-  at about twice the time. A step does not stop
+- **Only the guest's own lines** have probes: not the standard library's, or a dependency's.
+  Stepping stays out of those, and so does their cost. Which they are is decided as on wasmtime
+  ([which lines are a guest's own](running.md#which-lines-are-a-guests-own)), by
+  `lines: { include, exclude, anchor, known }`: by default, any language's, what is under the
+  directory the guest's `run` was compiled in, less the libraries witgraph knows of.
+  `lines: { exclude: ['**/bindings/**'] }` leaves out generated bindings, and
+  `lines: { include: ['/home/me/project/**'], exclude: ['**'] }` takes only that directory.
+  `lines: { all: true }` puts them on every line, at about twice the time. A step does not stop
   in a function all on one line, which is what a macro usually generates, though a breakpoint
   there does.
 

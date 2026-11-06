@@ -30,7 +30,9 @@ use wasmparser::{
 mod variables;
 use variables::ReadFrom;
 pub use variables::{Frame, ModuleDebug};
-pub use witgraph_traits::lines::{OwnLines, SourceVariable as Variable};
+pub use witgraph_traits::lines::{
+    OwnLines, OwnRules, PathPattern, SourceFile, SourceLanguage, SourceVariable as Variable,
+};
 
 /// The module of the import a probe calls.
 pub const IMPORT_MODULE: &str = "witgraph:debug";
@@ -141,6 +143,216 @@ fn slot(spilled: &[u8], at: u64) -> Option<[u8; 8]> {
     spilled.get(start..start.checked_add(8)?)?.try_into().ok()
 }
 
+/// The language of a compile unit's code, if it is one witgraph knows.
+fn language_of<R: gimli::Reader>(
+    unit: &gimli::Unit<R>,
+) -> Result<Option<SourceLanguage>, ProbeError> {
+    use gimli::{
+        DW_LANG_C, DW_LANG_C_plus_plus, DW_LANG_C_plus_plus_03, DW_LANG_C_plus_plus_11,
+        DW_LANG_C_plus_plus_14, DW_LANG_C_plus_plus_17, DW_LANG_C_plus_plus_20, DW_LANG_C11,
+        DW_LANG_C17, DW_LANG_C89, DW_LANG_C99, DW_LANG_Rust,
+    };
+    let root = unit.entry(unit.header.root_offset())?;
+    let Some(gimli::AttributeValue::Language(language)) = root.attr_value(gimli::DW_AT_language)
+    else {
+        return Ok(None);
+    };
+    let c = [
+        DW_LANG_C89,
+        DW_LANG_C,
+        DW_LANG_C99,
+        DW_LANG_C11,
+        DW_LANG_C17,
+    ];
+    let cpp = [
+        DW_LANG_C_plus_plus,
+        DW_LANG_C_plus_plus_03,
+        DW_LANG_C_plus_plus_11,
+        DW_LANG_C_plus_plus_14,
+        DW_LANG_C_plus_plus_17,
+        DW_LANG_C_plus_plus_20,
+    ];
+    Ok(if language == DW_LANG_Rust {
+        Some(SourceLanguage::Rust)
+    } else if c.contains(&language) {
+        Some(SourceLanguage::C)
+    } else if cpp.contains(&language) {
+        Some(SourceLanguage::Cpp)
+    } else {
+        None
+    })
+}
+
+/// `path` with its `.` and `..` worked out, as far as its text says.
+fn normalized(path: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "." => {}
+            ".." if parts
+                .last()
+                .is_some_and(|last| !last.is_empty() && *last != "..") =>
+            {
+                parts.pop();
+            }
+            part => parts.push(part),
+        }
+    }
+    let joined = parts.join("/");
+    // `a//b` is `a/b`, but a leading `/` stays.
+    let mut out = String::with_capacity(joined.len());
+    for (at, part) in joined.split('/').enumerate() {
+        if at > 0 && part.is_empty() {
+            continue;
+        }
+        if at > 0 {
+            out.push('/');
+        }
+        out.push_str(part);
+    }
+    out
+}
+
+/// The directory of the guest's project: that of the compile unit its `run` is in, or the
+/// first with debug info that `run` calls, as a C guest's bindings have none. Of the directory
+/// the unit was compiled in and that of its first file, what they have in common, so it is the
+/// project's whether a compiler ran in it, or in a build directory of it. `None` for a module
+/// with no `run`, or none that comes to debug info.
+fn anchor_root<R: gimli::Reader>(
+    module: &[u8],
+    dwarf: &Dwarf<R>,
+) -> Result<Option<String>, ProbeError> {
+    let shape = shape_of(module)?;
+    let Some(code_start) = shape.code_start else {
+        return Ok(None);
+    };
+    let mut run = None;
+    // By defined function, where its body is and the functions it calls.
+    let mut bodies: Vec<(std::ops::Range<u64>, Vec<u32>)> = Vec::new();
+    for payload in Parser::new(0).parse_all(module) {
+        match payload? {
+            Payload::ExportSection(section) => {
+                for export in section {
+                    let export = export?;
+                    // `[async-lift]node#run`, and not its callback.
+                    let named =
+                        export.name.ends_with("#run") && !export.name.starts_with("[callback]");
+                    if named && export.kind == wasmparser::ExternalKind::Func {
+                        run = Some(export.index);
+                    }
+                }
+            }
+            Payload::CodeSectionEntry(body) => {
+                let mut calls = Vec::new();
+                let mut reader = body.get_operators_reader()?;
+                while !reader.eof() {
+                    if let Operator::Call { function_index } = reader.read()? {
+                        calls.push(function_index);
+                    }
+                }
+                let range = body.range();
+                bodies.push((range.start..range.end, calls));
+            }
+            _ => {}
+        }
+    }
+    let Some(run) = run else {
+        return Ok(None);
+    };
+    let mut units = Vec::new();
+    let mut headers = dwarf.units();
+    while let Some(header) = headers.next()? {
+        let unit = dwarf.unit(header)?;
+        let mut ranges = Vec::new();
+        let mut found = dwarf.unit_ranges(&unit)?;
+        while let Some(range) = found.next()? {
+            ranges.push(range.begin..range.end);
+        }
+        units.push((unit, ranges));
+    }
+    let mut seen = HashSet::from([run]);
+    let mut waiting = std::collections::VecDeque::from([run]);
+    while let Some(function) = waiting.pop_front() {
+        // Not far: past a few calls, it is not the guest's `run` any more.
+        if seen.len() > MOST_ANCHOR_CALLS {
+            break;
+        }
+        let Some(defined) = function.checked_sub(shape.imported_functions) else {
+            continue;
+        };
+        let Some((body, calls)) = bodies.get(defined as usize) else {
+            continue;
+        };
+        let (begin, end) = (
+            body.start.saturating_sub(code_start),
+            body.end.saturating_sub(code_start),
+        );
+        let covering = units.iter().find(|(_, ranges)| {
+            ranges
+                .iter()
+                .any(|range| range.start < end && begin < range.end)
+        });
+        if let Some((unit, _)) = covering {
+            return Ok(project_root(unit));
+        }
+        for call in calls {
+            if seen.insert(*call) {
+                waiting.push_back(*call);
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// How many functions [`anchor_root`] looks at, from `run`, for one with debug info.
+const MOST_ANCHOR_CALLS: usize = 64;
+
+/// The directory of the project a compile unit is of: see [`anchor_root`].
+fn project_root<R: gimli::Reader>(unit: &gimli::Unit<R>) -> Option<String> {
+    let built_in = unit
+        .comp_dir
+        .clone()
+        .and_then(|dir| dir.to_string_lossy().ok().map(|dir| dir.into_owned()));
+    let name = unit
+        .name
+        .clone()
+        .and_then(|name| name.to_string_lossy().ok().map(|name| name.into_owned()));
+    // Rust names a unit `{file}/@/{codegen unit}`.
+    let name = name.map(|name| match name.split_once("/@/") {
+        Some((file, _)) => file.to_string(),
+        None => name,
+    });
+    let file = match (name, &built_in) {
+        (Some(name), Some(dir)) if !name.starts_with('/') => Some(format!("{dir}/{name}")),
+        (name, _) => name,
+    };
+    let file_dir = file.map(|file| {
+        let file = normalized(&file);
+        match file.rsplit_once('/') {
+            Some((dir, _)) => dir.to_string(),
+            None => file,
+        }
+    });
+    let root = match (built_in.map(|dir| normalized(&dir)), file_dir) {
+        (Some(built), Some(file_dir)) => common_directory(&built, &file_dir),
+        (Some(dir), None) | (None, Some(dir)) => dir,
+        (None, None) => return None,
+    };
+    // A root of everything says nothing.
+    (root.starts_with('/') && !root.trim_end_matches('/').is_empty()).then_some(root)
+}
+
+/// The deepest directory both `a` and `b` are in, or are.
+fn common_directory(a: &str, b: &str) -> String {
+    let common: Vec<&str> = a
+        .split('/')
+        .zip(b.split('/'))
+        .take_while(|(a, b)| a == b)
+        .map(|(a, _)| a)
+        .collect();
+    common.join("/")
+}
+
 /// How many of a function's locals a probe writes out.
 pub const MOST_SPILLED_LOCALS: u32 = 2048;
 
@@ -152,8 +364,9 @@ struct Row {
     column: u32,
 }
 
-/// The first row of each run of one line, by address.
-fn line_rows(module: &[u8]) -> Result<Vec<Row>, ProbeError> {
+/// The first row of each run of one line, by address, of the files `own` counts as the
+/// guest's own.
+fn own_rows(module: &[u8], own: &OwnLines) -> Result<Vec<Row>, ProbeError> {
     let mut sections: HashMap<&str, &[u8]> = HashMap::new();
     for payload in Parser::new(0).parse_all(module) {
         if let Payload::CustomSection(section) = payload?
@@ -167,6 +380,7 @@ fn line_rows(module: &[u8]) -> Result<Vec<Row>, ProbeError> {
         Ok(EndianSlice::new(data, LittleEndian))
     };
     let dwarf = Dwarf::load(load)?;
+    let root = anchor_root(module, &dwarf)?;
     let mut rows = Vec::new();
     let mut units = dwarf.units();
     while let Some(header) = units.next()? {
@@ -174,6 +388,9 @@ fn line_rows(module: &[u8]) -> Result<Vec<Row>, ProbeError> {
         let Some(program) = unit.line_program.clone() else {
             continue;
         };
+        let language = language_of(&unit)?;
+        // Whether each file counts, decided once.
+        let mut counts: HashMap<String, bool> = HashMap::new();
         let mut lines = program.rows();
         let mut files: HashMap<u64, String> = HashMap::new();
         let mut last: Option<(u64, u64)> = None;
@@ -218,9 +435,20 @@ fn line_rows(module: &[u8]) -> Result<Vec<Row>, ProbeError> {
                         path = format!("{}/{path}", directory.to_string_lossy());
                     }
                 }
+                let path = normalized(&path);
                 files.insert(row.file_index(), path.clone());
                 path
             };
+            let counted = *counts.entry(file.clone()).or_insert_with(|| {
+                own.covers(&SourceFile {
+                    path: &file,
+                    language,
+                    root: root.as_deref(),
+                })
+            });
+            if !counted {
+                continue;
+            }
             let column = match row.column() {
                 ColumnType::LeftEdge => 0,
                 ColumnType::Column(column) => u32::try_from(column.get()).unwrap_or(0),
@@ -701,8 +929,7 @@ pub fn instrument(module: &[u8], lines: &OwnLines) -> Result<Option<Instrumented
     let Some(code_start) = shape.code_start else {
         return Ok(None);
     };
-    let mut rows = line_rows(module)?;
-    rows.retain(|row| lines.covers(&row.file));
+    let rows = own_rows(module, lines)?;
     if rows.is_empty() {
         return Ok(None);
     }
@@ -793,9 +1020,7 @@ pub fn source_lines(module: &[u8], lines: &OwnLines) -> Result<Vec<Probe>, Probe
     let Some(code_start) = shape.code_start else {
         return Ok(Vec::new());
     };
-    let mut rows = line_rows(module)?;
-    rows.retain(|row| lines.covers(&row.file));
-    let mut rows = rows.into_iter().peekable();
+    let mut rows = own_rows(module, lines)?.into_iter().peekable();
     let mut function = shape.imported_functions;
     let mut probes = Vec::new();
     for payload in Parser::new(0).parse_all(module) {
@@ -1122,7 +1347,9 @@ mod tests {
 
     #[test]
     fn probes_stand_on_the_guests_own_lines() {
-        let instrumented = instrument(&line_walk(), &OwnLines::Guess).unwrap().unwrap();
+        let instrumented = instrument(&line_walk(), &OwnLines::default())
+            .unwrap()
+            .unwrap();
         validate(&instrumented.module);
         assert!(
             instrumented
@@ -1155,24 +1382,68 @@ mod tests {
         );
     }
 
+    /// The root a module's `run` anchors its own lines to.
+    fn root_of(module: &[u8]) -> Option<String> {
+        let mut sections: HashMap<&str, &[u8]> = HashMap::new();
+        for payload in Parser::new(0).parse_all(module) {
+            if let Payload::CustomSection(section) = payload.unwrap()
+                && section.name().starts_with(".debug_")
+            {
+                sections.insert(section.name(), section.data());
+            }
+        }
+        let load = |id: SectionId| -> Result<_, gimli::Error> {
+            let data = sections.get(id.name()).copied().unwrap_or(&[]);
+            Ok(EndianSlice::new(data, LittleEndian))
+        };
+        anchor_root(module, &Dwarf::load(load).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn run_anchors_a_guest_to_its_project_in_rust_and_c() {
+        let guests = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../test-fixtures/test-components/guests"
+        );
+        let guests = normalized(guests);
+        // Cargo compiles a workspace's crates in its directory.
+        assert_eq!(root_of(&line_walk()).as_deref(), Some(guests.as_str()));
+        // The bindings, with no debug info, call the guest's `node_run`.
+        let modules = core_modules(test_components::C_WALK.wasm).unwrap();
+        let c_walk = modules.iter().max_by_key(|module| module.len()).unwrap();
+        assert_eq!(root_of(c_walk), Some(format!("{guests}/c-walk")));
+        // No `run`, no anchor.
+        let plain = wat::parse_str("(module (func (export \"other\")))").unwrap();
+        assert_eq!(root_of(&plain), None);
+    }
+
+    #[test]
+    fn paths_are_worked_out_as_their_text_says() {
+        assert_eq!(normalized("/a/./b/../c//d.c"), "/a/c/d.c");
+        assert_eq!(normalized("a/../../b"), "../b");
+        assert_eq!(common_directory("/p/build", "/p/src"), "/p");
+        assert_eq!(common_directory("/p/x", "/p/x"), "/p/x");
+        assert_eq!(common_directory("/p/xy", "/p/x"), "/p");
+    }
+
     #[test]
     fn all_lines_reach_into_what_is_not_the_guests() {
         let module = line_walk();
-        let own = instrument(&module, &OwnLines::Guess).unwrap().unwrap();
+        let own = instrument(&module, &OwnLines::default()).unwrap().unwrap();
         let all = instrument(&module, &OwnLines::All).unwrap().unwrap();
         validate(&all.module);
         assert!(all.probes.len() > own.probes.len() * 2);
         assert!(
             all.probes
                 .iter()
-                .any(|probe| !OwnLines::Guess.covers(&probe.file))
+                .any(|probe| probe.file.contains("/rustc/"))
         );
     }
 
     #[test]
     fn the_rewrite_keeps_memories_and_names_where_they_mean_the_same() {
         let module = line_walk();
-        let instrumented = instrument(&module, &OwnLines::Guess).unwrap().unwrap();
+        let instrumented = instrument(&module, &OwnLines::default()).unwrap().unwrap();
         let shape = shape_of(&module).unwrap();
 
         let found = exports(&instrumented.module);
@@ -1224,16 +1495,16 @@ mod tests {
     #[test]
     fn a_host_can_say_what_counts_as_its_own() {
         let module = line_walk();
-        let guessed = instrument(&module, &OwnLines::Guess).unwrap().unwrap();
+        let guessed = instrument(&module, &OwnLines::default()).unwrap().unwrap();
         let file = guessed.probes[0].file.clone();
         let directory = file.strip_suffix("lib.rs").unwrap().to_string();
 
-        let under = OwnLines::Under(vec![directory]);
+        let under = OwnLines::under([directory]);
         let mine = instrument(&module, &under).unwrap().unwrap();
         assert_eq!(mine.probes.len(), guessed.probes.len());
 
         // Not what a Rust guess would pick: only the standard library's.
-        let library = OwnLines::Under(vec!["/rustc/".to_string()]);
+        let library = OwnLines::under(["/rustc/".to_string()]);
         let all = instrument(&module, &OwnLines::All).unwrap().unwrap();
         let rustc = all
             .probes
@@ -1242,15 +1513,15 @@ mod tests {
         let theirs = instrument(&module, &library).unwrap();
         assert_eq!(rustc.is_some(), theirs.is_some());
 
-        let nothing = OwnLines::Under(vec!["/nowhere/".to_string()]);
+        let nothing = OwnLines::under(["/nowhere/".to_string()]);
         assert!(instrument(&module, &nothing).unwrap().is_none());
     }
 
     #[test]
     fn calls_are_paired_up_past_the_probes_and_find_their_lines() {
         let module = line_walk();
-        let instrumented = instrument(&module, &OwnLines::Guess).unwrap().unwrap();
-        let index = LineIndex::new(source_lines(&module, &OwnLines::Guess).unwrap());
+        let instrumented = instrument(&module, &OwnLines::default()).unwrap().unwrap();
+        let index = LineIndex::new(source_lines(&module, &OwnLines::default()).unwrap());
         let [file] = index.files().collect::<Vec<_>>()[..] else {
             panic!("one file of its own");
         };
@@ -1344,7 +1615,7 @@ mod tests {
     #[test]
     fn lines_stand_on_operators_and_say_how_a_step_ends() {
         let module = line_walk();
-        let index = LineIndex::new(source_lines(&module, &OwnLines::Guess).unwrap());
+        let index = LineIndex::new(source_lines(&module, &OwnLines::default()).unwrap());
         let [file] = index.files().collect::<Vec<_>>()[..] else {
             panic!("one file of its own");
         };
@@ -1375,7 +1646,7 @@ mod tests {
         let module = line_walk();
         let shape = shape_of(&module).unwrap();
         let names = defined_function_names(&module).unwrap();
-        let index = LineIndex::new(source_lines(&module, &OwnLines::Guess).unwrap());
+        let index = LineIndex::new(source_lines(&module, &OwnLines::default()).unwrap());
         let [file] = index.files().collect::<Vec<_>>()[..] else {
             panic!("one file of its own");
         };
@@ -1397,7 +1668,7 @@ mod tests {
         let read = debug.read_from().unwrap();
         // Rust keeps each variable in memory, behind a frame pointer, at this level.
         let mut body = None;
-        let walk = instrument(&module, &OwnLines::Guess)
+        let walk = instrument(&module, &OwnLines::default())
             .unwrap()
             .unwrap()
             .probes

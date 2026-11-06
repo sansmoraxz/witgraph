@@ -11,8 +11,8 @@ use std::time::Duration;
 use test_components::{C_WALK, Guest, LINE_WALK};
 use witgraph_ir::{Graph, NodeId, PortName, PortRef};
 use witgraph_runtime::{
-    LineDebugger, LineStop, OwnLines, Perf, RunningGraph, RuntimeConfig, RuntimeGraph,
-    RuntimeLines, StopReason, TickResult,
+    LineDebugger, LineStop, OwnLines, OwnRules, PathPattern, Perf, RunningGraph, RuntimeConfig,
+    RuntimeGraph, RuntimeLines, StopReason, TickResult,
 };
 
 const SOURCE: &str =
@@ -32,6 +32,15 @@ fn mark(name: &str) -> u32 {
 async fn load(
     nodes: &[(&str, Guest)],
     edges: &[(&str, &str)],
+) -> (RuntimeGraph<Perf>, RuntimeLines) {
+    load_with(nodes, edges, OwnLines::default()).await
+}
+
+/// [`load`], with `own` the lines that count.
+async fn load_with(
+    nodes: &[(&str, Guest)],
+    edges: &[(&str, &str)],
+    own: OwnLines,
 ) -> (RuntimeGraph<Perf>, RuntimeLines) {
     let mut contracts = Vec::new();
     let mut wasm = HashMap::new();
@@ -56,7 +65,7 @@ async fn load(
         );
     }
     let config = RuntimeConfig {
-        debug_lines: Some(OwnLines::default()),
+        debug_lines: Some(own),
         ..RuntimeConfig::default()
     };
     let compiled = builder.build().compile(&contracts).expect("graph compiles");
@@ -256,4 +265,74 @@ async fn a_rust_guest_and_a_c_guest_are_debugged_side_by_side() {
     })
     .await;
     assert_eq!(output(&mut rt, "c").await.as_deref(), Some("11"));
+}
+
+/// The files a C guest alone has, with `own` the lines that count, by their ends.
+async fn c_files_with(own: OwnLines) -> Vec<String> {
+    let (_rt, lines) = load_with(&[("c", C_WALK)], &[], own).await;
+    let mut files: Vec<String> = lines
+        .files()
+        .into_iter()
+        .map(|file| {
+            let parts: Vec<&str> = file.rsplitn(3, '/').collect();
+            format!("{}/{}", parts[1], parts[0])
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+#[tokio::test]
+async fn a_library_from_outside_the_project_is_not_its_own_whatever_its_path() {
+    // `clang.h` of `c-lib`, beside `c-walk`, has debug info, and no list knows its path: what
+    // leaves it out is that it is not under the directory `run` was compiled in.
+    assert_eq!(c_files_with(OwnLines::default()).await, ["src/walk.c"]);
+    let unanchored = OwnLines::Rules(OwnRules {
+        anchor: false,
+        ..OwnRules::default()
+    });
+    assert_eq!(
+        c_files_with(unanchored).await,
+        ["include/clamp.h", "src/walk.c"]
+    );
+    let included = OwnLines::Rules(OwnRules {
+        include: vec![PathPattern::new("**/c-lib/**")],
+        ..OwnRules::default()
+    });
+    assert_eq!(
+        c_files_with(included).await,
+        ["include/clamp.h", "src/walk.c"]
+    );
+    let excluded = OwnLines::Rules(OwnRules {
+        exclude: vec![PathPattern::new("**/walk.c")],
+        ..OwnRules::default()
+    });
+    assert!(c_files_with(excluded).await.is_empty());
+    // Every line: clang's own `stdint.h` has none, only what it defines.
+    let all = c_files_with(OwnLines::All).await;
+    assert!(all.contains(&"include/clamp.h".to_string()), "{all:?}");
+}
+
+#[tokio::test]
+async fn a_step_goes_through_a_library_that_is_not_its_own() {
+    let (mut rt, lines) = load(&[("c", C_WALK)], &[]).await;
+    let file = c_file(&lines);
+    lines.set_breakpoint(&file, mark("run-clamp"));
+    inject(&mut rt, "c", "in", "5").await;
+    settling(&mut rt, async {
+        let stop = lines.next_stop().await;
+        assert_eq!(stop.line, mark("run-clamp"));
+        lines.clear_breakpoint(&file, mark("run-clamp"));
+        lines.step_in();
+        let next = lines.next_stop().await;
+        assert_eq!(
+            (next.file.as_str(), next.line),
+            (file.as_str(), mark("run-end")),
+            "past `clamp_u32`: {:?}",
+            next.frames
+        );
+        lines.resume();
+    })
+    .await;
+    assert_eq!(output(&mut rt, "c").await.as_deref(), Some("8"));
 }

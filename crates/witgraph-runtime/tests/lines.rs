@@ -676,12 +676,12 @@ async fn a_host_says_which_lines_are_its_own() {
             .unwrap();
         rt.lines().unwrap().files()
     };
-    let guessed = load(OwnLines::Guess).await;
+    let guessed = load(OwnLines::default()).await;
     assert_eq!(guessed.len(), 1);
     let directory = guessed[0].strip_suffix("lib.rs").unwrap().to_string();
-    assert_eq!(load(OwnLines::Under(vec![directory])).await, guessed);
+    assert_eq!(load(OwnLines::under([directory])).await, guessed);
     assert!(
-        load(OwnLines::Under(vec!["/nowhere/".to_string()]))
+        load(OwnLines::under(["/nowhere/".to_string()]))
             .await
             .is_empty()
     );

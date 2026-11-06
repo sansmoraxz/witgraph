@@ -73,7 +73,8 @@ pub use witgraph_sched::{
 pub use witgraph_traits::holds::{HeldRun, HoldAt, HoldId, NodeHolds};
 #[cfg(feature = "debug")]
 pub use witgraph_traits::lines::{
-    LineDebugger, LineStop, OwnLines, SourceVariable, StackFrame, StopReason,
+    LineDebugger, LineStop, OwnLines, OwnRules, PathPattern, SourceFile, SourceLanguage,
+    SourceVariable, StackFrame, StopReason,
 };
 pub use witgraph_traits::{OutputReader, RunningGraph, until};
 pub use {wasmtime, witgraph_ir, witgraph_sched, witgraph_traits};

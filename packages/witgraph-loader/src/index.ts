@@ -19,7 +19,7 @@ import initModule, {
   moduleVariables,
   WebGraph,
 } from '../pkg/witgraph_web.js';
-import type { SessionLines, SourceProbe, SourceVariable } from './lines.ts';
+import { ownLines, type SessionLines, type SourceProbe, type SourceVariable } from './lines.ts';
 
 /** A port of a component, as the editor catalog describes one. */
 export interface Port {
@@ -920,9 +920,7 @@ function transpileCached(
   lines: SessionLines | undefined,
 ): Promise<Transpiled> {
   // Probes make other modules of the same bytes.
-  const key = lines
-    ? `${sha256}:lines:${lines.all ?? false}:${JSON.stringify(lines.own ?? null)}`
-    : sha256;
+  const key = lines ? `${sha256}:lines:${JSON.stringify(ownLines(lines))}` : sha256;
   let transpiled = transpileCache.get(key);
   if (transpiled === undefined) {
     transpiled = transpileComposite(bytes, lines);
@@ -963,12 +961,7 @@ async function transpileComposite(
   for (const [name, contents] of files as [string, Uint8Array<ArrayBuffer>][]) {
     if (name.endsWith('.wasm')) {
       const rewritten =
-        lines &&
-        (instrumentModule(
-          contents,
-          lines.all ?? false,
-          lines.own ? [...lines.own] : undefined,
-        ) as InstrumentedModule | null);
+        lines && (instrumentModule(contents, ownLines(lines)) as InstrumentedModule | null);
       const compiling = WebAssembly.compile(
         rewritten ? (rewritten.bytes as Uint8Array<ArrayBuffer>) : contents,
       );
@@ -1042,6 +1035,7 @@ export {
   LineDebugger,
   type LineModule,
   type LineStop,
+  type OwnLinesOptions,
   type SessionLines,
   type SourceProbe,
   type SourceVariable,

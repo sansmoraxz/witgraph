@@ -17,7 +17,14 @@ import {
   type TickResult,
   type Wasm,
 } from './index.ts';
-import { LineDebugger, LineProbes, type LineStop, type LinesInfo } from './lines.ts';
+import {
+  LineDebugger,
+  LineProbes,
+  type LineStop,
+  type LinesInfo,
+  type OwnLinesOptions,
+  ownLines,
+} from './lines.ts';
 
 /** A worker that can be ended, for what never returns to read another message. */
 export type SessionWorker = Endpoint & { terminate?(): unknown };
@@ -95,7 +102,7 @@ export interface RemoteSessionOptions {
    * says where a guest has stopped. It needs shared memory, so a page that is
    * cross-origin isolated, and a real worker, as a stop blocks the thread.
    */
-  lines?: { all?: boolean; own?: readonly string[]; onStop: (stop: LineStop) => void };
+  lines?: OwnLinesOptions & { onStop: (stop: LineStop) => void };
 }
 
 /** The state a worker reports. */
@@ -254,7 +261,7 @@ class Served {
       mocked: string[];
       holds: readonly string[] | 'all';
       observed: readonly (readonly [string, string])[];
-      lines?: { all?: boolean; own?: readonly string[] };
+      lines?: OwnLinesOptions;
     },
     ask: (kind: string, fields: object) => Promise<unknown>,
   ): Promise<Loaded> {
@@ -912,7 +919,7 @@ export class RemoteSession {
         mocked: Object.keys(mocks).filter((node) => typeof mocks[node] === 'function'),
         holds: options.holds ?? [],
         observed: options.observed ?? [],
-        ...(options.lines ? { lines: { all: options.lines.all, own: options.lines.own } } : {}),
+        ...(options.lines ? { lines: ownLines(options.lines) } : {}),
       })) as Loaded;
     } catch (error) {
       channel.sessions.delete(id);

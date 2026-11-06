@@ -190,8 +190,10 @@ writes without `--no-object-file`: a guest that embeds its world as above define
 doing nothing. `test-fixtures/test-components/guests/c-walk` is such a node, built by the
 fixtures' build script.
 
-To stop on its lines, build its own files with `-g -O0`, and the bindings and anything else
-that is not yours without debug info (`-g0`): what has none, a debugger does not stop in.
+To stop on its lines, build its own files with `-g -O0`, from the project's directory, which the
+debug info records: a debugger counts what is under it as the guest's own, and a library from
+elsewhere not ([which lines are a guest's own](running.md#which-lines-are-a-guests-own)). Build
+the bindings, which are under it too, without debug info (`-g0`), or exclude them by a pattern.
 
 ## Previewing outputs
 

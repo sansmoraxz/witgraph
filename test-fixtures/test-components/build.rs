@@ -141,6 +141,7 @@ fn main() {
         let component = if C_GUESTS.contains(&name) {
             println!("cargo::rerun-if-changed=guests/{name}/bindings");
             println!("cargo::rerun-if-changed=guests/{name}/support");
+            println!("cargo::rerun-if-changed=guests/c-lib");
             println!("cargo::rerun-if-env-changed=CLANG");
             build_c_guest(name, &guest_dir, &out_dir)
         } else {
@@ -215,11 +216,14 @@ fn build_c_guest(name: &str, guest_dir: &Path, out_dir: &Path) -> Vec<u8> {
     let work = out_dir.join("c").join(name);
     fs::create_dir_all(&work)
         .unwrap_or_else(|e| panic!("failed to create {}: {e}", work.display()));
+    // `c-lib` is a library kept outside the guest's directory, as one is.
     let includes = [
         OsString::from("-I"),
         dir.join("bindings").into(),
         OsString::from("-I"),
         dir.join("support/include").into(),
+        OsString::from("-I"),
+        guest_dir.join("c-lib/include").into(),
     ];
     let mut objects = Vec::new();
     for (sub, flags) in [
@@ -234,7 +238,7 @@ fn build_c_guest(name: &str, guest_dir: &Path, out_dir: &Path) -> Vec<u8> {
             args.extend(includes.iter().cloned());
             // By its full path, as the debug info names it for a debugger to find.
             args.extend([file.into(), "-o".into(), object.clone().into()]);
-            clang(name, args);
+            clang(name, &dir, args);
             objects.push(object);
         }
     }
@@ -242,7 +246,7 @@ fn build_c_guest(name: &str, guest_dir: &Path, out_dir: &Path) -> Vec<u8> {
     let mut args = vec![OsString::from("-Wl,--no-entry")];
     args.extend(objects.into_iter().map(OsString::from));
     args.extend(["-o".into(), core_wasm.clone().into()]);
-    clang(name, args);
+    clang(name, &dir, args);
 
     let mut module = fs::read(&core_wasm)
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", core_wasm.display()));
@@ -277,10 +281,12 @@ fn c_files(dir: &Path) -> Vec<PathBuf> {
     files
 }
 
-/// Runs clang for wasm with no C library, for the guest `name`.
-fn clang(name: &str, args: Vec<OsString>) {
+/// Runs clang for wasm with no C library, for the guest `name`, in its directory `dir`, as a
+/// project's build runs: the debug info says it was compiled there.
+fn clang(name: &str, dir: &Path, args: Vec<OsString>) {
     let clang = env::var("CLANG").unwrap_or_else(|_| "clang".into());
     let status = Command::new(&clang)
+        .current_dir(dir)
         .args([
             "--target=wasm32-unknown-unknown",
             "-nostdlib",

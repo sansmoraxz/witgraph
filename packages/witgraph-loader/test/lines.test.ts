@@ -114,7 +114,7 @@ async function load(
   nodes: [string, string][],
   connections: [string, string, string, boolean?][] = [],
   more: Partial<RemoteSessionOptions> = {},
-  which: { all?: boolean; own?: readonly string[] } = {},
+  which: OwnLinesOptions = {},
 ) {
   const stops: LineStop[] = [];
   const waiting: ((stop: LineStop) => void)[] = [];
@@ -382,12 +382,28 @@ test('a frame says the line it is waiting on', async () => {
 test('a host says which lines are its own', async () => {
   const guessed = await load([['a', 'line-walk']]);
   const directory = guessed.file.slice(0, -'lib.rs'.length);
-  const under = await load([['a', 'line-walk']], [], {}, { own: [directory] });
+  const only = (patterns: string[]) => ({ include: patterns, exclude: ['**'] });
+  const under = await load([['a', 'line-walk']], [], {}, only([`${directory}**`]));
   assert.deepEqual(under.lines.files, guessed.lines.files);
-  const nowhere = await load([['a', 'line-walk']], [], {}, { own: ['/nowhere/'] });
+  const nowhere = await load([['a', 'line-walk']], [], {}, only(['/nowhere/**']));
   assert.deepEqual(nowhere.lines.files, []);
   await nowhere.session.settle();
   assert.equal(await nowhere.session.graph.readOutput('a', 'out'), 3);
+});
+
+test("a guest's project is its own, whatever its language, and a library beside it is not", async () => {
+  // `c-lib`'s `clamp.h` has debug info, and no list knows its path: it is outside the
+  // directory `run` was compiled in.
+  const ends = (files: readonly string[]) =>
+    files.map((file) => file.split('/').slice(-2).join('/')).sort();
+  const guessed = await load([['c', 'c-walk']]);
+  assert.deepEqual(ends(guessed.lines.files), ['src/walk.c']);
+  const unanchored = await load([['c', 'c-walk']], [], {}, { anchor: false });
+  assert.deepEqual(ends(unanchored.lines.files), ['include/clamp.h', 'src/walk.c']);
+  const included = await load([['c', 'c-walk']], [], {}, { include: ['**/c-lib/**'] });
+  assert.deepEqual(ends(included.lines.files), ['include/clamp.h', 'src/walk.c']);
+  const excluded = await load([['c', 'c-walk']], [], {}, { exclude: ['**/walk.c'] });
+  assert.deepEqual(excluded.lines.files, []);
 });
 
 test('a line with no code comes to the next that has it', async () => {
