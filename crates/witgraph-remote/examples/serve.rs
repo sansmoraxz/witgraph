@@ -1,5 +1,6 @@
-//! A graph on wasmtime that a debugger can attach to: a counter feeding a guest built with
-//! debug info, ticked a few times a second. Prints where to attach, as one line of JSON.
+//! A graph on wasmtime that a debugger can attach to: a counter feeding a guest written in Rust
+//! and built with debug info, which feeds one written in C, built so too; ticked a few times a
+//! second. Prints where to attach, as one line of JSON.
 //!
 //! `cargo run -p witgraph-remote --example serve [address]`, then open the editor demo with
 //! `?attach=<url>&hash=<certificateHash>`.
@@ -11,7 +12,7 @@ use std::hash::{BuildHasher, RandomState};
 use std::io::Write as _;
 use std::time::Duration;
 
-use test_components::{LINE_WALK, RELAY};
+use test_components::{C_WALK, LINE_WALK, RELAY};
 use witgraph_ir::{Graph, NodeId, PortName, PortRef};
 use witgraph_remote::{Debuggee, Watched, serve};
 use witgraph_runtime::{OwnLines, Perf, RunningGraph, RuntimeConfig, RuntimeGraph};
@@ -23,7 +24,7 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|| "127.0.0.1:0".into());
     let mut contracts = Vec::new();
     let mut wasm = HashMap::new();
-    for guest in [RELAY, LINE_WALK] {
+    for guest in [RELAY, LINE_WALK, C_WALK] {
         let contract = witgraph_wit::load_components(guest.wit)?.remove(0);
         wasm.insert(contract.id.clone(), guest.wasm);
         contracts.push(contract);
@@ -31,8 +32,10 @@ async fn main() -> anyhow::Result<()> {
     let graph = Graph::builder("attached")
         .add_component(&contracts[0])
         .add_component(&contracts[1])
+        .add_component(&contracts[2])
         .add_node("counter", contracts[0].id.clone())
         .add_node("walker", contracts[1].id.clone())
+        .add_node("c-walker", contracts[2].id.clone())
         .connect_feedback(
             "loop",
             PortRef::new("counter", "out"),
@@ -42,6 +45,11 @@ async fn main() -> anyhow::Result<()> {
             "walk",
             PortRef::new("counter", "out"),
             PortRef::new("walker", "in"),
+        )
+        .connect(
+            "walk-in-c",
+            PortRef::new("walker", "out"),
+            PortRef::new("c-walker", "in"),
         )
         .build();
     let config = RuntimeConfig {

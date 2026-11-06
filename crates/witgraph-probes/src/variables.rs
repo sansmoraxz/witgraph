@@ -8,11 +8,12 @@ use gimli::Reader as _;
 use gimli::{
     AttributeValue, DW_AT_abstract_origin, DW_AT_byte_size, DW_AT_const_value, DW_AT_count,
     DW_AT_data_member_location, DW_AT_discr, DW_AT_discr_value, DW_AT_encoding, DW_AT_frame_base,
-    DW_AT_location, DW_AT_name, DW_AT_type, DW_AT_upper_bound, DW_ATE_UTF, DW_ATE_boolean,
-    DW_ATE_float, DW_ATE_signed, DW_ATE_signed_char, DW_TAG_array_type, DW_TAG_base_type,
-    DW_TAG_const_type, DW_TAG_enumeration_type, DW_TAG_enumerator, DW_TAG_formal_parameter,
-    DW_TAG_inlined_subroutine, DW_TAG_lexical_block, DW_TAG_member, DW_TAG_pointer_type,
-    DW_TAG_reference_type, DW_TAG_restrict_type, DW_TAG_rvalue_reference_type,
+    DW_AT_language, DW_AT_location, DW_AT_name, DW_AT_type, DW_AT_upper_bound, DW_ATE_UTF,
+    DW_ATE_boolean, DW_ATE_float, DW_ATE_signed, DW_ATE_signed_char, DW_ATE_unsigned_char,
+    DW_LANG_C, DW_LANG_C11, DW_LANG_C17, DW_LANG_C89, DW_LANG_C99, DW_TAG_array_type,
+    DW_TAG_base_type, DW_TAG_const_type, DW_TAG_enumeration_type, DW_TAG_enumerator,
+    DW_TAG_formal_parameter, DW_TAG_inlined_subroutine, DW_TAG_lexical_block, DW_TAG_member,
+    DW_TAG_pointer_type, DW_TAG_reference_type, DW_TAG_restrict_type, DW_TAG_rvalue_reference_type,
     DW_TAG_structure_type, DW_TAG_subprogram, DW_TAG_subrange_type, DW_TAG_template_type_parameter,
     DW_TAG_typedef, DW_TAG_union_type, DW_TAG_variable, DW_TAG_variant, DW_TAG_variant_part,
     DW_TAG_volatile_type, Dwarf, EndianArcSlice, LittleEndian, Operation, SectionId, Unit,
@@ -201,6 +202,7 @@ impl ModuleDebug {
                     frame,
                     pc,
                     values: 0,
+                    c: is_c(&unit)?,
                 };
                 return reader.variables(&path);
             }
@@ -287,6 +289,29 @@ struct Decoder<'a> {
     frame: &'a dyn Frame,
     pc: u64,
     values: usize,
+    /// Whether the code is C's, whose values are written as C writes them; Rust's otherwise.
+    c: bool,
+}
+
+/// Whether a base type encoded so is a C `char`.
+fn is_char(encoding: Option<gimli::DwAte>) -> bool {
+    encoding == Some(DW_ATE_signed_char) || encoding == Some(DW_ATE_unsigned_char)
+}
+
+/// Whether `unit` was compiled from C.
+fn is_c(unit: &Unit<Reader>) -> Result<bool, ProbeError> {
+    let root = unit.entry(unit.header.root_offset())?;
+    Ok(match root.attr_value(DW_AT_language) {
+        Some(AttributeValue::Language(language)) => [
+            DW_LANG_C89,
+            DW_LANG_C,
+            DW_LANG_C99,
+            DW_LANG_C11,
+            DW_LANG_C17,
+        ]
+        .contains(&language),
+        _ => false,
+    })
 }
 
 impl Decoder<'_> {
@@ -508,9 +533,86 @@ impl Decoder<'_> {
         }
     }
 
+    /// A type's name, as its source writes it. Rust's debug info names each type in full; C's
+    /// leaves a pointer's and a qualified type's to be made of what they point to and qualify.
     fn type_name(&self, offset: UnitOffset) -> Result<String, ProbeError> {
         let entry = self.unit.entry(offset)?;
-        Ok(self.name_of(&entry)?.unwrap_or_else(|| "?".to_string()))
+        let name = self.name_of(&entry)?;
+        if !self.c {
+            return Ok(name.unwrap_or_else(|| "?".to_string()));
+        }
+        let inner = || -> Result<String, ProbeError> {
+            match self.type_of(&entry)? {
+                Some(inner) => self.type_name(inner),
+                None => Ok("void".to_string()),
+            }
+        };
+        let tagged = |kind: &str| match &name {
+            Some(name) => format!("{kind} {name}"),
+            None => format!("{kind} {{…}}"),
+        };
+        let tag = entry.tag();
+        Ok(if tag == DW_TAG_structure_type {
+            tagged("struct")
+        } else if tag == DW_TAG_union_type {
+            tagged("union")
+        } else if tag == DW_TAG_enumeration_type {
+            tagged("enum")
+        } else if tag == DW_TAG_pointer_type {
+            format!("{} *", inner()?)
+        } else if tag == DW_TAG_const_type {
+            format!("const {}", inner()?)
+        } else if tag == DW_TAG_volatile_type {
+            format!("volatile {}", inner()?)
+        } else if tag == DW_TAG_restrict_type {
+            format!("{} restrict", inner()?)
+        } else {
+            name.unwrap_or_else(|| "?".to_string())
+        })
+    }
+
+    /// The base type a C pointer to text points to, through its qualifiers and typedefs: a
+    /// `char`, of one byte.
+    fn points_to_text(&self, entry: &Entry<'_>) -> Result<bool, ProbeError> {
+        let mut at = self.type_of(entry)?;
+        while let Some(offset) = at {
+            let pointee = self.unit.entry(offset)?;
+            let tag = pointee.tag();
+            if tag == DW_TAG_base_type {
+                let encoding = match pointee.attr_value(DW_AT_encoding) {
+                    Some(AttributeValue::Encoding(encoding)) => Some(encoding),
+                    _ => None,
+                };
+                return Ok(is_char(encoding));
+            }
+            if tag != DW_TAG_typedef
+                && tag != DW_TAG_const_type
+                && tag != DW_TAG_volatile_type
+                && tag != DW_TAG_restrict_type
+            {
+                return Ok(false);
+            }
+            at = self.type_of(&pointee)?;
+        }
+        Ok(false)
+    }
+
+    /// The text a C string at `address` holds, up to its NUL.
+    fn c_string(&self, name: String, type_name: &str, address: u32) -> Variable {
+        // As much as is there, short of the end of memory.
+        let bytes = (0..=MOST_TEXT.ilog2())
+            .rev()
+            .map(|shift| 1 << shift)
+            .find_map(|len| self.frame.read(address, len));
+        let Some(bytes) = bytes else {
+            return leaf(name, type_name, "<unreadable>");
+        };
+        let (text, more) = match bytes.iter().position(|byte| *byte == 0) {
+            Some(end) => (&bytes[..end], ""),
+            None => (&bytes[..], "…"),
+        };
+        let text = String::from_utf8_lossy(text);
+        leaf(name, type_name, &format!("{text:?}{more}"))
     }
 
     fn size_of(&self, offset: UnitOffset) -> Result<Option<u64>, ProbeError> {
@@ -536,7 +638,7 @@ impl Decoder<'_> {
         depth: usize,
     ) -> Result<Variable, ProbeError> {
         let entry = self.unit.entry(type_at)?;
-        let type_name = self.name_of(&entry)?.unwrap_or_else(|| "?".to_string());
+        let type_name = self.type_name(type_at)?;
         self.values += 1;
         if depth > MOST_DEPTH || self.values > MOST_VALUES {
             return Ok(leaf(name, &type_name, "…"));
@@ -617,11 +719,22 @@ impl Decoder<'_> {
                 .and_then(char::from_u32)
                 .map_or_else(|| format!("{unsigned:#x}"), |letter| format!("{letter:?}"));
         }
-        if size > 0 && (encoding == Some(DW_ATE_signed) || encoding == Some(DW_ATE_signed_char)) {
+        let number = if size > 0
+            && (encoding == Some(DW_ATE_signed) || encoding == Some(DW_ATE_signed_char))
+        {
             let shift = 128 - size * 8;
-            return ((unsigned << shift).cast_signed() >> shift).to_string();
+            ((unsigned << shift).cast_signed() >> shift).to_string()
+        } else {
+            unsigned.to_string()
+        };
+        // A C `char`: its number, and the letter it is if it is one.
+        let letter = u8::try_from(unsigned)
+            .ok()
+            .filter(|byte| byte.is_ascii_graphic() || *byte == b' ');
+        match letter {
+            Some(letter) if is_char(encoding) => format!("{number} {:?}", char::from(letter)),
+            _ => number,
         }
-        unsigned.to_string()
     }
 
     fn pointer(
@@ -641,6 +754,9 @@ impl Decoder<'_> {
         let address = u32::from_le_bytes(bytes);
         if address == 0 {
             return Ok(leaf(name, type_name, "null"));
+        }
+        if self.c && self.points_to_text(entry)? {
+            return Ok(self.c_string(name, type_name, address));
         }
         let Some(pointee) = self.type_of(entry)? else {
             return Ok(leaf(name, type_name, &format!("{address:#x}")));
@@ -732,10 +848,12 @@ impl Decoder<'_> {
             break;
         }
         let item_name = self.type_name(item_type)?;
-        let shown_type = if type_name == "?" {
-            format!("[{item_name}; {count}]")
-        } else {
+        let shown_type = if type_name != "?" {
             type_name.to_string()
+        } else if self.c {
+            format!("{item_name}[{count}]")
+        } else {
+            format!("[{item_name}; {count}]")
         };
         self.items(name, shown_type, item_type, place.clone(), count, depth)
     }
@@ -764,7 +882,11 @@ impl Decoder<'_> {
             String::new()
         };
         let list: Vec<&str> = children.iter().map(|item| item.value.as_str()).collect();
-        let value = shorten(format!("[{}{more}]", list.join(", ")));
+        let value = if self.c {
+            shorten(format!("{{ {}{more} }}", list.join(", ")))
+        } else {
+            shorten(format!("[{}{more}]", list.join(", ")))
+        };
         Ok(Variable {
             name,
             type_name,
@@ -994,7 +1116,11 @@ impl Decoder<'_> {
             }
             children.push(self.value(field, member_type, &inner, depth + 1)?);
         }
-        let value = summary_of(type_name, &children);
+        let value = if self.c {
+            c_summary_of(&children)
+        } else {
+            summary_of(type_name, &children)
+        };
         Ok(Variable {
             name,
             type_name: type_name.to_string(),
@@ -1132,6 +1258,18 @@ fn summary_of(type_name: &str, children: &[Variable]) -> String {
         format!("{short} {{ {} }}", fields.join(", "))
     };
     shorten(text)
+}
+
+/// A C struct or union on one line, as its source would write it: `{ .x = 3, .y = 2.5 }`.
+fn c_summary_of(children: &[Variable]) -> String {
+    if children.is_empty() {
+        return "{}".to_string();
+    }
+    let fields: Vec<String> = children
+        .iter()
+        .map(|child| format!(".{} = {}", child.name, child.value))
+        .collect();
+    shorten(format!("{{ {} }}", fields.join(", ")))
 }
 
 #[cfg(test)]

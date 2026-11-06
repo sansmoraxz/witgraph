@@ -1,8 +1,9 @@
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::{env, fs};
 
-const GUESTS: [&str; 50] = [
+const GUESTS: [&str; 51] = [
     "echo",
     "m0-import",
     "configurable",
@@ -53,11 +54,17 @@ const GUESTS: [&str; 50] = [
     "line-walk",
     "line-stream",
     "line-stream-sink",
+    "c-walk",
 ];
 
 /// The guests built with debug info and no optimizing, so that each source line is there
 /// to step to.
-const WITH_DEBUG_INFO: [&str; 3] = ["line-walk", "line-stream", "line-stream-sink"];
+const WITH_DEBUG_INFO: [&str; 4] = ["line-walk", "line-stream", "line-stream-sink", "c-walk"];
+
+/// The guests written in C, built with clang (`CLANG`, or `clang` on the path) and its
+/// `wasm-ld`: `src/*.c` is the guest's own code, `bindings/` what `wit-bindgen c` makes of its
+/// WIT, and `support/` the little of a C library the bindings use.
+const C_GUESTS: [&str; 1] = ["c-walk"];
 
 /// Names guests, comma-separated, to build with debug info too, as `{name}.debug.wasm`.
 const DEBUG_GUESTS: &str = "WITGRAPH_DEBUG_GUESTS";
@@ -131,7 +138,14 @@ fn main() {
         println!("cargo::rerun-if-changed=guests/{name}/Cargo.toml");
 
         let debug = WITH_DEBUG_INFO.contains(&name);
-        let component = build_guest(name, &guest_dir, &target_dir, debug);
+        let component = if C_GUESTS.contains(&name) {
+            println!("cargo::rerun-if-changed=guests/{name}/bindings");
+            println!("cargo::rerun-if-changed=guests/{name}/support");
+            println!("cargo::rerun-if-env-changed=CLANG");
+            build_c_guest(name, &guest_dir, &out_dir)
+        } else {
+            build_guest(name, &guest_dir, &target_dir, debug)
+        };
         let wasm_dst = out_dir.join(format!("{name}.wasm"));
         fs::write(&wasm_dst, &component)
             .unwrap_or_else(|e| panic!("failed to write {}: {e}", wasm_dst.display()));
@@ -190,10 +204,101 @@ fn build_guest(name: &str, guest_dir: &Path, target_dir: &Path, debug: bool) -> 
         .join(format!("{lib_name}.wasm"));
     let module = fs::read(&core_wasm)
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", core_wasm.display()));
+    componentize(name, &crate_dir, &module)
+}
 
+/// Builds a guest written in C as a component, its own code with debug info and no
+/// optimizing, so that each line is there to step to; its bindings and support without, so a
+/// debugger stops only in its own code.
+fn build_c_guest(name: &str, guest_dir: &Path, out_dir: &Path) -> Vec<u8> {
+    let dir = guest_dir.join(name);
+    let work = out_dir.join("c").join(name);
+    fs::create_dir_all(&work)
+        .unwrap_or_else(|e| panic!("failed to create {}: {e}", work.display()));
+    let includes = [
+        OsString::from("-I"),
+        dir.join("bindings").into(),
+        OsString::from("-I"),
+        dir.join("support/include").into(),
+    ];
+    let mut objects = Vec::new();
+    for (sub, flags) in [
+        ("src", ["-g", "-O0"]),
+        ("bindings", ["-g0", "-O2"]),
+        ("support", ["-g0", "-O2"]),
+    ] {
+        for file in c_files(&dir.join(sub)) {
+            let object = work.join(file.file_name().unwrap()).with_extension("o");
+            let mut args: Vec<OsString> = flags.iter().map(OsString::from).collect();
+            args.extend(["-Wall", "-Werror", "-c"].map(OsString::from));
+            args.extend(includes.iter().cloned());
+            // By its full path, as the debug info names it for a debugger to find.
+            args.extend([file.into(), "-o".into(), object.clone().into()]);
+            clang(name, args);
+            objects.push(object);
+        }
+    }
+    let core_wasm = work.join("core.wasm");
+    let mut args = vec![OsString::from("-Wl,--no-entry")];
+    args.extend(objects.into_iter().map(OsString::from));
+    args.extend(["-o".into(), core_wasm.clone().into()]);
+    clang(name, args);
+
+    let mut module = fs::read(&core_wasm)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", core_wasm.display()));
+    // What `wit-bindgen` embeds for a Rust guest, its world, embedded here.
+    let mut resolve = wit_parser::Resolve::default();
+    let (package, _) = resolve
+        .push_dir(dir.join("wit"))
+        .unwrap_or_else(|e| panic!("failed to read the WIT of {name}: {e:#}"));
+    let world = resolve
+        .select_world(&[package], None)
+        .unwrap_or_else(|e| panic!("{name} has no world: {e:#}"));
+    wit_component::embed_component_metadata(
+        &mut module,
+        &resolve,
+        world,
+        wit_component::StringEncoding::UTF8,
+        // As the bindings name what they import and export: not by the canonical names.
+        false,
+    )
+    .unwrap_or_else(|e| panic!("failed to embed the world of {name}: {e:#}"));
+    componentize(name, &dir, &module)
+}
+
+/// The C files in `dir`, in order.
+fn c_files(dir: &Path) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", dir.display()))
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "c"))
+        .collect();
+    files.sort();
+    files
+}
+
+/// Runs clang for wasm with no C library, for the guest `name`.
+fn clang(name: &str, args: Vec<OsString>) {
+    let clang = env::var("CLANG").unwrap_or_else(|_| "clang".into());
+    let status = Command::new(&clang)
+        .args([
+            "--target=wasm32-unknown-unknown",
+            "-nostdlib",
+            "-ffreestanding",
+        ])
+        .args(args)
+        .status()
+        .unwrap_or_else(|e| {
+            panic!("failed to run {clang} for the {name} guest, which needs clang and wasm-ld: {e}")
+        });
+    assert!(status.success(), "{clang} failed for the {name} guest");
+}
+
+/// A guest's core module as a component, with its world's docs.
+fn componentize(name: &str, crate_dir: &Path, module: &[u8]) -> Vec<u8> {
     let component = wit_component::ComponentEncoder::default()
         .validate(true)
-        .module(&module)
+        .module(module)
         .unwrap_or_else(|e| panic!("failed to encode {name} module: {e:#}"))
         .encode()
         .unwrap_or_else(|e| panic!("failed to produce {name} component: {e:#}"));

@@ -49,6 +49,7 @@ const GUESTS = [
   'camera-source',
   'busy-loop',
   'line-walk',
+  'c-walk',
 ];
 
 // For CI to build these with debug info, in a job of its own.

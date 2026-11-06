@@ -229,7 +229,9 @@ stays with its guest: others run on past their probes.
   with `value` on one line and `children` to look into, read as the guest stopped since it
   cannot be asked later. They are those in scope at that line of the innermost function: its
   callers' locals are out of reach from outside them. Rust's `String`, `Vec`, slices, enums and
-  `Option` read as their source would write them, and anything else field by field. Text, lists
+  `Option` read as their source would write them, and so do C's structs, unions, arrays, enums,
+  `char`s and `char *` strings (`{ .x = 3, .y = 2.5 }`, `const char *`), by the language the
+  debug info names; anything else field by field. Text, lists
   and nesting are cut off past a limit. A function's parameters hold nonsense on its opening line, before it has stored them, so a step
   goes past that line, though a breakpoint set on it stops there. Optimizing leaves few variables to read: at `opt-level = 0` you get them all, and
   above that most show as `<optimized out>`, or are not listed at all.
@@ -240,7 +242,8 @@ stays with its guest: others run on past their probes.
   some lines with no code of their own. A guest with none has no lines, and runs as usual.
 - **Only the guest's own lines** have probes, by the path the debug info gives: not the
   standard library's, or a dependency's. Stepping stays out of those, and so does their cost.
-  That is a guess from Rust's paths, so another language's libraries count as the guest's own, and
+  That is a guess from Rust's paths, so another language's libraries count as the guest's own (build
+  them without debug info, as [a node in C](components.md#writing-a-node-in-c) does its bindings), and
   so does a dependency kept in your repository: `lines: { own: ['/home/me/project/'] }` says which
   they are instead, by what their paths start with. `lines: { all: true }` puts them on every line,
   at about twice the time. A step does not stop

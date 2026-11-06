@@ -4,7 +4,8 @@
 [workspace]
 resolver = "3"
 members = ["*"]
-exclude = [".cargo", "target"]
+# `c-walk` is written in C.
+exclude = [".cargo", "target", "c-walk"]
 
 [workspace.dependencies]
 # The guests only need a wit-bindgen whose output the host's wit-component

@@ -125,6 +125,7 @@ const videoSinkRef = {
 const GUESTS = [
   'busy-loop',
   'line-walk',
+  'c-walk',
   'relay',
   'stream-producer',
   'stream-consumer',
@@ -158,6 +159,11 @@ const allComponents = GUESTS.map((guest) => ({
 const lineWalkRef = {
   package: { namespace: 'test', name: 'line-walk', version: '0.1.0' },
   world: 'line-walk',
+};
+
+const cWalkRef = {
+  package: { namespace: 'test', name: 'c-walk', version: '0.1.0' },
+  world: 'c-walk',
 };
 
 const portKinds: GraphJson = {
@@ -491,9 +497,35 @@ const lines: GraphJson = {
   ],
 };
 
+/** A guest written in Rust feeding one written in C, both built with debug info. */
+const cLines: GraphJson = {
+  metadata: {
+    name: 'demo-c-lines',
+    description: 'A guest written in Rust feeding one written in C, to step through both.',
+  },
+  components: allComponents,
+  nodes: [
+    {
+      id: 'rust',
+      component: lineWalkRef,
+      label: 'Rust',
+      attrs: { 'inject.in': '5' },
+    },
+    { id: 'c', component: cWalkRef, label: 'C', attrs: { 'inject.kinds': '4' } },
+  ],
+  connections: [
+    {
+      id: 'rust-c',
+      from: { node: 'rust', port: 'out' },
+      to: { node: 'c', port: 'in' },
+    },
+  ],
+};
+
 const demos: Record<string, Demo> = {
   spin: { graph: spin, select: 'busy' },
   lines: { graph: lines, select: 'first' },
+  'c-lines': { graph: cLines, select: 'c' },
   'port-kinds': {
     graph: portKinds,
     select: 'relay-a',

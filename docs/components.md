@@ -155,6 +155,44 @@ impl Guest for Producer {
 If the world imports other packages, put their WIT under `wit/deps/` and pass
 `generate_all` to `generate!`.
 
+## Writing a node in C
+
+`wit-bindgen c --world <world> --no-object-file wit` writes the bindings, `<world>.c` and
+`<world>.h`. `run` is an async export, which C takes as a callback: `node_run` is called with
+the inputs, hands the outputs to `node_run_return`, and returns `EXIT` to say it is done.
+
+```c
+#include "echo.h"
+
+echo_callback_code_t node_run(node_inputs_t *inputs) {
+  node_run_return((node_outputs_t){.out = inputs->in.is_some ? inputs->in.val : 0});
+  return ECHO_CALLBACK_CODE_EXIT;
+}
+
+// Called back only for what `node_run` waits on, which is nothing.
+echo_callback_code_t node_run_callback(echo_event_t *event) { __builtin_trap(); }
+```
+
+Build it for `wasm32-unknown-unknown` with clang and `wasm-ld`, then embed the world and make
+it a component:
+
+```sh
+clang --target=wasm32-unknown-unknown -nostdlib -ffreestanding -I include -Wl,--no-entry \
+  -o core.wasm echo_node.c echo.c rt.c
+wasm-tools component embed wit core.wasm -o embedded.wasm
+wasm-tools component new embedded.wasm -o echo.wasm
+```
+
+A node imports no WASI, so it has no C library. The bindings need only `realloc` and `abort`,
+which the guest defines itself (in `rt.c`), with an `include/stdlib.h` declaring them. They
+also call `__component_type_object_force_link_<world>`, which is in the object `wit-bindgen`
+writes without `--no-object-file`: a guest that embeds its world as above defines it itself,
+doing nothing. `test-fixtures/test-components/guests/c-walk` is such a node, built by the
+fixtures' build script.
+
+To stop on its lines, build its own files with `-g -O0`, and the bindings and anything else
+that is not yours without debug info (`-g0`): what has none, a debugger does not stop in.
+
 ## Previewing outputs
 
 A component can tell an editor how to preview its outputs, the way an image

@@ -38,6 +38,8 @@ jobs:
       - uses: actions/checkout@v7
       # Installs the toolchain, components and wasm32 target from rust-toolchain.toml.
       - run: rustup toolchain install
+      # The guests written in C build with clang, which the runner has, and `wasm-ld`.
+      - run: sudo apt-get update && sudo apt-get install -y lld
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: rust
@@ -69,6 +71,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: rustup toolchain install
+      # The guests written in C build with clang, which the runner has, and `wasm-ld`.
+      - run: sudo apt-get update && sudo apt-get install -y lld
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: rust

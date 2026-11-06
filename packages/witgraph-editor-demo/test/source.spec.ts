@@ -305,3 +305,51 @@ test('`?debug` loads debug builds, so any graph has its source to stop in', asyn
   await controls.locator('button.stop').click();
   await expect(controls.locator('button.run')).toBeEnabled({ timeout: 10_000 });
 });
+
+test('a guest written in C stops and steps, its variables as C writes them', async ({ page }) => {
+  const cText = readFileSync(
+    new URL('../../../test-fixtures/test-components/guests/c-walk/src/walk.c', import.meta.url),
+    'utf8',
+  );
+  const cMark = (name: string) =>
+    cText.split('\n').findIndex((line) => line.endsWith(`// mark: ${name}`)) + 1;
+  await page.goto('/?graph=c-lines&debug');
+  await expect(page.locator('#status')).toHaveClass(/ready/, { timeout: 30_000 });
+  const source = page.locator('witgraph-source');
+  const controls = page.locator('witgraph-controls');
+  const variables = source.locator('.variables');
+  const current = source.locator('.row.current');
+  const options = source.locator('select.file option');
+  await expect(options).toHaveText(['c-walk/src/walk.c', 'line-walk/src/lib.rs'], {
+    useInnerText: true,
+  });
+  await source.locator('select.file').selectOption({ label: 'c-walk/src/walk.c' });
+
+  await source.locator(`.row[data-line="${cMark('walk-first')}"] .gutter`).click();
+  await controls.locator('button.run').click();
+  await expect(current).toHaveAttribute('data-line', String(cMark('walk-first')));
+  await expect(source.locator('.where')).toContainText('in c');
+  // What the Rust guest made of 5.
+  await expect(variables.locator('[data-path="x"]')).toContainText('8');
+  await expect(variables.locator('[data-path="x"]')).toContainText('uint32_t');
+  await page.keyboard.press('F11');
+  await expect(current).toHaveAttribute('data-line', String(cMark('add-body')));
+  await expect(source.locator('.frames .frame').first()).toContainText('add');
+  await source.locator(`.row[data-line="${cMark('walk-first')}"] .gutter`).click();
+
+  await source.locator(`.row[data-line="${cMark('kinds-end')}"] .gutter`).click();
+  await page.keyboard.press('F5');
+  await expect(current).toHaveAttribute('data-line', String(cMark('kinds-end')));
+  for (const [path, shown] of [
+    ['letter', "120 'x'"],
+    ['point', '{ .x = 3, .y = 2.5 }'],
+    ['text', '"hello"'],
+    ['list', '{ 10, 20, 30 }'],
+    ['shape', 'RECT'],
+    ['pointer', '→ { .x = 3, .y = 2.5 }'],
+  ]) {
+    await expect(variables.locator(`[data-path="${path}"]`)).toContainText(shown);
+  }
+  await expect(variables.locator('[data-path="point"]')).toContainText('struct point');
+  await controls.locator('button.stop').click();
+});

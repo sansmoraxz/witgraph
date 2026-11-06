@@ -41,7 +41,7 @@ test('the editor attaches, and holds a node of the graph its program runs', asyn
   // The rest looks as it does on a graph of the page's own.
   await expect(page.locator('#graph-picker')).toContainText('Attached: 127.0.0.1');
   const catalog = page.locator('witgraph-catalog');
-  await expect(catalog.locator('.card')).toHaveCount(2);
+  await expect(catalog.locator('.card')).toHaveCount(3);
   await expect(catalog).toContainText('test:line-walk/line-walk@0.1.0');
   await expect(catalog).not.toContainText('#');
   await expect(page.locator('witgraph-timeline')).toContainText('run-returned', {
@@ -69,6 +69,7 @@ test("the editor stops on a line of the program's guest, with its source", async
   const canvas = page.locator('witgraph-canvas');
   await expect(canvas.locator('[data-node-id="walker"]')).toBeVisible({ timeout: 20_000 });
   const source = page.locator('witgraph-source');
+  await source.locator('select.file').selectOption({ label: 'line-walk/src/lib.rs' });
   // Its text comes from the program's machine.
   await expect(source.locator('.row', { hasText: 'mark: walk-first' })).toBeVisible({
     timeout: 20_000,
@@ -81,6 +82,33 @@ test("the editor stops on a line of the program's guest, with its source", async
   await expect(source).toContainText('x');
 
   await source.locator('.row', { hasText: 'mark: walk-first' }).locator('.gutter').click();
+  await page.locator('witgraph-controls').locator('button.resume').click();
+  await expect(page.locator('witgraph-controls').locator('.badge')).toHaveText('Attached');
+});
+
+test("the editor stops on a line of the program's guest written in C", async ({ page }) => {
+  await page.goto(attach);
+  const canvas = page.locator('witgraph-canvas');
+  await expect(canvas.locator('[data-node-id="c-walker"]')).toBeVisible({ timeout: 20_000 });
+  const source = page.locator('witgraph-source');
+  await source.locator('select.file').selectOption({ label: 'c-walk/src/walk.c' });
+  const row = source.locator('.row', { hasText: 'mark: walk-first' });
+  await expect(row).toContainText('uint32_t a = add(x, 1);', { timeout: 20_000 });
+  await row.locator('.gutter').click();
+  await expect(source.locator('.row.current')).toContainText('mark: walk-first', {
+    timeout: 20_000,
+  });
+  await expect(source.locator('.where')).toContainText('in c-walker');
+  await expect(source.locator('.frames .frame').first()).toContainText('walk');
+  const x = source.locator('.variables [data-path="x"]');
+  await expect(x).toContainText('uint32_t');
+
+  // Into `add`, as in a Rust guest.
+  await page.locator('witgraph-controls').locator('button.step-in').click();
+  await expect(source.locator('.row.current')).toContainText('mark: add-body');
+  await expect(source.locator('.frames .frame').first()).toContainText('add');
+
+  await row.locator('.gutter').click();
   await page.locator('witgraph-controls').locator('button.resume').click();
   await expect(page.locator('witgraph-controls').locator('.badge')).toHaveText('Attached');
 });
