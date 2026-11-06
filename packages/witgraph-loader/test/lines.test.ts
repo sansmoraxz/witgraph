@@ -7,6 +7,7 @@ import { afterEach, test } from 'node:test';
 import { pathToFileURL } from 'node:url';
 import { MessageChannel, Worker } from 'node:worker_threads';
 import {
+  type BreakpointScope,
   type Endpoint,
   endWorker,
   type LineDebugger,
@@ -157,7 +158,7 @@ async function load(
 test('a breakpoint stops on its line, naming the node, and resuming goes on', async () => {
   const { session, lines, nextStop, file } = await load([['a', 'line-walk']]);
   assert.ok(file, 'the guest has its own lines');
-  assert.equal(lines.setBreakpoint(file, mark('walk-first')), mark('walk-first'));
+  assert.equal(lines.setBreakpoint('every-node', file, mark('walk-first')), mark('walk-first'));
   await session.graph.inject('a', 'in', 5);
 
   const tick = session.tick();
@@ -190,7 +191,7 @@ async function countStops(
   line: number,
 ): Promise<number> {
   const { session, lines, nextStop } = loaded;
-  lines.setBreakpoint(file, line);
+  lines.setBreakpoint('every-node', file, line);
   const done = session
     .tick()
     .then(() => session.settle())
@@ -262,7 +263,7 @@ function variable(stop: LineStop, name: string) {
 
 test('a stop says what its variables hold, and which are in scope', async () => {
   const { session, lines, nextStop, file } = await load([['a', 'line-walk']]);
-  lines.setBreakpoint(file, mark('walk-first'));
+  lines.setBreakpoint('every-node', file, mark('walk-first'));
   await session.graph.inject('a', 'in', 5);
   const tick = session.tick();
 
@@ -284,14 +285,14 @@ test('a stop says what its variables hold, and which are in scope', async () => 
   assert.equal(variable(body, 'b').value, '2');
   assert.ok(!body.variables.some(({ name }) => name === 'x'), "its caller's is out of scope");
 
-  lines.clearBreakpoint(file, mark('walk-first'));
+  lines.clearBreakpoint('every-node', file, mark('walk-first'));
   lines.resume();
   await tick;
 });
 
 test('a variable of each kind reads as its source would write it', async () => {
   const { session, lines, nextStop, file } = await load([['a', 'line-walk']]);
-  lines.setBreakpoint(file, mark('kinds-end'));
+  lines.setBreakpoint('every-node', file, mark('kinds-end'));
   await session.graph.inject('a', 'kinds', 4);
   const tick = session.tick();
   const stop = await nextStop();
@@ -377,7 +378,7 @@ test('a variable of each kind reads as its source would write it', async () => {
 
 test('a frame says the line it is waiting on', async () => {
   const { session, lines, nextStop, file } = await load([['a', 'line-walk']]);
-  lines.setBreakpoint(file, mark('add-body'));
+  lines.setBreakpoint('every-node', file, mark('add-body'));
   const tick = session.tick();
   const stop = await nextStop();
   assert.equal(stop.frames[0].function, 'line_walk_guest::add');
@@ -449,12 +450,12 @@ for (const [guest, main, second, functions] of [
     const [home, away] = [fileOf(main), fileOf(second)] as string[];
     assert.ok(home && away, `${lines.files}`);
     assert.deepEqual(lines.filesOf('a'), [home, away].sort());
-    lines.setBreakpoint(home, markIn(mainText, 'run-scale'));
+    lines.setBreakpoint('every-node', home, markIn(mainText, 'run-scale'));
     await session.graph.inject('a', 'scale', 3);
     const tick = session.tick();
     const at = await nextStop();
     assert.deepEqual([at.file, at.line], [home, markIn(mainText, 'run-scale')]);
-    lines.clearBreakpoint(home, markIn(mainText, 'run-scale'));
+    lines.clearBreakpoint('every-node', home, markIn(mainText, 'run-scale'));
 
     lines.stepIn();
     const into = await nextStop();
@@ -492,11 +493,11 @@ for (const [guest, main, second, functions] of [
 test('a line with no code comes to the next that has it', async () => {
   const { session, lines, nextStop, file } = await load([['a', 'line-walk']]);
   const asked = mark('above-walk');
-  const actual = lines.setBreakpoint(file, asked) as number;
+  const actual = lines.setBreakpoint('every-node', file, asked) as number;
   assert.ok(actual > asked);
   assert.ok(lines.lines(file).includes(actual));
   assert.ok(!lines.lines(file).includes(asked));
-  assert.equal(lines.setBreakpoint(file, 100000), undefined, 'past the last line');
+  assert.equal(lines.setBreakpoint('every-node', file, 100000), undefined, 'past the last line');
   const tick = session.tick();
   assert.equal((await nextStop()).line, actual);
   lines.resume();
@@ -505,12 +506,12 @@ test('a line with no code comes to the next that has it', async () => {
 
 test('stepping goes over a call, into one, and out of it', async () => {
   const { session, lines, nextStop, file } = await load([['a', 'line-walk']]);
-  lines.setBreakpoint(file, mark('walk-first'));
+  lines.setBreakpoint('every-node', file, mark('walk-first'));
   const tick = session.tick();
   const first = await nextStop();
   assert.equal(first.line, mark('walk-first'));
 
-  lines.clearBreakpoint(file, mark('walk-first'));
+  lines.clearBreakpoint('every-node', file, mark('walk-first'));
   lines.stepOver();
   const second = await nextStop();
   assert.equal(second.reason, 'step');
@@ -554,7 +555,7 @@ test('pausing stops a guest in the middle of a spin', async () => {
   // A breakpoint set while it spins is seen too, with nothing in the worker reading messages.
   lines.resume();
   await new Promise((resolve) => setTimeout(resolve, 50));
-  lines.setBreakpoint(file, mark('spin-body'));
+  lines.setBreakpoint('every-node', file, mark('spin-body'));
   const hit = await nextStop();
   assert.equal(hit.reason, 'breakpoint');
   assert.equal(hit.line, mark('spin-body'));
@@ -587,7 +588,7 @@ test('a stop says whose guest it is, whichever order the graph has them in', asy
           },
         },
       );
-      lines.setBreakpoint(file, mark('walk-first'));
+      lines.setBreakpoint('every-node', file, mark('walk-first'));
       const tick = session.tick();
       const stop = await nextStop();
       assert.equal(stop.node, free, 'only the one not held is running');
@@ -615,7 +616,7 @@ test('a stop names the right node when connections decide the order', async () =
       nodes.map((node): [string, string] => [node, 'line-walk']),
       [['ab', 'a.out', 'b.in']],
     );
-    lines.setBreakpoint(file, mark('walk-first'));
+    lines.setBreakpoint('every-node', file, mark('walk-first'));
     await session.graph.inject('a', 'in', 5);
     const tick = session.tick();
     for (const [node, x] of [
@@ -640,7 +641,7 @@ test('a mocked node has no instance to count', async () => {
     [],
     { mocks: { mocked: () => ({ out: 1 }) } },
   );
-  lines.setBreakpoint(file, mark('walk-first'));
+  lines.setBreakpoint('every-node', file, mark('walk-first'));
   const tick = session.tick();
   assert.equal((await nextStop()).node, 'real');
   lines.resume();
@@ -649,18 +650,84 @@ test('a mocked node has no instance to count', async () => {
 
 test('a cleared breakpoint does not stop, and one set stays through a rebuild', async () => {
   const { session, lines, nextStop, file } = await load([['a', 'line-walk']]);
-  lines.setBreakpoint(file, mark('walk-first'));
-  lines.clearBreakpoint(file, mark('walk-first'));
+  lines.setBreakpoint('every-node', file, mark('walk-first'));
+  lines.clearBreakpoint('every-node', file, mark('walk-first'));
   await session.settle();
   assert.equal(lines.stopped, undefined);
   assert.equal(await session.graph.readOutput('a', 'out'), 3);
 
   // A new instance, with the breakpoint already set.
-  lines.setBreakpoint(file, mark('walk-second'));
+  lines.setBreakpoint('every-node', file, mark('walk-second'));
   session.graph.shutdown();
   session.graph.rerun('a');
   const tick = session.tick();
   assert.equal((await nextStop()).line, mark('walk-second'));
+  lines.resume();
+  await tick;
+});
+
+/**
+ * The nodes that stop on `walk-first`, in order, in a graph of `a` feeding `b`, with a breakpoint
+ * set there for each of `set` and those of `cleared` cleared again.
+ */
+async function whoStops(set: BreakpointScope[], cleared: BreakpointScope[] = []) {
+  const { session, lines, nextStop, file } = await load(
+    [
+      ['a', 'line-walk'],
+      ['b', 'line-walk'],
+    ],
+    [['ab', 'a.out', 'b.in']],
+  );
+  for (const scope of set) {
+    assert.equal(lines.setBreakpoint(scope, file, mark('walk-first')), mark('walk-first'));
+  }
+  for (const scope of cleared) lines.clearBreakpoint(scope, file, mark('walk-first'));
+  await session.graph.inject('a', 'in', 5);
+  const done = session
+    .tick()
+    .then(() => session.settle())
+    .then(() => null);
+  const stopped: (string | undefined)[] = [];
+  for (;;) {
+    const stop = await Promise.race([nextStop(), done]);
+    if (!stop) break;
+    stopped.push(stop.node);
+    lines.resume();
+  }
+  assert.equal(await session.graph.readOutput('b', 'out'), 11);
+  return stopped;
+}
+
+test('a breakpoint for a node stops only it, and one for every node all of them', async () => {
+  const [a, b] = [{ node: 'a' }, { node: 'b' }];
+  assert.deepEqual(await whoStops([b]), ['b']);
+  assert.deepEqual(await whoStops([a]), ['a']);
+  assert.deepEqual(await whoStops(['every-node']), ['a', 'b']);
+  assert.deepEqual(await whoStops([a, b]), ['a', 'b']);
+  assert.deepEqual(await whoStops([{ node: 'nowhere' }]), []);
+  // One for a node and one for every node are two: each is cleared on its own.
+  assert.deepEqual(await whoStops([a, 'every-node'], ['every-node']), ['a']);
+  assert.deepEqual(await whoStops([a, 'every-node'], [{ node: 'a' }]), ['a', 'b']);
+  assert.deepEqual(await whoStops([b], [b]), []);
+});
+
+// A breakpoint that never stops would leave it waiting: it fails in time instead.
+test("a node's breakpoint stays through a rebuild, for it alone", { timeout: 20_000 }, async () => {
+  const { session, lines, nextStop, file } = await load(
+    [
+      ['a', 'line-walk'],
+      ['b', 'line-walk'],
+    ],
+    [['ab', 'a.out', 'b.in']],
+  );
+  await session.settle();
+  // New instances, with the breakpoint already set.
+  lines.setBreakpoint({ node: 'b' }, file, mark('walk-second'));
+  session.graph.shutdown();
+  session.graph.rerun('a');
+  const tick = session.tick();
+  const stop = await nextStop();
+  assert.deepEqual([stop.node, stop.line], ['b', mark('walk-second')]);
   lines.resume();
   await tick;
 });
@@ -673,11 +740,11 @@ test('a step stays with its guest, while the others run past their probes', asyn
     ],
     [['ab', 'a.out', 'b.in']],
   );
-  lines.setBreakpoint(file, mark('walk-first'));
+  lines.setBreakpoint('every-node', file, mark('walk-first'));
   const tick = session.tick();
   const first = await nextStop();
   assert.equal(first.node, 'a');
-  lines.clearBreakpoint(file, mark('walk-first'));
+  lines.clearBreakpoint('every-node', file, mark('walk-first'));
 
   let result: TickResult | undefined;
   void tick.then((value) => {
@@ -708,7 +775,7 @@ test('disposing a session stopped on a line lets the worker go on to the next', 
   );
   const firstLines = first.lines as LineDebugger;
   const file = firstLines.files.find((name) => name.endsWith('line-walk/src/lib.rs')) as string;
-  firstLines.setBreakpoint(file, mark('walk-first'));
+  firstLines.setBreakpoint('every-node', file, mark('walk-first'));
   void first.tick().catch(() => {});
   await stopped.promise;
   first.dispose();
@@ -723,7 +790,7 @@ test('disposing a session stopped on a line lets the worker go on to the next', 
 
 test('ending the worker ends a guest stopped on a line', async () => {
   const { session, lines, nextStop, file, worker } = await load([['a', 'line-walk']]);
-  lines.setBreakpoint(file, mark('walk-first'));
+  lines.setBreakpoint('every-node', file, mark('walk-first'));
   const tick = session.tick();
   await nextStop();
   assert.equal(endWorker(worker), true);

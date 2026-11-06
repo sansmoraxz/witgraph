@@ -149,10 +149,19 @@ interface lines {
     stopped: func() -> option<line-stop>;
     /// Waits for the next stop not yet told of.
     next-stop: func() -> line-stop;
-    /// Stops on this line, or the next with code. Says which, if any.
-    set-breakpoint: func(file: string, line: u32) -> option<u32>;
-    /// Stops on it no more.
-    clear-breakpoint: func(file: string, line: u32);
+    /// Which nodes a breakpoint stops: two nodes of one component run the same lines.
+    variant breakpoint-scope {
+        /// Only this one.
+        node(string),
+        /// Every one whose guest has the line.
+        every-node,
+    }
+
+    /// Stops on this line, or the next with code, in the nodes `scope` says. Says which line, if
+    /// any.
+    set-breakpoint: func(scope: breakpoint-scope, file: string, line: u32) -> option<u32>;
+    /// Stops on it no more, in the nodes `scope` says.
+    clear-breakpoint: func(scope: breakpoint-scope, file: string, line: u32);
     /// Stops at the next line any guest reaches.
     pause: func();
     /// Takes back a pause no guest has reached.

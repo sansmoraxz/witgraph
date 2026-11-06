@@ -1,5 +1,6 @@
-import type { LineStop, SourceVariable, StackFrame } from 'witgraph-loader';
+import type { BreakpointScope, LineStop, SourceVariable, StackFrame } from 'witgraph-loader';
 import type { EditorController } from '../controller/editor-controller.ts';
+import { ContextMenu } from './context-menu.ts';
 import { adoptStyles } from './shared-styles.ts';
 
 const EXTRA_CSS = `
@@ -30,7 +31,12 @@ const EXTRA_CSS = `
   .gutter { flex: none; width: 1.4em; display: flex; align-items: center; justify-content: center; cursor: pointer; }
   .gutter:hover { background: var(--wg-surface-hover); }
   .dot { width: 0.7em; height: 0.7em; border-radius: 50%; }
-  .row.breakpoint .dot { background: var(--wg-error); }
+  .row.breakpoint .dot, .row.breakpoint-every .dot { background: var(--wg-error); }
+  /* One for every node running the line: ringed. */
+  .row.breakpoint-every .dot { box-shadow: 0 0 0 1.5px var(--wg-bg), 0 0 0 3px var(--wg-error); }
+  /* Fixed, so a menu near the panel's edge is not cut off by it. */
+  .menu-layer { position: fixed; inset: 0; z-index: 100; pointer-events: none; }
+  .menu-layer .ctx-menu { pointer-events: auto; white-space: nowrap; }
   .number { flex: none; width: 4em; padding-right: 1em; text-align: right; color: var(--wg-text-dim); }
   .row.no-code .number { opacity: 0.45; }
   .text { color: var(--wg-text); }
@@ -89,6 +95,10 @@ export class WitgraphSource extends HTMLElement {
   #here: LineStop | null = null;
   /** The node the variables on show are of. */
   #variablesNode: string | undefined;
+  /** The node whose files are on show. */
+  #node: string | null = null;
+  #menu = new ContextMenu();
+  #menuLayer!: HTMLDivElement;
 
   connectedCallback(): void {
     if (this.shadowRoot) {
@@ -128,8 +138,11 @@ export class WitgraphSource extends HTMLElement {
     body.className = 'body';
     body.append(this.#scroller, this.#variables);
 
+    this.#menuLayer = document.createElement('div');
+    this.#menuLayer.className = 'menu-layer';
+
     panel.append(header, body);
-    shadow.appendChild(panel);
+    shadow.append(panel, this.#menuLayer);
     this.#controller?.addEventListener('state-changed', this.#onStateChanged);
     this.#sync();
   }
@@ -160,6 +173,7 @@ export class WitgraphSource extends HTMLElement {
     if (!controller || this.hidden) return;
 
     const node = controller.selectedNode;
+    this.#node = node;
     const files = node === null ? [] : controller.lineFilesOf(node);
     const stop = controller.lineStop;
     const here = stop !== null && node !== null && stop.node === node ? stop : null;
@@ -376,11 +390,20 @@ export class WitgraphSource extends HTMLElement {
       row.dataset.line = String(number);
       const gutter = document.createElement('span');
       gutter.className = 'gutter';
-      gutter.title = 'Break on this line (or the next with code)';
+      gutter.title =
+        'Break on this line (or the next with code) in this node\n' +
+        'Alt-click: in every node running it\nRight-click: choose';
       const dot = document.createElement('span');
       dot.className = 'dot';
       gutter.appendChild(dot);
-      gutter.addEventListener('click', () => controller.toggleLineBreakpoint(file, number));
+      gutter.addEventListener('click', (event) => {
+        const scope = event.altKey ? 'every-node' : this.#nodeScope();
+        if (scope) controller.toggleLineBreakpoint(scope, file, number);
+      });
+      gutter.addEventListener('contextmenu', (event) => {
+        event.preventDefault();
+        this.#breakpointMenu(event, file, number);
+      });
       const shown = document.createElement('span');
       shown.className = 'number';
       shown.textContent = String(number);
@@ -395,6 +418,41 @@ export class WitgraphSource extends HTMLElement {
     this.#mark();
   }
 
+  /** A breakpoint for the node on show, if one is. */
+  #nodeScope(): BreakpointScope | undefined {
+    return this.#node === null ? undefined : { node: this.#node };
+  }
+
+  /** Offers a breakpoint on a line for the node on show, and for every node, each set or not. */
+  #breakpointMenu(event: MouseEvent, file: string, line: number): void {
+    const controller = this.#controller;
+    const scope = this.#nodeScope();
+    if (!controller || !scope) return;
+    const actual = controller.linesOf(file).find((candidate) => candidate >= line);
+    const set = controller.lineBreakpoints(file).filter((breakpoint) => breakpoint.line === actual);
+    const forNode = set.some(
+      (breakpoint) => breakpoint.scope !== 'every-node' && breakpoint.scope.node === this.#node,
+    );
+    const forEvery = set.some((breakpoint) => breakpoint.scope === 'every-node');
+    this.#menu.show(
+      event.clientX,
+      event.clientY,
+      [
+        {
+          label: `${forNode ? 'Remove the breakpoint' : 'Break here'} in ${this.#node}`,
+          shortcut: 'Click',
+          action: () => controller.toggleLineBreakpoint(scope, file, line),
+        },
+        {
+          label: `${forEvery ? 'Remove the breakpoint' : 'Break here'} in every node`,
+          shortcut: 'Alt+Click',
+          action: () => controller.toggleLineBreakpoint('every-node', file, line),
+        },
+      ],
+      this.#menuLayer,
+    );
+  }
+
   /** Marks the breakpoints and the current line, if they moved. */
   #mark(): void {
     const controller = this.#controller;
@@ -403,12 +461,21 @@ export class WitgraphSource extends HTMLElement {
     const stop = this.#here;
     const current = stop?.file === file ? stop.line : null;
     const breakpoints = controller.lineBreakpoints(file);
-    const marks = `${current}|${this.#frameLine}|${breakpoints.join()}`;
+    const node = this.#node;
+    const own = new Set(
+      breakpoints
+        .filter(({ scope }) => scope !== 'every-node' && scope.node === node)
+        .map(({ line }) => line),
+    );
+    const every = new Set(
+      breakpoints.filter(({ scope }) => scope === 'every-node').map(({ line }) => line),
+    );
+    const marks = `${current}|${this.#frameLine}|${[...own]}|${[...every]}`;
     if (marks !== this.#marksShown) {
       this.#marksShown = marks;
-      const set = new Set(breakpoints);
       for (const [number, row] of this.#rows) {
-        row.classList.toggle('breakpoint', set.has(number));
+        row.classList.toggle('breakpoint', own.has(number));
+        row.classList.toggle('breakpoint-every', every.has(number));
         row.classList.toggle('current', number === current);
         row.classList.toggle('frame-line', number === this.#frameLine);
       }

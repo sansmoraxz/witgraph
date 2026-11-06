@@ -84,12 +84,8 @@ test.describe('the source panel', () => {
     await expect(source.locator('.frames .frame').first()).toContainText('walk');
     await expect(controls.locator('.badge')).toContainText('Paused');
 
-    // Both nodes run this code: Continue stops at the same line in the other.
+    // Both nodes run this code, but the breakpoint is the first's: Continue runs to the end.
     await page.keyboard.press('F5');
-    await expect(source.locator('.where')).toContainText('in second');
-    await expect(current).toHaveAttribute('data-line', String(mark('walk-first')));
-
-    await controls.locator('button.resume').click();
     await expect(controls.locator('button.run')).toBeEnabled();
     await expect(current).toHaveCount(0);
     const output = await page
@@ -105,7 +101,10 @@ test.describe('the source panel', () => {
     const named = (path: string) => variables.locator(`[data-path="${path}"]`);
 
     await expect(variables).toBeHidden();
-    await source.locator(`.row[data-line="${mark('walk-first')}"] .gutter`).click();
+    // For every node: what changed is told from one node's stop to the next's.
+    await source
+      .locator(`.row[data-line="${mark('walk-first')}"] .gutter`)
+      .click({ modifiers: ['Alt'] });
     await controls.locator('button.run').click();
     await expect(source.locator('.row.current')).toBeVisible();
     await expect(variables).toBeInViewport();
@@ -328,7 +327,7 @@ test('a breakpoint in a stream loop comes back for each item', async ({ page }) 
     if (!file) throw new Error('no debug build of the sink');
     const text = (await controller.sourceOf(file)) ?? '';
     const line = text.split('\n').findIndex((row) => row.includes('frames.next()')) + 1;
-    controller.toggleLineBreakpoint(file, line);
+    controller.toggleLineBreakpoint({ node: 'video-sink' }, file, line);
   });
   await page.locator('witgraph-controls').locator('button.run').click();
   for (let stop = 0; stop < 4; stop++) {
@@ -472,4 +471,70 @@ test("the panel shows the selected node's files, and none with none selected", a
   await expect(source.locator('.variables')).toBeVisible();
   await controls.locator('button.stop').click();
   await expect(controls.locator('button.run')).toBeEnabled();
+});
+
+test('a breakpoint is for the node on show, or with Alt for every node', async ({ page }) => {
+  await page.goto('/?graph=lines&debug');
+  await expect(page.locator('#status')).toHaveClass(/ready/, { timeout: 30_000 });
+  const canvas = page.locator('witgraph-canvas');
+  const source = page.locator('witgraph-source');
+  const row = source.locator(`.row[data-line="${mark('walk-first')}"]`);
+  const select = (node: string) =>
+    canvas.evaluate((el: WitgraphCanvas, node) => el.controller?.select(node), node);
+  /** Where a run stops, resuming each time, until it is over. */
+  const stopsIn = async () => {
+    const state = () =>
+      canvas.evaluate((el: WitgraphCanvas) => {
+        const controller = el.controller;
+        if (controller?.lineStop) return `stop:${controller.lineStop.node}`;
+        return controller?.mode === 'idle' ? 'idle' : 'busy';
+      });
+    const nodes: string[] = [];
+    await canvas.evaluate((el: WitgraphCanvas) => {
+      void el.controller?.run();
+    });
+    for (;;) {
+      let now = 'busy';
+      await expect
+        .poll(async () => {
+          now = await state();
+          return now;
+        })
+        .not.toBe('busy');
+      if (now === 'idle') return nodes;
+      nodes.push(now.slice('stop:'.length));
+      await canvas.evaluate((el: WitgraphCanvas) => el.controller?.resumeBreakpoint());
+    }
+  };
+
+  // The second's, set in its view: not in the first's.
+  await select('second');
+  await row.locator('.gutter').click();
+  await expect(row).toHaveClass(/\bbreakpoint\b/);
+  await select('first');
+  await expect(row).not.toHaveClass(/breakpoint/);
+  expect(await stopsIn()).toEqual(['second']);
+
+  // With Alt, every node's: shown ringed, in each view, and stopping each.
+  await select('second');
+  await row.locator('.gutter').click();
+  await expect(row).not.toHaveClass(/breakpoint/);
+  await row.locator('.gutter').click({ modifiers: ['Alt'] });
+  await expect(row).toHaveClass(/breakpoint-every/);
+  await select('first');
+  await expect(row).toHaveClass(/breakpoint-every/);
+  expect(await stopsIn()).toEqual(['first', 'second']);
+
+  // A right-click offers both, as they are.
+  await select('first');
+  await row.locator('.gutter').click({ button: 'right' });
+  const menu = source.locator('.ctx-menu');
+  await expect(menu.locator('.ctx-item')).toHaveText([
+    /Break here in first/,
+    /Remove the breakpoint in every node/,
+  ]);
+  await menu.locator('.ctx-item', { hasText: 'every node' }).click();
+  await expect(menu).toHaveCount(0);
+  await expect(row).not.toHaveClass(/breakpoint/);
+  expect(await stopsIn()).toEqual([]);
 });

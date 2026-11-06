@@ -15,6 +15,7 @@ export type {
   GraphJsonConnection,
   GraphJsonNode,
   GraphJsonPortRef,
+  LineBreakpoint,
   NodePreview,
   NodeVisual,
   OutputView,

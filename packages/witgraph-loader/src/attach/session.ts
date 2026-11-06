@@ -12,7 +12,7 @@ import {
   type PortValues,
   type TickResult,
 } from '../index.ts';
-import type { LineStop, SourceVariable } from '../lines.ts';
+import type { BreakpointScope, LineStop, SourceVariable } from '../lines.ts';
 import type { DebugGraph, DebugLines, DebugSession } from '../remote.ts';
 import * as graph from './bindings/witgraph/debug/graph.js';
 import * as holds from './bindings/witgraph/debug/holds.js';
@@ -334,6 +334,10 @@ function attachedGraph(
   };
 }
 
+function wireScope(scope: BreakpointScope): lines.BreakpointScope {
+  return scope === 'every-node' ? { kind: 'every-node' } : { kind: 'node', value: scope.node };
+}
+
 function attachedLines(
   send: (call: (transport: Transport) => Promise<unknown>) => Promise<void>,
   sources: Map<string, number[]>,
@@ -361,13 +365,20 @@ function attachedLines(
     get stopped() {
       return stopped;
     },
-    setBreakpoint(file, line) {
+    setBreakpoint(scope, file, line) {
       const actual = sources.get(file)?.find((candidate) => candidate >= line);
-      if (actual !== undefined) send((transport) => lines.setBreakpoint(transport, file, actual));
+      if (actual !== undefined) {
+        send((transport) => lines.setBreakpoint(transport, wireScope(scope), file, actual));
+      }
       return actual;
     },
-    clearBreakpoint: (file, line) =>
-      send((transport) => lines.clearBreakpoint(transport, file, line)),
+    clearBreakpoint(scope, file, line) {
+      // Set as the line it came to.
+      const actual = sources.get(file)?.find((candidate) => candidate >= line);
+      if (actual !== undefined) {
+        send((transport) => lines.clearBreakpoint(transport, wireScope(scope), file, actual));
+      }
+    },
     pause: () => send(lines.pause),
     cancelPause: () => send(lines.cancelPause),
     holdNodes(on) {

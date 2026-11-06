@@ -567,8 +567,10 @@ test('a run stops on a line, shows it, and goes on from it by step or continue',
   assert.ok(controller.linesOf(file).includes(mark('walk-first')));
   assert.equal(await controller.sourceOf(file), lineWalkSource);
 
-  controller.toggleLineBreakpoint(file, mark('walk-first'));
-  assert.deepEqual(controller.lineBreakpoints(file), [mark('walk-first')]);
+  controller.toggleLineBreakpoint('every-node', file, mark('walk-first'));
+  assert.deepEqual(controller.lineBreakpoints(file), [
+    { scope: 'every-node', file, line: mark('walk-first') },
+  ]);
   await controller.injectValue('a', 'in', '5');
   const running = controller.run();
   await eventually(() => controller.lineStop !== null);
@@ -596,6 +598,33 @@ test('a run stops on a line, shows it, and goes on from it by step or continue',
   assert.equal(await controller.readOutput('a', 'out'), 8);
 });
 
+test("a node's line breakpoint stops it alone, and one for every node is another", async () => {
+  const { controller, file } = await loadLines(
+    [['ab', 'a.out', 'b.in']],
+    [
+      ['a', 'line-walk'],
+      ['b', 'line-walk'],
+    ],
+  );
+  const line = mark('walk-first');
+  controller.toggleLineBreakpoint({ node: 'b' }, file, line);
+  controller.toggleLineBreakpoint('every-node', file, line);
+  controller.toggleLineBreakpoint('every-node', file, line);
+  assert.deepEqual(controller.lineBreakpoints(file), [{ scope: { node: 'b' }, file, line }]);
+  const running = controller.run();
+  await eventually(() => controller.lineStop !== null);
+  // The first stop is `b`'s: `a`, which runs first, ran past the line.
+  assert.equal(controller.lineStop?.node, 'b');
+
+  controller.toggleLineBreakpoint({ node: 'b' }, file, line);
+  controller.toggleLineBreakpoint({ node: 'a' }, file, line);
+  assert.deepEqual(controller.lineBreakpoints(file), [{ scope: { node: 'a' }, file, line }]);
+  controller.resumeBreakpoint();
+  await eventually(() => controller.lineStop === null);
+  await controller.stop();
+  await running;
+});
+
 test('next node finishes the node stopped in, and pauses before the next', async () => {
   const { controller, file } = await loadLines(
     [['ab', 'a.out', 'b.in']],
@@ -604,11 +633,11 @@ test('next node finishes the node stopped in, and pauses before the next', async
       ['b', 'line-walk'],
     ],
   );
-  controller.toggleLineBreakpoint(file, mark('walk-first'));
+  controller.toggleLineBreakpoint('every-node', file, mark('walk-first'));
   const running = controller.run();
   await eventually(() => controller.lineStop !== null);
   assert.equal(controller.lineStop?.node, 'a');
-  controller.toggleLineBreakpoint(file, mark('walk-first'));
+  controller.toggleLineBreakpoint('every-node', file, mark('walk-first'));
 
   await controller.step();
   assert.equal(controller.lineStop, null, 'no longer in code');
@@ -646,10 +675,10 @@ test('a host can say which lines are its own', async () => {
 
 test('a step never stops in what a macro generated', async () => {
   const { controller, file } = await loadLines();
-  controller.toggleLineBreakpoint(file, mark('run-walk'));
+  controller.toggleLineBreakpoint('every-node', file, mark('run-walk'));
   const running = controller.run();
   await eventually(() => controller.lineStop !== null);
-  controller.toggleLineBreakpoint(file, mark('run-walk'));
+  controller.toggleLineBreakpoint('every-node', file, mark('run-walk'));
   const seen: (number | undefined)[] = [];
   while (controller.lineStop && seen.length < 40) {
     seen.push(lineOf(controller));
@@ -662,7 +691,7 @@ test('a step never stops in what a macro generated', async () => {
 
 test('stop ends a guest stopped on a line, in time, and its breakpoints stay', async () => {
   const { controller, file, workers } = await loadLines();
-  controller.toggleLineBreakpoint(file, mark('walk-first'));
+  controller.toggleLineBreakpoint('every-node', file, mark('walk-first'));
   const running = controller.run();
   await eventually(() => controller.lineStop !== null);
 
@@ -675,7 +704,9 @@ test('stop ends a guest stopped on a line, in time, and its breakpoints stay', a
   assert.deepEqual([workers.made, workers.ended], [1, 0], 'the worker answered');
 
   // The next run stops there again.
-  assert.deepEqual(controller.lineBreakpoints(file), [mark('walk-first')]);
+  assert.deepEqual(controller.lineBreakpoints(file), [
+    { scope: 'every-node', file, line: mark('walk-first') },
+  ]);
   const again = controller.run();
   await eventually(() => controller.lineStop !== null);
   assert.equal(lineOf(controller), mark('walk-first'));
@@ -708,7 +739,8 @@ test('pausing stops a guest mid-spin, and stopping it from there ends it', async
 
 test('breakpoints stay through a reload, and a step in goes from a node into its code', async () => {
   const { controller, file } = await loadLines();
-  controller.toggleLineBreakpoint(file, mark('walk-first'));
+  // The node's: it goes with it when it is renamed.
+  controller.toggleLineBreakpoint({ node: 'a' }, file, mark('walk-first'));
   controller.moveNode('a', 10, 10);
   await controller.injectValue('a', 'in', '1');
   controller.renameNode('a', 'renamed');
@@ -716,7 +748,11 @@ test('breakpoints stay through a reload, and a step in goes from a node into its
   const running = controller.run();
   await eventually(() => controller.lineStop !== null);
   assert.equal(controller.lineStop?.node, 'renamed');
-  controller.toggleLineBreakpoint(file, mark('walk-first'));
+  assert.deepEqual(controller.lineBreakpoints(file), [
+    { scope: { node: 'renamed' }, file, line: mark('walk-first') },
+  ]);
+  controller.toggleLineBreakpoint({ node: 'renamed' }, file, mark('walk-first'));
+  assert.deepEqual(controller.lineBreakpoints(file), []);
   controller.resumeBreakpoint();
   await running;
 

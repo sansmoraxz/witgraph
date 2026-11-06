@@ -1,4 +1,5 @@
 import type {
+  BreakpointScope,
   ComponentSource,
   OwnLinesOptions,
   PortValues,
@@ -9,6 +10,14 @@ import type {
 // ---------------------------------------------------------------------------
 // Editor state
 // ---------------------------------------------------------------------------
+
+/** A breakpoint on a line of a guest's source: of one node, or of every node running the line. */
+export interface LineBreakpoint {
+  scope: BreakpointScope;
+  file: string;
+  /** The line it came to: the one asked for, or the next with code. */
+  line: number;
+}
 
 /** Overall mode of the editor controller. */
 export type EditorMode = 'idle' | 'running' | 'paused' | 'error';

@@ -37,6 +37,31 @@ export interface StackFrame {
   line?: number;
 }
 
+/**
+ * Which nodes a line breakpoint stops: two nodes of one component run the same lines. What
+ * `BreakpointScope` says on wasmtime.
+ */
+export type BreakpointScope = { node: string } | 'every-node';
+
+/** Whether `scope` covers a guest of `node`, if it is one's. */
+function covers(scope: BreakpointScope, node: string | undefined): boolean {
+  return scope === 'every-node' || scope.node === node;
+}
+
+/**
+ * The breakpoints of an instance of a module: its row of the module's shared ones, which have a
+ * row for each node it runs, or one for all if it runs none. Past its rows, none.
+ */
+function breakpointsOf(
+  breakpoints: Uint8Array,
+  { probes, nodes }: Pick<LineModule, 'probes' | 'nodes'>,
+  instance: number,
+): Uint8Array {
+  const row = nodes.length === 0 ? 0 : instance;
+  if (row >= Math.max(1, nodes.length)) return new Uint8Array(probes.length);
+  return breakpoints.subarray(row * probes.length, (row + 1) * probes.length);
+}
+
 /** A core module with probes in it, as the graph's session knows it. */
 export interface LineModule {
   probes: SourceProbe[];
@@ -252,7 +277,10 @@ export class LineProbes implements SessionLines {
   modules(modules: readonly LineModule[]): void {
     this.#modules = modules;
     this.#breakpoints = modules.map(
-      (module) => new Uint8Array(new SharedArrayBuffer(Math.max(1, module.probes.length))),
+      ({ probes, nodes }) =>
+        new Uint8Array(
+          new SharedArrayBuffer(Math.max(1, probes.length * Math.max(1, nodes.length))),
+        ),
     );
     this.#lineSites = modules.map(({ probes }) => {
       const sites = new Map<string, number[]>();
@@ -298,7 +326,7 @@ export class LineProbes implements SessionLines {
     // Set here as well, as the page may be a while seeing this, if the guest goes on to spin.
     const bytes = new Uint8Array(flags);
     if (Atomics.load(this.#control, Control.Pause)) bytes.fill(1);
-    else bytes.set(this.#breakpoints[module]);
+    else bytes.set(this.#breakpointsOf(module, instance));
     this.#post('lines-instance', { module, instance, flags });
   }
 
@@ -306,7 +334,7 @@ export class LineProbes implements SessionLines {
     const control = this.#control;
     const asked = Atomics.load(control, Control.Pause) !== 0;
     const breakpoint =
-      this.#breakpoints[module][id] !== 0 && !this.#stillOnLine(module, instance, id);
+      this.#breakpointsOf(module, instance)[id] === 1 && !this.#stillOnLine(module, instance, id);
     const step = this.#stepEnds(module, instance, id);
     if (!asked && !breakpoint && !step) return;
     const frames = ownFrames();
@@ -351,7 +379,11 @@ export class LineProbes implements SessionLines {
     ) {
       return;
     }
-    this.#instances[module]?.[instance]?.flags.set(this.#breakpoints[module]);
+    this.#instances[module]?.[instance]?.flags.set(this.#breakpointsOf(module, instance));
+  }
+
+  #breakpointsOf(module: number, instance: number): Uint8Array {
+    return breakpointsOf(this.#breakpoints[module], this.#modules[module], instance);
   }
 
   /** Once it goes on, watches this line being left, and any other: the page has reset them. */
@@ -375,8 +407,8 @@ export class LineProbes implements SessionLines {
       });
     }
     for (const [at, leaving] of this.#leaving) {
-      const breakpoints = this.#breakpoints[leaving.module];
-      if (leaving.sites.some((site) => breakpoints[site] !== 0)) {
+      const breakpoints = this.#breakpointsOf(leaving.module, leaving.instance);
+      if (leaving.sites.some((site) => breakpoints[site] === 1)) {
         this.#instances[leaving.module]?.[leaving.instance]?.flags.fill(1);
       } else {
         this.#leaving.delete(at);
@@ -484,6 +516,10 @@ export class LineProbes implements SessionLines {
   }
 }
 
+function askedKey(scope: BreakpointScope, file: string, line: number): string {
+  return JSON.stringify([scope === 'every-node' ? null : scope.node, file, line]);
+}
+
 /** Sets breakpoints in a worker's guests, and steps through them, from the page. */
 export class LineDebugger {
   #control: Int32Array;
@@ -496,8 +532,11 @@ export class LineDebugger {
    * several places, and the first by address may be taken once or never.
    */
   #sites = new Map<string, Map<number, { module: number; probe: number }[]>>();
-  /** By what was asked for, the line it came to. */
-  #asked = new Map<string, Map<number, number>>();
+  /** What was asked for, by its scope, file and line, with the line it came to. */
+  #asked = new Map<
+    string,
+    { scope: BreakpointScope; file: string; line: number; actual: number }
+  >();
   #stopped: LineStop | undefined;
   #onStop: (stop: LineStop) => void;
 
@@ -547,35 +586,46 @@ export class LineDebugger {
   }
 
   /**
-   * Stops every guest on `line` of `file`, or the next line with code. Returns the line it
-   * came to, or `undefined` if there is none. A running guest sees it at once, even one that
-   * is spinning.
+   * Stops the guests `scope` says on `line` of `file`, or the next line with code. Returns the
+   * line it came to, or `undefined` if there is none. One set for a node and one for every node
+   * are two, each cleared on its own. A running guest sees it at once, even one that is spinning.
    */
-  setBreakpoint(file: string, line: number): number | undefined {
+  setBreakpoint(scope: BreakpointScope, file: string, line: number): number | undefined {
     const actual = this.lines(file).find((candidate) => candidate >= line);
     if (actual === undefined) return undefined;
-    const asked = this.#asked.get(file) ?? new Map<number, number>();
-    this.#asked.set(file, asked);
-    asked.set(line, actual);
-    this.#mark(file, actual, 1);
+    this.#asked.set(askedKey(scope, file, line), { scope, file, line, actual });
+    this.#mark(file, actual);
     return actual;
   }
 
-  /** Clears what {@link setBreakpoint} set for this line. */
-  clearBreakpoint(file: string, line: number): void {
-    const asked = this.#asked.get(file);
-    const actual = asked?.get(line);
-    if (actual === undefined) return;
-    asked?.delete(line);
-    // Another asked line may have come to the same one.
-    if (![...(asked?.values() ?? [])].includes(actual)) this.#mark(file, actual, 0);
+  /** Clears what {@link setBreakpoint} set for this line in `scope`. */
+  clearBreakpoint(scope: BreakpointScope, file: string, line: number): void {
+    const key = askedKey(scope, file, line);
+    const asked = this.#asked.get(key);
+    if (!asked) return;
+    this.#asked.delete(key);
+    this.#mark(file, asked.actual);
   }
 
-  #mark(file: string, line: number, value: 0 | 1): void {
+  /** Arms each instance's probes of a line as what is asked of it says. */
+  #mark(file: string, line: number): void {
+    const asked = [...this.#asked.values()].filter(
+      (other) => other.file === file && other.actual === line,
+    );
     for (const { module, probe } of this.#sites.get(file)?.get(line) ?? []) {
-      this.#breakpoints[module][probe] = value;
-      for (const flags of this.#flags[module]) if (flags) flags[probe] = value;
+      const { nodes, probes } = this.#modules[module];
+      for (let row = 0; row < Math.max(1, nodes.length); row++) {
+        const value = asked.some(({ scope }) => covers(scope, nodes[row])) ? 1 : 0;
+        this.#breakpoints[module][row * probes.length + probe] = value;
+      }
+      for (const [instance, flags] of this.#flags[module].entries()) {
+        if (flags) flags[probe] = this.#breakpointsOf(module, instance)[probe];
+      }
     }
+  }
+
+  #breakpointsOf(module: number, instance: number): Uint8Array {
+    return breakpointsOf(this.#breakpoints[module], this.#modules[module], instance);
   }
 
   /** Stops at the next probe any guest reaches, even one that is spinning. */
@@ -641,7 +691,9 @@ export class LineDebugger {
 
   #restore(): void {
     for (const [module, instances] of this.#flags.entries()) {
-      for (const flags of instances) flags?.set(this.#breakpoints[module]);
+      for (const [instance, flags] of instances.entries()) {
+        flags?.set(this.#breakpointsOf(module, instance));
+      }
     }
   }
 
@@ -655,6 +707,7 @@ export class LineDebugger {
   release(): void {
     Atomics.store(this.#control, Control.Pause, 0);
     Atomics.store(this.#control, Control.Step, 0);
+    this.#asked.clear();
     for (const breakpoints of this.#breakpoints) breakpoints.fill(0);
     this.#restore();
     this.#go();
@@ -670,7 +723,7 @@ export class LineDebugger {
       this.#flags[data.module][data.instance] = flags;
       // A breakpoint set since it was made: this writes what the worker could not know.
       if (Atomics.load(this.#control, Control.Pause)) flags.fill(1);
-      else flags.set(this.#breakpoints[data.module]);
+      else flags.set(this.#breakpointsOf(data.module, data.instance));
     } else if (kind === 'lines-stop') {
       this.#stopped = data.stop;
       this.#onStop(data.stop);

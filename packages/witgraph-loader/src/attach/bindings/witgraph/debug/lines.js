@@ -6,6 +6,7 @@ export const StackFrame = $t.record({ "function": $t.string, "file": $t.option($
 export const Child = $t.record({ "path": $t.string, "type-name": $t.string, "value": $t.string });
 export const Variable = $t.record({ "name": $t.string, "type-name": $t.string, "value": $t.string, "children": $t.list(Child) });
 export const LineStop = $t.record({ "reason": StopReason, "file": $t.string, "line": $t.u32, "column": $t.u32, "node": $t.option($t.string), "frames": $t.list(StackFrame), "variables": $t.list(Variable) });
+export const BreakpointScope = $t.variant({ "node": $t.string, "every-node": null });
 export async function files(transport) {
   const $r = await $invoke(transport, "witgraph:debug/lines@0.1.0", "files", [], [], [$t.list($t.string)]);
   await $r.finished;
@@ -36,13 +37,13 @@ export async function nextStop(transport) {
   await $r.finished;
   return $r.results[0];
 }
-export async function setBreakpoint(transport, file, line) {
-  const $r = await $invoke(transport, "witgraph:debug/lines@0.1.0", "set-breakpoint", [$t.string, $t.u32], [file, line], [$t.option($t.u32)]);
+export async function setBreakpoint(transport, scope, file, line) {
+  const $r = await $invoke(transport, "witgraph:debug/lines@0.1.0", "set-breakpoint", [BreakpointScope, $t.string, $t.u32], [scope, file, line], [$t.option($t.u32)]);
   await $r.finished;
   return $r.results[0];
 }
-export async function clearBreakpoint(transport, file, line) {
-  const $r = await $invoke(transport, "witgraph:debug/lines@0.1.0", "clear-breakpoint", [$t.string, $t.u32], [file, line], []);
+export async function clearBreakpoint(transport, scope, file, line) {
+  const $r = await $invoke(transport, "witgraph:debug/lines@0.1.0", "clear-breakpoint", [BreakpointScope, $t.string, $t.u32], [scope, file, line], []);
   await $r.finished;
 }
 export async function pause(transport) {

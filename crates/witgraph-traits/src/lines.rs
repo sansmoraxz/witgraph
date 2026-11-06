@@ -297,6 +297,26 @@ pub struct LineStop {
     pub variables: Vec<SourceVariable>,
 }
 
+/// Which nodes a line breakpoint stops: two nodes of one component run the same lines.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum BreakpointScope {
+    /// Only this node: another of its component runs past.
+    Node(NodeId),
+    /// Every node whose guest has the line.
+    EveryNode,
+}
+
+impl BreakpointScope {
+    /// Whether a guest of `node`, if it is one's, stops here.
+    #[must_use]
+    pub fn covers(&self, node: Option<&NodeId>) -> bool {
+        match self {
+            Self::Node(only) => node == Some(only),
+            Self::EveryNode => true,
+        }
+    }
+}
+
 /// Sets breakpoints in a graph's guests, and steps through them. Only guests built with debug
 /// info have lines, and only their own: not the standard library's, or a dependency's.
 ///
@@ -320,12 +340,13 @@ pub trait LineDebugger {
     /// The next stop not yet told of.
     fn next_stop(&self) -> impl Future<Output = LineStop> + MaybeSend;
 
-    /// Stops every guest on `line` of `file`, or the next line with code. Returns the line it
-    /// came to, or `None` if there is none.
-    fn set_breakpoint(&self, file: &str, line: u32) -> Option<u32>;
+    /// Stops the guests `scope` says on `line` of `file`, or the next line with code. Returns
+    /// the line it came to, or `None` if there is none. One set for a node and one for every
+    /// node are two, each cleared on its own.
+    fn set_breakpoint(&self, scope: &BreakpointScope, file: &str, line: u32) -> Option<u32>;
 
-    /// Clears what [`set_breakpoint`](Self::set_breakpoint) set for this line.
-    fn clear_breakpoint(&self, file: &str, line: u32);
+    /// Clears what [`set_breakpoint`](Self::set_breakpoint) set for this line in `scope`.
+    fn clear_breakpoint(&self, scope: &BreakpointScope, file: &str, line: u32);
 
     /// Stops at the next line any guest reaches.
     fn pause(&self);

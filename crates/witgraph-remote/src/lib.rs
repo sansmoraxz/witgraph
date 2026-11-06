@@ -463,6 +463,15 @@ impl<C: Send + Sync, M: RuntimeMode, H: Host> holds::Handler<C> for Handler<M, H
     }
 }
 
+fn breakpoint_scope(scope: lines::BreakpointScope) -> witgraph_runtime::BreakpointScope {
+    match scope {
+        lines::BreakpointScope::Node(node) => {
+            witgraph_runtime::BreakpointScope::Node(NodeId::from(node.as_str()))
+        }
+        lines::BreakpointScope::EveryNode => witgraph_runtime::BreakpointScope::EveryNode,
+    }
+}
+
 fn held_run(held: witgraph_runtime::HeldRun) -> holds::HeldRun {
     holds::HeldRun {
         id: held.id.0,
@@ -512,15 +521,28 @@ impl<C: Send + Sync, M: RuntimeMode, H: Host> lines::Handler<C> for Handler<M, H
         }
     }
 
-    async fn set_breakpoint(&self, _: C, file: String, line: u32) -> anyhow::Result<Option<u32>> {
+    async fn set_breakpoint(
+        &self,
+        _: C,
+        scope: lines::BreakpointScope,
+        file: String,
+        line: u32,
+    ) -> anyhow::Result<Option<u32>> {
+        let scope = breakpoint_scope(scope);
         Ok(self
             .lines()
-            .and_then(|lines| lines.set_breakpoint(&file, line)))
+            .and_then(|lines| lines.set_breakpoint(&scope, &file, line)))
     }
 
-    async fn clear_breakpoint(&self, _: C, file: String, line: u32) -> anyhow::Result<()> {
+    async fn clear_breakpoint(
+        &self,
+        _: C,
+        scope: lines::BreakpointScope,
+        file: String,
+        line: u32,
+    ) -> anyhow::Result<()> {
         if let Some(lines) = self.lines() {
-            lines.clear_breakpoint(&file, line);
+            lines.clear_breakpoint(&breakpoint_scope(scope), &file, line);
         }
         Ok(())
     }

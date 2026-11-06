@@ -27,6 +27,11 @@ export declare const Variable: $wrpc.Type;
 export type LineStop = { reason: StopReason; file: string; line: number; column: number; node: string | undefined; frames: globalThis.Array<StackFrame>; variables: globalThis.Array<Variable> };
 export declare const LineStop: $wrpc.Type;
 /**
+ * Which nodes a breakpoint stops: two nodes of one component run the same lines.
+ */
+export type BreakpointScope = { kind: "node"; value: string } | { kind: "every-node" };
+export declare const BreakpointScope: $wrpc.Type;
+/**
  * The source files with lines to stop on.
  */
 export function files(transport: $wrpc.Transport): globalThis.Promise<globalThis.Array<string>>;
@@ -51,13 +56,14 @@ export function stopped(transport: $wrpc.Transport): globalThis.Promise<LineStop
  */
 export function nextStop(transport: $wrpc.Transport): globalThis.Promise<LineStop>;
 /**
- * Stops on this line, or the next with code. Says which, if any.
+ * Stops on this line, or the next with code, in the nodes `scope` says. Says which line, if
+ * any.
  */
-export function setBreakpoint(transport: $wrpc.Transport, file: string, line: number): globalThis.Promise<number | undefined>;
+export function setBreakpoint(transport: $wrpc.Transport, scope: BreakpointScope, file: string, line: number): globalThis.Promise<number | undefined>;
 /**
- * Stops on it no more.
+ * Stops on it no more, in the nodes `scope` says.
  */
-export function clearBreakpoint(transport: $wrpc.Transport, file: string, line: number): globalThis.Promise<void>;
+export function clearBreakpoint(transport: $wrpc.Transport, scope: BreakpointScope, file: string, line: number): globalThis.Promise<void>;
 /**
  * Stops at the next line any guest reaches.
  */

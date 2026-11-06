@@ -298,7 +298,9 @@ async fn a_debugger_stops_a_guest_on_a_line_and_reads_its_source() {
         }
     });
     assert_eq!(
-        lines::set_breakpoint(&wrpc, (), &file, line).await.unwrap(),
+        lines::set_breakpoint(&wrpc, (), &lines::BreakpointScope::EveryNode, &file, line)
+            .await
+            .unwrap(),
         Some(line)
     );
     let stop = tokio::time::timeout(Duration::from_secs(20), lines::next_stop(&wrpc, ()))
@@ -311,7 +313,7 @@ async fn a_debugger_stops_a_guest_on_a_line_and_reads_its_source() {
         "{:?}",
         stop.variables
     );
-    lines::clear_breakpoint(&wrpc, (), &file, line)
+    lines::clear_breakpoint(&wrpc, (), &lines::BreakpointScope::EveryNode, &file, line)
         .await
         .unwrap();
     lines::resume(&wrpc, ()).await.unwrap();
@@ -360,7 +362,9 @@ async fn a_debugger_that_goes_leaves_no_breakpoint_behind() {
 
     let (served, gone, file, line) = lines_attached().await;
     assert_eq!(
-        lines::set_breakpoint(&gone, (), &file, line).await.unwrap(),
+        lines::set_breakpoint(&gone, (), &lines::BreakpointScope::EveryNode, &file, line)
+            .await
+            .unwrap(),
         Some(line)
     );
     tokio::time::timeout(Duration::from_secs(20), lines::next_stop(&gone, ()))
@@ -389,4 +393,32 @@ async fn a_debugger_that_goes_leaves_no_breakpoint_behind() {
         .await
         .expect("the breakpoint went with its debugger");
     assert!(lines::stopped(&next, ()).await.unwrap().is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_breakpoint_for_one_node_stops_only_it() {
+    use client::witgraph::debug::lines::{self, BreakpointScope};
+
+    let (_served, wrpc, file, line) = lines_attached().await;
+    // The walker runs this line at every count: a breakpoint for another node never stops it.
+    let other = BreakpointScope::Node("counter".into());
+    lines::set_breakpoint(&wrpc, (), &other, &file, line)
+        .await
+        .unwrap();
+    let early = tokio::time::timeout(Duration::from_secs(1), lines::next_stop(&wrpc, ())).await;
+    assert!(early.is_err(), "stopped for another node: {early:?}");
+
+    let walker = BreakpointScope::Node("walker".into());
+    lines::set_breakpoint(&wrpc, (), &walker, &file, line)
+        .await
+        .unwrap();
+    let stop = tokio::time::timeout(Duration::from_secs(20), lines::next_stop(&wrpc, ()))
+        .await
+        .expect("it stops")
+        .unwrap();
+    assert_eq!((stop.line, stop.node.as_deref()), (line, Some("walker")));
+    lines::clear_breakpoint(&wrpc, (), &walker, &file, line)
+        .await
+        .unwrap();
+    lines::resume(&wrpc, ()).await.unwrap();
 }

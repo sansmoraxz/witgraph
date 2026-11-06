@@ -1032,6 +1032,7 @@ export function diagnosticsOf(error: unknown): Diagnostic[] | undefined {
 
 export { AttachedSession, type AttachOptions } from './attach/session.ts';
 export {
+  type BreakpointScope,
   LineDebugger,
   type LineModule,
   type LineStop,

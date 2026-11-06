@@ -11,9 +11,12 @@ use std::time::Duration;
 use test_components::{C_WALK, Guest, LINE_WALK};
 use witgraph_ir::{Graph, NodeId, PortName, PortRef};
 use witgraph_runtime::{
-    LineDebugger, LineStop, OwnLines, OwnRules, PathPattern, Perf, RunningGraph, RuntimeConfig,
-    RuntimeGraph, RuntimeLines, StopReason, TickResult,
+    BreakpointScope, LineDebugger, LineStop, OwnLines, OwnRules, PathPattern, Perf, RunningGraph,
+    RuntimeConfig, RuntimeGraph, RuntimeLines, StopReason, TickResult,
 };
+
+/// What the tests here set: written before breakpoints were per node, they ask for every one.
+const EVERY: BreakpointScope = BreakpointScope::EveryNode;
 
 const SOURCE: &str =
     include_str!("../../../test-fixtures/test-components/guests/c-walk/src/walk.c");
@@ -149,7 +152,7 @@ async fn a_breakpoint_stops_on_a_line_of_c_naming_the_node_and_function() {
     let (mut rt, lines) = load(&[("c", C_WALK)], &[]).await;
     let file = c_file(&lines);
     assert_eq!(
-        lines.set_breakpoint(&file, mark("walk-first")),
+        lines.set_breakpoint(&EVERY, &file, mark("walk-first")),
         Some(mark("walk-first"))
     );
     inject(&mut rt, "c", "in", "5").await;
@@ -183,11 +186,11 @@ async fn a_breakpoint_stops_on_a_line_of_c_naming_the_node_and_function() {
 async fn stepping_through_c_goes_over_a_call_into_one_and_out_of_it() {
     let (mut rt, lines) = load(&[("c", C_WALK)], &[]).await;
     let file = c_file(&lines);
-    lines.set_breakpoint(&file, mark("walk-first"));
+    lines.set_breakpoint(&EVERY, &file, mark("walk-first"));
     inject(&mut rt, "c", "in", "5").await;
     settling(&mut rt, async {
         let first = lines.next_stop().await;
-        lines.clear_breakpoint(&file, mark("walk-first"));
+        lines.clear_breakpoint(&EVERY, &file, mark("walk-first"));
 
         lines.step_over();
         let second = lines.next_stop().await;
@@ -219,7 +222,7 @@ async fn stepping_through_c_goes_over_a_call_into_one_and_out_of_it() {
 async fn a_c_variable_of_each_kind_reads_as_c_would_write_it() {
     let (mut rt, lines) = load(&[("c", C_WALK)], &[]).await;
     let file = c_file(&lines);
-    lines.set_breakpoint(&file, mark("kinds-end"));
+    lines.set_breakpoint(&EVERY, &file, mark("kinds-end"));
     inject(&mut rt, "c", "kinds", "4").await;
     settling(&mut rt, async {
         let stop = lines.next_stop().await;
@@ -287,7 +290,7 @@ async fn a_rust_guest_and_a_c_guest_are_debugged_side_by_side() {
         "only the C guest's"
     );
     assert!(lines.files_of(&NodeId::from("nowhere")).is_empty());
-    lines.set_breakpoint(&file, mark("walk-first"));
+    lines.set_breakpoint(&EVERY, &file, mark("walk-first"));
     inject(&mut rt, "rust", "in", "5").await;
     settling(&mut rt, async {
         // What the Rust guest made of 5 is what the C one walks.
@@ -353,12 +356,12 @@ async fn a_library_from_outside_the_project_is_not_its_own_whatever_its_path() {
 async fn a_step_goes_through_a_library_that_is_not_its_own() {
     let (mut rt, lines) = load(&[("c", C_WALK)], &[]).await;
     let file = c_file(&lines);
-    lines.set_breakpoint(&file, mark("run-clamp"));
+    lines.set_breakpoint(&EVERY, &file, mark("run-clamp"));
     inject(&mut rt, "c", "in", "5").await;
     settling(&mut rt, async {
         let stop = lines.next_stop().await;
         assert_eq!(stop.line, mark("run-clamp"));
-        lines.clear_breakpoint(&file, mark("run-clamp"));
+        lines.clear_breakpoint(&EVERY, &file, mark("run-clamp"));
         lines.step_in();
         let next = lines.next_stop().await;
         assert_eq!(
@@ -377,7 +380,7 @@ async fn a_step_goes_through_a_library_that_is_not_its_own() {
 async fn a_step_goes_from_one_c_file_of_the_guest_into_another_and_back() {
     let (mut rt, lines) = load(&[("c", C_WALK)], &[]).await;
     let (walk, scale) = c_files(&lines);
-    lines.set_breakpoint(&walk, mark("run-scale"));
+    lines.set_breakpoint(&EVERY, &walk, mark("run-scale"));
     inject(&mut rt, "c", "scale", "3").await;
     settling(&mut rt, async {
         let at = lines.next_stop().await;
@@ -385,7 +388,7 @@ async fn a_step_goes_from_one_c_file_of_the_guest_into_another_and_back() {
             (at.file.as_str(), at.line),
             (walk.as_str(), mark("run-scale"))
         );
-        lines.clear_breakpoint(&walk, mark("run-scale"));
+        lines.clear_breakpoint(&EVERY, &walk, mark("run-scale"));
 
         // Into `scale.c`, called from `walk.c`.
         lines.step_in();
@@ -443,7 +446,7 @@ async fn a_step_goes_from_one_c_file_of_the_guest_into_another_and_back() {
 async fn a_breakpoint_in_a_second_c_file_stops_there() {
     let (mut rt, lines) = load(&[("c", C_WALK)], &[]).await;
     let (_, scale) = c_files(&lines);
-    lines.set_breakpoint(&scale, scale_mark("scale-end"));
+    lines.set_breakpoint(&EVERY, &scale, scale_mark("scale-end"));
     inject(&mut rt, "c", "scale", "4").await;
     settling(&mut rt, async {
         let stop = lines.next_stop().await;

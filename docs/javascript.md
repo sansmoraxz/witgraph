@@ -206,8 +206,9 @@ const session = await RemoteSession.load(worker, {
   lines: { onStop: (stop) => show(stop.file, stop.line, stop.node, stop.frames) },
 });
 const { lines } = session;
-lines.setBreakpoint(file, 42); // from `lines.filesOf(node)`, or `lines.files` for every node's
-// It returns the line it came to.
+// `file` from `lines.filesOf(node)`, or `lines.files` for every node's. It returns the line it
+// came to. `{ node }` stops only that node; `'every-node'` each one whose guest has the line.
+lines.setBreakpoint({ node: 'walker' }, file, 42);
 // `stop.frames` is the stack: `{ function, file?, line? }`, the line a caller's call is on.
 void session.tick();
 // ... `onStop` says where it stopped, and what its variables hold; then one of:
@@ -219,8 +220,10 @@ lines.resume();
 
 `pause()` stops at the next line any guest reaches. It and `setBreakpoint` take effect at
 once, even on a guest in a loop that never returns to its worker. A breakpoint on a line
-with no code comes to the next that has some, and stops every node running that code. A step
-stays with its guest: others run on past their probes.
+with no code comes to the next that has some. Two nodes of one component run the same lines:
+one set for a node stops it alone, and the other runs past at no cost. One set for a node and one
+for every node are two, each cleared on its own. A step stays with its guest: others run on past
+their probes.
 
 - **The page must be cross-origin isolated**, for the shared memory this goes through: serve
   it with `Cross-Origin-Opener-Policy: same-origin` and

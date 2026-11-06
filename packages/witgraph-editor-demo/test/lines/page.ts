@@ -50,8 +50,8 @@ Object.assign(window, {
     frames: () => frames,
     stops: () => stops,
     file: () => file,
-    set: (line: number) => lines.setBreakpoint(file, line),
-    clear: (line: number) => lines.clearBreakpoint(file, line),
+    set: (line: number) => lines.setBreakpoint('every-node', file, line),
+    clear: (line: number) => lines.clearBreakpoint('every-node', file, line),
     inject: (port: string, value: number) => session.graph.inject('walker', port, value),
     tick: () => {
       ticked = undefined;

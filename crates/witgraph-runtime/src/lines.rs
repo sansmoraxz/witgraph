@@ -24,7 +24,9 @@ use witgraph_probes::{
     defined_function_names, imported_functions, source_lines,
 };
 use witgraph_traits::executor::MaybeSend;
-use witgraph_traits::lines::{LineDebugger, LineStop, OwnLines, StackFrame, StopReason};
+use witgraph_traits::lines::{
+    BreakpointScope, LineDebugger, LineStop, OwnLines, StackFrame, StopReason,
+};
 
 /// What tells one core module from another, for finding its nodes.
 fn fingerprint(module: &[u8]) -> u64 {
@@ -76,11 +78,19 @@ struct StoppedAt {
     depth: usize,
 }
 
+/// A breakpoint a host asked for.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct Asked {
+    scope: BreakpointScope,
+    file: String,
+    line: u32,
+}
+
 #[derive(Default)]
 struct State {
     modules: Vec<Arc<ModuleLines>>,
-    /// What a host asked, by file: the line asked for, and the one it came to.
-    asked: HashMap<String, HashMap<u32, u32>>,
+    /// What a host asked, and the line each came to.
+    asked: HashMap<Asked, u32>,
     pause: bool,
     step: Option<Step>,
     stopped: Option<LineStop>,
@@ -105,18 +115,31 @@ struct Leaving {
 }
 
 impl State {
+    /// Where the Store is to break: a module's code is every instance's, so a breakpoint for one
+    /// node is set for all of its module's, and [`stops`](Self::stops) tells them apart.
     fn wanted(&self) -> BTreeSet<(usize, ProbeId)> {
         let mut wanted = BTreeSet::new();
-        for (file, asked) in &self.asked {
-            for line in asked.values() {
-                for (at, module) in self.modules.iter().enumerate() {
-                    for site in module.index.sites(file, *line) {
+        for (asked, line) in &self.asked {
+            for (at, module) in self.modules.iter().enumerate() {
+                let runs = match &asked.scope {
+                    BreakpointScope::Node(node) => module.nodes.contains(node),
+                    BreakpointScope::EveryNode => true,
+                };
+                if runs {
+                    for site in module.index.sites(&asked.file, *line) {
                         wanted.insert((at, *site));
                     }
                 }
             }
         }
         wanted
+    }
+
+    /// Whether a breakpoint stops `node`'s guest on `line` of `file`.
+    fn stops(&self, file: &str, line: u32, node: Option<&NodeId>) -> bool {
+        self.asked.iter().any(|(asked, came_to)| {
+            *came_to == line && asked.file == file && asked.scope.covers(node)
+        })
     }
 }
 
@@ -186,6 +209,22 @@ impl Shared {
         }
     }
 
+    /// The node whose guest `instance` of `module` is, by its place among the module's instances.
+    fn node_of<D: 'static>(
+        store: &mut StoreContextMut<'_, D>,
+        module: &ModuleLines,
+        module_id: u64,
+        instance: Instance,
+    ) -> Option<NodeId> {
+        let ordinal = store
+            .as_context_mut()
+            .debug_all_instances()
+            .into_iter()
+            .filter(|other| other.module(store.as_context()).debug_index_in_engine() == module_id)
+            .position(|other| other == instance)?;
+        module.nodes.get(ordinal).cloned()
+    }
+
     /// The frames of `module` on the stack from `top`, innermost first: each function, among
     /// those it defines, and where in the module it is.
     fn own_frames<D: 'static>(
@@ -238,6 +277,17 @@ impl Shared {
         };
         let probe = module.index.at(pc.raw())?;
         let instance = top.instance(&mut *store).ok()?;
+        let source = module.index.probe(probe)?;
+        // Found only when it matters: single-stepping comes here at every line.
+        let mut node = None;
+        if armed {
+            let found = Self::node_of(store, &module, module_id, instance);
+            // Set for the module, which another node's guest may be.
+            armed = self
+                .state()
+                .stops(&source.file, source.line, found.as_ref());
+            node = Some(found);
+        }
         let frames = Self::own_frames(store, &top, module_id);
         let depth = frames.len();
         {
@@ -276,19 +326,16 @@ impl Shared {
             return None;
         };
 
-        let source = module.index.probe(probe)?;
-        let ordinal = store
-            .as_context_mut()
-            .debug_all_instances()
-            .into_iter()
-            .filter(|other| other.module(store.as_context()).debug_index_in_engine() == module_id)
-            .position(|other| other == instance);
+        let node = match node {
+            Some(node) => node,
+            None => Self::node_of(store, &module, module_id, instance),
+        };
         let stop = LineStop {
             reason,
             file: source.file.clone(),
             line: source.line,
             column: source.column,
-            node: ordinal.and_then(|ordinal| module.nodes.get(ordinal).cloned()),
+            node,
             frames: frames
                 .iter()
                 .map(|(function, pc)| {
@@ -614,28 +661,28 @@ impl LineDebugger for RuntimeLines {
         })
     }
 
-    fn set_breakpoint(&self, file: &str, line: u32) -> Option<u32> {
+    fn set_breakpoint(&self, scope: &BreakpointScope, file: &str, line: u32) -> Option<u32> {
         let actual = self
             .lines(file)
             .into_iter()
             .find(|candidate| *candidate >= line)?;
-        let mut state = self.shared.state();
-        state
-            .asked
-            .entry(file.to_string())
-            .or_default()
-            .insert(line, actual);
-        drop(state);
+        let asked = Asked {
+            scope: scope.clone(),
+            file: file.to_string(),
+            line,
+        };
+        self.shared.state().asked.insert(asked, actual);
         self.shared.notify_store();
         Some(actual)
     }
 
-    fn clear_breakpoint(&self, file: &str, line: u32) {
-        let mut state = self.shared.state();
-        if let Some(asked) = state.asked.get_mut(file) {
-            asked.remove(&line);
-        }
-        drop(state);
+    fn clear_breakpoint(&self, scope: &BreakpointScope, file: &str, line: u32) {
+        let asked = Asked {
+            scope: scope.clone(),
+            file: file.to_string(),
+            line,
+        };
+        self.shared.state().asked.remove(&asked);
         self.shared.notify_store();
     }
 

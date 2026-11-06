@@ -450,7 +450,8 @@ let mut graph = RuntimeGraph::load(compiled, &wasm, config, Perf).await?;
 let lines = graph.lines().expect("loaded to debug");
 
 let file = lines.files_of(&NodeId::from("walker")).remove(0); // `files()` has every node's
-lines.set_breakpoint(&file, 42); // returns the line it came to
+// Returns the line it came to. `BreakpointScope::EveryNode` stops each node whose guest has it.
+lines.set_breakpoint(&BreakpointScope::Node(NodeId::from("walker")), &file, 42);
 let (_, ()) = tokio::join!(graph.tick(), async {
     let stop = lines.next_stop().await;
     println!("{}:{} in {:?}: {:?}", stop.file, stop.line, stop.node, stop.variables);
@@ -460,7 +461,9 @@ let (_, ()) = tokio::join!(graph.tick(), async {
 });
 ```
 
-A guest's lines can be in many files of its own, and a step goes from one into another as its
+A breakpoint for one node stops it alone, though another of its component runs the same code: on
+wasmtime that code is shared, so the other is stopped at the line for as long as it takes to see
+it is not the one, and goes on. A guest's lines can be in many files of its own, and a step goes from one into another as its
 calls do: `frames` says the file and line of each. Hold on to a clone of `lines`, as a stopped
 guest holds up its tick. What it is told takes effect
 even on a guest in a loop that never returns.

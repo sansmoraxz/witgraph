@@ -15,9 +15,12 @@ use witgraph_ir::{
     ComponentContract, ComponentRef, Graph, GraphBuilder, NodeId, PortName, PortRef,
 };
 use witgraph_runtime::{
-    LineDebugger, LineStop, OwnLines, Perf, RunningGraph, RuntimeConfig, RuntimeGraph,
-    RuntimeLines, StopReason, TickResult,
+    BreakpointScope, LineDebugger, LineStop, OwnLines, Perf, RunningGraph, RuntimeConfig,
+    RuntimeGraph, RuntimeLines, StopReason, TickResult,
 };
+
+/// What the tests here set: written before breakpoints were per node, they ask for every one.
+const EVERY: BreakpointScope = BreakpointScope::EveryNode;
 
 const SOURCE: &str =
     include_str!("../../../test-fixtures/test-components/guests/line-walk/src/lib.rs");
@@ -164,7 +167,7 @@ async fn a_breakpoint_stops_on_its_line_naming_the_node_and_resuming_goes_on() {
     let (mut rt, lines) = line_walk(&["a"]).await;
     let file = file_of(&lines);
     assert_eq!(
-        lines.set_breakpoint(&file, mark("walk-first")),
+        lines.set_breakpoint(&EVERY, &file, mark("walk-first")),
         Some(mark("walk-first"))
     );
     inject(&mut rt, "a", "in", "5").await;
@@ -198,7 +201,7 @@ async fn count_stops(
     file: &str,
     line: u32,
 ) -> usize {
-    assert_eq!(lines.set_breakpoint(file, line), Some(line));
+    assert_eq!(lines.set_breakpoint(&EVERY, file, line), Some(line));
     let mut stops = 0;
     let ticking = async {
         loop {
@@ -308,7 +311,7 @@ async fn a_breakpoint_in_a_stream_loop_stops_for_every_item() {
 async fn a_breakpoint_still_stops_after_a_step() {
     let (mut rt, lines) = line_walk(&["a"]).await;
     let file = file_of(&lines);
-    lines.set_breakpoint(&file, mark("spin-body"));
+    lines.set_breakpoint(&EVERY, &file, mark("spin-body"));
     inject(&mut rt, "a", "spin", "3").await;
     settling(&mut rt, async {
         let first = lines.next_stop().await;
@@ -320,7 +323,7 @@ async fn a_breakpoint_still_stops_after_a_step() {
         let again = lines.next_stop().await;
         assert_eq!(again.line, mark("spin-body"));
         assert_eq!(again.reason, StopReason::Breakpoint);
-        lines.clear_breakpoint(&file, mark("spin-body"));
+        lines.clear_breakpoint(&EVERY, &file, mark("spin-body"));
         lines.resume();
     })
     .await;
@@ -331,12 +334,12 @@ async fn a_line_with_no_code_comes_to_the_next_that_has_it() {
     let (mut rt, lines) = line_walk(&["a"]).await;
     let file = file_of(&lines);
     let asked = mark("above-walk");
-    let actual = lines.set_breakpoint(&file, asked).unwrap();
+    let actual = lines.set_breakpoint(&EVERY, &file, asked).unwrap();
     assert!(actual > asked);
     assert!(lines.lines(&file).contains(&actual));
     assert!(!lines.lines(&file).contains(&asked));
     assert_eq!(
-        lines.set_breakpoint(&file, 100_000),
+        lines.set_breakpoint(&EVERY, &file, 100_000),
         None,
         "past the last line"
     );
@@ -351,11 +354,11 @@ async fn a_line_with_no_code_comes_to_the_next_that_has_it() {
 async fn stepping_goes_over_a_call_into_one_and_out_of_it() {
     let (mut rt, lines) = line_walk(&["a"]).await;
     let file = file_of(&lines);
-    lines.set_breakpoint(&file, mark("walk-first"));
+    lines.set_breakpoint(&EVERY, &file, mark("walk-first"));
     settling(&mut rt, async {
         let first = lines.next_stop().await;
         assert_eq!(first.line, mark("walk-first"));
-        lines.clear_breakpoint(&file, mark("walk-first"));
+        lines.clear_breakpoint(&EVERY, &file, mark("walk-first"));
 
         lines.step_over();
         let second = lines.next_stop().await;
@@ -394,10 +397,10 @@ async fn stepping_goes_over_a_call_into_one_and_out_of_it() {
 async fn a_step_never_stops_in_what_a_macro_generated() {
     let (mut rt, lines) = line_walk(&["a"]).await;
     let file = file_of(&lines);
-    lines.set_breakpoint(&file, mark("run-walk"));
+    lines.set_breakpoint(&EVERY, &file, mark("run-walk"));
     let seen = settling(&mut rt, async {
         let mut seen = vec![lines.next_stop().await.line];
-        lines.clear_breakpoint(&file, mark("run-walk"));
+        lines.clear_breakpoint(&EVERY, &file, mark("run-walk"));
         for _ in 0..40 {
             lines.step_in();
             let stop = tokio::time::timeout(Duration::from_millis(500), lines.next_stop()).await;
@@ -418,7 +421,7 @@ async fn a_step_never_stops_in_what_a_macro_generated() {
 async fn a_stop_says_what_its_variables_hold_and_which_are_in_scope() {
     let (mut rt, lines) = line_walk(&["a"]).await;
     let file = file_of(&lines);
-    lines.set_breakpoint(&file, mark("walk-first"));
+    lines.set_breakpoint(&EVERY, &file, mark("walk-first"));
     inject(&mut rt, "a", "in", "5").await;
     settling(&mut rt, async {
         let first = lines.next_stop().await;
@@ -437,7 +440,7 @@ async fn a_stop_says_what_its_variables_hold_and_which_are_in_scope() {
         assert_eq!(value(&body, "b"), "2");
         assert!(!has(&body, "x"), "its caller's is out of scope");
 
-        lines.clear_breakpoint(&file, mark("walk-first"));
+        lines.clear_breakpoint(&EVERY, &file, mark("walk-first"));
         lines.resume();
     })
     .await;
@@ -447,7 +450,7 @@ async fn a_stop_says_what_its_variables_hold_and_which_are_in_scope() {
 async fn a_variable_of_each_kind_reads_as_its_source_would_write_it() {
     let (mut rt, lines) = line_walk(&["a"]).await;
     let file = file_of(&lines);
-    lines.set_breakpoint(&file, mark("kinds-end"));
+    lines.set_breakpoint(&EVERY, &file, mark("kinds-end"));
     inject(&mut rt, "a", "kinds", "4").await;
     settling(&mut rt, async {
         let stop = lines.next_stop().await;
@@ -524,7 +527,7 @@ async fn pausing_stops_a_guest_in_the_middle_of_a_spin() {
         lines.resume();
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(
-            lines.set_breakpoint(&file, mark("spin-body")),
+            lines.set_breakpoint(&EVERY, &file, mark("spin-body")),
             Some(mark("spin-body"))
         );
         let hit = lines.next_stop().await;
@@ -554,7 +557,7 @@ async fn a_stop_says_whose_guest_it_is_whichever_order_the_graph_has_them_in() {
             .build();
         let (mut rt, lines) = kit.load(graph).await;
         let file = file_of(&lines);
-        lines.set_breakpoint(&file, mark("walk-first"));
+        lines.set_breakpoint(&EVERY, &file, mark("walk-first"));
         inject(&mut rt, "a", "in", "5").await;
         settling(&mut rt, async {
             for (node, x) in [("a", "5"), ("b", "8")] {
@@ -572,8 +575,8 @@ async fn a_stop_says_whose_guest_it_is_whichever_order_the_graph_has_them_in() {
 async fn a_cleared_breakpoint_does_not_stop_and_one_set_stays_through_a_rebuild() {
     let (mut rt, lines) = line_walk(&["a"]).await;
     let file = file_of(&lines);
-    lines.set_breakpoint(&file, mark("walk-first"));
-    lines.clear_breakpoint(&file, mark("walk-first"));
+    lines.set_breakpoint(&EVERY, &file, mark("walk-first"));
+    lines.clear_breakpoint(&EVERY, &file, mark("walk-first"));
     settling(&mut rt, async {
         tokio::time::sleep(Duration::from_millis(20)).await;
     })
@@ -582,7 +585,7 @@ async fn a_cleared_breakpoint_does_not_stop_and_one_set_stays_through_a_rebuild(
     assert_eq!(output(&mut rt, "a", "out").await.as_deref(), Some("3"));
 
     // A new Store, with the breakpoint already set.
-    lines.set_breakpoint(&file, mark("walk-second"));
+    lines.set_breakpoint(&EVERY, &file, mark("walk-second"));
     rt.shutdown();
     rt.rerun(&NodeId::from("a")).unwrap();
     settling(&mut rt, async {
@@ -603,11 +606,11 @@ async fn a_step_stays_with_its_guest_while_the_others_run_past() {
         .build();
     let (mut rt, lines) = kit.load(graph).await;
     let file = file_of(&lines);
-    lines.set_breakpoint(&file, mark("walk-first"));
+    lines.set_breakpoint(&EVERY, &file, mark("walk-first"));
     settling(&mut rt, async {
         let first = lines.next_stop().await;
         assert_eq!(node_of(&first), Some("a"));
-        lines.clear_breakpoint(&file, mark("walk-first"));
+        lines.clear_breakpoint(&EVERY, &file, mark("walk-first"));
         for _ in 0..30 {
             lines.step_over();
             match tokio::time::timeout(Duration::from_millis(400), lines.next_stop()).await {
@@ -627,7 +630,7 @@ async fn a_step_stays_with_its_guest_while_the_others_run_past() {
 async fn shutting_down_ends_a_guest_stopped_on_a_line() {
     let (mut rt, lines) = line_walk(&["a"]).await;
     let file = file_of(&lines);
-    lines.set_breakpoint(&file, mark("walk-first"));
+    lines.set_breakpoint(&EVERY, &file, mark("walk-first"));
     let (end, ended) = futures::channel::oneshot::channel::<()>();
     let ticking = rt.tick_until(async {
         let _ = ended.await;
@@ -659,7 +662,7 @@ async fn shutting_down_ends_a_guest_stopped_on_a_line() {
 async fn a_frame_says_the_line_it_is_waiting_on() {
     let (mut rt, lines) = line_walk(&["a"]).await;
     let file = file_of(&lines);
-    lines.set_breakpoint(&file, mark("add-body"));
+    lines.set_breakpoint(&EVERY, &file, mark("add-body"));
     settling(&mut rt, async {
         let stop = lines.next_stop().await;
         assert_eq!(stop.frames[0].function, "line_walk_guest::add");
@@ -773,7 +776,7 @@ async fn a_step_goes_from_one_file_of_the_guest_into_another_and_back() {
         lines.files_of(&NodeId::from("a")),
         [main.clone(), scale.clone()]
     );
-    lines.set_breakpoint(&main, mark("run-scale"));
+    lines.set_breakpoint(&EVERY, &main, mark("run-scale"));
     inject(&mut rt, "a", "scale", "3").await;
     settling(&mut rt, async {
         let at = lines.next_stop().await;
@@ -781,7 +784,7 @@ async fn a_step_goes_from_one_file_of_the_guest_into_another_and_back() {
             (at.file.as_str(), at.line),
             (main.as_str(), mark("run-scale"))
         );
-        lines.clear_breakpoint(&main, mark("run-scale"));
+        lines.clear_breakpoint(&EVERY, &main, mark("run-scale"));
 
         // Into `scale.rs`, called from `lib.rs`.
         lines.step_in();
@@ -850,7 +853,7 @@ async fn a_step_goes_from_one_file_of_the_guest_into_another_and_back() {
 async fn a_breakpoint_in_a_second_file_stops_there() {
     let (mut rt, lines) = line_walk(&["a"]).await;
     let (_, scale) = files_of(&lines);
-    lines.set_breakpoint(&scale, scale_mark("scale-end"));
+    lines.set_breakpoint(&EVERY, &scale, scale_mark("scale-end"));
     inject(&mut rt, "a", "scale", "4").await;
     settling(&mut rt, async {
         let stop = lines.next_stop().await;
@@ -864,4 +867,84 @@ async fn a_breakpoint_in_a_second_file_stops_there() {
     })
     .await;
     assert_eq!(output(&mut rt, "a", "out").await.as_deref(), Some("11"));
+}
+
+/// The nodes that stop on `walk-first`, in order, in a graph of `a` feeding `b`, with a
+/// breakpoint set there for each of `set` and those of `cleared` cleared again.
+async fn who_stops(set: &[BreakpointScope], cleared: &[BreakpointScope]) -> Vec<String> {
+    let kit = Kit::new(&[LINE_WALK]);
+    let graph = kit
+        .builder()
+        .add_node("a", kit.id(0))
+        .add_node("b", kit.id(0))
+        .connect("ab", PortRef::new("a", "out"), PortRef::new("b", "in"))
+        .build();
+    let (mut rt, lines) = kit.load(graph).await;
+    let file = file_of(&lines);
+    for scope in set {
+        assert_eq!(
+            lines.set_breakpoint(scope, &file, mark("walk-first")),
+            Some(mark("walk-first"))
+        );
+    }
+    for scope in cleared {
+        lines.clear_breakpoint(scope, &file, mark("walk-first"));
+    }
+    inject(&mut rt, "a", "in", "5").await;
+    let mut stopped = Vec::new();
+    let ticking = async {
+        loop {
+            match rt.tick().await {
+                TickResult::Idle => break,
+                TickResult::Progress | TickResult::StepLimitReached => {}
+                other => panic!("a tick went wrong: {other:?}"),
+            }
+        }
+    };
+    let stopping = async {
+        loop {
+            let stop = lines.next_stop().await;
+            stopped.push(node_of(&stop).unwrap().to_string());
+            lines.resume();
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(60), async {
+        tokio::select! {
+            () = ticking => {}
+            () = stopping => {}
+        }
+    })
+    .await
+    .expect("it never finished");
+    assert_eq!(output(&mut rt, "b", "out").await.as_deref(), Some("11"));
+    stopped
+}
+
+#[tokio::test]
+async fn a_breakpoint_for_a_node_stops_only_it_and_one_for_every_node_all_of_them() {
+    use BreakpointScope::{EveryNode, Node};
+    let (a, b) = (Node(NodeId::from("a")), Node(NodeId::from("b")));
+    assert_eq!(who_stops(std::slice::from_ref(&b), &[]).await, ["b"]);
+    assert_eq!(who_stops(std::slice::from_ref(&a), &[]).await, ["a"]);
+    assert_eq!(who_stops(&[EveryNode], &[]).await, ["a", "b"]);
+    assert_eq!(who_stops(&[a.clone(), b.clone()], &[]).await, ["a", "b"]);
+    assert!(
+        who_stops(&[Node(NodeId::from("nowhere"))], &[])
+            .await
+            .is_empty()
+    );
+    // One for a node and one for every node are two: each is cleared on its own.
+    assert_eq!(
+        who_stops(&[a.clone(), EveryNode], &[EveryNode]).await,
+        ["a"]
+    );
+    assert_eq!(
+        who_stops(&[a.clone(), EveryNode], std::slice::from_ref(&a)).await,
+        ["a", "b"]
+    );
+    assert!(
+        who_stops(std::slice::from_ref(&b), std::slice::from_ref(&b))
+            .await
+            .is_empty()
+    );
 }

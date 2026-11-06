@@ -1,5 +1,6 @@
 import {
   AttachedSession,
+  type BreakpointScope,
   type Contract,
   type DebugLines,
   type DebugSession,
@@ -29,6 +30,7 @@ import type {
   GraphJsonConnection,
   GraphJsonNode,
   GraphJsonPortRef,
+  LineBreakpoint,
   NodeState,
   NodeVisual,
   OutputView,
@@ -123,7 +125,7 @@ export class EditorController extends EventTarget {
   /** Where a guest is stopped on a line. The worker answers nothing until it goes on. */
   #lineStop: LineStop | null = null;
   /** By file, the lines to stop on, kept here as each session starts with none. */
-  #lineBreakpoints = new Map<string, Set<number>>();
+  #lineBreakpoints: LineBreakpoint[] = [];
   /** By file, its text as asked of `sources` once per load. */
   #sourceTexts = new Map<string, Promise<string | undefined>>();
   #originalOptions: EditorLoadOptions | null = null;
@@ -692,6 +694,12 @@ export class EditorController extends EventTarget {
       this.#injectedValues.delete(oldId);
       this.#injectedValues.set(newId, injected);
     }
+    // A line breakpoint of the node is its still: the session is made again, and armed with it.
+    for (const breakpoint of this.#lineBreakpoints) {
+      if (breakpoint.scope !== 'every-node' && breakpoint.scope.node === oldId) {
+        breakpoint.scope = { node: newId };
+      }
+    }
     // Update breakpoints
     if (this.#breakpoints.has(oldId)) {
       this.#breakpoints.delete(oldId);
@@ -1215,7 +1223,7 @@ export class EditorController extends EventTarget {
     this.#session = null;
     this.#endWorker();
     this.#lineStop = null;
-    this.#lineBreakpoints.clear();
+    this.#lineBreakpoints = [];
     this.#sourceTexts.clear();
     this.#streamGroups = [];
     this.#warned.clear();
@@ -1378,26 +1386,35 @@ export class EditorController extends EventTarget {
     return this.#lineStop;
   }
 
-  /** The lines of `file` guests stop on. */
-  lineBreakpoints(file: string): readonly number[] {
-    return [...(this.#lineBreakpoints.get(file) ?? [])];
+  /** The line breakpoints set in `file`: of a node, or of every node. */
+  lineBreakpoints(file: string): readonly LineBreakpoint[] {
+    return this.#lineBreakpoints
+      .filter((breakpoint) => breakpoint.file === file)
+      .map((breakpoint) => ({ ...breakpoint }));
   }
 
   /**
-   * Stops guests on `line` of `file`, or the next line with code, or stops doing so if they
-   * do. A guest that is running sees it at once.
+   * Stops the guests `scope` says on `line` of `file`, or the next line with code, or stops doing
+   * so if they do. One for a node and one for every node are two, each toggled on its own. A
+   * guest that is running sees it at once.
    */
-  toggleLineBreakpoint(file: string, line: number): void {
+  toggleLineBreakpoint(scope: BreakpointScope, file: string, line: number): void {
     const lines = this.#session?.lines;
     const actual = this.linesOf(file).find((candidate) => candidate >= line);
     if (!lines || actual === undefined) return;
-    const set = this.#lineBreakpoints.get(file) ?? new Set<number>();
-    this.#lineBreakpoints.set(file, set);
-    if (set.delete(actual)) {
-      lines.clearBreakpoint(file, actual);
+    const same = (other: LineBreakpoint) =>
+      other.file === file &&
+      other.line === actual &&
+      (other.scope === 'every-node'
+        ? scope === 'every-node'
+        : scope !== 'every-node' && other.scope.node === scope.node);
+    const at = this.#lineBreakpoints.findIndex(same);
+    if (at >= 0) {
+      this.#lineBreakpoints.splice(at, 1);
+      lines.clearBreakpoint(scope, file, actual);
     } else {
-      set.add(actual);
-      lines.setBreakpoint(file, actual);
+      this.#lineBreakpoints.push({ scope, file, line: actual });
+      lines.setBreakpoint(scope, file, actual);
     }
     this.#dispatch('state-changed');
   }
@@ -1406,9 +1423,8 @@ export class EditorController extends EventTarget {
   #armLineBreakpoints(): void {
     const lines = this.#session?.lines;
     if (!lines) return;
-    for (const [file, set] of this.#lineBreakpoints) {
-      for (const line of set) lines.setBreakpoint(file, line);
-    }
+    for (const { scope, file, line } of this.#lineBreakpoints)
+      lines.setBreakpoint(scope, file, line);
   }
 
   /** The text of a source file, if the host can say. */
