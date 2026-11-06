@@ -21,11 +21,22 @@ use witgraph_runtime::{
 
 const SOURCE: &str =
     include_str!("../../../test-fixtures/test-components/guests/line-walk/src/lib.rs");
+const SCALE_SOURCE: &str =
+    include_str!("../../../test-fixtures/test-components/guests/line-walk/src/scale.rs");
 
-/// The line of the `// mark: {name}` comment in `line-walk`'s source.
+/// The line of the `// mark: {name}` comment in `line-walk`'s `lib.rs`.
 fn mark(name: &str) -> u32 {
+    mark_in(SOURCE, name)
+}
+
+/// The line of the `// mark: {name}` comment in `line-walk`'s `scale.rs`.
+fn scale_mark(name: &str) -> u32 {
+    mark_in(SCALE_SOURCE, name)
+}
+
+fn mark_in(source: &str, name: &str) -> u32 {
     let wanted = format!("// mark: {name}");
-    let at = SOURCE
+    let at = source
         .lines()
         .position(|line| line.trim_end().ends_with(&wanted))
         .unwrap_or_else(|| panic!("no mark `{name}`"));
@@ -87,14 +98,23 @@ async fn line_walk(nodes: &[&str]) -> (RuntimeGraph<Perf>, RuntimeLines) {
     kit.load(builder.build()).await
 }
 
-fn file_of(lines: &RuntimeLines) -> String {
+/// The files `line-walk` has as its own, `lib.rs` and `scale.rs`.
+fn files_of(lines: &RuntimeLines) -> (String, String) {
     let files = lines.files();
-    assert_eq!(files.len(), 1, "only the guest's own: {files:?}");
+    let [main, scale] = files.as_slice() else {
+        panic!("only the guest's own: {files:?}");
+    };
+    assert!(main.ends_with("guests/line-walk/src/lib.rs"), "{files:?}");
     assert!(
-        files[0].ends_with("guests/line-walk/src/lib.rs"),
+        scale.ends_with("guests/line-walk/src/scale.rs"),
         "{files:?}"
     );
-    files[0].clone()
+    (main.clone(), scale.clone())
+}
+
+/// `lib.rs`, of [`files_of`].
+fn file_of(lines: &RuntimeLines) -> String {
+    files_of(lines).0
 }
 
 async fn inject(rt: &mut RuntimeGraph<Perf>, node: &str, port: &str, wave: &str) {
@@ -677,7 +697,7 @@ async fn a_host_says_which_lines_are_its_own() {
         rt.lines().unwrap().files()
     };
     let guessed = load(OwnLines::default()).await;
-    assert_eq!(guessed.len(), 1);
+    assert_eq!(guessed.len(), 2, "`lib.rs` and `scale.rs`: {guessed:?}");
     let directory = guessed[0].strip_suffix("lib.rs").unwrap().to_string();
     assert_eq!(load(OwnLines::under([directory])).await, guessed);
     assert!(
@@ -743,4 +763,105 @@ async fn an_engine_not_made_to_debug_is_refused_and_a_graph_may_share_one_that_i
     assert!(rt.lines().is_none());
     settling(&mut rt, async {}).await;
     assert_eq!(output(&mut rt, "a", "out").await.as_deref(), Some("3"));
+}
+
+#[tokio::test]
+async fn a_step_goes_from_one_file_of_the_guest_into_another_and_back() {
+    let (mut rt, lines) = line_walk(&["a"]).await;
+    let (main, scale) = files_of(&lines);
+    assert_eq!(
+        lines.files_of(&NodeId::from("a")),
+        [main.clone(), scale.clone()]
+    );
+    lines.set_breakpoint(&main, mark("run-scale"));
+    inject(&mut rt, "a", "scale", "3").await;
+    settling(&mut rt, async {
+        let at = lines.next_stop().await;
+        assert_eq!(
+            (at.file.as_str(), at.line),
+            (main.as_str(), mark("run-scale"))
+        );
+        lines.clear_breakpoint(&main, mark("run-scale"));
+
+        // Into `scale.rs`, called from `lib.rs`.
+        lines.step_in();
+        let into = lines.next_stop().await;
+        assert_eq!(
+            (into.file.as_str(), into.line),
+            (scale.as_str(), scale_mark("scale-add"))
+        );
+        assert_eq!(
+            into.frames[0].function, "line_walk_guest::scale::scale",
+            "{:?}",
+            into.frames
+        );
+        assert_eq!(into.frames[0].file.as_deref(), Some(scale.as_str()));
+        assert_eq!(
+            into.frames[1].file.as_deref(),
+            Some(main.as_str()),
+            "{:?}",
+            into.frames
+        );
+        assert_eq!(into.frames[1].line, Some(mark("run-scale")));
+        assert_eq!(value(&into, "x"), "3");
+
+        // And from it back into `lib.rs`, a frame deeper.
+        lines.step_in();
+        let back = lines.next_stop().await;
+        assert_eq!(
+            (back.file.as_str(), back.line),
+            (main.as_str(), mark("add-body"))
+        );
+        assert_eq!(
+            back.frames[0].function, "line_walk_guest::add",
+            "{:?}",
+            back.frames
+        );
+        assert_eq!(back.frames[1].file.as_deref(), Some(scale.as_str()));
+        assert_eq!(back.frames[1].line, Some(scale_mark("scale-add")));
+        assert_eq!(back.frames.len(), into.frames.len() + 1);
+
+        // Out of `add`, to `scale.rs` again, and on to its next line.
+        lines.step_out();
+        let out = lines.next_stop().await;
+        assert_eq!(out.file, scale, "{:?}", out.frames);
+        assert_eq!(out.frames[0].function, "line_walk_guest::scale::scale");
+        assert_eq!(
+            out.line,
+            scale_mark("scale-end"),
+            "past the rest of the line of the call"
+        );
+        assert_eq!(value(&out, "doubled"), "6");
+        assert_eq!(out.frames.len(), into.frames.len());
+
+        // Out of `scale`, to `lib.rs`.
+        lines.step_out();
+        let home = lines.next_stop().await;
+        assert_eq!(home.file, main, "{:?}", home.frames);
+        assert_eq!(home.frames.len(), at.frames.len(), "{:?}", home.frames);
+        lines.resume();
+    })
+    .await;
+    // `walk(0)` is 3, and `scale(3)` is 6.
+    assert_eq!(output(&mut rt, "a", "out").await.as_deref(), Some("9"));
+}
+
+#[tokio::test]
+async fn a_breakpoint_in_a_second_file_stops_there() {
+    let (mut rt, lines) = line_walk(&["a"]).await;
+    let (_, scale) = files_of(&lines);
+    lines.set_breakpoint(&scale, scale_mark("scale-end"));
+    inject(&mut rt, "a", "scale", "4").await;
+    settling(&mut rt, async {
+        let stop = lines.next_stop().await;
+        assert_eq!(
+            (stop.file.as_str(), stop.line),
+            (scale.as_str(), scale_mark("scale-end"))
+        );
+        assert_eq!(node_of(&stop), Some("a"));
+        assert_eq!(value(&stop, "doubled"), "8");
+        lines.resume();
+    })
+    .await;
+    assert_eq!(output(&mut rt, "a", "out").await.as_deref(), Some("11"));
 }

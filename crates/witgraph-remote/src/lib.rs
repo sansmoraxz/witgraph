@@ -475,6 +475,13 @@ impl<C: Send + Sync, M: RuntimeMode, H: Host> lines::Handler<C> for Handler<M, H
         Ok(self.lines().map(LineDebugger::files).unwrap_or_default())
     }
 
+    async fn files_of(&self, _: C, node: String) -> anyhow::Result<Vec<String>> {
+        Ok(self
+            .lines()
+            .map(|lines| lines.files_of(&NodeId::from(node.as_str())))
+            .unwrap_or_default())
+    }
+
     async fn lines(&self, _: C, file: String) -> anyhow::Result<Vec<u32>> {
         Ok(self
             .lines()

@@ -267,6 +267,20 @@ async fn a_debugger_stops_a_guest_on_a_line_and_reads_its_source() {
     use client::witgraph::debug::lines;
 
     let (served, wrpc, file, line) = lines_attached().await;
+    let files = lines::files(&wrpc, ()).await.unwrap();
+    assert_eq!(files.len(), 2, "`lib.rs` and `scale.rs`: {files:?}");
+    assert_eq!(
+        lines::files_of(&wrpc, (), "walker").await.unwrap(),
+        files,
+        "the walker's guest has them all"
+    );
+    assert!(
+        lines::files_of(&wrpc, (), "counter")
+            .await
+            .unwrap()
+            .is_empty(),
+        "the counter's has no debug info"
+    );
     assert!(
         lines::source(&wrpc, (), "/etc/passwd")
             .await

@@ -11,6 +11,11 @@ export async function files(transport) {
   await $r.finished;
   return $r.results[0];
 }
+export async function filesOf(transport, node) {
+  const $r = await $invoke(transport, "witgraph:debug/lines@0.1.0", "files-of", [$t.string], [node], [$t.list($t.string)]);
+  await $r.finished;
+  return $r.results[0];
+}
 export async function lines(transport, file) {
   const $r = await $invoke(transport, "witgraph:debug/lines@0.1.0", "lines", [$t.string], [file], [$t.list($t.u32)]);
   await $r.finished;

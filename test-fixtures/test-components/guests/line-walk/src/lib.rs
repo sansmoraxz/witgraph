@@ -2,6 +2,8 @@ wit_bindgen::generate!({ path: "wit", world: "line-walk", generate_all });
 
 use exports::node::{Guest, Inputs, Outputs};
 
+mod scale;
+
 struct LineWalk;
 
 fn add(a: u32, b: u32) -> u32 {
@@ -70,6 +72,9 @@ impl Guest for LineWalk {
         }
         if let Some(rounds) = inputs.spin {
             out = out.wrapping_add(spin(rounds)); // mark: run-spin
+        }
+        if let Some(x) = inputs.scale {
+            out = out.wrapping_add(scale::scale(x)); // mark: run-scale
         }
         Outputs { out } // mark: run-end
     }

@@ -44,12 +44,23 @@ const source = await readFile(
   'utf8',
 );
 
-/** The line of the `// mark: {name}` comment in `line-walk`'s source. */
+/** The line of the `// mark: {name}` comment in `line-walk`'s `lib.rs`. */
 function mark(name: string): number {
-  const at = source.split('\n').findIndex((line) => line.endsWith(`// mark: ${name}`));
+  return markIn(source, name);
+}
+
+/** The line of the `// mark: {name}` comment in `text`. */
+function markIn(text: string, name: string): number {
+  const at = text.split('\n').findIndex((line) => line.endsWith(`// mark: ${name}`));
   assert.ok(at >= 0, `no mark \`${name}\``);
   return at + 1;
 }
+
+const fixture = (path: string) =>
+  readFile(
+    new URL(`../../../test-fixtures/test-components/guests/${path}`, import.meta.url),
+    'utf8',
+  );
 
 const ref = (guest: string) => ({
   package: { namespace: 'test', name: guest, version: '0.1.0' },
@@ -397,14 +408,86 @@ test("a guest's project is its own, whatever its language, and a library beside 
   const ends = (files: readonly string[]) =>
     files.map((file) => file.split('/').slice(-2).join('/')).sort();
   const guessed = await load([['c', 'c-walk']]);
-  assert.deepEqual(ends(guessed.lines.files), ['src/walk.c']);
+  assert.deepEqual(ends(guessed.lines.files), ['src/scale.c', 'src/walk.c']);
   const unanchored = await load([['c', 'c-walk']], [], {}, { anchor: false });
-  assert.deepEqual(ends(unanchored.lines.files), ['include/clamp.h', 'src/walk.c']);
+  assert.deepEqual(ends(unanchored.lines.files), ['include/clamp.h', 'src/scale.c', 'src/walk.c']);
   const included = await load([['c', 'c-walk']], [], {}, { include: ['**/c-lib/**'] });
-  assert.deepEqual(ends(included.lines.files), ['include/clamp.h', 'src/walk.c']);
-  const excluded = await load([['c', 'c-walk']], [], {}, { exclude: ['**/walk.c'] });
+  assert.deepEqual(ends(included.lines.files), ['include/clamp.h', 'src/scale.c', 'src/walk.c']);
+  const excluded = await load([['c', 'c-walk']], [], {}, { exclude: ['**/src/*.c'] });
   assert.deepEqual(excluded.lines.files, []);
 });
+
+test("each node's files are its own guest's", async () => {
+  const { lines } = await load(
+    [
+      ['rust', 'line-walk'],
+      ['c', 'c-walk'],
+    ],
+    [['walk', 'rust.out', 'c.in']],
+  );
+  const ends = (files: readonly string[]) => files.map((file) => file.split('/').at(-1));
+  assert.deepEqual(ends(lines.filesOf('rust')), ['lib.rs', 'scale.rs']);
+  assert.deepEqual(ends(lines.filesOf('c')), ['scale.c', 'walk.c']);
+  assert.deepEqual(lines.filesOf('nowhere'), []);
+  assert.deepEqual(
+    [...lines.filesOf('rust'), ...lines.filesOf('c')].sort(),
+    [...lines.files].sort(),
+  );
+});
+
+for (const [guest, main, second, functions] of [
+  ['line-walk', 'src/lib.rs', 'src/scale.rs', { scale: /scale::scale$/, add: /::add$/ }],
+  ['c-walk', 'src/walk.c', 'src/scale.c', { scale: /^scale$/, add: /^add$/ }],
+] as const) {
+  test(`a step in ${guest} goes from one file of its own into another and back`, async () => {
+    const [mainText, secondText] = await Promise.all([
+      fixture(`${guest}/${main}`),
+      fixture(`${guest}/${second}`),
+    ]);
+    const { session, lines, nextStop } = await load([['a', guest]]);
+    const fileOf = (end: string) => lines.files.find((file) => file.endsWith(`${guest}/${end}`));
+    const [home, away] = [fileOf(main), fileOf(second)] as string[];
+    assert.ok(home && away, `${lines.files}`);
+    assert.deepEqual(lines.filesOf('a'), [home, away].sort());
+    lines.setBreakpoint(home, markIn(mainText, 'run-scale'));
+    await session.graph.inject('a', 'scale', 3);
+    const tick = session.tick();
+    const at = await nextStop();
+    assert.deepEqual([at.file, at.line], [home, markIn(mainText, 'run-scale')]);
+    lines.clearBreakpoint(home, markIn(mainText, 'run-scale'));
+
+    lines.stepIn();
+    const into = await nextStop();
+    assert.deepEqual([into.file, into.line], [away, markIn(secondText, 'scale-add')]);
+    assert.match(into.frames[0].function, functions.scale);
+    assert.equal(into.frames[0].file, away);
+    assert.deepEqual([into.frames[1].file, into.frames[1].line], [home, at.line]);
+    assert.equal(variable(into, 'x').value, '3');
+
+    lines.stepIn();
+    const back = await nextStop();
+    assert.deepEqual([back.file, back.line], [home, markIn(mainText, 'add-body')]);
+    assert.match(back.frames[0].function, functions.add);
+    assert.deepEqual([back.frames[1].file, back.frames[1].line], [away, into.line]);
+    assert.equal(back.frames.length, into.frames.length + 1);
+
+    lines.stepOut();
+    const out = await nextStop();
+    assert.deepEqual([out.file, out.line], [away, markIn(secondText, 'scale-end')]);
+    assert.equal(variable(out, 'doubled').value, '6');
+    assert.equal(out.frames.length, into.frames.length);
+
+    lines.stepOut();
+    const left = await nextStop();
+    assert.equal(left.file, home);
+    assert.equal(left.frames.length, at.frames.length);
+
+    lines.resume();
+    await tick;
+    await session.settle();
+    assert.equal(await session.graph.readOutput('a', 'out'), 9, '`walk(0)` and `scale(3)`');
+  });
+}
 
 test('a line with no code comes to the next that has it', async () => {
   const { session, lines, nextStop, file } = await load([['a', 'line-walk']]);
@@ -709,7 +792,7 @@ test("all lines reach into what is not the guest's own", async () => {
   assert.ok(file);
   assert.ok(lines.files.some((name) => name.includes('/rustlib/') || name.includes('/rustc/')));
   const own = await load([['a', 'line-walk']]);
-  assert.deepEqual(own.lines.files, [own.file]);
+  assert.deepEqual(own.lines.files, [own.file, own.file.replace(/lib\.rs$/, 'scale.rs')]);
 });
 
 test('without a debugger, a session calls what it was given at each set flag', async () => {

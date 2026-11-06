@@ -139,6 +139,8 @@ interface lines {
 
     /// The source files with lines to stop on.
     files: func() -> list<string>;
+    /// Of `files`, those of a node's guest, links composed into it included.
+    files-of: func(node: string) -> list<string>;
     /// The lines of a file that have code.
     lines: func(file: string) -> list<u32>;
     /// A file's text, as the host has it, for one of `files` only.

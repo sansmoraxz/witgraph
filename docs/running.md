@@ -449,7 +449,7 @@ let config = RuntimeConfig { debug_lines: Some(OwnLines::default()), ..RuntimeCo
 let mut graph = RuntimeGraph::load(compiled, &wasm, config, Perf).await?;
 let lines = graph.lines().expect("loaded to debug");
 
-let file = lines.files().remove(0);
+let file = lines.files_of(&NodeId::from("walker")).remove(0); // `files()` has every node's
 lines.set_breakpoint(&file, 42); // returns the line it came to
 let (_, ()) = tokio::join!(graph.tick(), async {
     let stop = lines.next_stop().await;
@@ -460,7 +460,9 @@ let (_, ()) = tokio::join!(graph.tick(), async {
 });
 ```
 
-Hold on to a clone of `lines`, as a stopped guest holds up its tick. What it is told takes effect
+A guest's lines can be in many files of its own, and a step goes from one into another as its
+calls do: `frames` says the file and line of each. Hold on to a clone of `lines`, as a stopped
+guest holds up its tick. What it is told takes effect
 even on a guest in a loop that never returns.
 
 ### Which lines are a guest's own

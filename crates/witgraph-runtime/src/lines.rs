@@ -572,6 +572,20 @@ impl LineDebugger for RuntimeLines {
         files
     }
 
+    fn files_of(&self, node: &NodeId) -> Vec<String> {
+        let state = self.shared.state();
+        let mut files: Vec<String> = state
+            .modules
+            .iter()
+            .filter(|module| module.nodes.contains(node))
+            .flat_map(|module| module.index.files())
+            .map(str::to_string)
+            .collect();
+        files.sort();
+        files.dedup();
+        files
+    }
+
     fn lines(&self, file: &str) -> Vec<u32> {
         let state = self.shared.state();
         let mut lines: Vec<u32> = state

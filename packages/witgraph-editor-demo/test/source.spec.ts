@@ -7,9 +7,23 @@ const text = readFileSync(
   'utf8',
 );
 
-/** The line of the `// mark: {name}` comment in `line-walk`'s source. */
+const scaleText = readFileSync(
+  new URL('../../../test-fixtures/test-components/guests/line-walk/src/scale.rs', import.meta.url),
+  'utf8',
+);
+
+/** The line of the `// mark: {name}` comment in `line-walk`'s `lib.rs`. */
 function mark(name: string): number {
-  const at = text.split('\n').findIndex((line) => line.endsWith(`// mark: ${name}`));
+  return markIn(text, name);
+}
+
+/** The line of the `// mark: {name}` comment in `line-walk`'s `scale.rs`. */
+function scaleMark(name: string): number {
+  return markIn(scaleText, name);
+}
+
+function markIn(source: string, name: string): number {
+  const at = source.split('\n').findIndex((line) => line.endsWith(`// mark: ${name}`));
   expect(at, name).toBeGreaterThanOrEqual(0);
   return at + 1;
 }
@@ -208,6 +222,64 @@ test.describe('the source panel', () => {
     await controls.locator('button.stop').click();
   });
 
+  test('a step goes from one file into another and back, the panel with it', async ({ page }) => {
+    const source = page.locator('witgraph-source');
+    const controls = page.locator('witgraph-controls');
+    const picker = source.locator('select.file');
+    const current = source.locator('.row.current');
+    const frames = source.locator('.frames .frame');
+    await expect(source.locator('select.file option')).toHaveText(
+      ['line-walk/src/lib.rs', 'line-walk/src/scale.rs'],
+      { useInnerText: true },
+    );
+    await page
+      .locator('witgraph-canvas')
+      .evaluate((el: WitgraphCanvas) => el.controller?.injectValue('first', 'scale', '3'));
+    await source.locator(`.row[data-line="${mark('run-scale')}"] .gutter`).click();
+    await controls.locator('button.run').click();
+    await expect(current).toHaveAttribute('data-line', String(mark('run-scale')));
+
+    // Into `scale.rs`: the panel goes with it.
+    await page.keyboard.press('F11');
+    await expect(picker).toHaveValue(/line-walk\/src\/scale\.rs$/);
+    await expect(current).toHaveAttribute('data-line', String(scaleMark('scale-add')));
+    await expect(current).toContainText('crate::add(x, x)');
+    await expect(frames.first()).toContainText(`scale.rs:${scaleMark('scale-add')}`);
+    await expect(frames.nth(1)).toContainText(`lib.rs:${mark('run-scale')}`);
+    await expect(source.locator('.variables [data-path="x"]')).toContainText('3');
+
+    // Back into `lib.rs`, to `add`, called from `scale.rs`.
+    await page.keyboard.press('F11');
+    await expect(picker).toHaveValue(/line-walk\/src\/lib\.rs$/);
+    await expect(current).toHaveAttribute('data-line', String(mark('add-body')));
+    await expect(frames.nth(1)).toContainText(`scale.rs:${scaleMark('scale-add')}`);
+
+    // A caller in the other file shows that file, at the line it waits on.
+    await frames.nth(1).click();
+    await expect(picker).toHaveValue(/scale\.rs$/);
+    const waiting = source.locator(`.row[data-line="${scaleMark('scale-add')}"]`);
+    await expect(waiting).toHaveClass(/frame-line/);
+    await expect(current).toHaveCount(0);
+    await expect(source.locator('.where')).toContainText(`line ${mark('add-body')} in first of`);
+
+    // Out of `add`, to `scale.rs`, and out of `scale` to `lib.rs`.
+    await page.keyboard.press('Shift+F11');
+    await expect(picker).toHaveValue(/scale\.rs$/);
+    await expect(current).toHaveAttribute('data-line', String(scaleMark('scale-end')));
+    await expect(source.locator('.variables [data-path="doubled"]')).toContainText('6');
+    await page.keyboard.press('Shift+F11');
+    await expect(picker).toHaveValue(/lib\.rs$/);
+    await expect(frames.first()).toContainText('run');
+
+    await source.locator(`.row[data-line="${mark('run-scale')}"] .gutter`).click();
+    await controls.locator('button.resume').click();
+    await expect(controls.locator('button.run')).toBeEnabled();
+    const output = await page
+      .locator('witgraph-canvas')
+      .evaluate((el: WitgraphCanvas) => el.controller?.readOutput('first', 'out'));
+    expect(output, '`walk(5)` and `scale(3)`').toBe(14);
+  });
+
   test('stop ends a guest stopped on a line, and leaves its breakpoints set', async ({ page }) => {
     const source = page.locator('witgraph-source');
     const controls = page.locator('witgraph-controls');
@@ -286,14 +358,10 @@ test('`?debug` loads debug builds, so any graph has its source to stop in', asyn
   const controls = page.locator('witgraph-controls');
   await expect(source).toBeVisible();
 
-  // A file for each kind of guest in the graph: `relay` is one that has no debug info otherwise.
+  // The selected node's files: `relay` is a guest that has no debug info otherwise.
   const files = await source.locator('select.file option').allTextContents();
-  expect(files.length).toBeGreaterThan(3);
-  const relay = files.find(
-    (file) => file.startsWith('relay/src/lib.rs') || file.includes('/relay/src/lib.rs'),
-  );
-  expect(relay, files.join()).toBeTruthy();
-  await source.locator('select.file').selectOption({ label: relay as string });
+  expect(files, 'the files of relay-a only').toEqual(['relay/src/lib.rs']);
+  await source.locator('select.file').selectOption({ label: 'relay/src/lib.rs' });
 
   // In its `run`, as only this guest has it: the file draws once its text is there.
   const line = source.locator('.row', { hasText: 'inputs.in_.wrapping_add' });
@@ -320,7 +388,8 @@ test('a guest written in C stops and steps, its variables as C writes them', asy
   const variables = source.locator('.variables');
   const current = source.locator('.row.current');
   const options = source.locator('select.file option');
-  await expect(options).toHaveText(['c-walk/src/walk.c', 'line-walk/src/lib.rs'], {
+  // Those of the node selected, the C one.
+  await expect(options).toHaveText(['c-walk/src/scale.c', 'c-walk/src/walk.c'], {
     useInnerText: true,
   });
   await source.locator('select.file').selectOption({ label: 'c-walk/src/walk.c' });
@@ -352,4 +421,55 @@ test('a guest written in C stops and steps, its variables as C writes them', asy
   }
   await expect(variables.locator('[data-path="point"]')).toContainText('struct point');
   await controls.locator('button.stop').click();
+});
+
+test("the panel shows the selected node's files, and none with none selected", async ({ page }) => {
+  await page.goto('/?graph=c-lines&debug');
+  await expect(page.locator('#status')).toHaveClass(/ready/, { timeout: 30_000 });
+  const canvas = page.locator('witgraph-canvas');
+  const source = page.locator('witgraph-source');
+  const controls = page.locator('witgraph-controls');
+  const options = source.locator('select.file option');
+  const select = (node: string | null) =>
+    canvas.evaluate((el: WitgraphCanvas, node) => el.controller?.select(node), node);
+
+  await expect(options).toHaveText(['c-walk/src/scale.c', 'c-walk/src/walk.c'], {
+    useInnerText: true,
+  });
+  await canvas.locator('[data-node-id="rust"]').click();
+  await expect(options).toHaveText(['line-walk/src/lib.rs', 'line-walk/src/scale.rs'], {
+    useInnerText: true,
+  });
+  await expect(source.locator('.row', { hasText: 'mark: walk-first' })).toBeVisible();
+
+  await select(null);
+  await expect(source).toBeVisible();
+  await expect(source.locator('select.file')).toBeHidden();
+  await expect(source.locator('.row')).toHaveCount(0);
+  await expect(source).toContainText('Select a node to see its source.');
+
+  // A stop selects its node, and shows its file.
+  await select('rust');
+  await source.locator('.row', { hasText: 'mark: walk-first' }).locator('.gutter').click();
+  await controls.locator('button.run').click();
+  await expect(source.locator('.row.current')).toContainText('mark: walk-first');
+  await expect(source.locator('.variables')).toBeVisible();
+
+  // Another node's files are not where it stopped: nothing is marked current in them.
+  await select('c');
+  await expect(options).toHaveText(['c-walk/src/scale.c', 'c-walk/src/walk.c'], {
+    useInnerText: true,
+  });
+  await expect(source.locator('.row.current')).toHaveCount(0);
+  await expect(source.locator('.variables')).toBeHidden();
+  await expect(source.locator('.where')).toHaveText('Stopped in rust');
+  await select(null);
+  await expect(source).toContainText('Select a node to see its source.');
+  await expect(source.locator('.where')).toHaveText('Stopped in rust');
+
+  await select('rust');
+  await expect(source.locator('.row.current')).toContainText('mark: walk-first');
+  await expect(source.locator('.variables')).toBeVisible();
+  await controls.locator('button.stop').click();
+  await expect(controls.locator('button.run')).toBeEnabled();
 });

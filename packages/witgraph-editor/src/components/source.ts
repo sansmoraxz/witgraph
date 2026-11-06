@@ -54,8 +54,9 @@ function shortName(file: string): string {
 }
 
 /**
- * The source of the guests that can be stopped on a line. Its gutter sets breakpoints, and it
- * follows where a guest stops. With no such guest in the graph, it is hidden.
+ * The source of the selected node's guest, to stop on a line of. Its gutter sets breakpoints, and
+ * it follows where a guest stops. With no node selected it shows none, and with no guest in the
+ * graph that can be stopped on a line, it is hidden.
  */
 export class WitgraphSource extends HTMLElement {
   #controller: EditorController | null = null;
@@ -84,6 +85,10 @@ export class WitgraphSource extends HTMLElement {
   #marksShown = '';
   /** The stop last scrolled to, so a user scrolling away stays where they went. */
   #followed: unknown = null;
+  /** The stop, if it is in the guest of the node on show: another's is not marked here. */
+  #here: LineStop | null = null;
+  /** The node the variables on show are of. */
+  #variablesNode: string | undefined;
 
   connectedCallback(): void {
     if (this.shadowRoot) {
@@ -144,15 +149,36 @@ export class WitgraphSource extends HTMLElement {
     return this.#controller;
   }
 
+  /**
+   * Shows the files of the selected node's guest, and none with no node selected. A stop is
+   * marked, with its variables, only in its own node's.
+   */
   #sync(): void {
     if (!this.#picker) return;
     const controller = this.#controller;
-    const files = controller?.lineFiles ?? [];
-    this.hidden = files.length === 0;
-    if (!controller || files.length === 0) return;
+    this.hidden = (controller?.lineFiles.length ?? 0) === 0;
+    if (!controller || this.hidden) return;
 
+    const node = controller.selectedNode;
+    const files = node === null ? [] : controller.lineFilesOf(node);
     const stop = controller.lineStop;
-    if (stop && stop !== this.#followed && files.includes(stop.file)) this.#file = stop.file;
+    const here = stop !== null && node !== null && stop.node === node ? stop : null;
+    this.#here = here;
+    this.#showVariables(stop);
+    this.#variables.hidden ||= this.#variablesNode !== (node ?? undefined);
+
+    this.#picker.hidden = files.length === 0;
+    if (files.length === 0) {
+      this.#where.textContent = stop ? `Stopped${stop.node ? ` in ${stop.node}` : ''}` : '';
+      this.#none(
+        node === null
+          ? 'Select a node to see its source.'
+          : `${node} has no source to show: its guest was built without debug info.`,
+      );
+      return;
+    }
+
+    if (here && here !== this.#followed && files.includes(here.file)) this.#file = here.file;
     if (this.#file === null || !files.includes(this.#file)) this.#file = files[0];
 
     const listed = files.join('\n');
@@ -170,15 +196,28 @@ export class WitgraphSource extends HTMLElement {
     }
     this.#picker.value = this.#file;
 
-    this.#where.textContent = stop
-      ? `Stopped at line ${stop.line}${stop.node ? ` in ${stop.node}` : ''}${
-          stop.file === this.#file ? '' : ` of ${shortName(stop.file)}`
+    this.#where.textContent = here
+      ? `Stopped at line ${here.line} in ${node}${
+          here.file === this.#file ? '' : ` of ${shortName(here.file)}`
         }`
-      : '';
-    this.#showVariables(stop);
+      : stop
+        ? `Stopped${stop.node ? ` in ${stop.node}` : ''}`
+        : '';
 
     if (this.#drawn !== this.#file) void this.#draw(this.#file);
     else this.#mark();
+  }
+
+  /** Shows `message` where a file would be. */
+  #none(message: string): void {
+    this.#file = null;
+    this.#drawn = null;
+    this.#rows.clear();
+    this.#marksShown = '';
+    const none = document.createElement('div');
+    none.className = 'missing';
+    none.textContent = message;
+    this.#scroller.replaceChildren(none);
   }
 
   /**
@@ -191,16 +230,20 @@ export class WitgraphSource extends HTMLElement {
     if (stop === null && !running) {
       // Over: the next run has nothing to differ from.
       this.#variablesOf = null;
+      this.#variablesNode = undefined;
       this.#variables.hidden = true;
       this.#before.clear();
       this.#beforeIn = undefined;
       this.#variables.replaceChildren();
       return;
     }
+    // Left dimmed from the stop before, while the guest goes on.
+    this.#variables.hidden = this.#variables.childElementCount === 0;
     if (stop === this.#variablesOf) return;
     this.#variablesOf = stop;
     if (stop === null) return;
     const { variables } = stop;
+    this.#variablesNode = stop.node;
     this.#variables.hidden = false;
     // Another function's variables are others, whatever their names.
     if (stop.frames[0]?.function !== this.#beforeIn) this.#before.clear();
@@ -357,7 +400,7 @@ export class WitgraphSource extends HTMLElement {
     const controller = this.#controller;
     const file = this.#file;
     if (!controller || file === null) return;
-    const stop = controller.lineStop;
+    const stop = this.#here;
     const current = stop?.file === file ? stop.line : null;
     const breakpoints = controller.lineBreakpoints(file);
     const marks = `${current}|${this.#frameLine}|${breakpoints.join()}`;

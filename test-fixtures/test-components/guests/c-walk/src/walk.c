@@ -4,8 +4,9 @@
 
 #include "c_walk.h"
 #include "clamp.h"
+#include "scale.h"
 
-static uint32_t add(uint32_t a, uint32_t b) {
+uint32_t add(uint32_t a, uint32_t b) {
   uint32_t sum = a + b; // mark: add-body
   return sum;
 } // mark: add-end
@@ -51,6 +52,9 @@ c_walk_callback_code_t node_run(node_inputs_t *inputs) {
   uint32_t out = walk(inputs->in.is_some ? inputs->in.val : 0); // mark: run-walk
   if (inputs->kinds.is_some) {
     out += kinds(inputs->kinds.val); // mark: run-kinds
+  }
+  if (inputs->scale.is_some) {
+    out += scale(inputs->scale.val); // mark: run-scale
   }
   out = clamp_u32(out, 1, UINT32_MAX); // mark: run-clamp
   node_run_return((node_outputs_t){.out = out}); // mark: run-end

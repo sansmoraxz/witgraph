@@ -26,6 +26,7 @@ void c_walk_option_u32_free(c_walk_option_u32_t *ptr) {
 void node_inputs_free(node_inputs_t *ptr) {
   c_walk_option_u32_free(&ptr->in);
   c_walk_option_u32_free(&ptr->kinds);
+  c_walk_option_u32_free(&ptr->scale);
 }
 
 __attribute__((__export_name__("[callback][async-lift]node#run")))
@@ -144,7 +145,7 @@ void c_walk_thread_yield(void) {
 // Component Adapters
 
 __attribute__((__export_name__("[async-lift]node#run")))
-int32_t __wasm_export_node_run(int32_t arg, int32_t arg0, int32_t arg1, int32_t arg2) {
+int32_t __wasm_export_node_run(int32_t arg, int32_t arg0, int32_t arg1, int32_t arg2, int32_t arg3, int32_t arg4) {
   c_walk_option_u32_t option;
   switch (arg) {
     case 0: {
@@ -157,23 +158,36 @@ int32_t __wasm_export_node_run(int32_t arg, int32_t arg0, int32_t arg1, int32_t 
       break;
     }
   }
-  c_walk_option_u32_t option3;
+  c_walk_option_u32_t option5;
   switch (arg1) {
     case 0: {
-      option3.is_some = false;
+      option5.is_some = false;
       break;
     }
     case 1: {
-      option3.is_some = true;
-      option3.val = (uint32_t) (arg2);
+      option5.is_some = true;
+      option5.val = (uint32_t) (arg2);
       break;
     }
   }
-  node_inputs_t arg4 = (node_inputs_t) {
+  c_walk_option_u32_t option6;
+  switch (arg3) {
+    case 0: {
+      option6.is_some = false;
+      break;
+    }
+    case 1: {
+      option6.is_some = true;
+      option6.val = (uint32_t) (arg4);
+      break;
+    }
+  }
+  node_inputs_t arg7 = (node_inputs_t) {
     (c_walk_option_u32_t) option,
-    (c_walk_option_u32_t) option3,
+    (c_walk_option_u32_t) option5,
+    (c_walk_option_u32_t) option6,
   };
-  c_walk_callback_code_t ret = node_run(&arg4);
+  c_walk_callback_code_t ret = node_run(&arg7);
   return ret;
 }
 

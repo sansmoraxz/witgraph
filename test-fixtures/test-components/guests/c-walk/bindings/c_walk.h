@@ -84,6 +84,7 @@ typedef struct {
 typedef struct node_inputs_t {
   c_walk_option_u32_t   in;
   c_walk_option_u32_t   kinds;
+  c_walk_option_u32_t   scale;
 } node_inputs_t;
 
 typedef struct node_outputs_t {

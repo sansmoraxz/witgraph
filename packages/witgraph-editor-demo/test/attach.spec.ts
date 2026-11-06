@@ -69,6 +69,13 @@ test("the editor stops on a line of the program's guest, with its source", async
   const canvas = page.locator('witgraph-canvas');
   await expect(canvas.locator('[data-node-id="walker"]')).toBeVisible({ timeout: 20_000 });
   const source = page.locator('witgraph-source');
+  // Nothing is selected yet, so no source is on show.
+  await expect(source).toContainText('Select a node to see its source.');
+  await canvas.locator('[data-node-id="walker"]').click();
+  await expect(source.locator('select.file option')).toHaveText(
+    ['line-walk/src/lib.rs', 'line-walk/src/scale.rs'],
+    { useInnerText: true },
+  );
   await source.locator('select.file').selectOption({ label: 'line-walk/src/lib.rs' });
   // Its text comes from the program's machine.
   await expect(source.locator('.row', { hasText: 'mark: walk-first' })).toBeVisible({
@@ -91,6 +98,11 @@ test("the editor stops on a line of the program's guest written in C", async ({ 
   const canvas = page.locator('witgraph-canvas');
   await expect(canvas.locator('[data-node-id="c-walker"]')).toBeVisible({ timeout: 20_000 });
   const source = page.locator('witgraph-source');
+  await canvas.locator('[data-node-id="c-walker"]').click();
+  await expect(source.locator('select.file option')).toHaveText(
+    ['c-walk/src/scale.c', 'c-walk/src/walk.c'],
+    { useInnerText: true },
+  );
   await source.locator('select.file').selectOption({ label: 'c-walk/src/walk.c' });
   const row = source.locator('.row', { hasText: 'mark: walk-first' });
   await expect(row).toContainText('uint32_t a = add(x, 1);', { timeout: 20_000 });
@@ -118,6 +130,9 @@ test('an editor attaching takes over from one gone without a word', async ({ pag
   // notices it has gone once it times out.
   await page.goto(attach);
   const source = page.locator('witgraph-source');
+  const walker = page.locator('witgraph-canvas').locator('[data-node-id="walker"]');
+  await expect(walker).toBeVisible({ timeout: 20_000 });
+  await walker.click();
   await source.locator('select.file').selectOption({ label: 'line-walk/src/lib.rs' });
   const row = source.locator('.row', { hasText: 'mark: walk-first' });
   await expect(row).toBeVisible({ timeout: 20_000 });

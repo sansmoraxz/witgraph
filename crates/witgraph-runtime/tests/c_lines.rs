@@ -17,11 +17,22 @@ use witgraph_runtime::{
 
 const SOURCE: &str =
     include_str!("../../../test-fixtures/test-components/guests/c-walk/src/walk.c");
+const SCALE_SOURCE: &str =
+    include_str!("../../../test-fixtures/test-components/guests/c-walk/src/scale.c");
 
-/// The line of the `// mark: {name}` comment in `c-walk`'s source.
+/// The line of the `// mark: {name}` comment in `c-walk`'s `walk.c`.
 fn mark(name: &str) -> u32 {
+    mark_in(SOURCE, name)
+}
+
+/// The line of the `// mark: {name}` comment in `c-walk`'s `scale.c`.
+fn scale_mark(name: &str) -> u32 {
+    mark_in(SCALE_SOURCE, name)
+}
+
+fn mark_in(source: &str, name: &str) -> u32 {
     let wanted = format!("// mark: {name}");
-    let at = SOURCE
+    let at = source
         .lines()
         .position(|line| line.trim_end().ends_with(&wanted))
         .unwrap_or_else(|| panic!("no mark `{name}`"));
@@ -76,16 +87,25 @@ async fn load_with(
     (rt, lines)
 }
 
-/// The C file, the one the guest has as its own: not its bindings, built without debug info.
-fn c_file(lines: &RuntimeLines) -> String {
+/// The C files the guest has as its own, `walk.c` and `scale.c`: not its bindings, built
+/// without debug info.
+fn c_files(lines: &RuntimeLines) -> (String, String) {
     let files: Vec<String> = lines
         .files()
         .into_iter()
         .filter(|file| file.ends_with(".c"))
         .collect();
-    assert_eq!(files.len(), 1, "only the guest's own: {files:?}");
-    assert!(files[0].ends_with("guests/c-walk/src/walk.c"), "{files:?}");
-    files[0].clone()
+    let [scale, walk] = files.as_slice() else {
+        panic!("only the guest's own: {files:?}");
+    };
+    assert!(walk.ends_with("guests/c-walk/src/walk.c"), "{files:?}");
+    assert!(scale.ends_with("guests/c-walk/src/scale.c"), "{files:?}");
+    (walk.clone(), scale.clone())
+}
+
+/// `walk.c`, of [`c_files`].
+fn c_file(lines: &RuntimeLines) -> String {
+    c_files(lines).0
 }
 
 async fn inject(rt: &mut RuntimeGraph<Perf>, node: &str, port: &str, wave: &str) {
@@ -254,6 +274,19 @@ async fn a_rust_guest_and_a_c_guest_are_debugged_side_by_side() {
             .any(|file| file.ends_with("guests/line-walk/src/lib.rs")),
         "{files:?}"
     );
+    let rust: Vec<String> = lines
+        .files_of(&NodeId::from("rust"))
+        .iter()
+        .map(|file| file.rsplit('/').next().unwrap().to_string())
+        .collect();
+    assert_eq!(rust, ["lib.rs", "scale.rs"], "only the Rust guest's");
+    let (walk, scale) = c_files(&lines);
+    assert_eq!(
+        lines.files_of(&NodeId::from("c")),
+        [scale, walk],
+        "only the C guest's"
+    );
+    assert!(lines.files_of(&NodeId::from("nowhere")).is_empty());
     lines.set_breakpoint(&file, mark("walk-first"));
     inject(&mut rt, "rust", "in", "5").await;
     settling(&mut rt, async {
@@ -286,14 +319,17 @@ async fn c_files_with(own: OwnLines) -> Vec<String> {
 async fn a_library_from_outside_the_project_is_not_its_own_whatever_its_path() {
     // `clang.h` of `c-lib`, beside `c-walk`, has debug info, and no list knows its path: what
     // leaves it out is that it is not under the directory `run` was compiled in.
-    assert_eq!(c_files_with(OwnLines::default()).await, ["src/walk.c"]);
+    assert_eq!(
+        c_files_with(OwnLines::default()).await,
+        ["src/scale.c", "src/walk.c"]
+    );
     let unanchored = OwnLines::Rules(OwnRules {
         anchor: false,
         ..OwnRules::default()
     });
     assert_eq!(
         c_files_with(unanchored).await,
-        ["include/clamp.h", "src/walk.c"]
+        ["include/clamp.h", "src/scale.c", "src/walk.c"]
     );
     let included = OwnLines::Rules(OwnRules {
         include: vec![PathPattern::new("**/c-lib/**")],
@@ -301,10 +337,10 @@ async fn a_library_from_outside_the_project_is_not_its_own_whatever_its_path() {
     });
     assert_eq!(
         c_files_with(included).await,
-        ["include/clamp.h", "src/walk.c"]
+        ["include/clamp.h", "src/scale.c", "src/walk.c"]
     );
     let excluded = OwnLines::Rules(OwnRules {
-        exclude: vec![PathPattern::new("**/walk.c")],
+        exclude: vec![PathPattern::new("**/src/*.c")],
         ..OwnRules::default()
     });
     assert!(c_files_with(excluded).await.is_empty());
@@ -335,4 +371,90 @@ async fn a_step_goes_through_a_library_that_is_not_its_own() {
     })
     .await;
     assert_eq!(output(&mut rt, "c").await.as_deref(), Some("8"));
+}
+
+#[tokio::test]
+async fn a_step_goes_from_one_c_file_of_the_guest_into_another_and_back() {
+    let (mut rt, lines) = load(&[("c", C_WALK)], &[]).await;
+    let (walk, scale) = c_files(&lines);
+    lines.set_breakpoint(&walk, mark("run-scale"));
+    inject(&mut rt, "c", "scale", "3").await;
+    settling(&mut rt, async {
+        let at = lines.next_stop().await;
+        assert_eq!(
+            (at.file.as_str(), at.line),
+            (walk.as_str(), mark("run-scale"))
+        );
+        lines.clear_breakpoint(&walk, mark("run-scale"));
+
+        // Into `scale.c`, called from `walk.c`.
+        lines.step_in();
+        let into = lines.next_stop().await;
+        assert_eq!(
+            (into.file.as_str(), into.line),
+            (scale.as_str(), scale_mark("scale-add"))
+        );
+        assert_eq!(into.frames[0].function, "scale", "{:?}", into.frames);
+        assert_eq!(into.frames[0].file.as_deref(), Some(scale.as_str()));
+        assert_eq!(into.frames[1].function, "node_run", "{:?}", into.frames);
+        assert_eq!(into.frames[1].file.as_deref(), Some(walk.as_str()));
+        assert_eq!(into.frames[1].line, Some(mark("run-scale")));
+        assert_eq!(variable(&into, "x"), ("uint32_t", "3"));
+
+        // And from it back into `walk.c`, a frame deeper.
+        lines.step_in();
+        let back = lines.next_stop().await;
+        assert_eq!(
+            (back.file.as_str(), back.line),
+            (walk.as_str(), mark("add-body"))
+        );
+        assert_eq!(back.frames[0].function, "add", "{:?}", back.frames);
+        assert_eq!(back.frames[1].file.as_deref(), Some(scale.as_str()));
+        assert_eq!(back.frames[1].line, Some(scale_mark("scale-add")));
+        assert_eq!(back.frames.len(), into.frames.len() + 1);
+
+        // Out of `add`, to `scale.c` again, and on to its next line.
+        lines.step_out();
+        let out = lines.next_stop().await;
+        assert_eq!(out.file, scale, "{:?}", out.frames);
+        assert_eq!(out.frames[0].function, "scale");
+        assert_eq!(
+            out.line,
+            scale_mark("scale-end"),
+            "past the rest of the line of the call"
+        );
+        assert_eq!(variable(&out, "doubled"), ("uint32_t", "6"));
+        assert_eq!(out.frames.len(), into.frames.len());
+
+        // Out of `scale`, to `walk.c`.
+        lines.step_out();
+        let home = lines.next_stop().await;
+        assert_eq!(home.file, walk, "{:?}", home.frames);
+        assert_eq!(home.frames[0].function, "node_run");
+        assert_eq!(home.frames.len(), at.frames.len());
+        lines.resume();
+    })
+    .await;
+    // `walk(0)` is 3, and `scale(3)` is 6.
+    assert_eq!(output(&mut rt, "c").await.as_deref(), Some("9"));
+}
+
+#[tokio::test]
+async fn a_breakpoint_in_a_second_c_file_stops_there() {
+    let (mut rt, lines) = load(&[("c", C_WALK)], &[]).await;
+    let (_, scale) = c_files(&lines);
+    lines.set_breakpoint(&scale, scale_mark("scale-end"));
+    inject(&mut rt, "c", "scale", "4").await;
+    settling(&mut rt, async {
+        let stop = lines.next_stop().await;
+        assert_eq!(
+            (stop.file.as_str(), stop.line),
+            (scale.as_str(), scale_mark("scale-end"))
+        );
+        assert_eq!(stop.node.as_ref().map(|node| node.as_str()), Some("c"));
+        assert_eq!(variable(&stop, "doubled"), ("uint32_t", "8"));
+        lines.resume();
+    })
+    .await;
+    assert_eq!(output(&mut rt, "c").await.as_deref(), Some("11"));
 }

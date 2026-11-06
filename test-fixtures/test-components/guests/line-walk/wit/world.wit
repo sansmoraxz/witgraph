@@ -1,13 +1,14 @@
 package test:line-walk@0.1.0;
 
 /// Built with debug info, for stepping through its source: tests find its lines by
-/// the `mark:` comments in `src/lib.rs`.
+/// the `mark:` comments in `src/lib.rs` and `src/scale.rs`.
 world line-walk {
     export node: interface {
         record inputs {
             in: option<u32>,
             spin: option<u32>,
             kinds: option<u32>,
+            scale: option<u32>,
         }
         record outputs {
             out: u32,

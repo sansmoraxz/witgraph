@@ -96,9 +96,11 @@ Put them anywhere on your page. They all share one `EditorController`.
   `lines: true`, or `lines: { include, exclude, anchor, known }` to say what counts as the guest's
   own ([which lines are a guest's own](running.md#which-lines-are-a-guests-own)), and
   a guest built with debug info can be stopped on a line of its own code, even a node that is
-  spinning. The source panel follows each stop, and lists the call stack, where choosing a caller
-  shows the line it is waiting on, and the variables in scope, marking what changed since the last
-  stop in that function. A caller's variables are out of reach. All of the graph stops with it, so
+  spinning. The source panel shows the files of the selected node's guest, and none with no node
+  selected. A stop selects its node, and the panel follows it from file to file, and lists the
+  call stack, where choosing a caller shows the line it is waiting on, in whichever file, and the
+  variables in scope, marking what changed since the last stop in that function. Selecting
+  another node while stopped shows its files, unmarked, until you select the stopped one again. A caller's variables are out of reach. All of the graph stops with it, so
   previews wait until it goes on. It takes a page that is cross-origin isolated
   ([why](javascript.md#stopping-on-a-source-line)): elsewhere the graph runs as usual, and the
   timeline says so. Without debug info in a graph, the panel and the Code buttons stay hidden.

@@ -206,7 +206,8 @@ const session = await RemoteSession.load(worker, {
   lines: { onStop: (stop) => show(stop.file, stop.line, stop.node, stop.frames) },
 });
 const { lines } = session;
-lines.setBreakpoint(file, 42); // from `lines.files`; returns the line it came to
+lines.setBreakpoint(file, 42); // from `lines.filesOf(node)`, or `lines.files` for every node's
+// It returns the line it came to.
 // `stop.frames` is the stack: `{ function, file?, line? }`, the line a caller's call is on.
 void session.tick();
 // ... `onStop` says where it stopped, and what its variables hold; then one of:

@@ -1345,6 +1345,16 @@ mod tests {
         found
     }
 
+    /// `line-walk`'s `lib.rs`, of the two files of its own: `scale.rs` is the other.
+    fn lib_rs(index: &LineIndex) -> &str {
+        let files: Vec<&str> = index.files().collect();
+        assert_eq!(files.len(), 2, "{files:?}");
+        files
+            .into_iter()
+            .find(|file| file.ends_with("guests/line-walk/src/lib.rs"))
+            .expect("its `lib.rs`")
+    }
+
     #[test]
     fn probes_stand_on_the_guests_own_lines() {
         let instrumented = instrument(&line_walk(), &OwnLines::default())
@@ -1355,7 +1365,8 @@ mod tests {
             instrumented
                 .probes
                 .iter()
-                .all(|probe| probe.file.ends_with("guests/line-walk/src/lib.rs")),
+                .all(|probe| probe.file.ends_with("guests/line-walk/src/lib.rs")
+                    || probe.file.ends_with("guests/line-walk/src/scale.rs")),
             "{:?}",
             instrumented.probes.first(),
         );
@@ -1522,9 +1533,7 @@ mod tests {
         let module = line_walk();
         let instrumented = instrument(&module, &OwnLines::default()).unwrap().unwrap();
         let index = LineIndex::new(source_lines(&module, &OwnLines::default()).unwrap());
-        let [file] = index.files().collect::<Vec<_>>()[..] else {
-            panic!("one file of its own");
-        };
+        let file = lib_rs(&index);
         let first = index
             .probe(index.sites(file, marked("walk-first"))[0])
             .unwrap();
@@ -1616,9 +1625,7 @@ mod tests {
     fn lines_stand_on_operators_and_say_how_a_step_ends() {
         let module = line_walk();
         let index = LineIndex::new(source_lines(&module, &OwnLines::default()).unwrap());
-        let [file] = index.files().collect::<Vec<_>>()[..] else {
-            panic!("one file of its own");
-        };
+        let file = lib_rs(&index);
         let first = index.sites(file, marked("walk-first"))[0];
         let second = index.sites(file, marked("walk-second"))[0];
         let body = index.sites(file, marked("add-body"))[0];
@@ -1647,9 +1654,7 @@ mod tests {
         let shape = shape_of(&module).unwrap();
         let names = defined_function_names(&module).unwrap();
         let index = LineIndex::new(source_lines(&module, &OwnLines::default()).unwrap());
-        let [file] = index.files().collect::<Vec<_>>()[..] else {
-            panic!("one file of its own");
-        };
+        let file = lib_rs(&index);
         let first = index
             .probe(index.sites(file, marked("walk-first"))[0])
             .unwrap();

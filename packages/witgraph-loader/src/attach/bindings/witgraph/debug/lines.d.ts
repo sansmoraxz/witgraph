@@ -31,6 +31,10 @@ export declare const LineStop: $wrpc.Type;
  */
 export function files(transport: $wrpc.Transport): globalThis.Promise<globalThis.Array<string>>;
 /**
+ * Of `files`, those of a node's guest, links composed into it included.
+ */
+export function filesOf(transport: $wrpc.Transport, node: string): globalThis.Promise<globalThis.Array<string>>;
+/**
  * The lines of a file that have code.
  */
 export function lines(transport: $wrpc.Transport, file: string): globalThis.Promise<globalThis.Uint32Array>;

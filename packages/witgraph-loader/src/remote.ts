@@ -825,6 +825,7 @@ export type DebugGraph = Pick<
 export type DebugLines = Pick<
   LineDebugger,
   | 'files'
+  | 'filesOf'
   | 'lines'
   | 'stopped'
   | 'setBreakpoint'

@@ -1,12 +1,13 @@
 package test:c-walk@0.1.0;
 
 /// Written in C, and built with debug info, for stepping through its source: tests
-/// find its lines by the `mark:` comments in `src/walk.c`.
+/// find its lines by the `mark:` comments in `src/walk.c` and `src/scale.c`.
 world c-walk {
     export node: interface {
         record inputs {
             in: option<u32>,
             kinds: option<u32>,
+            scale: option<u32>,
         }
         record outputs {
             out: u32,

@@ -74,6 +74,7 @@ export class AttachedSession implements DebugSession {
     contracts: Map<string, Contract>,
     groups: string[][],
     sources: Map<string, number[]>,
+    nodeFiles: Map<string, string[]>,
     options: AttachOptions,
   ) {
     this.#connection = connection;
@@ -136,7 +137,8 @@ export class AttachedSession implements DebugSession {
     void poll();
     this.graph = attachedGraph(open, states, versions, trace, groups, poll);
     const send = (call: (transport: Transport) => Promise<unknown>) => this.#send(call);
-    this.lines = sources.size > 0 ? attachedLines(send, sources, this.#toldStop) : undefined;
+    this.lines =
+      sources.size > 0 ? attachedLines(send, sources, nodeFiles, this.#toldStop) : undefined;
     void this.#follow();
   }
 
@@ -160,12 +162,16 @@ export class AttachedSession implements DebugSession {
     ]);
     const sources = new Map<string, number[]>();
     for (const file of files) sources.set(file, [...(await lines.lines(await open(), file))]);
+    const nodeFiles = new Map<string, string[]>();
+    const { nodes } = JSON.parse(described) as { nodes: { id: string }[] };
+    for (const { id } of nodes) nodeFiles.set(id, await lines.filesOf(await open(), id));
     return new AttachedSession(
       connection,
       described,
       new Map(Object.entries(JSON.parse(contracts) as Record<string, Contract>)),
       groups,
       sources,
+      nodeFiles,
       options,
     );
   }
@@ -331,6 +337,7 @@ function attachedGraph(
 function attachedLines(
   send: (call: (transport: Transport) => Promise<unknown>) => Promise<void>,
   sources: Map<string, number[]>,
+  nodeFiles: Map<string, string[]>,
   told: Told,
 ): DebugLines {
   let stopped: LineStop | undefined;
@@ -349,6 +356,7 @@ function attachedLines(
     get files() {
       return [...sources.keys()];
     },
+    filesOf: (node) => [...(nodeFiles.get(node) ?? [])],
     lines: (file) => sources.get(file) ?? [],
     get stopped() {
       return stopped;

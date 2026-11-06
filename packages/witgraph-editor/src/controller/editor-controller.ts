@@ -1360,6 +1360,14 @@ export class EditorController extends EventTarget {
     return this.#session?.lines?.files ?? [];
   }
 
+  /**
+   * Of {@link lineFiles}, those of `node`'s guest, links composed into it included. Two nodes of
+   * one component have the same.
+   */
+  lineFilesOf(node: string): readonly string[] {
+    return this.#session?.lines?.filesOf(node) ?? [];
+  }
+
   /** The lines of `file` with code. */
   linesOf(file: string): readonly number[] {
     return this.#session?.lines?.lines(file) ?? [];

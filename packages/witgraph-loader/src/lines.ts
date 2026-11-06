@@ -524,6 +524,18 @@ export class LineDebugger {
     return [...this.#sites.keys()].sort();
   }
 
+  /**
+   * Of {@link files}, those of `node`'s guest: of the core modules it runs, those of the links
+   * composed into it as well. Two nodes of one component have the same.
+   */
+  filesOf(node: string): string[] {
+    const files = new Set<string>();
+    for (const { probes, nodes } of this.#modules) {
+      if (nodes.includes(node)) for (const { file } of probes) files.add(file);
+    }
+    return [...files].sort();
+  }
+
   /** The lines of `file` that have code, in order. */
   lines(file: string): number[] {
     return [...(this.#sites.get(file)?.keys() ?? [])].sort((a, b) => a - b);

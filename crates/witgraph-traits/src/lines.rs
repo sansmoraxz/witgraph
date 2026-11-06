@@ -307,6 +307,10 @@ pub trait LineDebugger {
     /// The source files with lines to stop on, as the debug info names them.
     fn files(&self) -> Vec<String>;
 
+    /// Of [`files`](Self::files), those of `node`'s guest: of the core modules it runs, those
+    /// of the links composed into it as well. Two nodes of one component have the same.
+    fn files_of(&self, node: &NodeId) -> Vec<String>;
+
     /// The lines of `file` that have code, in order.
     fn lines(&self, file: &str) -> Vec<u32>;
 

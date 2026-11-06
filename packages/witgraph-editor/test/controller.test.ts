@@ -633,7 +633,10 @@ test('a host can say which lines are its own', async () => {
     worker: workers.make,
     lines: { include: [`${directory}**`], exclude: ['**'] },
   });
-  assert.deepEqual(under.lineFiles, [file]);
+  const own = [file, file.replace(/lib\.rs$/, 'scale.rs')];
+  assert.deepEqual(under.lineFiles, own);
+  assert.deepEqual(under.lineFilesOf('a'), own, "the node's files are its guest's");
+  assert.deepEqual(under.lineFilesOf('nowhere'), []);
   const nowhere = await loadController([['a', 'line-walk']], [], {
     worker: realWorkers().make,
     lines: { include: ['/nowhere/**'], exclude: ['**'] },
