@@ -18,7 +18,7 @@ use futures::future::BoxFuture;
 use futures::stream::select_all;
 use tokio::sync::{Notify, oneshot};
 use witgraph_ir::{NodeId, PortName};
-use witgraph_runtime::witgraph_traits::RuntimeMode;
+use witgraph_runtime::witgraph_traits::{NodeFault, NodePhase, RuntimeMode, Trace, TraceEvent};
 use witgraph_runtime::{
     HoldAt, HoldId, Host, LineDebugger, NodeHolds, OutputReader, RunningGraph, RuntimeGraph,
     RuntimeHolds, RuntimeLines, StopReason, TickResult, ValReader,
@@ -35,16 +35,81 @@ mod bindings {
 
 use bindings::exports::witgraph::debug::{graph, holds, lines};
 
+/// The most trace events kept for a debugger to take: as many as the editor's timeline shows.
+const TRACE_KEPT: usize = 1000;
+
+/// The mode a graph a debugger can attach to runs in: the program's own, and a trace of the
+/// latest events for the debugger's timeline. Load the graph with it, as
+/// `RuntimeGraph::load(compiled, &wasm, config, Watched::new(Perf))`.
+pub struct Watched<M = witgraph_runtime::Perf> {
+    mode: M,
+    trace: Arc<Trace>,
+}
+
+impl<M: RuntimeMode> Watched<M> {
+    /// The program's own mode, watched.
+    pub fn new(mode: M) -> Self {
+        Self {
+            mode,
+            trace: Arc::new(Trace::bounded(TRACE_KEPT)),
+        }
+    }
+
+    /// The program's own mode.
+    pub fn mode(&self) -> &M {
+        &self.mode
+    }
+}
+
+impl<M: RuntimeMode> RuntimeMode for Watched<M> {
+    fn on_run_started(&self, node: &NodeId) {
+        self.mode.on_run_started(node);
+        self.trace.on_run_started(node);
+    }
+
+    fn on_run_returned(&self, node: &NodeId) {
+        self.mode.on_run_returned(node);
+        self.trace.on_run_returned(node);
+    }
+
+    fn on_group_drained(&self, nodes: &[NodeId]) {
+        self.mode.on_group_drained(nodes);
+        self.trace.on_group_drained(nodes);
+    }
+
+    fn on_phase_transition(&self, node: &NodeId, from: NodePhase, to: NodePhase) {
+        self.mode.on_phase_transition(node, from, to);
+        self.trace.on_phase_transition(node, from, to);
+    }
+
+    fn on_node_fault(&self, node: &NodeId, fault: &NodeFault) {
+        self.mode.on_node_fault(node, fault);
+        self.trace.on_node_fault(node, fault);
+    }
+
+    fn on_cancelled(&self, node: &NodeId) {
+        self.mode.on_cancelled(node);
+        self.trace.on_cancelled(node);
+    }
+
+    fn on_restarted(&self, node: &NodeId) {
+        self.mode.on_restarted(node);
+        self.trace.on_restarted(node);
+    }
+}
+
 /// Something asked of the graph, done when nothing else has it.
-type Job<M, H> = Box<dyn for<'a> FnOnce(&'a mut RuntimeGraph<M, H>) -> BoxFuture<'a, ()> + Send>;
+type Job<M, H> =
+    Box<dyn for<'a> FnOnce(&'a mut RuntimeGraph<Watched<M>, H>) -> BoxFuture<'a, ()> + Send>;
 
 struct Inner<M: RuntimeMode, H: Host> {
-    graph: tokio::sync::Mutex<RuntimeGraph<M, H>>,
+    graph: tokio::sync::Mutex<RuntimeGraph<Watched<M>, H>>,
     /// What waits for the graph, in the order asked.
     jobs: Mutex<Vec<Job<M, H>>>,
     /// Ends a tick early, for what waits.
     asked: Notify,
     reader: ValReader,
+    trace: Arc<Trace>,
     holds: RuntimeHolds,
     lines: Option<RuntimeLines>,
     described: String,
@@ -71,7 +136,7 @@ impl<M: RuntimeMode, H: Host> Debuggee<M, H> {
     /// # Errors
     ///
     /// If the graph cannot be described as JSON, which should not happen.
-    pub fn new(graph: RuntimeGraph<M, H>) -> anyhow::Result<Self> {
+    pub fn new(graph: RuntimeGraph<Watched<M>, H>) -> anyhow::Result<Self> {
         let described = serde_json::to_string(graph.compiled().graph())
             .context("failed to describe the graph")?;
         let compiled = graph.compiled();
@@ -97,6 +162,7 @@ impl<M: RuntimeMode, H: Host> Debuggee<M, H> {
         Ok(Self {
             inner: Arc::new(Inner {
                 reader: graph.reader(),
+                trace: graph.mode().trace.clone(),
                 holds: graph.holds(),
                 lines: graph.lines(),
                 graph: tokio::sync::Mutex::new(graph),
@@ -129,7 +195,9 @@ impl<M: RuntimeMode, H: Host> Debuggee<M, H> {
     /// it writes its inputs, say.
     pub async fn with<T: Send + 'static>(
         &self,
-        work: impl for<'a> FnOnce(&'a mut RuntimeGraph<M, H>) -> BoxFuture<'a, T> + Send + 'static,
+        work: impl for<'a> FnOnce(&'a mut RuntimeGraph<Watched<M>, H>) -> BoxFuture<'a, T>
+        + Send
+        + 'static,
     ) -> T {
         let (done, result) = oneshot::channel();
         lock(&self.inner.jobs).push(Box::new(move |graph| {
@@ -149,7 +217,7 @@ impl<M: RuntimeMode, H: Host> Debuggee<M, H> {
         }
     }
 
-    async fn drain(&self, graph: &mut RuntimeGraph<M, H>) {
+    async fn drain(&self, graph: &mut RuntimeGraph<Watched<M>, H>) {
         loop {
             let jobs = std::mem::take(&mut *lock(&self.inner.jobs));
             if jobs.is_empty() {
@@ -159,6 +227,39 @@ impl<M: RuntimeMode, H: Host> Debuggee<M, H> {
                 job(graph).await;
             }
         }
+    }
+}
+
+/// A node's phase, as both hosts name it.
+fn phase_name(phase: NodePhase) -> String {
+    serde_json::to_value(phase)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_default()
+}
+
+fn trace_event(event: TraceEvent) -> graph::TraceEvent {
+    use graph::TraceEvent as Event;
+    match event {
+        TraceEvent::RunStarted { node } => Event::RunStarted(node.to_string()),
+        TraceEvent::RunReturned { node } => Event::RunReturned(node.to_string()),
+        TraceEvent::GroupDrained { nodes } => {
+            Event::GroupDrained(nodes.iter().map(ToString::to_string).collect())
+        }
+        TraceEvent::PhaseTransition { node, from, to } => {
+            Event::PhaseTransition(graph::Transition {
+                node: node.to_string(),
+                before: phase_name(from),
+                after: phase_name(to),
+            })
+        }
+        TraceEvent::Fault { node, fault } => Event::Fault(graph::NodeFault {
+            node: node.to_string(),
+            kind: fault.kind().to_string(),
+            message: fault.to_string(),
+        }),
+        TraceEvent::Cancelled { node } => Event::Cancelled(node.to_string()),
+        TraceEvent::Restarted { node } => Event::Restarted(node.to_string()),
     }
 }
 
@@ -211,12 +312,8 @@ impl<C: Send + Sync, M: RuntimeMode, H: Host> graph::Handler<C> for Handler<M, H
             .with(move |graph| {
                 Box::pin(async move {
                     let state = graph.node_state(&node).map_err(|e| e.to_string())?;
-                    let phase = serde_json::to_value(state.phase())
-                        .ok()
-                        .and_then(|value| value.as_str().map(str::to_string))
-                        .unwrap_or_default();
                     Ok(graph::State {
-                        phase,
+                        phase: phase_name(state.phase()),
                         fault: state.fault_cause().map(ToString::to_string),
                         culprit: state.culprit().map(ToString::to_string),
                     })
@@ -252,6 +349,30 @@ impl<C: Send + Sync, M: RuntimeMode, H: Host> graph::Handler<C> for Handler<M, H
             .read_output_wave(&NodeId::from(node), &PortName::from(port))
             .await;
         Ok(read.map_err(|e| e.to_string()))
+    }
+
+    async fn read_input(
+        &self,
+        _: C,
+        node: String,
+        port: String,
+    ) -> anyhow::Result<Result<Option<String>, String>> {
+        let read = self
+            .inner()
+            .reader
+            .read_input_wave(&NodeId::from(node), &PortName::from(port))
+            .await;
+        Ok(read.map_err(|e| e.to_string()))
+    }
+
+    async fn take_trace(&self, _: C) -> anyhow::Result<Vec<graph::TraceEvent>> {
+        Ok(self
+            .inner()
+            .trace
+            .take_trace()
+            .into_iter()
+            .map(trace_event)
+            .collect())
     }
 
     async fn inject(

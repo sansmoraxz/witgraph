@@ -51,9 +51,9 @@ Put them anywhere on your page. They all share one `EditorController`.
   feedback loop or an endless stream runs until you stop it. On a graph that has finished,
   it runs it again.
 - **Next node** (F10) runs one node and pauses before the next, which is selected, with its
-  inputs in the inspector. It works from a stopped graph, a pause or a breakpoint, and past
-  the last node it starts over. A node that is left running, reading an endless stream say,
-  goes on beside what you step through.
+  inputs in the inspector, as WAVE text as outputs are. It works from a stopped graph, a pause
+  or a breakpoint, and past the last node it starts over. A node that is left running, reading
+  an endless stream say, goes on beside what you step through.
 - **Pause** (F6) holds each node from the next on: what is already running, streams
   included, goes on. **Continue** (F5) goes on to the next breakpoint, of either kind below.
 - **Stop** (Shift+F5) halts a run and everything it left running, endless streams included.
@@ -126,10 +126,12 @@ WebTransport: it pins the server's certificate by `certificateHash`, and the `to
 `url`. In the demo, open `?attach=<url>&hash=<hex of the hash>`;
 `cargo run -p witgraph-remote --example serve` runs a graph to try it on, and prints both.
 
-The program ticks the graph, so _Run_, _Stop_, _Restart_ and _Reset_ are hidden, the badge says
-_Attached_, and the graph cannot be edited. Node breakpoints, _Pause_, _Continue_, _Next node_,
-the source panel (its text comes from the program's machine), _Inject_ and rerunning a node
-work. Values are shown as WAVE text, and a node paused at shows no inputs. A debugger that goes
+The program ticks the graph, so _Run_, _Stop_, _Restart_, _Reset_ and _Rate_ are hidden, the
+badge says _Attached_, and the graph cannot be edited. The rest is as on a graph of the page's
+own: the components panel lists the graph's components, the timeline shows what the scheduler
+did (the latest thousand events, from before attaching too), and node breakpoints, _Pause_,
+_Continue_, _Next node_, the source panel (its text comes from the program's machine), _Inject_
+and rerunning a node work. Previews of streams and handles are not shown. A debugger that goes
 lets go of what it held and stopped, within ten seconds if it went without closing.
 
 ## Previews

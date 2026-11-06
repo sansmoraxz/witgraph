@@ -12,6 +12,33 @@ interface graph {
         culprit: option<string>,
     }
 
+    /// A node's phase changing.
+    record transition {
+        node: string,
+        before: string,
+        after: string,
+    }
+
+    /// A fault, and the node it is reported for.
+    record node-fault {
+        node: string,
+        /// `trap`, `memory-limit`, `hostcall-fuel`, `fuel`, `fatal` or `restart`.
+        kind: string,
+        message: string,
+    }
+
+    /// Something the scheduler did, as a timeline shows it.
+    variant trace-event {
+        run-started(string),
+        run-returned(string),
+        /// A stream group's members, its runs returned and no guest work left.
+        group-drained(list<string>),
+        phase-transition(transition),
+        fault(node-fault),
+        cancelled(string),
+        restarted(string),
+    }
+
     /// The graph, as the JSON a `witgraph_ir::Graph` serializes to.
     describe: func() -> string;
     /// By node, its component's contract, as JSON: what an editor draws its ports from.
@@ -24,6 +51,11 @@ interface graph {
     output-version: func(node: string, port: string) -> result<u64, string>;
     /// A Value or handle output port's latched value, as WAVE text.
     read-output: func(node: string, port: string) -> result<option<string>, string>;
+    /// A Value input port's latched value, as WAVE text: what its node runs on next.
+    read-input: func(node: string, port: string) -> result<option<string>, string>;
+    /// What the scheduler did since this was last asked, oldest first: the latest thousand
+    /// at most, from before the debugger attached too.
+    take-trace: func() -> list<trace-event>;
     /// Writes a Value input port, from WAVE text.
     inject: func(node: string, port: string, wave: string) -> result<_, string>;
     /// Clears what was written to an input port.

@@ -5,7 +5,13 @@
  */
 
 import { fromWebStreams, type Transport } from '@bytecodealliance/wrpc';
-import type { Contract, Diagnostic, PortValues, TickResult } from '../index.ts';
+import {
+  type Contract,
+  camelCase,
+  type Diagnostic,
+  type PortValues,
+  type TickResult,
+} from '../index.ts';
 import type { LineStop, SourceVariable } from '../lines.ts';
 import type { DebugGraph, DebugLines, DebugSession } from '../remote.ts';
 import * as graph from './bindings/witgraph/debug/graph.js';
@@ -67,8 +73,13 @@ export class AttachedSession implements DebugSession {
     const open = () => this.#open();
     const states = new Map<string, State>();
     const versions = new Map<string, number>();
+    const trace: unknown[] = [];
     const poll = async () => {
       let moved = false;
+      const taken = await open()
+        .then(graph.takeTrace)
+        .catch(() => []);
+      trace.push(...taken.map(traceEntry));
       await Promise.all(
         [...contracts.keys()].map(async (node) => {
           const state = await graph.nodeState(await open(), node).catch(() => undefined);
@@ -110,7 +121,7 @@ export class AttachedSession implements DebugSession {
     };
     this.#timer = setInterval(() => void poll(), options.pollEvery ?? 250);
     void poll();
-    this.graph = attachedGraph(open, states, versions, groups, poll);
+    this.graph = attachedGraph(open, states, versions, trace, groups, poll);
     this.lines = sources.size > 0 ? attachedLines(open, sources, this.#toldStop) : undefined;
     void this.#follow();
   }
@@ -201,9 +212,14 @@ export class AttachedSession implements DebugSession {
   /** The host's previews are its own: nothing is observed from here. */
   observeOnly(): void {}
 
-  /** wasmtime has no way to read a latched input as text yet. */
-  async readInputs(): Promise<PortValues> {
-    return {};
+  /** As {@link Session.readInputs}, but each value as WAVE text: a host's values are its own. */
+  async readInputs(node: string): Promise<PortValues> {
+    const inputs: PortValues = {};
+    for (const port of this.contracts.get(node)?.inputs ?? []) {
+      if (port.kind !== 'value') continue;
+      inputs[camelCase(port.name)] = await this.graph.readInputWave(node, port.name);
+    }
+    return inputs;
   }
 
   /** The program serving the graph ticks it. */
@@ -247,6 +263,7 @@ function attachedGraph(
   open: () => Promise<Transport>,
   states: Map<string, State>,
   versions: Map<string, number>,
+  trace: unknown[],
   groups: string[][],
   poll: () => Promise<void>,
 ): DebugGraph {
@@ -257,6 +274,7 @@ function attachedGraph(
     clearInput: async (node, port) => done(graph.clearInput(await open(), node, port)),
     rerun: async (node) => done(graph.rerun(await open(), node)),
     // Values cross as WAVE text: a host's values are its own.
+    readInputWave: async (node, port) => ok(graph.readInput(await open(), node, port)),
     readOutput: async (node, port) => ok(graph.readOutput(await open(), node, port)),
     readOutputWave: async (node, port) => ok(graph.readOutput(await open(), node, port)),
     readHandle: async (node, port) => ok(graph.readOutput(await open(), node, port)),
@@ -266,7 +284,7 @@ function attachedGraph(
       return state;
     },
     outputVersion: (node, port) => versions.get(`${node}\0${port}`) ?? 0,
-    takeTrace: () => [],
+    takeTrace: () => trace.splice(0),
     takeFaults: () => [],
     streamGroups: () => groups,
     catchUp: () => {},
@@ -321,6 +339,29 @@ function attachedLines(
     stepOut: () => goOn(lines.stepOut),
     release: () => goOn(lines.release),
   };
+}
+
+/** A trace event, as a JavaScript host's `takeTrace` gives it. */
+function traceEntry(event: graph.TraceEvent): unknown {
+  switch (event.kind) {
+    case 'group-drained':
+      return { event: event.kind, nodes: event.value };
+    case 'phase-transition':
+      return {
+        event: event.kind,
+        node: event.value.node,
+        from: event.value.before,
+        to: event.value.after,
+      };
+    case 'fault':
+      return {
+        event: event.kind,
+        node: event.value.node,
+        fault: { kind: event.value.kind, message: event.value.message },
+      };
+    default:
+      return { event: event.kind, node: event.value };
+  }
 }
 
 function lineStop(stop: lines.LineStop): LineStop {

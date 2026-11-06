@@ -37,10 +37,24 @@ test('the editor attaches, and holds a node of the graph its program runs', asyn
   // The program runs it: here it is only debugged.
   await expect(controls.locator('button.run')).toBeHidden();
   await expect(controls.locator('button.stop')).toBeHidden();
+  await expect(controls.locator('.rate-group')).toBeHidden();
+  // The rest looks as it does on a graph of the page's own.
+  await expect(page.locator('#graph-picker')).toContainText('Attached: 127.0.0.1');
+  const catalog = page.locator('witgraph-catalog');
+  await expect(catalog.locator('.card')).toHaveCount(2);
+  await expect(catalog).toContainText('test:line-walk/line-walk@0.1.0');
+  await expect(catalog).not.toContainText('#');
+  await expect(page.locator('witgraph-timeline')).toContainText('run-returned', {
+    timeout: 10_000,
+  });
 
   await canvas.evaluate((el: WitgraphCanvas) => el.controller?.toggleBreakpoint('walker'));
   await expect(controls.locator('.badge')).toHaveText('Paused at a node', { timeout: 10_000 });
   await expect(page.locator('#status')).toContainText('Paused before node walker');
+  // What it will run on, as WAVE, as outputs are shown.
+  const inspector = page.locator('witgraph-inspector');
+  await expect(inspector.locator('.bp-bg')).toContainText(/in\s*\d+/);
+  await expect(inspector.locator('.bp-bg')).toContainText(/spin\s*-/);
 
   // It goes on, and stops there again on its next run.
   await controls.locator('button.resume').click();

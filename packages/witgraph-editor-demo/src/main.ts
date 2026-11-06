@@ -544,13 +544,24 @@ function chosenDemo(): [string, Demo] {
   return name in demos ? [name, demos[name]] : ['port-kinds', demos['port-kinds']];
 }
 
-/** The graph picker: choosing another loads the page with it. */
-function setUpPicker(current: string): void {
+/**
+ * The graph picker: choosing another loads the page with it. Attached, it names the program's
+ * graph, and choosing a demo leaves it.
+ */
+function setUpPicker(current: string, attachedTo?: string): void {
   const picker = document.getElementById('graph-picker') as HTMLSelectElement | null;
   if (!picker) return;
-  picker.value = current;
+  if (attachedTo !== undefined) {
+    const attached = new Option(`Attached: ${attachedTo}`, '', true, true);
+    attached.disabled = true;
+    picker.prepend(attached);
+  } else {
+    picker.value = current;
+  }
   picker.addEventListener('change', () => {
     const url = new URL(location.href);
+    url.searchParams.delete('attach');
+    url.searchParams.delete('hash');
     url.searchParams.set('graph', picker.value);
     location.assign(url);
   });
@@ -562,6 +573,7 @@ async function loadDemo(): Promise<void> {
   const asked = new URLSearchParams(location.search);
   const attachTo = asked.get('attach');
   if (attachTo) {
+    setUpPicker('', URL.canParse(attachTo) ? new URL(attachTo).host : attachTo);
     try {
       statusEl.textContent = 'Attaching...';
       const hex = asked.get('hash') ?? '';

@@ -458,7 +458,7 @@ export class EditorController extends EventTarget {
     inputs: PortVisual[];
     outputs: PortVisual[];
   }[] {
-    if (!this.#session || !this.#originalOptions) return [];
+    if (!this.#session) return [];
     const result: {
       id: string;
       index: number;
@@ -481,10 +481,14 @@ export class EditorController extends EventTarget {
       });
       if (compIdx === undefined || compIdx < 0 || seen.has(compIdx)) continue;
       seen.add(compIdx);
-      const source = this.#originalOptions!.components[compIdx];
-      if (!source) continue;
+      // An attached graph's components are the program's: their contracts say what they are,
+      // named as a page's own are, without their content hash.
+      const id =
+        this.#originalOptions?.components[compIdx]?.id ??
+        this.#session.contracts.get(nodeId)?.id.split('#')[0];
+      if (!id) continue;
       result.push({
-        id: source.id,
+        id,
         index: compIdx,
         docs: this.#session.contracts.get(nodeId)?.docs,
         inputs: visual.inputs,
@@ -494,6 +498,7 @@ export class EditorController extends EventTarget {
 
     // Also include components not yet used by any node — derive ports
     // from the component's WIT contract so the catalog and paste show them.
+    if (!this.#originalOptions) return result;
     for (let i = 0; i < this.#originalOptions.components.length; i++) {
       if (seen.has(i)) continue;
       const comp = this.#originalOptions.components[i];
@@ -2535,7 +2540,7 @@ export class EditorController extends EventTarget {
     // Held, it waits for this. One no longer wanted held just goes on.
     if (held && (breakpoint || this.#stepping)) {
       // Read when it is hit, as nothing crosses to the host unasked.
-      const inputs = (await session?.readInputs(node)) ?? {};
+      const inputs = await this.#heldInputs(session, node);
       if (this.#stopRequested) return;
       return new Promise<void>((resume) => {
         this.#held.push({ node, inputs, resume, breakpoint });
@@ -2553,6 +2558,21 @@ export class EditorController extends EventTarget {
     for (const port of visual?.outputs ?? []) {
       if (port.kind === 'future') this.#observation(node, port.name).pending = true;
     }
+  }
+
+  /** A held run's Value inputs, as WAVE text by port name: as its outputs are shown. */
+  async #heldInputs(
+    session: DebugSession | null,
+    node: string,
+  ): Promise<BreakpointState['inputs']> {
+    const inputs: BreakpointState['inputs'] = {};
+    for (const port of this.#nodes.get(node)?.inputs ?? []) {
+      if (port.kind !== 'value') continue;
+      inputs[port.name] = await session?.graph
+        .readInputWave(node, port.name)
+        .catch(() => undefined);
+    }
+    return inputs;
   }
 
   #collectCapabilities(): void {

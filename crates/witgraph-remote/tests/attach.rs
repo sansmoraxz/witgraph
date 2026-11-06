@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use test_components::ECHO;
 use witgraph_ir::{ComponentRef, Graph, NodeId, PortName, PortRef};
-use witgraph_remote::{Debuggee, Served, serve};
+use witgraph_remote::{Debuggee, Served, Watched, serve};
 use witgraph_runtime::{Perf, RunningGraph, RuntimeConfig, RuntimeGraph};
 
 mod client {
@@ -33,9 +33,14 @@ async fn attached() -> (Debuggee<Perf, witgraph_runtime::NoCapabilities>, Served
         .build();
     let compiled = graph.compile(&[contract]).unwrap();
     let wasm = HashMap::from([(id, ECHO.wasm)]);
-    let rt = RuntimeGraph::load(compiled, &wasm, RuntimeConfig::default(), Perf)
-        .await
-        .unwrap();
+    let rt = RuntimeGraph::load(
+        compiled,
+        &wasm,
+        RuntimeConfig::default(),
+        Watched::new(Perf),
+    )
+    .await
+    .unwrap();
     let debuggee = Debuggee::new(rt).unwrap();
     let served = serve(
         debuggee.clone(),
@@ -107,6 +112,33 @@ async fn a_debugger_holds_a_node_and_sees_in_while_it_is_held() {
         .unwrap()
         .unwrap();
     assert_eq!(state.phase, "running");
+    // What it will run on, and what came before.
+    let input = graph::read_input(&wrpc, (), "b", "in")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(input.as_deref(), Some("5"));
+    let trace = graph::take_trace(&wrpc, ()).await.unwrap();
+    assert!(
+        trace
+            .iter()
+            .any(|event| matches!(event, graph::TraceEvent::RunReturned(node) if node == "a")),
+        "{trace:?}"
+    );
+    assert!(
+        trace.iter().any(|event| matches!(
+            event,
+            graph::TraceEvent::PhaseTransition(graph::Transition { node, after, .. })
+                if node == "b" && after == "running"
+        )),
+        "{trace:?}"
+    );
+    assert!(
+        graph::read_input(&wrpc, (), "b", "out")
+            .await
+            .unwrap()
+            .is_err()
+    );
     let a = graph::read_output(&wrpc, (), "a", "out")
         .await
         .unwrap()
@@ -179,9 +211,14 @@ async fn a_debugger_stops_a_guest_on_a_line_and_reads_its_source() {
         debug_lines: Some(OwnLines::default()),
         ..RuntimeConfig::default()
     };
-    let mut rt = RuntimeGraph::load(graph.compile(&contracts).unwrap(), &wasm, config, Perf)
-        .await
-        .unwrap();
+    let mut rt = RuntimeGraph::load(
+        graph.compile(&contracts).unwrap(),
+        &wasm,
+        config,
+        Watched::new(Perf),
+    )
+    .await
+    .unwrap();
     rt.inject_wave(&NodeId::from("counter"), &PortName::from("in"), "0")
         .await
         .unwrap();

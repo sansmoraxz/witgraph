@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use test_components::{LINE_WALK, RELAY};
 use witgraph_ir::{Graph, NodeId, PortName, PortRef};
-use witgraph_remote::{Debuggee, serve};
+use witgraph_remote::{Debuggee, Watched, serve};
 use witgraph_runtime::{OwnLines, Perf, RunningGraph, RuntimeConfig, RuntimeGraph};
 
 #[tokio::main]
@@ -48,7 +48,13 @@ async fn main() -> anyhow::Result<()> {
         debug_lines: Some(OwnLines::default()),
         ..RuntimeConfig::default()
     };
-    let mut rt = RuntimeGraph::load(graph.compile(&contracts)?, &wasm, config, Perf).await?;
+    let mut rt = RuntimeGraph::load(
+        graph.compile(&contracts)?,
+        &wasm,
+        config,
+        Watched::new(Perf),
+    )
+    .await?;
     rt.inject_wave(&NodeId::from("counter"), &PortName::from("in"), "0")
         .await?;
     rt.inject_wave(&NodeId::from("counter"), &PortName::from("add"), "1")

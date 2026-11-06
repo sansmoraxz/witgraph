@@ -39,7 +39,7 @@ const MODE_BG: Record<EditorMode, string> = {
 };
 
 const EXTRA_CSS = `
-  button[hidden], .btn-group[hidden], .sep[hidden], .level[hidden] { display: none; }
+  button[hidden], .btn-group[hidden], .sep[hidden], .level[hidden], .rate-group[hidden] { display: none; }
   .level { font-size: 0.6875rem; color: var(--wg-text-dim); margin: 0 2px 0 4px; }
   :host { display: block;
     --_btn-radius: var(--wg-btn-radius, 4px);
@@ -138,6 +138,7 @@ export class WitgraphControls extends HTMLElement {
   #badge!: HTMLSpanElement;
   /** Shows a tick rate on the slider; set once the toolbar is built. */
   #showRate: ((rate: number) => void) | null = null;
+  #rateGroup: HTMLElement | null = null;
   #durationSpan!: HTMLSpanElement;
 
   /** The usual debugger keys, wherever the focus is. */
@@ -344,6 +345,7 @@ export class WitgraphControls extends HTMLElement {
     });
     this.#showRate = showRate;
     rateGroup.append(rateLabel, rateSlider, rateValue);
+    this.#rateGroup = rateGroup;
     toolbar.appendChild(rateGroup);
 
     // Spacer + badge
@@ -451,6 +453,8 @@ export class WitgraphControls extends HTMLElement {
     for (const button of [this.#btnRun, this.#btnStop, this.#btnRestart, this.#btnReset]) {
       button.toggleAttribute('hidden', attached);
     }
+    // Its program sets how fast it ticks.
+    this.#rateGroup?.toggleAttribute('hidden', attached);
     for (const button of [this.#btnLoad, this.#btnSnapSave, this.#btnSnapRestore]) {
       if (attached) button.disabled = true;
     }
