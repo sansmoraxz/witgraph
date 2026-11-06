@@ -31,7 +31,7 @@ use witgraph_traits::{
 };
 
 use crate::diagnostics::{compile_error, component_entry, diagnostic_array};
-use crate::link::{self, Composed};
+use crate::link::{self, Linked};
 use crate::live::{Live, LiveMode, LiveState};
 use crate::plane::{Callbacks, WebHub, WebPlane, stream_inputs};
 use crate::value::{Data, camel, check_type, from_js, parse_wave, set, set_field, with_key};
@@ -885,8 +885,7 @@ impl WebGraph {
             &entries,
             &node_components,
             &node_exports,
-            &linked.composed,
-            &linked.of_node,
+            &linked,
             &mocked,
             debug.unwrap_or(false),
         )?;
@@ -1488,8 +1487,7 @@ fn compose(
     entries: &[(ComponentRef, Vec<u8>)],
     of_node: &HashMap<NodeId, u32>,
     exports: &HashMap<NodeId, &str>,
-    composed: &[Composed],
-    composed_of: &HashMap<NodeId, usize>,
+    linked: &Linked,
     mocked: &[NodeId],
     debug: bool,
 ) -> Result<(Composite, Vec<Capability>), JsError> {
@@ -1499,8 +1497,8 @@ fn compose(
         let unknown = || error(format!("unknown node `{}`", node.id));
         let contract = compiled.contract_for(&node.id).ok_or_else(unknown)?;
         let is_mocked = mocked.contains(&node.id);
-        let linked = composed_of.get(&node.id).map(|at| &composed[*at]);
-        let (bytes, export, imports): (&[u8], &str, &[Capability]) = match linked {
+        let composition = linked.of_node.get(&node.id).map(|at| &linked.composed[*at]);
+        let (bytes, export, imports): (&[u8], &str, &[Capability]) = match composition {
             Some(linked) => (&linked.bytes, &linked.export, &linked.capabilities),
             None => {
                 let (_, bytes) = of_node
