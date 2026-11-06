@@ -49,7 +49,7 @@ sha2 = "0.11"
 # wasmtime and the wasm-tools crates move together: this wasmtime is built on
 # wasm-tools 0.263. Bump every wasm-tools crate below together with wasmtime.
 # Bugs in wasmtime, wit-parser and wac are fixed on `witgraph-patches` in our
-# forks, as are those in oci-client, which is patched below.
+# forks.
 #
 # wasmtime's is on upstream main, for the fix for a table leak in
 # guest-to-guest async calls, not in 50.0.1, and keeps a component's
@@ -66,7 +66,6 @@ wasm-wave = { version = "0.263", default-features = false, features = ["std"] }
 opt-level = 1
 
 [patch.crates-io]
-oci-client = { git = "https://github.com/sansmoraxz/rust-oci-client", rev = "85dd6bff99f0d25a2fe752244195c312c9ec47c0" }
 wasm-encoder = { git = "https://github.com/sansmoraxz/wasm-tools", rev = "774832120e5640db309c0d74070b35c5ee05255f" }
 wasm-metadata = { git = "https://github.com/sansmoraxz/wasm-tools", rev = "774832120e5640db309c0d74070b35c5ee05255f" }
 wasm-wave = { git = "https://github.com/sansmoraxz/wasm-tools", rev = "774832120e5640db309c0d74070b35c5ee05255f" }

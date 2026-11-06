@@ -807,8 +807,6 @@ impl tokio::io::AsyncWrite for Capped {
 fn client(protocol: ClientProtocol) -> Client {
     Client::new(ClientConfig {
         protocol,
-        // A manifest comes from the registry, which does not choose where else we connect.
-        follow_layer_urls: false,
         ..ClientConfig::default()
     })
 }
