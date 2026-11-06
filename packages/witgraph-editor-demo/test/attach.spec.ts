@@ -112,3 +112,28 @@ test("the editor stops on a line of the program's guest written in C", async ({ 
   await page.locator('witgraph-controls').locator('button.resume').click();
   await expect(page.locator('witgraph-controls').locator('.badge')).toHaveText('Attached');
 });
+
+test('an editor attaching takes over from one gone without a word', async ({ page, context }) => {
+  // One left stopped on a line, as a page reloaded while stopped leaves it: the program only
+  // notices it has gone once it times out.
+  await page.goto(attach);
+  const source = page.locator('witgraph-source');
+  await source.locator('select.file').selectOption({ label: 'line-walk/src/lib.rs' });
+  const row = source.locator('.row', { hasText: 'mark: walk-first' });
+  await expect(row).toBeVisible({ timeout: 20_000 });
+  await row.locator('.gutter').click();
+  await expect(source.locator('.row.current')).toBeVisible({ timeout: 20_000 });
+
+  const next = await context.newPage();
+  await next.goto(attach);
+  const canvas = next.locator('witgraph-canvas');
+  await expect(canvas.locator('[data-node-id="walker"]')).toBeVisible({ timeout: 20_000 });
+  // Its graph runs on, stopping at no breakpoint of the other's.
+  const walked = () =>
+    canvas.evaluate((el: WitgraphCanvas) => el.controller?.readOutputWave('walker', 'out'));
+  const first = await walked();
+  await expect.poll(walked, { timeout: 10_000 }).not.toBe(first);
+  await expect(next.locator('witgraph-controls').locator('.badge')).toHaveText('Attached');
+  await expect(next.locator('witgraph-source').locator('.row.current')).toHaveCount(0);
+  await page.close();
+});

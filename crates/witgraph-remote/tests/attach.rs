@@ -178,9 +178,11 @@ async fn a_debugger_holds_a_node_and_sees_in_while_it_is_held() {
     let _ = (state, PortName::from("in"));
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn a_debugger_stops_a_guest_on_a_line_and_reads_its_source() {
-    use client::witgraph::debug::lines;
+/// `counter` feeding itself and `walker`, a guest built with debug info, served with a host
+/// ticking it; a debugger attached to it; and the line of `walker`'s source marked
+/// `walk-first`, in its file. The debugger is the test's to keep: one that goes clears the
+/// breakpoints set.
+async fn lines_attached() -> (Served, wrpc_webtransport::Client, String, u32) {
     use test_components::{LINE_WALK, RELAY};
     use witgraph_runtime::OwnLines;
 
@@ -233,27 +235,38 @@ async fn a_debugger_stops_a_guest_on_a_line_and_reads_its_source() {
     )
     .await
     .unwrap();
-    let ticking = debuggee.clone();
     tokio::spawn(async move {
         loop {
-            let _ = ticking.tick().await;
+            let _ = debuggee.tick().await;
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     });
     let wrpc = connect(&served, "secret").await.unwrap();
-    let files = lines::files(&wrpc, ()).await.unwrap();
+    let files = client::witgraph::debug::lines::files(&wrpc, ())
+        .await
+        .unwrap();
     let file = files
         .iter()
         .find(|file| file.ends_with("line-walk/src/lib.rs"))
         .unwrap()
         .clone();
-    let text = lines::source(&wrpc, (), &file).await.unwrap().unwrap();
+    let text = client::witgraph::debug::lines::source(&wrpc, (), &file)
+        .await
+        .unwrap()
+        .unwrap();
     let line = text
         .lines()
         .position(|line| line.ends_with("// mark: walk-first"))
         .unwrap()
         + 1;
-    let line = u32::try_from(line).unwrap();
+    (served, wrpc, file, u32::try_from(line).unwrap())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_debugger_stops_a_guest_on_a_line_and_reads_its_source() {
+    use client::witgraph::debug::lines;
+
+    let (served, wrpc, file, line) = lines_attached().await;
     assert!(
         lines::source(&wrpc, (), "/etc/passwd")
             .await
@@ -325,4 +338,41 @@ async fn a_debugger_that_goes_lets_go_of_what_it_held() {
         .await
         .expect("`b` was let go, and ran");
     assert!(holds::held(&next, ()).await.unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_debugger_that_goes_leaves_no_breakpoint_behind() {
+    use client::witgraph::debug::lines;
+
+    let (served, gone, file, line) = lines_attached().await;
+    assert_eq!(
+        lines::set_breakpoint(&gone, (), &file, line).await.unwrap(),
+        Some(line)
+    );
+    tokio::time::timeout(Duration::from_secs(20), lines::next_stop(&gone, ()))
+        .await
+        .expect("it stops")
+        .unwrap();
+    // Gone without clearing it, as a closed tab goes.
+    drop(gone);
+
+    // The guest is let go, and its next runs stop nowhere: it goes on walking.
+    let next = connect(&served, "secret").await.unwrap();
+    let walked = async {
+        let mut seen = Vec::new();
+        while seen.len() < 3 {
+            let out = graph::read_output(&next, (), "walker", "out")
+                .await
+                .unwrap()
+                .unwrap();
+            if seen.last() != Some(&out) {
+                seen.push(out);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(20), walked)
+        .await
+        .expect("the breakpoint went with its debugger");
+    assert!(lines::stopped(&next, ()).await.unwrap().is_none());
 }

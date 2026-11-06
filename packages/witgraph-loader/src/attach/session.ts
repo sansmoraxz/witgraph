@@ -34,6 +34,16 @@ export interface AttachOptions {
   pollEvery?: number;
 }
 
+/** The stop told of, and what has let a guest go since. */
+interface Told {
+  /** The stop told of, until the guest goes on: told once, by whichever way it came. */
+  stop?: string;
+  /** How many calls letting a guest go, a resume or a step, are yet to be done. */
+  going: number;
+  /** How many have been done. */
+  went: number;
+}
+
 interface State {
   phase: string;
   fault?: { kind: string; message: string };
@@ -56,7 +66,7 @@ export class AttachedSession implements DebugSession {
   /** The held runs told of: each once. */
   readonly #toldHeld = new Set<bigint>();
   /** The stop told of, until the guest goes on: told once, by whichever way it came. */
-  readonly #toldStop: { stop?: string } = {};
+  readonly #toldStop: Told = { going: 0, went: 0 };
 
   private constructor(
     connection: WebTransport,
@@ -106,6 +116,7 @@ export class AttachedSession implements DebugSession {
       if (moved) options.onState?.();
       // What a stream of them could have lost: to a debugger gone before this, still taking
       // them until its connection times out.
+      const went = this.#toldStop.went;
       const [held, stopped] = await Promise.all([
         open()
           .then(holds.held)
@@ -117,12 +128,15 @@ export class AttachedSession implements DebugSession {
           : undefined,
       ]);
       for (const run of held) this.#tellHeld(run);
-      if (stopped) this.#tellStop(stopped);
+      // Unless it was asked before the guest was let go: then it is the stop it went on from.
+      const current = this.#toldStop.going === 0 && this.#toldStop.went === went;
+      if (stopped && current) this.#tellStop(stopped);
     };
     this.#timer = setInterval(() => void poll(), options.pollEvery ?? 250);
     void poll();
     this.graph = attachedGraph(open, states, versions, trace, groups, poll);
-    this.lines = sources.size > 0 ? attachedLines(open, sources, this.#toldStop) : undefined;
+    const send = (call: (transport: Transport) => Promise<unknown>) => this.#send(call);
+    this.lines = sources.size > 0 ? attachedLines(send, sources, this.#toldStop) : undefined;
     void this.#follow();
   }
 
@@ -133,6 +147,11 @@ export class AttachedSession implements DebugSession {
     });
     await connection.ready;
     const open = async () => fromWebStreams(await connection.createBidirectionalStream());
+    // Attaching takes over: what a debugger left held and stopped, its breakpoints too, is let
+    // go. One gone without a word, as a reloaded page goes, is only noticed once it times out,
+    // and its breakpoints would stop the guest where this one shows none.
+    await holds.release(await open());
+    await lines.release(await open());
     const [described, contracts, groups, files] = await Promise.all([
       open().then(graph.describe),
       open().then(graph.contracts),
@@ -164,8 +183,8 @@ export class AttachedSession implements DebugSession {
   #tellHeld(run: holds.HeldRun): void {
     if (this.#toldHeld.has(run.id)) return;
     this.#toldHeld.add(run.id);
-    void Promise.resolve(this.#options.beforeRun?.(run.node, true)).then(async () => {
-      if (!this.#disposed) await holds.resume(await this.#open(), run.id);
+    void Promise.resolve(this.#options.beforeRun?.(run.node, true)).then(() => {
+      if (!this.#disposed) this.#send((transport) => holds.resume(transport, run.id));
     });
   }
 
@@ -206,7 +225,21 @@ export class AttachedSession implements DebugSession {
   holdAt(nodes: readonly string[] | 'all'): void {
     const at: holds.Holding =
       nodes === 'all' ? { kind: 'all' } : { kind: 'nodes', value: [...nodes] };
-    void this.#open().then((transport) => holds.holdAt(transport, at));
+    this.#send((transport) => holds.holdAt(transport, at));
+  }
+
+  /** What is asked, sent once what was asked before is done: each its own stream, unordered. */
+  #sent: Promise<unknown> = Promise.resolve();
+
+  #send(call: (transport: Transport) => Promise<unknown>): Promise<void> {
+    const sent = this.#sent
+      .then(() => this.#open().then(call))
+      .then(
+        () => {},
+        () => {},
+      );
+    this.#sent = sent;
+    return sent;
   }
 
   /** The host's previews are its own: nothing is observed from here. */
@@ -296,21 +329,22 @@ function attachedGraph(
 }
 
 function attachedLines(
-  open: () => Promise<Transport>,
+  send: (call: (transport: Transport) => Promise<unknown>) => Promise<void>,
   sources: Map<string, number[]>,
-  told: { stop?: string },
+  told: Told,
 ): DebugLines {
   let stopped: LineStop | undefined;
   // The guest goes on: its next stop is a new one, even on the same line with the same values.
   const goOn = (call: (transport: Transport) => Promise<unknown>) => {
     stopped = undefined;
     told.stop = undefined;
-    send(call);
+    told.going += 1;
+    void send(call).then(() => {
+      told.going -= 1;
+      told.went += 1;
+    });
   };
   let held: holds.Holding | undefined;
-  const send = (call: (transport: Transport) => Promise<unknown>) => {
-    void open().then(call);
-  };
   return {
     get files() {
       return [...sources.keys()];

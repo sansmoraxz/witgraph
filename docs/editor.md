@@ -134,7 +134,9 @@ own: the components panel lists the graph's components, the timeline shows what 
 did (the latest thousand events, from before attaching too), and node breakpoints, _Pause_,
 _Continue_, _Next node_, the source panel (its text comes from the program's machine), _Inject_
 and rerunning a node work. Previews of streams and handles are not shown. A debugger that goes
-lets go of what it held and stopped, within ten seconds if it went without closing.
+lets go of what it held and stopped, and its breakpoints, within ten seconds if it went without
+closing. One that attaches takes over: what was left held, stopped or set, by a page reloaded
+say, is let go at once.
 
 ## Previews
 
