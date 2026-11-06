@@ -2,7 +2,13 @@
   "$schema": "https://biomejs.dev/schemas/2.6.4/schema.json",
   "vcs": { "enabled": true, "clientKind": "git", "useIgnoreFile": true },
   "files": {
-    "includes": ["**", "!**/pkg", "!**/*.yaml", "!target"]
+    "includes": [
+      "**",
+      "!**/pkg",
+      "!**/*.yaml",
+      "!target",
+      "!packages/witgraph-loader/src/attach/bindings"
+    ]
   },
   "formatter": {
     "indentStyle": "space",
