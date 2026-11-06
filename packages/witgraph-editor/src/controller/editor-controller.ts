@@ -1386,33 +1386,47 @@ export class EditorController extends EventTarget {
     return this.#lineStop;
   }
 
-  /** The line breakpoints set in `file`: of a node, or of every node. */
+  /** The line breakpoints set in `file`, one at most on a line: of a node, or of every node. */
   lineBreakpoints(file: string): readonly LineBreakpoint[] {
     return this.#lineBreakpoints
       .filter((breakpoint) => breakpoint.file === file)
       .map((breakpoint) => ({ ...breakpoint }));
   }
 
+  /** The breakpoint on `line` of `file`, or the next line with code, if one is set. */
+  lineBreakpointAt(file: string, line: number): LineBreakpoint | undefined {
+    const actual = this.linesOf(file).find((candidate) => candidate >= line);
+    const found = this.#lineBreakpoints.find(
+      (breakpoint) => breakpoint.file === file && breakpoint.line === actual,
+    );
+    return found && { ...found };
+  }
+
   /**
-   * Stops the guests `scope` says on `line` of `file`, or the next line with code, or stops doing
-   * so if they do. One for a node and one for every node are two, each toggled on its own. A
-   * guest that is running sees it at once.
+   * As a click in a debugger's gutter: takes away the breakpoint on `line` of `file`, or the next
+   * line with code, whichever nodes it stops, or with none there sets one that stops every node.
    */
-  toggleLineBreakpoint(scope: BreakpointScope, file: string, line: number): void {
+  toggleLineBreakpoint(file: string, line: number): void {
+    this.setLineBreakpoint(file, line, this.lineBreakpointAt(file, line) ? null : 'every-node');
+  }
+
+  /**
+   * Puts a breakpoint on `line` of `file`, or the next line with code, stopping the nodes `scope`
+   * says, in place of any there: with `null`, takes it away. A guest that is running sees it at
+   * once.
+   */
+  setLineBreakpoint(file: string, line: number, scope: BreakpointScope | null): void {
     const lines = this.#session?.lines;
     const actual = this.linesOf(file).find((candidate) => candidate >= line);
     if (!lines || actual === undefined) return;
-    const same = (other: LineBreakpoint) =>
-      other.file === file &&
-      other.line === actual &&
-      (other.scope === 'every-node'
-        ? scope === 'every-node'
-        : scope !== 'every-node' && other.scope.node === scope.node);
-    const at = this.#lineBreakpoints.findIndex(same);
+    const at = this.#lineBreakpoints.findIndex(
+      (breakpoint) => breakpoint.file === file && breakpoint.line === actual,
+    );
     if (at >= 0) {
+      lines.clearBreakpoint(this.#lineBreakpoints[at].scope, file, actual);
       this.#lineBreakpoints.splice(at, 1);
-      lines.clearBreakpoint(scope, file, actual);
-    } else {
+    }
+    if (scope !== null) {
       this.#lineBreakpoints.push({ scope, file, line: actual });
       lines.setBreakpoint(scope, file, actual);
     }

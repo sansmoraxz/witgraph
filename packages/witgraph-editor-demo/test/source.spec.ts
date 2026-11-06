@@ -69,7 +69,9 @@ test.describe('the source panel', () => {
     // Where it stopped is on show, with what says so, however little room there is.
     await expect(current).toBeInViewport();
     await expect(source.locator('select.file')).toBeInViewport();
-    await expect(page.locator('#status')).toContainText(`Stopped at line ${mark('walk-first')}`);
+    await expect(page.locator('#status')).toContainText(
+      `Stopped at line ${mark('walk-first')} of lib.rs in first`,
+    );
     await expect(source.locator('.where')).toContainText('in first');
     await expect(source.locator('.frames .frame').first()).toContainText('walk');
     await expect(
@@ -84,8 +86,12 @@ test.describe('the source panel', () => {
     await expect(source.locator('.frames .frame').first()).toContainText('walk');
     await expect(controls.locator('.badge')).toContainText('Paused');
 
-    // Both nodes run this code, but the breakpoint is the first's: Continue runs to the end.
+    // Both nodes run this code, and a breakpoint stops each: Continue stops in the other.
     await page.keyboard.press('F5');
+    await expect(source.locator('.where')).toContainText('in second');
+    await expect(current).toHaveAttribute('data-line', String(mark('walk-first')));
+
+    await controls.locator('button.resume').click();
     await expect(controls.locator('button.run')).toBeEnabled();
     await expect(current).toHaveCount(0);
     const output = await page
@@ -101,10 +107,7 @@ test.describe('the source panel', () => {
     const named = (path: string) => variables.locator(`[data-path="${path}"]`);
 
     await expect(variables).toBeHidden();
-    // For every node: what changed is told from one node's stop to the next's.
-    await source
-      .locator(`.row[data-line="${mark('walk-first')}"] .gutter`)
-      .click({ modifiers: ['Alt'] });
+    await source.locator(`.row[data-line="${mark('walk-first')}"] .gutter`).click();
     await controls.locator('button.run').click();
     await expect(source.locator('.row.current')).toBeVisible();
     await expect(variables).toBeInViewport();
@@ -243,6 +246,13 @@ test.describe('the source panel', () => {
     await expect(picker).toHaveValue(/line-walk\/src\/scale\.rs$/);
     await expect(current).toHaveAttribute('data-line', String(scaleMark('scale-add')));
     await expect(current).toContainText('crate::add(x, x)');
+    // Which file it is in, wherever it is said.
+    await expect(source.locator('.where')).toHaveText(
+      `Stopped at line ${scaleMark('scale-add')} of scale.rs in first`,
+    );
+    await expect(page.locator('#status')).toContainText(
+      `Stopped at line ${scaleMark('scale-add')} of scale.rs in first`,
+    );
     await expect(frames.first()).toContainText(`scale.rs:${scaleMark('scale-add')}`);
     await expect(frames.nth(1)).toContainText(`lib.rs:${mark('run-scale')}`);
     await expect(source.locator('.variables [data-path="x"]')).toContainText('3');
@@ -259,7 +269,9 @@ test.describe('the source panel', () => {
     const waiting = source.locator(`.row[data-line="${scaleMark('scale-add')}"]`);
     await expect(waiting).toHaveClass(/frame-line/);
     await expect(current).toHaveCount(0);
-    await expect(source.locator('.where')).toContainText(`line ${mark('add-body')} in first of`);
+    await expect(source.locator('.where')).toHaveText(
+      `Stopped at line ${mark('add-body')} of lib.rs in first`,
+    );
 
     // Out of `add`, to `scale.rs`, and out of `scale` to `lib.rs`.
     await page.keyboard.press('Shift+F11');
@@ -327,7 +339,7 @@ test('a breakpoint in a stream loop comes back for each item', async ({ page }) 
     if (!file) throw new Error('no debug build of the sink');
     const text = (await controller.sourceOf(file)) ?? '';
     const line = text.split('\n').findIndex((row) => row.includes('frames.next()')) + 1;
-    controller.toggleLineBreakpoint({ node: 'video-sink' }, file, line);
+    controller.setLineBreakpoint(file, line, { node: 'video-sink' });
   });
   await page.locator('witgraph-controls').locator('button.run').click();
   for (let stop = 0; stop < 4; stop++) {
@@ -397,8 +409,8 @@ test('a guest written in C stops and steps, its variables as C writes them', asy
   await controls.locator('button.run').click();
   await expect(current).toHaveAttribute('data-line', String(cMark('walk-first')));
   await expect(source.locator('.where')).toContainText('in c');
-  // What the Rust guest made of 5.
-  await expect(variables.locator('[data-path="x"]')).toContainText('8');
+  // What the Rust guest made of 5: `walk(5)` and `scale(2)`.
+  await expect(variables.locator('[data-path="x"]')).toContainText('12');
   await expect(variables.locator('[data-path="x"]')).toContainText('uint32_t');
   await page.keyboard.press('F11');
   await expect(current).toHaveAttribute('data-line', String(cMark('add-body')));
@@ -432,6 +444,7 @@ test('a guest written in C stops and steps, its variables as C writes them', asy
   await source.locator(`.row[data-line="${scaleAdd}"] .gutter`).click();
   await page.keyboard.press('F5');
   await expect(current).toHaveAttribute('data-line', String(scaleAdd));
+  await expect(source.locator('.where')).toHaveText(`Stopped at line ${scaleAdd} of scale.c in c`);
   await expect(source.locator('select.file')).toHaveValue(/c-walk\/src\/scale\.c$/);
   await expect(variables.locator('[data-path="x"]')).toContainText('2');
   await controls.locator('button.stop').click();
@@ -476,10 +489,14 @@ test("the panel shows the selected node's files, and none with none selected", a
   });
   await expect(source.locator('.row.current')).toHaveCount(0);
   await expect(source.locator('.variables')).toBeHidden();
-  await expect(source.locator('.where')).toHaveText('Stopped in rust');
+  await expect(source.locator('.where')).toHaveText(
+    `Stopped at line ${mark('walk-first')} of lib.rs in rust`,
+  );
   await select(null);
   await expect(source).toContainText('Select a node to see its source.');
-  await expect(source.locator('.where')).toHaveText('Stopped in rust');
+  await expect(source.locator('.where')).toHaveText(
+    `Stopped at line ${mark('walk-first')} of lib.rs in rust`,
+  );
 
   await select('rust');
   await expect(source.locator('.row.current')).toContainText('mark: walk-first');
@@ -488,14 +505,22 @@ test("the panel shows the selected node's files, and none with none selected", a
   await expect(controls.locator('button.run')).toBeEnabled();
 });
 
-test('a breakpoint is for the node on show, or with Alt for every node', async ({ page }) => {
+test('a breakpoint stops every node, or narrowed by its menu, the one on show', async ({
+  page,
+}) => {
   await page.goto('/?graph=lines&debug');
   await expect(page.locator('#status')).toHaveClass(/ready/, { timeout: 30_000 });
   const canvas = page.locator('witgraph-canvas');
   const source = page.locator('witgraph-source');
   const row = source.locator(`.row[data-line="${mark('walk-first')}"]`);
+  const menu = source.locator('.ctx-menu');
   const select = (node: string) =>
     canvas.evaluate((el: WitgraphCanvas, node) => el.controller?.select(node), node);
+  const choose = async (item: string) => {
+    await row.locator('.gutter').click({ button: 'right' });
+    await menu.locator('.ctx-item', { hasText: item }).click();
+    await expect(menu).toHaveCount(0);
+  };
   /** Where a run stops, resuming each time, until it is over. */
   const stopsIn = async () => {
     const state = () =>
@@ -522,34 +547,51 @@ test('a breakpoint is for the node on show, or with Alt for every node', async (
     }
   };
 
-  // The second's, set in its view: not in the first's.
+  // A click, as in any debugger: every node running the line stops there.
   await select('second');
   await row.locator('.gutter').click();
   await expect(row).toHaveClass(/\bbreakpoint\b/);
   await select('first');
-  await expect(row).not.toHaveClass(/breakpoint/);
-  expect(await stopsIn()).toEqual(['second']);
-
-  // With Alt, every node's: shown ringed, in each view, and stopping each.
-  await select('second');
-  await row.locator('.gutter').click();
-  await expect(row).not.toHaveClass(/breakpoint/);
-  await row.locator('.gutter').click({ modifiers: ['Alt'] });
-  await expect(row).toHaveClass(/breakpoint-every/);
-  await select('first');
-  await expect(row).toHaveClass(/breakpoint-every/);
+  await expect(row).toHaveClass(/\bbreakpoint\b/);
   expect(await stopsIn()).toEqual(['first', 'second']);
 
-  // A right-click offers both, as they are.
+  // Narrowed to the first: ringed in its view, faint in the second's, which runs past. The
+  // run's last stop selected the second.
   await select('first');
   await row.locator('.gutter').click({ button: 'right' });
-  const menu = source.locator('.ctx-menu');
+  await expect(menu.locator('.ctx-item')).toHaveText([/Remove breakpoint/, /Only in first/]);
+  await menu.locator('.ctx-item', { hasText: 'Only in first' }).click();
+  await expect(row).toHaveClass(/breakpoint-node/);
+  await expect(row.locator('.gutter')).toHaveAttribute('title', /only in first/);
+  await select('second');
+  await expect(row).toHaveClass(/breakpoint-other/);
+  await expect(row.locator('.gutter')).toHaveAttribute('title', /second runs past it/);
+  expect(await stopsIn()).toEqual(['first']);
+
+  // From the second's view: its own instead, then every node's again.
+  await select('second');
+  await row.locator('.gutter').click({ button: 'right' });
   await expect(menu.locator('.ctx-item')).toHaveText([
-    /Break here in first/,
-    /Remove the breakpoint in every node/,
+    /Remove breakpoint \(only in first\)/,
+    /Only in second/,
+    /In every node/,
   ]);
-  await menu.locator('.ctx-item', { hasText: 'every node' }).click();
-  await expect(menu).toHaveCount(0);
-  await expect(row).not.toHaveClass(/breakpoint/);
+  await menu.locator('.ctx-item', { hasText: 'Only in second' }).click();
+  await expect(row).toHaveClass(/breakpoint-node/);
+  expect(await stopsIn()).toEqual(['second']);
+  await choose('In every node');
+  await expect(row).toHaveClass(/\bbreakpoint\b/);
+
+  // A click on it takes it away, and a line with none offers to add one.
+  await row.locator('.gutter').click();
+  for (const kind of [/\bbreakpoint\b/, /breakpoint-node/, /breakpoint-other/]) {
+    await expect(row).not.toHaveClass(kind);
+  }
+  await row.locator('.gutter').click({ button: 'right' });
+  await expect(menu.locator('.ctx-item')).toHaveText([
+    /Add breakpoint/,
+    /Add breakpoint only in second/,
+  ]);
+  await page.keyboard.press('Escape');
   expect(await stopsIn()).toEqual([]);
 });

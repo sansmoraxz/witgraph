@@ -85,9 +85,12 @@ Put them anywhere on your page. They all share one `EditorController`.
   | **Graph**: whole nodes                  | **Next node**                                       | **Break on node** (F9)        | _Paused at a node_ |
   | **Code**: lines of a guest, if debugged | **Over** (F10), **Into** (F11), **Out** (Shift+F11) | A click in the panel's gutter | _Paused on a line_ |
 
-  A click in the gutter sets a breakpoint for the node on show: another node of its component
-  runs past the line. Alt-click sets one for every node running it, shown ringed, and a
-  right-click offers both, saying which are set.
+  A click in the gutter sets a breakpoint, as in any debugger: every node running the line
+  stops there. A click on it takes it away. Its right-click menu narrows it to the node on show,
+  so that another node of its component runs past, or widens it to every node again. A
+  breakpoint for every node is a dot, one for the node on show a ringed dot, and one for another
+  node a faint ring, which this node runs past. Where a guest stops is said with its file, in the
+  panel and in the status.
 
   They go together. **Next node** from a line finishes that node and pauses before the next, and
   **Into** from a node about to run stops at its first line. F10 does what is next at the level it

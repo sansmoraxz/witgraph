@@ -510,7 +510,8 @@ const cLines: GraphJson = {
       id: 'rust',
       component: lineWalkRef,
       label: 'Rust',
-      attrs: { 'inject.in': '5' },
+      // `scale` runs `scale.rs`, the guest's second file.
+      attrs: { 'inject.in': '5', 'inject.scale': '2' },
     },
     // `scale` runs `scale.c`, the guest's second file.
     {
@@ -701,7 +702,7 @@ function updateStatus(): void {
     const node = controller.pausedNode;
     const line = controller.lineStop;
     text = line
-      ? `Stopped at line ${line.line}${node ? ` in ${node}` : ''}. Over, Into and Out move through its code; Next node finishes it.`
+      ? `Stopped at line ${line.line} of ${line.file.split('/').at(-1)}${line.node || node ? ` in ${line.node ?? node}` : ''}. Over, Into and Out move through its code; Next node finishes it.`
       : `Paused before node ${node ?? '?'}. Next node runs it${controller.lineFiles.length > 0 ? ', Into goes into its code' : ''}.${controller.streamGroups.some((group) => group.includes(controller.pausedNode ?? '')) ? ' It runs once per stream: to stop on each item, stop on a line of its code.' : ''}`;
   } else if (mode === 'error') {
     state = 'error';
