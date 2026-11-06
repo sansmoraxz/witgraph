@@ -1,0 +1,17 @@
+package test:generate@0.1.0;
+
+/// Stands in for an image or LLM generation node: its run is one call to what its host
+/// generates with, which takes as long as the host does.
+world generate {
+    import test:model/model@0.1.0;
+
+    export node: interface {
+        record inputs {
+            prompt: option<u32>,
+        }
+        record outputs {
+            out: u32,
+        }
+        run: async func(inputs: inputs) -> outputs;
+    }
+}

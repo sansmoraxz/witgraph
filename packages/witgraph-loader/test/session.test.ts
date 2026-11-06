@@ -80,6 +80,7 @@ const ids: Record<string, string> = {
   'tensor-future-source': 'test:tensor-future-source/tensor-future-source@0.1.0',
   'tensor-future-sink': 'test:tensor-future-sink/tensor-future-sink@0.1.0',
   calc: 'test:calc/calc@0.1.0',
+  generate: 'test:generate/generate@0.1.0',
   math: 'test:math/math@0.1.0',
   'video-source': 'test:video-source/video-source@0.1.0',
   'frame-grayscale': 'test:frame-grayscale/frame-grayscale@0.1.0',
@@ -529,6 +530,67 @@ test('a feedback loop advances one iteration per tick, and a snapshot carries it
   assert.equal(restored.graph.nodeState('n').phase, 'pending');
   await restored.tick();
   assert.equal(await restored.graph.readOutput('n', 'out'), 5);
+});
+
+test('a node waiting on its host holds up no other node, nor a feedback loop', async () => {
+  // `generate` takes until this says it is done, as a model takes as long as it takes.
+  let called = false;
+  let finish!: () => void;
+  const done = new Promise<void>((resolve) => (finish = resolve));
+  const session = await load(
+    [
+      ['generate', 'generate'],
+      ['echo', 'echo'],
+      ['counter', 'relay'],
+    ],
+    [['count', 'counter.out', 'counter.in', true]],
+    {
+      capabilities: (capability) =>
+        capability.interface === 'test:model/model@0.1.0'
+          ? {
+              generate: async (prompt: number) => {
+                called = true;
+                await done;
+                return prompt * 10;
+              },
+            }
+          : undefined,
+    },
+  );
+  await session.graph.inject('generate', 'prompt', 4);
+  await session.graph.inject('echo', 'in', 1.5);
+  await session.graph.inject('counter', 'in', 0);
+  await session.graph.inject('counter', 'add', 1);
+
+  // As a program ticks: each tick ends on its timer, what is in flight carrying on.
+  const timer = () => new Promise((resolve) => setTimeout(resolve, 50));
+  const counted: number[] = [];
+  for (let at = 0; at < 5; at++) {
+    assert.deepEqual(
+      await session.tick(timer()),
+      { result: 'interrupted' },
+      'with `generate` in flight a tick does not end of itself',
+    );
+    counted.push((await session.graph.readOutput('counter', 'out')) as number);
+  }
+  assert.ok(called, '`generate` was asked');
+  assert.equal(
+    await session.graph.readOutput('generate', 'out'),
+    undefined,
+    'and has not answered',
+  );
+  assert.equal(await session.graph.readOutput('echo', 'out'), 1.5, 'a node beside it ran');
+  assert.ok(
+    counted.every((count, at) => at === 0 || count > counted[at - 1]),
+    `the feedback loop went on at each tick: ${counted}`,
+  );
+
+  finish();
+  for (let at = 0; at < 200; at++) {
+    if ((await session.graph.readOutput('generate', 'out')) !== undefined) break;
+    await session.tick(timer());
+  }
+  assert.equal(await session.graph.readOutput('generate', 'out'), 40);
 });
 
 test('a mock replaces a node, and the hooks see every run', async () => {

@@ -114,6 +114,11 @@ pub const MATH: Guest = guest!("MATH_WASM", "math");
 /// `0..x`), `calls: u32` (how often its provider's `double` has run).
 pub const CALC: Guest = guest!("CALC_WASM", "calc");
 
+/// Imports `test:model/model`, an `async func generate(prompt: u32) -> u32` its host provides.
+/// `prompt: option<u32>` (default 0) → `out: u32`, what `generate` returned: a stand-in for an
+/// image or LLM generation node, which waits on its host for as long as the host takes.
+pub const GENERATE: Guest = guest!("GENERATE_WASM", "generate");
+
 /// `burst-size: option<u32>` → `items: stream<reading>` (a record
 /// `{ value: u32 }`), with values 0, 1, 2, ... (forever when `burst-size`
 /// is absent). A stream of records cannot be moved between Stores.

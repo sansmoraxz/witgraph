@@ -8,9 +8,9 @@ use witgraph_runtime::{OutputReader, RunningGraph, until};
 
 use test_components::{
     BLOB_SINK, BLOB_SOURCE, BUSY_LOOP, BYTES_CONSUMER, CALC, CONFIGURABLE, ECHO, EDGE_DETECT,
-    FRAME_GRAYSCALE, FRAME_INVERT, FUTURE_WRITER, Guest, LABELLED, MATH, MAYBE, MQTT_NODE,
-    NAMED_ECHO, READING_CONSUMER, READING_PRODUCER, RELAY, RELAY_PLUS, RELAY_WIDE, STREAM_CONSUMER,
-    STREAM_DRAIN, STREAM_PRODUCER, STREAM_RELAY, VIDEO_SINK, VIDEO_SOURCE,
+    FRAME_GRAYSCALE, FRAME_INVERT, FUTURE_WRITER, GENERATE, Guest, LABELLED, MATH, MAYBE,
+    MQTT_NODE, NAMED_ECHO, READING_CONSUMER, READING_PRODUCER, RELAY, RELAY_PLUS, RELAY_WIDE,
+    STREAM_CONSUMER, STREAM_DRAIN, STREAM_PRODUCER, STREAM_RELAY, VIDEO_SINK, VIDEO_SOURCE,
 };
 use wasmtime::StoreContextMut;
 use wasmtime::component::{ComponentType, Lift, Lower, Resource, ResourceType};
@@ -4544,4 +4544,116 @@ async fn a_new_instance_after_a_restore_resets_a_loop() {
     inject(&mut rt, "busy", "action", Val::Enum("finish".into())).await;
     let _ = rt.tick().await;
     assert_eq!(output_of(&mut rt, "r", "out").await, Some(Val::U32(1)));
+}
+
+/// Provides `test:model/model`: `generate` takes until the test says it is done, as a model
+/// takes as long as it takes, and says once it has been called.
+#[derive(Clone)]
+struct Model {
+    called: Arc<std::sync::atomic::AtomicBool>,
+    done: futures::future::Shared<futures::channel::oneshot::Receiver<()>>,
+}
+
+impl Host for Model {
+    type Data = HostState;
+
+    fn link(
+        &self,
+        capabilities: &[Capability],
+        linker: &mut wasmtime::component::Linker<HostState>,
+    ) -> wasmtime::Result<()> {
+        const MODEL: &str = "test:model/model@0.1.0";
+        if !capabilities.iter().any(|c| c.interface == MODEL) {
+            return Ok(());
+        }
+        let model = self.clone();
+        linker
+            .instance(MODEL)?
+            .func_wrap_concurrent("generate", move |_, (prompt,): (u32,)| {
+                let model = model.clone();
+                Box::pin(async move {
+                    model
+                        .called
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    let _ = model.done.clone().await;
+                    Ok((prompt * 10,))
+                })
+            })
+    }
+
+    fn store_data(&self, state: HostState) -> wasmtime::Result<HostState> {
+        Ok(state)
+    }
+}
+
+#[tokio::test]
+async fn a_node_waiting_on_its_host_holds_up_no_other_node_nor_a_feedback_loop() {
+    let kit = Kit::new(&[GENERATE, ECHO, RELAY]);
+    let graph = kit
+        .builder("generating")
+        .add_node("generate", kit.get(GENERATE))
+        .add_node("echo", kit.get(ECHO))
+        .add_node("counter", kit.get(RELAY))
+        .connect_feedback("count", port("counter", "out"), port("counter", "in"))
+        .build();
+    let compiled = graph.compile(&kit.contracts).expect("compiles");
+    let (finish, done) = futures::channel::oneshot::channel();
+    let model = Model {
+        called: Arc::default(),
+        done: futures::FutureExt::shared(done),
+    };
+    let mut rt = RuntimeGraph::load_with_host(
+        compiled,
+        &kit.wasm,
+        RuntimeConfig::default(),
+        Perf,
+        model.clone(),
+    )
+    .await
+    .expect("loads with the model");
+    inject(&mut rt, "generate", "prompt", Val::U32(4)).await;
+    inject(&mut rt, "echo", "in", Val::Float64(1.5)).await;
+    inject(&mut rt, "counter", "in", Val::U32(0)).await;
+    inject(&mut rt, "counter", "add", Val::U32(1)).await;
+
+    // As a program ticks: each tick ends on its timer, what is in flight carrying on.
+    let mut counted = Vec::new();
+    for _ in 0..5 {
+        let result = rt
+            .tick_until(tokio::time::sleep(Duration::from_millis(50)))
+            .await;
+        assert!(
+            matches!(result, TickResult::Interrupted),
+            "with `generate` in flight a tick does not end of itself: {result:?}"
+        );
+        counted.push(read_u32(&mut rt, "counter", "out").await);
+    }
+    assert!(
+        model.called.load(std::sync::atomic::Ordering::SeqCst),
+        "`generate` was asked"
+    );
+    assert!(
+        read(&mut rt, "generate", "out").await.is_none(),
+        "and has not answered"
+    );
+    assert!(
+        matches!(read(&mut rt, "echo", "out").await, Some(Val::Float64(out)) if out == 1.5),
+        "a node beside it ran"
+    );
+    assert!(
+        counted.windows(2).all(|pair| pair[1] > pair[0]),
+        "the feedback loop went on at each tick: {counted:?}"
+    );
+
+    finish.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while read(&mut rt, "generate", "out").await.is_none() {
+            let _ = rt
+                .tick_until(tokio::time::sleep(Duration::from_millis(50)))
+                .await;
+        }
+    })
+    .await
+    .expect("`generate` answers once its host has");
+    assert_eq!(read_u32(&mut rt, "generate", "out").await, 40);
 }

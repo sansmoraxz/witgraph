@@ -238,6 +238,12 @@ let value = witgraph_runtime::until(sleep(Duration::from_secs(1)), reader.read_o
 
 A timeout around a tick still fires, because fuel yields to the host.
 
+A node waiting on its host is not spinning: one that generates an image or text through an
+`async func` its host provides is suspended until the host answers, and the other nodes run
+meanwhile. A tick does not end while a `run` is in flight, though, and a feedback loop goes on
+as a tick ends, so tick such a graph with `tick_until` and a timer: each tick then ends on
+time, its loops go on, and the run carries on into the next.
+
 ## Stream groups
 
 A stream or future can be read once, so nodes joined by one always re-run

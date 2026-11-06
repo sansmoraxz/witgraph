@@ -1,0 +1,7 @@
+package test:model@0.1.0;
+
+/// What a host generates with: a model on its GPU, say, or a service it calls.
+interface model {
+    /// What `prompt` makes, once the host has made it.
+    generate: async func(prompt: u32) -> u32;
+}

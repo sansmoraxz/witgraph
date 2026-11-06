@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::{env, fs};
 
-const GUESTS: [&str; 52] = [
+const GUESTS: [&str; 53] = [
     "echo",
     "m0-import",
     "configurable",
@@ -56,6 +56,7 @@ const GUESTS: [&str; 52] = [
     "line-stream-sink",
     "c-walk",
     "zig-walk",
+    "generate",
 ];
 
 /// The guests built with debug info and no optimizing, so that each source line is there
