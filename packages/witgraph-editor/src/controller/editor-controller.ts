@@ -1165,9 +1165,16 @@ export class EditorController extends EventTarget {
       },
       onState: (): void => {
         if (this.#session !== session) return;
+        // Stopped or run, by this debugger or by one that went.
+        if (session && !this.#lineStop && this.#held.length === 0) {
+          this.#mode = session.running ? 'running' : 'idle';
+        }
         this.#pollState();
         void this.#pullObserved(false);
         this.#dispatch('state-changed');
+      },
+      onError: (message: string): void => {
+        if (this.#session === session) this.#warn(message);
       },
     });
     this.#attached = session;
@@ -1182,9 +1189,18 @@ export class EditorController extends EventTarget {
     this.#armLineBreakpoints();
     this.#sendHolds();
     this.#collectCapabilities();
-    // The program is ticking it.
-    this.#mode = 'running';
+    // Ticking it, unless a debugger stopped it.
+    this.#mode = session.running ? 'running' : 'idle';
     this.#dispatch('state-changed');
+  }
+
+  /** Says `message` in the trace, as a warning. */
+  #warn(message: string): void {
+    this.#traceEvents.push({ event: 'warning', message, timestamp: performance.now() });
+    if (this.#traceEvents.length > MAX_TRACE_ENTRIES) {
+      this.#traceEvents = this.#traceEvents.slice(-MAX_TRACE_ENTRIES);
+    }
+    this.#dispatch('trace-event');
   }
 
   async load(options: EditorLoadOptions): Promise<void> {
@@ -1277,9 +1293,17 @@ export class EditorController extends EventTarget {
       this.resumeBreakpoint();
       return;
     }
-    // The program running an attached graph ticks it.
-    if (this.#attached) return;
     if (this.#mode === 'running') return;
+    // The program running an attached graph ticks it: a debugger that stopped it lets it go on,
+    // with its breakpoints set again, as a run here starts.
+    if (this.#attached) {
+      this.#armLineBreakpoints();
+      this.#sendHolds();
+      this.#mode = 'running';
+      this.#dispatch('state-changed');
+      await this.#attached.run();
+      return;
+    }
     this.#setStepping(false);
     await this.#startRun('run');
     await this.#runLoop;
@@ -1873,8 +1897,7 @@ export class EditorController extends EventTarget {
    * stops too. Between ticks, it stops what earlier ticks left running.
    */
   stop(): Promise<void> {
-    // What stops an attached graph is the program's: a debugger only lets go of it.
-    if (this.#attached) return Promise.resolve();
+    if (this.#attached) return this.#stopAttached(this.#attached);
     this.#stopRequested = true;
     if (!this.#ticking && this.#session) {
       // Sent now, in order with what else is asked: what it changes is polled once it is done.
@@ -1894,6 +1917,22 @@ export class EditorController extends EventTarget {
     const session = this.#session;
     if (session) this.#stopping ??= this.#stoppedOrEnded(session);
     return this.#stopping ?? Promise.resolve();
+  }
+
+  /**
+   * Stops the program's graph: its ticks advance nothing until it is run again. What it was
+   * held at, a node or a line, is let go, to go on once it runs: as here, its breakpoints are
+   * set again then.
+   */
+  async #stopAttached(session: AttachedSession): Promise<void> {
+    const stopped = session.stop();
+    for (const { resume } of this.#held.splice(0)) resume();
+    this.#setStepping(false);
+    this.#lineStop = null;
+    session.lines?.release();
+    this.#mode = 'idle';
+    this.#dispatch('state-changed');
+    await stopped;
   }
 
   /**

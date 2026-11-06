@@ -714,7 +714,7 @@ function updateStatus(): void {
   } else if (mode === 'running') {
     state = 'running';
     text = controller.attached
-      ? 'Attached to a graph its program runs. Pause or a breakpoint stops it here.'
+      ? 'Attached to a graph its program runs. Stop halts it; Pause or a breakpoint stops it on a line.'
       : `Running — tick ${controller.tickCount}. Click Stop to end the run.`;
   } else if (mode === 'paused') {
     state = 'paused';
@@ -726,6 +726,10 @@ function updateStatus(): void {
   } else if (mode === 'error') {
     state = 'error';
     text = 'The run stopped on an error. The timeline says what failed.';
+  } else if (controller.attached) {
+    state = 'ready';
+    text =
+      'Attached to a graph its program runs, stopped from here: its ticks advance nothing. Run lets it go on.';
   } else if (running.length > 0) {
     state = 'running';
     text = `Still running — ${running.length} of ${controller.nodes.size} nodes. Click Stop to end them.`;

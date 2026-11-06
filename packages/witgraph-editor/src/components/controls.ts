@@ -435,7 +435,10 @@ export class WitgraphControls extends HTMLElement {
     const anyRunning = [...(this.#controller?.nodes.values() ?? [])].some(
       (node) => node.phase === 'running',
     );
-    this.#btnStop.disabled = !anyRunning && (mode === 'idle' || mode === 'error');
+    // An attached graph's nodes stay running where its stop left them: stopped is stopped.
+    this.#btnStop.disabled = this.#controller?.attached
+      ? mode === 'idle'
+      : !anyRunning && (mode === 'idle' || mode === 'error');
     // What changes the graph waits while it runs.
     const editable = this.#controller?.editable ?? true;
     this.#btnReset.disabled = !editable;
@@ -448,9 +451,10 @@ export class WitgraphControls extends HTMLElement {
     this.#btnSnapSave.disabled = !this.#controller || mode === 'running';
     this.#btnSnapRestore.disabled =
       !this.#controller || this.#controller.savedSnapshots.length === 0 || mode === 'running';
-    // An attached graph is the program's to run, stop and change: here it is only debugged.
+    // An attached graph is the program's to rebuild and change: here it is run, stopped and
+    // debugged.
     const attached = this.#controller?.attached ?? false;
-    for (const button of [this.#btnRun, this.#btnStop, this.#btnRestart, this.#btnReset]) {
+    for (const button of [this.#btnRestart, this.#btnReset]) {
       button.toggleAttribute('hidden', attached);
     }
     // Its program sets how fast it ticks.
@@ -464,6 +468,7 @@ export class WitgraphControls extends HTMLElement {
     let badgeText = MODE_LABELS[shown];
     if (mode === 'paused') badgeText = onLine ? 'Paused on a line' : 'Paused at a node';
     if (attached && mode === 'running') badgeText = 'Attached';
+    if (attached && mode === 'idle') badgeText = 'Attached, stopped';
     if (mode === 'idle' && this.#controller?.lastRunDurationMs != null) {
       const ms = this.#controller.lastRunDurationMs;
       const ticks = this.#controller.lastRunTicks;

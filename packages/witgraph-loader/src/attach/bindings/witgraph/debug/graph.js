@@ -5,6 +5,11 @@ export const State = $t.record({ "phase": $t.string, "fault": $t.option($t.strin
 export const Transition = $t.record({ "node": $t.string, "before": $t.string, "after": $t.string });
 export const NodeFault = $t.record({ "node": $t.string, "kind": $t.string, "message": $t.string });
 export const TraceEvent = $t.variant({ "run-started": $t.string, "run-returned": $t.string, "group-drained": $t.list($t.string), "phase-transition": Transition, "fault": NodeFault, "cancelled": $t.string, "restarted": $t.string });
+export async function protocol(transport) {
+  const $r = await $invoke(transport, "witgraph:debug/graph@0.1.0", "protocol", [], [], [$t.u32]);
+  await $r.finished;
+  return $r.results[0];
+}
 export async function describe(transport) {
   const $r = await $invoke(transport, "witgraph:debug/graph@0.1.0", "describe", [], [], [$t.string]);
   await $r.finished;
@@ -59,4 +64,17 @@ export async function rerun(transport, node) {
   const $r = await $invoke(transport, "witgraph:debug/graph@0.1.0", "rerun", [$t.string], [node], [$t.result(null, $t.string)]);
   await $r.finished;
   return $r.results[0];
+}
+export async function running(transport) {
+  const $r = await $invoke(transport, "witgraph:debug/graph@0.1.0", "running", [], [], [$t.bool]);
+  await $r.finished;
+  return $r.results[0];
+}
+export async function run(transport) {
+  const $r = await $invoke(transport, "witgraph:debug/graph@0.1.0", "run", [], [], []);
+  await $r.finished;
+}
+export async function stop(transport) {
+  const $r = await $invoke(transport, "witgraph:debug/graph@0.1.0", "stop", [], [], []);
+  await $r.finished;
 }

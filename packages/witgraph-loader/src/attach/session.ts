@@ -19,6 +19,15 @@ import * as holds from './bindings/witgraph/debug/holds.js';
 import * as lines from './bindings/witgraph/debug/lines.js';
 
 /** Where to attach, as the program serving the graph printed it. */
+/**
+ * The version of witgraph's debug protocol this speaks, as `PROTOCOL` in `witgraph-remote` has
+ * it: a program speaking another is refused, as calls one side does not know would fail.
+ */
+export const PROTOCOL = 2;
+
+/** How long a program has to say which protocol it speaks: one too old to know never says. */
+const PROTOCOL_WAIT_MS = 5000;
+
 export interface AttachOptions {
   /** The URL, with its `token`. */
   url: string;
@@ -28,8 +37,10 @@ export interface AttachOptions {
   beforeRun?: (node: string, held: boolean) => void | Promise<void>;
   /** A guest stopped on a line. */
   onStop?: (stop: LineStop) => void;
-  /** Node states moved. */
+  /** Node states moved, or the program's graph was stopped or run. */
   onState?: () => void;
+  /** What was asked of the program failed: a breakpoint it did not set, say. */
+  onError?: (message: string) => void;
   /** How often node states are asked for, in milliseconds. 250 by default. */
   pollEvery?: number;
 }
@@ -67,6 +78,8 @@ export class AttachedSession implements DebugSession {
   readonly #toldHeld = new Set<bigint>();
   /** The stop told of, until the guest goes on: told once, by whichever way it came. */
   readonly #toldStop: Told = { going: 0, went: 0 };
+  /** Whether the program's ticks advance its graph: a debugger can stop it. */
+  #running: boolean;
 
   private constructor(
     connection: WebTransport,
@@ -75,10 +88,12 @@ export class AttachedSession implements DebugSession {
     groups: string[][],
     sources: Map<string, number[]>,
     nodeFiles: Map<string, string[]>,
+    running: boolean,
     options: AttachOptions,
   ) {
     this.#connection = connection;
     this.#options = options;
+    this.#running = running;
     this.described = described;
     this.contracts = contracts;
     const open = () => this.#open();
@@ -114,6 +129,14 @@ export class AttachedSession implements DebugSession {
           }
         }),
       );
+      // Run again by the program, say, for a debugger gone that had stopped it.
+      const running = await open()
+        .then(graph.running)
+        .catch(() => this.#running);
+      if (running !== this.#running) {
+        this.#running = running;
+        moved = true;
+      }
       if (moved) options.onState?.();
       // What a stream of them could have lost: to a debugger gone before this, still taking
       // them until its connection times out.
@@ -136,7 +159,8 @@ export class AttachedSession implements DebugSession {
     this.#timer = setInterval(() => void poll(), options.pollEvery ?? 250);
     void poll();
     this.graph = attachedGraph(open, states, versions, trace, groups, poll);
-    const send = (call: (transport: Transport) => Promise<unknown>) => this.#send(call);
+    const send = (call: (transport: Transport) => Promise<unknown>, what?: string) =>
+      this.#send(call, what);
     this.lines =
       sources.size > 0 ? attachedLines(send, sources, nodeFiles, this.#toldStop) : undefined;
     void this.#follow();
@@ -149,16 +173,37 @@ export class AttachedSession implements DebugSession {
     });
     await connection.ready;
     const open = async () => fromWebStreams(await connection.createBidirectionalStream());
+    // Before anything else: a program speaking another protocol would get calls it does not know.
+    const timeout = new Promise<undefined>((resolve) => setTimeout(resolve, PROTOCOL_WAIT_MS));
+    const spoken = await Promise.race([
+      open()
+        .then(graph.protocol)
+        .catch(() => undefined),
+      timeout,
+    ]);
+    if (spoken !== PROTOCOL) {
+      connection.close();
+      const rebuild =
+        spoken === undefined || spoken < PROTOCOL
+          ? 'the program, and start it again'
+          : 'this editor';
+      throw new Error(
+        `The program speaks ${
+          spoken === undefined ? 'an older version' : `version ${spoken}`
+        } of witgraph's debug protocol, and this editor version ${PROTOCOL}: rebuild ${rebuild}.`,
+      );
+    }
     // Attaching takes over: what a debugger left held and stopped, its breakpoints too, is let
     // go. One gone without a word, as a reloaded page goes, is only noticed once it times out,
     // and its breakpoints would stop the guest where this one shows none.
     await holds.release(await open());
     await lines.release(await open());
-    const [described, contracts, groups, files] = await Promise.all([
+    const [described, contracts, groups, files, running] = await Promise.all([
       open().then(graph.describe),
       open().then(graph.contracts),
       open().then(graph.streamGroups),
       open().then(lines.files),
+      open().then(graph.running),
     ]);
     const sources = new Map<string, number[]>();
     for (const file of files) sources.set(file, [...(await lines.lines(await open(), file))]);
@@ -172,8 +217,29 @@ export class AttachedSession implements DebugSession {
       groups,
       sources,
       nodeFiles,
+      running,
       options,
     );
+  }
+
+  /** Whether the program's ticks advance its graph, as last known: a debugger can stop it. */
+  get running(): boolean {
+    return this.#running;
+  }
+
+  /** Lets the program's ticks advance its graph again. */
+  run(): Promise<void> {
+    this.#running = true;
+    return this.#send(graph.run, 'Running the graph');
+  }
+
+  /**
+   * Stops the program's graph: the tick under way ends, and its ticks advance nothing until
+   * {@link run}, what was under way waiting where it is. Going lets it run again.
+   */
+  stop(): Promise<void> {
+    this.#running = false;
+    return this.#send(graph.stop, 'Stopping the graph');
   }
 
   /** A file's text, as the host has it. */
@@ -190,7 +256,9 @@ export class AttachedSession implements DebugSession {
     if (this.#toldHeld.has(run.id)) return;
     this.#toldHeld.add(run.id);
     void Promise.resolve(this.#options.beforeRun?.(run.node, true)).then(() => {
-      if (!this.#disposed) this.#send((transport) => holds.resume(transport, run.id));
+      if (!this.#disposed) {
+        this.#send((transport) => holds.resume(transport, run.id), `Letting ${run.node} run`);
+      }
     });
   }
 
@@ -231,18 +299,23 @@ export class AttachedSession implements DebugSession {
   holdAt(nodes: readonly string[] | 'all'): void {
     const at: holds.Holding =
       nodes === 'all' ? { kind: 'all' } : { kind: 'nodes', value: [...nodes] };
-    this.#send((transport) => holds.holdAt(transport, at));
+    this.#send((transport) => holds.holdAt(transport, at), 'Holding nodes');
   }
 
   /** What is asked, sent once what was asked before is done: each its own stream, unordered. */
   #sent: Promise<unknown> = Promise.resolve();
 
-  #send(call: (transport: Transport) => Promise<unknown>): Promise<void> {
+  #send(call: (transport: Transport) => Promise<unknown>, what = 'A call'): Promise<void> {
     const sent = this.#sent
       .then(() => this.#open().then(call))
       .then(
         () => {},
-        () => {},
+        // In order still, but said: what failed is not done, and nothing else would tell.
+        (error: unknown) => {
+          if (this.#disposed) return;
+          const reason = error instanceof Error ? error.message : String(error);
+          this.#options.onError?.(`${what} failed in the program: ${reason}`);
+        },
       );
     this.#sent = sent;
     return sent;
@@ -339,18 +412,18 @@ function wireScope(scope: BreakpointScope): lines.BreakpointScope {
 }
 
 function attachedLines(
-  send: (call: (transport: Transport) => Promise<unknown>) => Promise<void>,
+  send: (call: (transport: Transport) => Promise<unknown>, what?: string) => Promise<void>,
   sources: Map<string, number[]>,
   nodeFiles: Map<string, string[]>,
   told: Told,
 ): DebugLines {
   let stopped: LineStop | undefined;
   // The guest goes on: its next stop is a new one, even on the same line with the same values.
-  const goOn = (call: (transport: Transport) => Promise<unknown>) => {
+  const goOn = (call: (transport: Transport) => Promise<unknown>, what: string) => {
     stopped = undefined;
     told.stop = undefined;
     told.going += 1;
-    void send(call).then(() => {
+    void send(call, what).then(() => {
       told.going -= 1;
       told.went += 1;
     });
@@ -368,7 +441,10 @@ function attachedLines(
     setBreakpoint(scope, file, line) {
       const actual = sources.get(file)?.find((candidate) => candidate >= line);
       if (actual !== undefined) {
-        send((transport) => lines.setBreakpoint(transport, wireScope(scope), file, actual));
+        send(
+          (transport) => lines.setBreakpoint(transport, wireScope(scope), file, actual),
+          `Setting a breakpoint on line ${actual}`,
+        );
       }
       return actual;
     },
@@ -376,21 +452,26 @@ function attachedLines(
       // Set as the line it came to.
       const actual = sources.get(file)?.find((candidate) => candidate >= line);
       if (actual !== undefined) {
-        send((transport) => lines.clearBreakpoint(transport, wireScope(scope), file, actual));
+        send(
+          (transport) => lines.clearBreakpoint(transport, wireScope(scope), file, actual),
+          `Clearing the breakpoint on line ${actual}`,
+        );
       }
     },
-    pause: () => send(lines.pause),
-    cancelPause: () => send(lines.cancelPause),
+    pause: () => send(lines.pause, 'Pausing'),
+    cancelPause: () => send(lines.cancelPause, 'Taking back a pause'),
     holdNodes(on) {
       // Every node's next run, while a guest is stopped and the debugger goes on to the next.
       held = on ? { kind: 'all' } : undefined;
-      if (held) send((transport) => holds.holdAt(transport, held as holds.Holding));
+      if (held) {
+        send((transport) => holds.holdAt(transport, held as holds.Holding), 'Holding nodes');
+      }
     },
-    resume: () => goOn(lines.resume),
-    stepIn: () => goOn(lines.stepIn),
-    stepOver: () => goOn(lines.stepOver),
-    stepOut: () => goOn(lines.stepOut),
-    release: () => goOn(lines.release),
+    resume: () => goOn(lines.resume, 'Going on'),
+    stepIn: () => goOn(lines.stepIn, 'Stepping in'),
+    stepOver: () => goOn(lines.stepOver, 'Stepping over'),
+    stepOut: () => goOn(lines.stepOut, 'Stepping out'),
+    release: () => goOn(lines.release, 'Letting go of the guest'),
   };
 }
 

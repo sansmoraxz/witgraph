@@ -22,6 +22,10 @@ export declare const NodeFault: $wrpc.Type;
 export type TraceEvent = { kind: "run-started"; value: string } | { kind: "run-returned"; value: string } | { kind: "group-drained"; value: globalThis.Array<string> } | { kind: "phase-transition"; value: Transition } | { kind: "fault"; value: NodeFault } | { kind: "cancelled"; value: string } | { kind: "restarted"; value: string };
 export declare const TraceEvent: $wrpc.Type;
 /**
+ * The version of this protocol the program speaks: a debugger speaking another refuses it.
+ */
+export function protocol(transport: $wrpc.Transport): globalThis.Promise<number>;
+/**
  * The graph, as the JSON a `witgraph_ir::Graph` serializes to.
  */
 export function describe(transport: $wrpc.Transport): globalThis.Promise<string>;
@@ -66,3 +70,16 @@ export function clearInput(transport: $wrpc.Transport, node: string, port: strin
  * Makes a node owe a run on its latched inputs.
  */
 export function rerun(transport: $wrpc.Transport, node: string): globalThis.Promise<{ kind: "ok" } | { kind: "error"; value: string }>;
+/**
+ * Whether the graph advances when its program ticks it: a debugger can stop it.
+ */
+export function running(transport: $wrpc.Transport): globalThis.Promise<boolean>;
+/**
+ * Lets the program's ticks advance the graph again.
+ */
+export function run(transport: $wrpc.Transport): globalThis.Promise<void>;
+/**
+ * Stops the graph: the tick under way ends, and the program's ticks advance nothing, what
+ * was under way waiting where it is, until `run`. A debugger going lets it run again.
+ */
+export function stop(transport: $wrpc.Transport): globalThis.Promise<void>;

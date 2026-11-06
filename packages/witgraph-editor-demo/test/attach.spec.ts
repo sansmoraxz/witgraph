@@ -34,9 +34,10 @@ test('the editor attaches, and holds a node of the graph its program runs', asyn
   await expect(canvas.locator('[data-node-id="walker"]')).toBeVisible({ timeout: 20_000 });
   const controls = page.locator('witgraph-controls');
   await expect(controls.locator('.badge')).toHaveText('Attached');
-  // The program runs it: here it is only debugged.
-  await expect(controls.locator('button.run')).toBeHidden();
-  await expect(controls.locator('button.stop')).toBeHidden();
+  // The program runs it: here it is stopped, run and debugged, but not rebuilt.
+  await expect(controls.locator('button.run')).toBeDisabled();
+  await expect(controls.locator('button.stop')).toBeEnabled();
+  await expect(controls.locator('button.restart')).toBeHidden();
   await expect(controls.locator('.rate-group')).toBeHidden();
   // The rest looks as it does on a graph of the page's own.
   await expect(page.locator('#graph-picker')).toContainText('Attached: 127.0.0.1');
@@ -160,6 +161,53 @@ test("the editor stops on a line of the program's guest written in Zig", async (
   await row.locator('.gutter').click();
   await page.locator('witgraph-controls').locator('button.resume').click();
   await expect(page.locator('witgraph-controls').locator('.badge')).toHaveText('Attached');
+});
+
+test("the editor stops the program's graph, and runs it again", async ({ page }) => {
+  await page.goto(attach);
+  const canvas = page.locator('witgraph-canvas');
+  const source = page.locator('witgraph-source');
+  const controls = page.locator('witgraph-controls');
+  const badge = controls.locator('.badge');
+  await expect(canvas.locator('[data-node-id="walker"]')).toBeVisible({ timeout: 20_000 });
+  await expect(badge).toHaveText('Attached');
+  const walked = () =>
+    canvas.evaluate((el: WitgraphCanvas) => el.controller?.readOutputWave('walker', 'out'));
+
+  await controls.locator('button.stop').click();
+  await expect(badge).toHaveText('Attached, stopped');
+  await expect(controls.locator('button.run')).toBeEnabled();
+  await expect(controls.locator('button.stop')).toBeDisabled();
+  await expect(page.locator('#status')).toContainText('Run lets it go on');
+  const at = await walked();
+  await page.waitForTimeout(600);
+  expect(await walked(), 'no tick advances it').toBe(at);
+
+  // A breakpoint set while it is stopped stops it once it runs.
+  await canvas.locator('[data-node-id="walker"]').click();
+  await source.locator('select.file').selectOption({ label: 'line-walk/src/lib.rs' });
+  const row = source.locator('.row', { hasText: 'mark: walk-first' });
+  await expect(row).toBeVisible({ timeout: 20_000 });
+  await row.locator('.gutter').click();
+  await controls.locator('button.run').click();
+  await expect(source.locator('.row.current')).toContainText('mark: walk-first', {
+    timeout: 20_000,
+  });
+
+  // Stopped from a line, it lets the guest go, to go on once it runs; the breakpoint stays.
+  await controls.locator('button.stop').click();
+  await expect(badge).toHaveText('Attached, stopped');
+  await expect(source.locator('.row.current')).toHaveCount(0);
+  await expect(row).toHaveClass(/\bbreakpoint\b/);
+  await controls.locator('button.run').click();
+  await expect(source.locator('.row.current')).toContainText('mark: walk-first', {
+    timeout: 20_000,
+  });
+
+  await row.locator('.gutter').click();
+  await controls.locator('button.resume').click();
+  await expect(badge).toHaveText('Attached');
+  await expect.poll(walked, { timeout: 10_000 }).not.toBe(at);
 });
 
 test('an editor attaching takes over from one gone without a word', async ({ page, context }) => {

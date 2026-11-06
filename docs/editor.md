@@ -139,14 +139,20 @@ WebTransport: it pins the server's certificate by `certificateHash`, and the `to
 `url`. In the demo, open `?attach=<url>&hash=<hex of the hash>`;
 `cargo run -p witgraph-remote --example serve` runs a graph to try it on, and prints both.
 
-The program ticks the graph, so _Run_, _Stop_, _Restart_, _Reset_ and _Rate_ are hidden, the
-badge says _Attached_, and the graph cannot be edited. The rest is as on a graph of the page's
+The program ticks the graph. _Stop_ halts it: the tick under way ends, and the program's ticks
+advance nothing, what was under way waiting where it is, until _Run_ lets it go on. A guest
+stopped on a line is let go, to go on once it runs, and its breakpoints are set again then, as
+on a graph of the page's own. The badge says _Attached_, or _Attached, stopped_. _Restart_,
+_Reset_ and _Rate_ are hidden, and the graph cannot be edited, as they are the program's. A
+program built from another version of witgraph may speak another version of the debug
+protocol: the editor refuses to attach to it, and says to rebuild it. What the program fails to
+do, a breakpoint it did not set say, the timeline says. The rest is as on a graph of the page's
 own: the components panel lists the graph's components, the timeline shows what the scheduler
 did (the latest thousand events, from before attaching too), and node breakpoints, _Pause_,
 _Continue_, _Next node_, the source panel (its text comes from the program's machine), _Inject_
 and rerunning a node work. Previews of streams and handles are not shown. A debugger that goes
-lets go of what it held and stopped, and its breakpoints, within ten seconds if it went without
-closing. One that attaches takes over: what was left held, stopped or set, by a page reloaded
+lets go of what it held and stopped, and its breakpoints, and lets the graph run if it had
+stopped it, within ten seconds if it went without closing. One that attaches takes over: what was left held, stopped or set, by a page reloaded
 say, is let go at once.
 
 ## Previews

@@ -39,6 +39,8 @@ interface graph {
         restarted(string),
     }
 
+    /// The version of this protocol the program speaks: a debugger speaking another refuses it.
+    protocol: func() -> u32;
     /// The graph, as the JSON a `witgraph_ir::Graph` serializes to.
     describe: func() -> string;
     /// By node, its component's contract, as JSON: what an editor draws its ports from.
@@ -62,6 +64,13 @@ interface graph {
     clear-input: func(node: string, port: string) -> result<_, string>;
     /// Makes a node owe a run on its latched inputs.
     rerun: func(node: string) -> result<_, string>;
+    /// Whether the graph advances when its program ticks it: a debugger can stop it.
+    running: func() -> bool;
+    /// Lets the program's ticks advance the graph again.
+    run: func();
+    /// Stops the graph: the tick under way ends, and the program's ticks advance nothing, what
+    /// was under way waiting where it is, until `run`. A debugger going lets it run again.
+    stop: func();
 }
 
 /// Node runs held before they start: node breakpoints, and stepping a node at a time.

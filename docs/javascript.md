@@ -257,7 +257,7 @@ their probes.
 
 ## Attaching to a graph on wasmtime
 
-`AttachedSession.attach({ url, certificateHash, beforeRun, onStop, onState })` is a session of a
+`AttachedSession.attach({ url, certificateHash, beforeRun, onStop, onState, onError })` is a session of a
 graph a program runs on wasmtime, served with `witgraph-remote`
 ([Attaching a debugger](running.md#attaching-a-debugger)), over wRPC on WebTransport. It has
 the shape of a worker's `RemoteSession` (`DebugSession`), so a debugger uses either the same
@@ -265,8 +265,12 @@ way, but the program ticks the graph, so `tick` rejects, as do `snapshot`, `rest
 `shutdown`. A held run is told to `beforeRun(node, true)` and goes on once it settles; a stop on
 a line to `onStop`. Node states and output versions are asked for every `pollEvery`
 milliseconds (250), and `onState` says when they have moved. `source(file)` reads a guest's
-source from the program's machine. Attaching lets go of what another debugger left held, stopped
-or set, and what is asked is sent in the order asked.
+source from the program's machine. `stop()` halts the program's graph, so that its ticks advance
+nothing, and `run()` lets it go on; `running` says which, and `onState` says when it changes.
+Attaching lets go of what another debugger left held, stopped or set, and what is asked is sent
+in the order asked: what the program fails to do is told to `onError`. A program speaking
+another version of the debug protocol than `PROTOCOL` is refused, with an error saying which to
+rebuild.
 
 Its calls are bindings `wit-bindgen-wrpc js` makes from `crates/witgraph-remote/wit`, over
 `@bytecodealliance/wrpc`, both from our wRPC fork. After changing the WIT, generate them again:

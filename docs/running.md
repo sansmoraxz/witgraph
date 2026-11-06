@@ -426,13 +426,15 @@ loop {
 
 A debugger presents the token in the URL, and pins the server's self-signed certificate by
 the hash, as a browser does with `serverCertificateHashes`: anyone with the token can pause
-the guests and read their memory, so keep it secret. It can hold nodes, stop on lines (with
+the guests and read their memory, so keep it secret. It can stop the graph and run it again, hold nodes, stop on lines (with
 `debug_lines` set), read inputs and outputs, write inputs and rerun nodes, but not change the
-graph.
+graph. Stopped, `debuggee.tick()` does what the debugger asks, advances nothing, and says
+`Idle`, until the debugger runs it again or goes; `debuggee.stopped()` says whether it is.
 Your own calls on the graph go through `debuggee.with(...)`. What it asks that needs the
 graph while a tick runs ends that tick early, is done, and the tick goes on, so a debugger
 sees in even while a held node keeps the tick from ending. The interface is
-`crates/witgraph-remote/wit/debug.wit`. The editor attaches to it
+`crates/witgraph-remote/wit/debug.wit`, whose version is `PROTOCOL`: a debugger speaking another
+refuses to attach, so rebuild a program after updating witgraph. The editor attaches to it
 ([Attaching to a graph on wasmtime](editor.md#attaching-to-a-graph-on-wasmtime)), and
 `cargo run -p witgraph-remote --example serve` runs a graph to attach to.
 

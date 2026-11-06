@@ -10,6 +10,7 @@
 //! Dropping or interrupting a tick loses nothing ([`RunningGraph::tick_until`]).
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context as _;
@@ -108,6 +109,8 @@ struct Inner<M: RuntimeMode, H: Host> {
     jobs: Mutex<Vec<Job<M, H>>>,
     /// Ends a tick early, for what waits.
     asked: Notify,
+    /// Whether a debugger has stopped the graph: its ticks then advance nothing.
+    stopped: Arc<AtomicBool>,
     reader: ValReader,
     trace: Arc<Trace>,
     holds: RuntimeHolds,
@@ -116,6 +119,11 @@ struct Inner<M: RuntimeMode, H: Host> {
     contracts: String,
     groups: Vec<Vec<String>>,
 }
+
+/// The version of the debug protocol, `wit/debug.wit`, that this crate speaks. A debugger that
+/// speaks another refuses to attach, as calls the other side does not know would fail. It moves on
+/// with each change to the protocol, which a test makes sure of.
+pub const PROTOCOL: u32 = 2;
 
 /// A graph a debugger can attach to. Tick it through this, not the graph itself.
 pub struct Debuggee<M: RuntimeMode, H: Host> {
@@ -168,6 +176,7 @@ impl<M: RuntimeMode, H: Host> Debuggee<M, H> {
                 graph: tokio::sync::Mutex::new(graph),
                 jobs: Mutex::new(Vec::new()),
                 asked: Notify::new(),
+                stopped: Arc::new(AtomicBool::new(false)),
                 described,
                 contracts,
                 groups,
@@ -176,9 +185,15 @@ impl<M: RuntimeMode, H: Host> Debuggee<M, H> {
     }
 
     /// Runs one tick, as [`RunningGraph::tick`] does, doing what a debugger asks meanwhile.
+    /// With the graph stopped by a debugger, it does only what is asked, and says `Idle`: what
+    /// was under way waits where it is until the debugger runs the graph again.
     pub async fn tick(&self) -> TickResult {
         let mut graph = self.inner.graph.lock().await;
         loop {
+            if self.stopped() {
+                self.drain(&mut graph).await;
+                return TickResult::Idle;
+            }
             self.drain(&mut graph).await;
             let asked = self.inner.asked.notified();
             let result = graph.tick_until(asked).await;
@@ -189,6 +204,12 @@ impl<M: RuntimeMode, H: Host> Debuggee<M, H> {
             self.drain(&mut graph).await;
             return result;
         }
+    }
+
+    /// Whether a debugger has stopped the graph, so that its ticks advance nothing.
+    #[must_use]
+    pub fn stopped(&self) -> bool {
+        self.inner.stopped.load(Ordering::SeqCst)
     }
 
     /// Does `work` on the graph, between ticks or by ending one early: as the program running
@@ -414,6 +435,26 @@ impl<C: Send + Sync, M: RuntimeMode, H: Host> graph::Handler<C> for Handler<M, H
                 })
             })
             .await)
+    }
+
+    async fn protocol(&self, _: C) -> anyhow::Result<u32> {
+        Ok(PROTOCOL)
+    }
+
+    async fn running(&self, _: C) -> anyhow::Result<bool> {
+        Ok(!self.debuggee.stopped())
+    }
+
+    async fn run(&self, _: C) -> anyhow::Result<()> {
+        self.inner().stopped.store(false, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn stop(&self, _: C) -> anyhow::Result<()> {
+        self.inner().stopped.store(true, Ordering::SeqCst);
+        // The tick under way ends now, leaving what it runs where it is.
+        self.inner().asked.notify_one();
+        Ok(())
     }
 
     async fn rerun(&self, _: C, node: String) -> anyhow::Result<Result<(), String>> {
@@ -710,6 +751,7 @@ pub async fn serve<M: RuntimeMode, H: Host>(
     let left = Left {
         holds: handler.debuggee.inner.holds.clone(),
         lines: handler.debuggee.inner.lines.clone(),
+        stopped: handler.debuggee.inner.stopped.clone(),
     };
     let invocations = bindings::serve(server.as_ref(), handler)
         .await
@@ -780,10 +822,13 @@ async fn run(
 struct Left {
     holds: RuntimeHolds,
     lines: Option<RuntimeLines>,
+    stopped: Arc<AtomicBool>,
 }
 
 impl Left {
     fn release(&self) {
+        // A graph a debugger stopped runs again: the program is not left waiting on it.
+        self.stopped.store(false, Ordering::SeqCst);
         self.holds.release();
         if let Some(lines) = &self.lines {
             lines.release();
@@ -822,4 +867,29 @@ async fn session(
             .context("failed to take a call")?;
     }
     Ok(true)
+}
+
+#[cfg(test)]
+mod protocol_tests {
+    use super::PROTOCOL;
+
+    /// FNV-1a: stable across Rust versions, as the standard hasher is not.
+    fn fnv1a(text: &str) -> u64 {
+        text.bytes()
+            .filter(|byte| *byte != b'\r')
+            .fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+                (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+            })
+    }
+
+    #[test]
+    fn the_protocol_moves_on_with_its_wit() {
+        let wit = include_str!("../wit/debug.wit");
+        assert_eq!(
+            (PROTOCOL, fnv1a(wit)),
+            (2, 0xdf1c_02b6_8d12_6e7a),
+            "`wit/debug.wit` changed: move `PROTOCOL` on, here and as `PROTOCOL` in \
+             `packages/witgraph-loader/src/attach/session.ts`, and record the new hash here"
+        );
+    }
 }

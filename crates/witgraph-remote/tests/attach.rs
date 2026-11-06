@@ -422,3 +422,44 @@ async fn a_breakpoint_for_one_node_stops_only_it() {
         .unwrap();
     lines::resume(&wrpc, ()).await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_debugger_stops_the_programs_graph_and_runs_it_again() {
+    let (served, wrpc, _, _) = lines_attached().await;
+    // What the counter has counted: it moves on at each of the program's ticks.
+    let counted = || async {
+        graph::read_output(&wrpc, (), "counter", "out")
+            .await
+            .unwrap()
+            .unwrap()
+    };
+    assert!(graph::running(&wrpc, ()).await.unwrap());
+
+    graph::stop(&wrpc, ()).await.unwrap();
+    assert!(!graph::running(&wrpc, ()).await.unwrap());
+    let stopped = counted().await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(counted().await, stopped, "no tick advances it");
+
+    graph::run(&wrpc, ()).await.unwrap();
+    assert!(graph::running(&wrpc, ()).await.unwrap());
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while counted().await == stopped {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("its ticks advance it again");
+
+    // A debugger gone while it is stopped does not leave it so.
+    graph::stop(&wrpc, ()).await.unwrap();
+    drop(wrpc);
+    let next = connect(&served, "secret").await.unwrap();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !graph::running(&next, ()).await.unwrap() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the program runs it again");
+}
