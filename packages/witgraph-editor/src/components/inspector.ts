@@ -1077,7 +1077,10 @@ export class WitgraphInspector extends HTMLElement {
       const fbLabel = document.createElement('label');
       fbLabel.htmlFor = fbCheck.id;
       fbLabel.className = 'text-2xs text-wg-text-dim cursor-pointer';
-      fbLabel.textContent = 'Feedback (unit delay)';
+      fbLabel.textContent = 'Feedback (value from the previous tick)';
+      fbRow.title =
+        'This input gets what its source produced on the previous tick, not this one. ' +
+        'A cycle needs a feedback connection somewhere in it.';
       fbRow.append(fbCheck, fbLabel);
       wrap.appendChild(fbRow);
     }
