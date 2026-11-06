@@ -1,0 +1,17 @@
+package test:zig-walk@0.1.0;
+
+/// Written in Zig, and built with debug info, for stepping through its source: tests
+/// find its lines by the `mark:` comments in `src/walk.zig` and `src/scale.zig`.
+world zig-walk {
+    export node: interface {
+        record inputs {
+            in: option<u32>,
+            kinds: option<u32>,
+            scale: option<u32>,
+        }
+        record outputs {
+            out: u32,
+        }
+        run: async func(inputs: inputs) -> outputs;
+    }
+}

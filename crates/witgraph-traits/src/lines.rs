@@ -147,6 +147,8 @@ pub enum SourceLanguage {
     C,
     /// C++, of any standard.
     Cpp,
+    /// Zig, which its debug info says is C: its producer tells it apart.
+    Zig,
 }
 
 /// Where the libraries witgraph knows of are, by a part of their path.
@@ -165,6 +167,9 @@ fn known_paths(language: SourceLanguage) -> &'static [&'static str] {
         SourceLanguage::C | SourceLanguage::Cpp => {
             &["/lib/clang/", "/share/wasi-sysroot/", "/include/c++/"]
         }
+        // Its standard library, as a distribution or a download has it, and its cache, where
+        // what it makes of the target is.
+        SourceLanguage::Zig => &["/lib/zig/", "/zig/lib/std/", "/.cache/zig/"],
     }
 }
 
@@ -172,7 +177,7 @@ fn known_paths(language: SourceLanguage) -> &'static [&'static str] {
 fn known_library(file: &SourceFile<'_>) -> bool {
     let languages: &[SourceLanguage] = match &file.language {
         Some(language) => std::slice::from_ref(language),
-        None => &[SourceLanguage::Rust, SourceLanguage::C],
+        None => &[SourceLanguage::Rust, SourceLanguage::C, SourceLanguage::Zig],
     };
     languages
         .iter()

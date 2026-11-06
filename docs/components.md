@@ -195,6 +195,47 @@ debug info records: a debugger counts what is under it as the guest's own, and a
 elsewhere not ([which lines are a guest's own](running.md#which-lines-are-a-guests-own)). Build
 the bindings, which are under it too, without debug info (`-g0`), or exclude them by a pattern.
 
+## Writing a node in Zig
+
+Zig calls the C bindings as it calls any C, so a Zig node starts from what a C one does:
+`wit-bindgen c --world <world> --no-object-file wit` writes them. `zig translate-c` makes the
+header something Zig can import, and the node exports `node_run` and `node_run_callback` as the
+C node defines them:
+
+```zig
+const c = @import("c"); // the bindings' header, as `zig translate-c` makes it
+
+export fn node_run(inputs: *c.node_inputs_t) c.echo_callback_code_t {
+    c.node_run_return(.{ .out = if (inputs.in.is_some) inputs.in.val else 0 });
+    return c.ECHO_CALLBACK_CODE_EXIT;
+}
+
+// Called back only for what `node_run` waits on, which is nothing.
+export fn node_run_callback(event: *c.echo_event_t) c.echo_callback_code_t {
+    _ = event;
+    @trap();
+}
+```
+
+Build the Zig to an object, the bindings and `rt.c` as for C, and link them with `wasm-ld`:
+
+```sh
+zig translate-c -target wasm32-freestanding echo.h > c.zig
+zig build-obj -target wasm32-freestanding -O Debug -fllvm \
+  --dep c -Mroot=src/node.zig -Mc=c.zig -femit-bin=node.o
+clang --target=wasm32-unknown-unknown -nostdlib -ffreestanding -I include -g0 -O2 -Wl,--no-entry \
+  -o core.wasm node.o echo.c rt.c
+wasm-tools component embed wit core.wasm -o embedded.wasm
+wasm-tools component new embedded.wasm -o echo.wasm
+```
+
+`-O Debug` keeps every line to stop on. Zig's debug info says its code is C, so witgraph tells it
+by its producer, and shows its values as Zig writes them: `"hello"` for a `[]const u8`,
+`.{ .x = 3 }` for a struct, `null` for an empty optional, a tagged union by its active field.
+Zig's standard library is not the guest's own. Zig works out at compile time what it can, and
+such a value is no variable once the guest runs: make it a `var` to see it. Zig 0.17 is what
+`test-fixtures/test-components/guests/zig-walk` is built with, by the fixtures' build script.
+
 ## Previewing outputs
 
 A component can tell an editor how to preview its outputs, the way an image

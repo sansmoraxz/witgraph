@@ -5,7 +5,7 @@
 resolver = "3"
 members = ["*"]
 # `c-walk` is written in C, and `c-lib` is a C library it uses.
-exclude = [".cargo", "target", "c-walk", "c-lib"]
+exclude = [".cargo", "target", "c-walk", "c-lib", "zig-walk"]
 
 [workspace.dependencies]
 # The guests only need a wit-bindgen whose output the host's wit-component

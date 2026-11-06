@@ -479,7 +479,8 @@ decides each file, the first that says anything deciding:
 1. **`include`**, patterns of paths that are the guest's own, whatever else says.
 2. **`exclude`**, patterns of paths that are not.
 3. **`known`**, the libraries witgraph knows of are not: Rust's standard library and Cargo's
-   dependencies, and clang's and wasi-sdk's headers, each only in code of its language.
+   dependencies, clang's and wasi-sdk's headers, and Zig's standard library and cache, each only
+   in code of its language.
 4. **`anchor`**, only what is under the guest's project is: the directory its `run` was compiled
    in, as the debug info has it, with that of `run`'s file. A dependency is compiled where it
    is, and the standard library where its toolchain was built, so this works for any language

@@ -113,8 +113,9 @@ Put them anywhere on your page. They all share one `EditorController`.
   timeline says so. Without debug info in a graph, the panel and the Code buttons stay hidden.
   In the demo, add `?debug` to the
   address to turn it on: the page then loads the guests as `setup` built them with debug info.
-  Its _Source lines: Rust and C_ graph (`?graph=c-lines&debug`) has a node written in C, whose
-  variables read as C writes them, fed by one written in Rust.
+  Its _Source lines: Rust, C and Zig_ graph (`?graph=c-lines&debug`) has a node written in each,
+  the Rust one feeding the C one, which feeds the Zig one, each one's variables read as its
+  language writes them.
 - **Values.** Select a node to see the current value of each output port.
 - **Previews.** A node can show one of its outputs inside it, as it changes:
   see [Previews](#previews).

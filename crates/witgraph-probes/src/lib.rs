@@ -144,9 +144,26 @@ fn slot(spilled: &[u8], at: u64) -> Option<[u8; 8]> {
 }
 
 /// The language of a compile unit's code, if it is one witgraph knows.
+/// Whether `unit` was compiled from Zig: its debug info says C, so it is by its producer.
+pub(crate) fn is_zig<R: gimli::Reader>(
+    dwarf: &gimli::Dwarf<R>,
+    unit: &gimli::Unit<R>,
+) -> Result<bool, ProbeError> {
+    let root = unit.entry(unit.header.root_offset())?;
+    let Some(producer) = root.attr_value(gimli::DW_AT_producer) else {
+        return Ok(false);
+    };
+    let producer = dwarf.attr_string(unit, producer)?;
+    Ok(producer.to_string_lossy()?.starts_with("zig "))
+}
+
 fn language_of<R: gimli::Reader>(
+    dwarf: &gimli::Dwarf<R>,
     unit: &gimli::Unit<R>,
 ) -> Result<Option<SourceLanguage>, ProbeError> {
+    if is_zig(dwarf, unit)? {
+        return Ok(Some(SourceLanguage::Zig));
+    }
     use gimli::{
         DW_LANG_C, DW_LANG_C_plus_plus, DW_LANG_C_plus_plus_03, DW_LANG_C_plus_plus_11,
         DW_LANG_C_plus_plus_14, DW_LANG_C_plus_plus_17, DW_LANG_C_plus_plus_20, DW_LANG_C11,
@@ -388,7 +405,7 @@ fn own_rows(module: &[u8], own: &OwnLines) -> Result<Vec<Row>, ProbeError> {
         let Some(program) = unit.line_program.clone() else {
             continue;
         };
-        let language = language_of(&unit)?;
+        let language = language_of(&dwarf, &unit)?;
         // Whether each file counts, decided once.
         let mut counts: HashMap<String, bool> = HashMap::new();
         let mut lines = program.rows();

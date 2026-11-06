@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::{env, fs};
 
-const GUESTS: [&str; 51] = [
+const GUESTS: [&str; 52] = [
     "echo",
     "m0-import",
     "configurable",
@@ -55,16 +55,28 @@ const GUESTS: [&str; 51] = [
     "line-stream",
     "line-stream-sink",
     "c-walk",
+    "zig-walk",
 ];
 
 /// The guests built with debug info and no optimizing, so that each source line is there
 /// to step to.
-const WITH_DEBUG_INFO: [&str; 4] = ["line-walk", "line-stream", "line-stream-sink", "c-walk"];
+const WITH_DEBUG_INFO: [&str; 5] = [
+    "line-walk",
+    "line-stream",
+    "line-stream-sink",
+    "c-walk",
+    "zig-walk",
+];
 
 /// The guests written in C, built with clang (`CLANG`, or `clang` on the path) and its
 /// `wasm-ld`: `src/*.c` is the guest's own code, `bindings/` what `wit-bindgen c` makes of its
 /// WIT, and `support/` the little of a C library the bindings use.
 const C_GUESTS: [&str; 1] = ["c-walk"];
+
+/// The guests written in Zig, built with `zig` (`ZIG`, or `zig` on the path), each with the
+/// file its module starts at: `src/*.zig` is the guest's own code, which calls `bindings/`, what
+/// `wit-bindgen c` makes of its WIT, as C. Those and `support/` are built as a C guest's are.
+const ZIG_GUESTS: [(&str, &str); 1] = [("zig-walk", "src/walk.zig")];
 
 /// Names guests, comma-separated, to build with debug info too, as `{name}.debug.wasm`.
 const DEBUG_GUESTS: &str = "WITGRAPH_DEBUG_GUESTS";
@@ -144,6 +156,12 @@ fn main() {
             println!("cargo::rerun-if-changed=guests/c-lib");
             println!("cargo::rerun-if-env-changed=CLANG");
             build_c_guest(name, &guest_dir, &out_dir)
+        } else if let Some((_, root)) = ZIG_GUESTS.iter().find(|(zig, _)| *zig == name) {
+            println!("cargo::rerun-if-changed=guests/{name}/bindings");
+            println!("cargo::rerun-if-changed=guests/{name}/support");
+            println!("cargo::rerun-if-env-changed=CLANG");
+            println!("cargo::rerun-if-env-changed=ZIG");
+            build_zig_guest(name, root, &guest_dir, &out_dir)
         } else {
             build_guest(name, &guest_dir, &target_dir, debug)
         };
@@ -217,20 +235,109 @@ fn build_c_guest(name: &str, guest_dir: &Path, out_dir: &Path) -> Vec<u8> {
     fs::create_dir_all(&work)
         .unwrap_or_else(|e| panic!("failed to create {}: {e}", work.display()));
     // `c-lib` is a library kept outside the guest's directory, as one is.
-    let includes = [
+    let objects = c_objects(
+        name,
+        &dir,
+        &work,
+        &[guest_dir.join("c-lib/include")],
+        &[
+            ("src", &["-g", "-O0"]),
+            ("bindings", &["-g0", "-O2"]),
+            ("support", &["-g0", "-O2"]),
+        ],
+    );
+    link_guest(name, &dir, &work, objects)
+}
+
+/// Builds a guest written in Zig: its own code from `root` on, with debug info and no
+/// optimizing, and its C bindings and support without, as a C guest's are.
+fn build_zig_guest(name: &str, root: &str, guest_dir: &Path, out_dir: &Path) -> Vec<u8> {
+    let dir = guest_dir.join(name);
+    let work = out_dir.join("zig").join(name);
+    fs::create_dir_all(&work)
+        .unwrap_or_else(|e| panic!("failed to create {}: {e}", work.display()));
+    let header = fs::read_dir(dir.join("bindings"))
+        .unwrap_or_else(|e| panic!("failed to read the bindings of {name}: {e}"))
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "h"))
+        .unwrap_or_else(|| panic!("{name} has no bindings header"));
+    // The header as Zig has it, which the guest imports as `c`: made here, so that what is
+    // generated is no file of the guest's project.
+    let translated = work.join("c.zig");
+    let header_zig = zig(name, &dir, &work, |command| {
+        command
+            .args(["translate-c", "-target", "wasm32-freestanding"])
+            .arg(&header);
+    });
+    fs::write(&translated, header_zig)
+        .unwrap_or_else(|e| panic!("failed to write {}: {e}", translated.display()));
+    let own = work.join("own.o");
+    zig(name, &dir, &work, |command| {
+        command
+            .args([
+                "build-obj",
+                "-target",
+                "wasm32-freestanding",
+                "-O",
+                "Debug",
+                "-fllvm",
+            ])
+            .args(["--dep", "c"])
+            .arg(format!("-Mroot={root}"))
+            .arg(format!("-Mc={}", translated.display()))
+            .arg(format!("-femit-bin={}", own.display()));
+    });
+    let mut objects = vec![own];
+    objects.extend(c_objects(
+        name,
+        &dir,
+        &work,
+        &[],
+        &[("bindings", &["-g0", "-O2"]), ("support", &["-g0", "-O2"])],
+    ));
+    link_guest(name, &dir, &work, objects)
+}
+
+/// Runs `zig` as `args` say, in the guest's directory, with its cache in `work`. Says what
+/// it wrote to its output.
+fn zig(name: &str, dir: &Path, work: &Path, args: impl FnOnce(&mut Command)) -> Vec<u8> {
+    let zig = env::var("ZIG").unwrap_or_else(|_| "zig".into());
+    let mut command = Command::new(&zig);
+    command.current_dir(dir);
+    args(&mut command);
+    command.arg("--cache-dir").arg(work.join("zig-cache"));
+    let output = command
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run {zig} for the {name} guest: {e}"));
+    if !output.status.success() {
+        panic!(
+            "{zig} failed for the {name} guest:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    output.stdout
+}
+
+/// Compiles the C files of each of `parts`, a subdirectory of `dir` and its flags, into
+/// objects in `work`.
+fn c_objects(
+    name: &str,
+    dir: &Path,
+    work: &Path,
+    more_includes: &[PathBuf],
+    parts: &[(&str, &[&str])],
+) -> Vec<PathBuf> {
+    let mut includes = vec![
         OsString::from("-I"),
         dir.join("bindings").into(),
         OsString::from("-I"),
         dir.join("support/include").into(),
-        OsString::from("-I"),
-        guest_dir.join("c-lib/include").into(),
     ];
+    for include in more_includes {
+        includes.extend([OsString::from("-I"), include.into()]);
+    }
     let mut objects = Vec::new();
-    for (sub, flags) in [
-        ("src", ["-g", "-O0"]),
-        ("bindings", ["-g0", "-O2"]),
-        ("support", ["-g0", "-O2"]),
-    ] {
+    for (sub, flags) in parts {
         for file in c_files(&dir.join(sub)) {
             let object = work.join(file.file_name().unwrap()).with_extension("o");
             let mut args: Vec<OsString> = flags.iter().map(OsString::from).collect();
@@ -238,15 +345,21 @@ fn build_c_guest(name: &str, guest_dir: &Path, out_dir: &Path) -> Vec<u8> {
             args.extend(includes.iter().cloned());
             // By its full path, as the debug info names it for a debugger to find.
             args.extend([file.into(), "-o".into(), object.clone().into()]);
-            clang(name, &dir, args);
+            clang(name, dir, args);
             objects.push(object);
         }
     }
+    objects
+}
+
+/// Links `objects` into a core module, with the world of the guest in `dir` embedded, and
+/// makes a component of it.
+fn link_guest(name: &str, dir: &Path, work: &Path, objects: Vec<PathBuf>) -> Vec<u8> {
     let core_wasm = work.join("core.wasm");
     let mut args = vec![OsString::from("-Wl,--no-entry")];
     args.extend(objects.into_iter().map(OsString::from));
     args.extend(["-o".into(), core_wasm.clone().into()]);
-    clang(name, &dir, args);
+    clang(name, dir, args);
 
     let mut module = fs::read(&core_wasm)
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", core_wasm.display()));
@@ -267,7 +380,7 @@ fn build_c_guest(name: &str, guest_dir: &Path, out_dir: &Path) -> Vec<u8> {
         false,
     )
     .unwrap_or_else(|e| panic!("failed to embed the world of {name}: {e:#}"));
-    componentize(name, &dir, &module)
+    componentize(name, dir, &module)
 }
 
 /// The C files in `dir`, in order.

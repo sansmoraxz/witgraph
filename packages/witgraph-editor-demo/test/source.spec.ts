@@ -595,3 +595,67 @@ test('a breakpoint stops every node, or narrowed by its menu, the one on show', 
   await page.keyboard.press('Escape');
   expect(await stopsIn()).toEqual([]);
 });
+
+test('a guest written in Zig stops and steps, its variables as Zig writes them', async ({
+  page,
+}) => {
+  const zigText = readFileSync(
+    new URL('../../../test-fixtures/test-components/guests/zig-walk/src/walk.zig', import.meta.url),
+    'utf8',
+  );
+  const zigMark = (name: string) =>
+    zigText.split('\n').findIndex((line) => line.endsWith(`// mark: ${name}`)) + 1;
+  await page.goto('/?graph=c-lines&debug');
+  await expect(page.locator('#status')).toHaveClass(/ready/, { timeout: 30_000 });
+  const canvas = page.locator('witgraph-canvas');
+  const source = page.locator('witgraph-source');
+  const controls = page.locator('witgraph-controls');
+  const variables = source.locator('.variables');
+  const current = source.locator('.row.current');
+  await canvas.locator('[data-node-id="zig"]').click();
+  await expect(source.locator('select.file option')).toHaveText(
+    ['zig-walk/src/scale.zig', 'zig-walk/src/walk.zig'],
+    { useInnerText: true },
+  );
+  await source.locator('select.file').selectOption({ label: 'zig-walk/src/walk.zig' });
+
+  const first = source.locator(`.row[data-line="${zigMark('walk-first')}"]`);
+  await expect(first).toContainText('const a = add(x, 1);');
+  await first.locator('.gutter').click();
+  await controls.locator('button.run').click();
+  await expect(current).toHaveAttribute('data-line', String(zigMark('walk-first')));
+  await expect(source.locator('.where')).toHaveText(
+    `Stopped at line ${zigMark('walk-first')} of walk.zig in zig`,
+  );
+  // What the C guest made of what the Rust one made of 5.
+  await expect(variables.locator('[data-path="x"]')).toContainText('24');
+  await expect(variables.locator('[data-path="x"]')).toContainText('u32');
+  await page.keyboard.press('F11');
+  await expect(current).toHaveAttribute('data-line', String(zigMark('add-body')));
+  await expect(source.locator('.frames .frame').first()).toContainText('walk.add');
+  await first.locator('.gutter').click();
+
+  await source.locator(`.row[data-line="${zigMark('kinds-end')}"] .gutter`).click();
+  await page.keyboard.press('F5');
+  await expect(current).toHaveAttribute('data-line', String(zigMark('kinds-end')));
+  for (const [path, shown] of [
+    ['text', '"hello"'],
+    ['slice', '.{ 10, 20, 30 }'],
+    ['some', '7'],
+    ['none', 'null'],
+    ['shape', '.{ .rect = .{ .w = 4, .h = 5 } }'],
+  ]) {
+    await expect(variables.locator(`[data-path="${path}"]`)).toContainText(shown);
+  }
+  await expect(variables.locator('[data-path="text"]')).toContainText('[]const u8');
+
+  // In its second file, which the graph runs.
+  await source.locator(`.row[data-line="${zigMark('kinds-end')}"] .gutter`).click();
+  await source.locator('select.file').selectOption({ label: 'zig-walk/src/scale.zig' });
+  const scaleRow = source.locator('.row', { hasText: 'mark: scale-add' });
+  await scaleRow.locator('.gutter').click();
+  await page.keyboard.press('F5');
+  await expect(current).toContainText('mark: scale-add');
+  await expect(source.locator('.where')).toContainText('of scale.zig in zig');
+  await controls.locator('button.stop').click();
+});

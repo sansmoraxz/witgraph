@@ -41,7 +41,7 @@ test('the editor attaches, and holds a node of the graph its program runs', asyn
   // The rest looks as it does on a graph of the page's own.
   await expect(page.locator('#graph-picker')).toContainText('Attached: 127.0.0.1');
   const catalog = page.locator('witgraph-catalog');
-  await expect(catalog.locator('.card')).toHaveCount(3);
+  await expect(catalog.locator('.card')).toHaveCount(4);
   await expect(catalog).toContainText('test:line-walk/line-walk@0.1.0');
   await expect(catalog).not.toContainText('#');
   await expect(page.locator('witgraph-timeline')).toContainText('run-returned', {
@@ -132,6 +132,32 @@ test("the editor stops on a line of the program's guest written in C", async ({ 
   await expect(source.locator('.where')).toContainText('in c-walker');
 
   await scaleRow.locator('.gutter').click();
+  await page.locator('witgraph-controls').locator('button.resume').click();
+  await expect(page.locator('witgraph-controls').locator('.badge')).toHaveText('Attached');
+});
+
+test("the editor stops on a line of the program's guest written in Zig", async ({ page }) => {
+  await page.goto(attach);
+  const canvas = page.locator('witgraph-canvas');
+  await expect(canvas.locator('[data-node-id="zig-walker"]')).toBeVisible({ timeout: 20_000 });
+  const source = page.locator('witgraph-source');
+  await canvas.locator('[data-node-id="zig-walker"]').click();
+  await expect(source.locator('select.file option')).toHaveText(
+    ['zig-walk/src/scale.zig', 'zig-walk/src/walk.zig'],
+    { useInnerText: true },
+  );
+  await source.locator('select.file').selectOption({ label: 'zig-walk/src/walk.zig' });
+  const row = source.locator('.row', { hasText: 'mark: walk-first' });
+  await expect(row).toContainText('const a = add(x, 1);', { timeout: 20_000 });
+  await row.locator('.gutter').click();
+  await expect(source.locator('.row.current')).toContainText('mark: walk-first', {
+    timeout: 20_000,
+  });
+  await expect(source.locator('.where')).toContainText('of walk.zig in zig-walker');
+  await expect(source.locator('.frames .frame').first()).toContainText('walk.walk');
+  await expect(source.locator('.variables [data-path="x"]')).toContainText('u32');
+
+  await row.locator('.gutter').click();
   await page.locator('witgraph-controls').locator('button.resume').click();
   await expect(page.locator('witgraph-controls').locator('.badge')).toHaveText('Attached');
 });

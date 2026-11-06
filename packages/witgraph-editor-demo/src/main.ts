@@ -126,6 +126,7 @@ const GUESTS = [
   'busy-loop',
   'line-walk',
   'c-walk',
+  'zig-walk',
   'relay',
   'stream-producer',
   'stream-consumer',
@@ -164,6 +165,11 @@ const lineWalkRef = {
 const cWalkRef = {
   package: { namespace: 'test', name: 'c-walk', version: '0.1.0' },
   world: 'c-walk',
+};
+
+const zigWalkRef = {
+  package: { namespace: 'test', name: 'zig-walk', version: '0.1.0' },
+  world: 'zig-walk',
 };
 
 const portKinds: GraphJson = {
@@ -498,11 +504,12 @@ const lines: GraphJson = {
   ],
 };
 
-/** A guest written in Rust feeding one written in C, both built with debug info. */
+/** Guests written in Rust, C and Zig, each feeding the next, all built with debug info. */
 const cLines: GraphJson = {
   metadata: {
     name: 'demo-c-lines',
-    description: 'A guest written in Rust feeding one written in C, to step through both.',
+    description:
+      'A guest written in Rust feeding one written in C, which feeds one written in Zig, to step through each.',
   },
   components: allComponents,
   nodes: [
@@ -520,12 +527,24 @@ const cLines: GraphJson = {
       label: 'C',
       attrs: { 'inject.kinds': '4', 'inject.scale': '2' },
     },
+    // `scale` runs `scale.zig`, the guest's second file.
+    {
+      id: 'zig',
+      component: zigWalkRef,
+      label: 'Zig',
+      attrs: { 'inject.kinds': '4', 'inject.scale': '2' },
+    },
   ],
   connections: [
     {
       id: 'rust-c',
       from: { node: 'rust', port: 'out' },
       to: { node: 'c', port: 'in' },
+    },
+    {
+      id: 'c-zig',
+      from: { node: 'c', port: 'out' },
+      to: { node: 'zig', port: 'in' },
     },
   ],
 };

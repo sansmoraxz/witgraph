@@ -22,7 +22,7 @@ use gimli::{
 use wasmparser::{Parser, Payload};
 use witgraph_traits::lines::SourceVariable as Variable;
 
-use crate::{ModuleOffset, ProbeError};
+use crate::{ModuleOffset, ProbeError, is_zig};
 
 type Reader = EndianArcSlice<LittleEndian>;
 type Entry<'a> = gimli::DebuggingInformationEntry<Reader>;
@@ -196,13 +196,15 @@ impl ModuleDebug {
             }
             let mut path = Vec::new();
             if self.scopes_at(&unit, pc, &mut path)? {
+                let zig = is_zig(&self.dwarf, &unit)?;
                 let mut reader = Decoder {
                     debug: self,
                     unit: &unit,
                     frame,
                     pc,
                     values: 0,
-                    c: is_c(&unit)?,
+                    c: !zig && is_c(&unit)?,
+                    zig,
                 };
                 return reader.variables(&path);
             }
@@ -291,6 +293,9 @@ struct Decoder<'a> {
     values: usize,
     /// Whether the code is C's, whose values are written as C writes them; Rust's otherwise.
     c: bool,
+    /// Whether it is Zig's, whose debug info says C, but names its types in full, as Rust's
+    /// does: its values are written as Zig writes them.
+    zig: bool,
 }
 
 /// Whether a base type encoded so is a C `char`.
@@ -810,6 +815,7 @@ impl Decoder<'_> {
                 let found = self
                     .name_of(&enumerator)?
                     .unwrap_or_else(|| held.to_string());
+                let found = if self.zig { format!(".{found}") } else { found };
                 return Ok(leaf(name, type_name, &found));
             }
         }
@@ -882,7 +888,9 @@ impl Decoder<'_> {
             String::new()
         };
         let list: Vec<&str> = children.iter().map(|item| item.value.as_str()).collect();
-        let value = if self.c {
+        let value = if self.zig {
+            shorten(format!(".{{ {}{more} }}", list.join(", ")))
+        } else if self.c {
             shorten(format!("{{ {}{more} }}", list.join(", ")))
         } else {
             shorten(format!("[{}{more}]", list.join(", ")))
@@ -1082,7 +1090,13 @@ impl Decoder<'_> {
         place: &Place,
         depth: usize,
     ) -> Result<Variable, ProbeError> {
-        if let Some(collection) = self.rust_collection(&name, type_name, offset, place, depth)? {
+        if self.zig {
+            if let Some(special) = self.zig_special(&name, type_name, offset, place, depth)? {
+                return Ok(special);
+            }
+        } else if let Some(collection) =
+            self.rust_collection(&name, type_name, offset, place, depth)?
+        {
             return Ok(collection);
         }
         let mut members = Vec::new();
@@ -1116,7 +1130,9 @@ impl Decoder<'_> {
             }
             children.push(self.value(field, member_type, &inner, depth + 1)?);
         }
-        let value = if self.c {
+        let value = if self.zig {
+            format!(".{}", c_summary_of(&children))
+        } else if self.c {
             c_summary_of(&children)
         } else {
             summary_of(type_name, &children)
@@ -1127,6 +1143,133 @@ impl Decoder<'_> {
             value,
             children,
         })
+    }
+
+    /// The members of the structure at `offset`, by name: each one's type, and where it is.
+    fn members_of(&self, offset: UnitOffset) -> Result<Vec<(String, UnitOffset, u64)>, ProbeError> {
+        let mut members = Vec::new();
+        for child in self.children_of(offset)? {
+            let entry = self.unit.entry(child)?;
+            if entry.tag() != DW_TAG_member {
+                continue;
+            }
+            if let (Some(name), Some(member_type)) = (self.name_of(&entry)?, self.type_of(&entry)?)
+            {
+                members.push((name, member_type, member_offset(&entry)));
+            }
+        }
+        Ok(members)
+    }
+
+    /// A little-endian number of `size` bytes at `place`.
+    fn number_at(&self, place: &Place, size: usize) -> Option<u64> {
+        let bytes = self.bytes(place, size)?;
+        let mut wide = [0u8; 8];
+        wide.get_mut(..size)?.copy_from_slice(&bytes);
+        Some(u64::from_le_bytes(wide))
+    }
+
+    /// What Zig makes of its own kinds of value, which its debug info gives as structures: an
+    /// optional (`?T`, a `payload` and whether there is `some`), a slice (`[]T`, a `ptr` and a
+    /// `len`), and a tagged union (a `payload` union and a `tag`). `None` for any other.
+    fn zig_special(
+        &mut self,
+        name: &str,
+        type_name: &str,
+        offset: UnitOffset,
+        place: &Place,
+        depth: usize,
+    ) -> Result<Option<Variable>, ProbeError> {
+        let members = self.members_of(offset)?;
+        let member = |wanted: &str| members.iter().find(|(name, ..)| name == wanted).cloned();
+        let name = name.to_string();
+        if type_name.starts_with('?')
+            && let (Some((_, payload_type, payload_at)), Some((_, some_type, some_at))) =
+                (member("payload"), member("some"))
+        {
+            let size = self
+                .size_of(some_type)?
+                .and_then(|size| usize::try_from(size).ok())
+                .unwrap_or(1);
+            let some = Self::at(place, some_at).and_then(|at| self.number_at(&at, size));
+            return Ok(Some(match some {
+                None => leaf(name, type_name, "<unreadable>"),
+                Some(0) => leaf(name, type_name, "null"),
+                Some(_) => {
+                    let Some(inner) = Self::at(place, payload_at) else {
+                        return Ok(Some(leaf(name, type_name, "<unreadable>")));
+                    };
+                    let mut value = self.value(name, payload_type, &inner, depth)?;
+                    value.type_name = type_name.to_string();
+                    value
+                }
+            }));
+        }
+        if type_name.starts_with("[]")
+            && let (Some((_, ptr_type, ptr_at)), Some((_, _, len_at))) =
+                (member("ptr"), member("len"))
+        {
+            let address = Self::at(place, ptr_at).and_then(|at| self.number_at(&at, 4));
+            let len = Self::at(place, len_at).and_then(|at| self.number_at(&at, 4));
+            let (Some(address), Some(len)) = (address, len) else {
+                return Ok(Some(leaf(name, type_name, "<unreadable>")));
+            };
+            let Some(item_type) = self.type_of(&self.unit.entry(ptr_type)?)? else {
+                return Ok(Some(leaf(name, type_name, "<no item type>")));
+            };
+            let item = self.unit.entry(item_type)?;
+            let byte = item.tag() == DW_TAG_base_type && self.size_of(item_type)? == Some(1);
+            let address = u32::try_from(address).unwrap_or(u32::MAX);
+            // `[]u8` and `[]const u8` are how Zig has text.
+            if byte && self.name_of(&item)?.as_deref() == Some("u8") {
+                return Ok(Some(self.text(name, type_name, address, len)));
+            }
+            return self
+                .items(
+                    name,
+                    type_name.to_string(),
+                    item_type,
+                    Place::Memory(address),
+                    len,
+                    depth,
+                )
+                .map(Some);
+        }
+        if let (Some((_, payload_type, payload_at)), Some((_, tag_type, tag_at))) =
+            (member("payload"), member("tag"))
+            && members.len() == 2
+            && self.unit.entry(tag_type)?.tag() == DW_TAG_enumeration_type
+        {
+            let Some(tag_place) = Self::at(place, tag_at) else {
+                return Ok(Some(leaf(name, type_name, "<unreadable>")));
+            };
+            let tag = self.value("tag".to_string(), tag_type, &tag_place, depth + 1)?;
+            let field = tag.value.trim_start_matches('.').to_string();
+            // The payload of the field the tag names; one with none, such as `.dot`, is the tag.
+            let active = self
+                .members_of(payload_type)?
+                .into_iter()
+                .find(|(name, ..)| *name == field);
+            let Some((_, field_type, field_at)) = active else {
+                return Ok(Some(leaf(name, type_name, &tag.value)));
+            };
+            if self.size_of(field_type)? == Some(0) {
+                return Ok(Some(leaf(name, type_name, &tag.value)));
+            }
+            let Some(inner) = Self::at(place, payload_at).and_then(|at| Self::at(&at, field_at))
+            else {
+                return Ok(Some(leaf(name, type_name, "<unreadable>")));
+            };
+            let payload = self.value(field.clone(), field_type, &inner, depth + 1)?;
+            let value = shorten(format!(".{{ .{field} = {} }}", payload.value));
+            return Ok(Some(Variable {
+                name,
+                type_name: type_name.to_string(),
+                value,
+                children: vec![payload],
+            }));
+        }
+        Ok(None)
     }
 
     /// A Rust enum: its discriminant says which variant, whose fields then follow.

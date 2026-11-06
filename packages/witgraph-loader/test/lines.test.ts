@@ -423,15 +423,20 @@ test("each node's files are its own guest's", async () => {
     [
       ['rust', 'line-walk'],
       ['c', 'c-walk'],
+      ['zig', 'zig-walk'],
     ],
-    [['walk', 'rust.out', 'c.in']],
+    [
+      ['walk', 'rust.out', 'c.in'],
+      ['on', 'c.out', 'zig.in'],
+    ],
   );
   const ends = (files: readonly string[]) => files.map((file) => file.split('/').at(-1));
   assert.deepEqual(ends(lines.filesOf('rust')), ['lib.rs', 'scale.rs']);
   assert.deepEqual(ends(lines.filesOf('c')), ['scale.c', 'walk.c']);
+  assert.deepEqual(ends(lines.filesOf('zig')), ['scale.zig', 'walk.zig']);
   assert.deepEqual(lines.filesOf('nowhere'), []);
   assert.deepEqual(
-    [...lines.filesOf('rust'), ...lines.filesOf('c')].sort(),
+    [...lines.filesOf('rust'), ...lines.filesOf('c'), ...lines.filesOf('zig')].sort(),
     [...lines.files].sort(),
   );
 });
@@ -439,6 +444,7 @@ test("each node's files are its own guest's", async () => {
 for (const [guest, main, second, functions] of [
   ['line-walk', 'src/lib.rs', 'src/scale.rs', { scale: /scale::scale$/, add: /::add$/ }],
   ['c-walk', 'src/walk.c', 'src/scale.c', { scale: /^scale$/, add: /^add$/ }],
+  ['zig-walk', 'src/walk.zig', 'src/scale.zig', { scale: /scale\.scale$/, add: /walk\.add$/ }],
 ] as const) {
   test(`a step in ${guest} goes from one file of its own into another and back`, async () => {
     const [mainText, secondText] = await Promise.all([
@@ -489,6 +495,40 @@ for (const [guest, main, second, functions] of [
     assert.equal(await session.graph.readOutput('a', 'out'), 9, '`walk(0)` and `scale(3)`');
   });
 }
+
+test('a variable of each kind in Zig reads as Zig would write it', async () => {
+  const text = await fixture('zig-walk/src/walk.zig');
+  const { session, lines, nextStop } = await load([['z', 'zig-walk']]);
+  const file = lines.files.find((name) => name.endsWith('zig-walk/src/walk.zig')) as string;
+  assert.ok(file, `${lines.files}`);
+  lines.setBreakpoint('every-node', file, markIn(text, 'kinds-end'));
+  await session.graph.inject('z', 'kinds', 4);
+  const tick = session.tick();
+  const stop = await nextStop();
+  const shown = Object.fromEntries(
+    stop.variables.map(({ name, type, value }) => [name, `${type} = ${value}`]),
+  );
+  assert.deepEqual(
+    {
+      text: shown.text,
+      slice: shown.slice,
+      some: shown.some,
+      none: shown.none,
+      shape: shown.shape,
+      pointer: shown.pointer,
+    },
+    {
+      text: '[]const u8 = "hello"',
+      slice: '[]const u32 = .{ 10, 20, 30 }',
+      some: '?u32 = 7',
+      none: '?u32 = null',
+      shape: 'walk.Shape = .{ .rect = .{ .w = 4, .h = 5 } }',
+      pointer: '*walk.Point = → .{ .y = 2.5, .x = 3 }',
+    },
+  );
+  lines.resume();
+  await tick;
+});
 
 test('a line with no code comes to the next that has it', async () => {
   const { session, lines, nextStop, file } = await load([['a', 'line-walk']]);

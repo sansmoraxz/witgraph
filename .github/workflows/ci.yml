@@ -40,6 +40,10 @@ jobs:
       - run: rustup toolchain install
       # The guests written in C build with clang, which the runner has, and `wasm-ld`.
       - run: sudo apt-get update && sudo apt-get install -y lld
+      # The guest written in Zig builds with the version it was written for.
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: rust
@@ -73,6 +77,10 @@ jobs:
       - run: rustup toolchain install
       # The guests written in C build with clang, which the runner has, and `wasm-ld`.
       - run: sudo apt-get update && sudo apt-get install -y lld
+      # The guest written in Zig builds with the version it was written for.
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: rust
