@@ -26,10 +26,12 @@ const SVG_CSS = `
 
   /* Node styling — solid with depth */
   .node-group { cursor: grab; filter: drop-shadow(0 2px 4px rgba(0,0,0,0.3)); transition: filter 0.15s; }
-  .node-group:hover { filter: drop-shadow(0 3px 8px rgba(0,0,0,0.4)); }
   .node-group.selected { filter: drop-shadow(0 0 8px color-mix(in srgb, var(--wg-primary) 50%, transparent)) drop-shadow(0 2px 4px rgba(0,0,0,0.3)); }
-  .node-group.selected .node-body { stroke: var(--wg-primary); stroke-width: 2; }
   .node-body { fill: url(#node-gradient); stroke: var(--wg-surface-hover); stroke-width: 1; rx: var(--_node-radius); }
+  /* Hovered: part of the way to selected, by the outline alone, so a previewing node has it too.
+     Before the rules below, which say more, so win at the same specificity. */
+  .node-group:hover .node-body { stroke: color-mix(in srgb, var(--wg-primary) 55%, var(--wg-surface-hover)); stroke-width: 1.5; }
+  .node-group.selected .node-body { stroke: var(--wg-primary); stroke-width: 2; }
   .node-group.paused-here .node-body { stroke: var(--wg-warning); stroke-width: 3; stroke-dasharray: 6 3; }
   .node-group.has-warning .node-body { stroke: var(--wg-warning); stroke-width: 2; }
   .node-group.has-error .node-body { stroke: var(--wg-error); stroke-width: 2; }
@@ -76,7 +78,7 @@ const SVG_CSS = `
 
   /* Preview region: a node's output, shown by its viewer. A filter would
      re-rasterize the node on every frame, so a previewing node has none. */
-  .node-group.has-preview, .node-group.has-preview:hover, .node-group.has-preview.selected { filter: none; }
+  .node-group.has-preview, .node-group.has-preview.selected { filter: none; }
   .node-preview-host { box-sizing: border-box; width: 100%; height: 100%; padding: 0 6px 6px;
     overflow: hidden; }
   .preview-image { display: block; width: 100%; height: 100%; object-fit: contain;
@@ -97,9 +99,12 @@ const SVG_CSS = `
   .preview-series-label { font: 10px ui-monospace, monospace; color: var(--wg-text-dim);
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
-  /* Resize handle */
-  .node-resize { fill: var(--wg-text-muted); opacity: 0; cursor: nwse-resize; transition: opacity 0.15s; }
-  .node-group:hover .node-resize, .node-resize.active { opacity: 0.8; }
+  /* Resize handle: a corner to grab, and a grip drawn inside the node's rounded one */
+  .node-resize { fill: transparent; cursor: nwse-resize; }
+  .node-resize-grip { fill: none; stroke: var(--wg-text-muted); stroke-width: 1.25; stroke-linecap: round;
+    opacity: 0; pointer-events: none; transition: opacity 0.15s, stroke 0.12s; }
+  .node-group:hover .node-resize-grip, .node-resize.active + .node-resize-grip { opacity: 1; }
+  .node-resize:hover + .node-resize-grip, .node-resize.active + .node-resize-grip { stroke: var(--wg-text-dim); }
 `;
 
 /** What a node's group was drawn for: a change redraws it from scratch. */
@@ -494,18 +499,26 @@ export class WitgraphCanvas extends HTMLElement {
     this.#previews.set(node.id, { port: preview.port, viewer });
   }
 
-  /** A grip at the node's bottom-right corner: drag it to resize the node. */
+  /**
+   * A grip at the node's bottom-right corner: drag it to resize the node. What takes the pointer
+   * is the corner; what shows is two short lines inside its rounding.
+   */
   #appendResizeHandle(g: SVGGElement, node: NodeVisual): void {
-    const size = 10;
+    const size = 12;
     const handle = document.createElementNS(SVG_NS, 'path');
     handle.classList.add('node-resize');
-    const place = (width: number, height: number) =>
+    const grip = document.createElementNS(SVG_NS, 'path');
+    grip.classList.add('node-resize-grip');
+    const place = (width: number, height: number) => {
       handle.setAttribute(
         'd',
         `M ${width},${height - size} L ${width},${height} L ${width - size},${height} Z`,
       );
+      const [x, y] = [width - 3, height - 3];
+      grip.setAttribute('d', `M ${x},${y - 7} L ${x - 7},${y} M ${x},${y - 3} L ${x - 3},${y}`);
+    };
     place(node.width, node.height);
-    g.appendChild(handle);
+    g.append(handle, grip);
 
     let width = node.width;
     let height = node.height;
