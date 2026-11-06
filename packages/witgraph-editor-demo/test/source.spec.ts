@@ -91,7 +91,7 @@ test.describe('the source panel', () => {
     const output = await page
       .locator('witgraph-canvas')
       .evaluate((el: WitgraphCanvas) => el.controller?.readOutput('second', 'out'));
-    expect(output).toBe(11);
+    expect(output, '`walk(8)` and `scale(2)`').toBe(15);
   });
 
   test('variables show what they hold, and mark what changed', async ({ page }) => {
@@ -419,6 +419,21 @@ test('a guest written in C stops and steps, its variables as C writes them', asy
     await expect(variables.locator(`[data-path="${path}"]`)).toContainText(shown);
   }
   await expect(variables.locator('[data-path="point"]')).toContainText('struct point');
+
+  // In its second file, which the graph runs.
+  const scaleText = readFileSync(
+    new URL('../../../test-fixtures/test-components/guests/c-walk/src/scale.c', import.meta.url),
+    'utf8',
+  );
+  const scaleAdd =
+    scaleText.split('\n').findIndex((line) => line.endsWith('// mark: scale-add')) + 1;
+  await source.locator(`.row[data-line="${cMark('kinds-end')}"] .gutter`).click();
+  await source.locator('select.file').selectOption({ label: 'c-walk/src/scale.c' });
+  await source.locator(`.row[data-line="${scaleAdd}"] .gutter`).click();
+  await page.keyboard.press('F5');
+  await expect(current).toHaveAttribute('data-line', String(scaleAdd));
+  await expect(source.locator('select.file')).toHaveValue(/c-walk\/src\/scale\.c$/);
+  await expect(variables.locator('[data-path="x"]')).toContainText('2');
   await controls.locator('button.stop').click();
 });
 

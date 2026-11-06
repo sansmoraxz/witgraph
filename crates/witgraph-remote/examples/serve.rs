@@ -67,6 +67,11 @@ async fn main() -> anyhow::Result<()> {
         .await?;
     rt.inject_wave(&NodeId::from("counter"), &PortName::from("add"), "1")
         .await?;
+    // Each walker's second file, `scale`, runs only with this.
+    for walker in ["walker", "c-walker"] {
+        rt.inject_wave(&NodeId::from(walker), &PortName::from("scale"), "2")
+            .await?;
+    }
     let debuggee = Debuggee::new(rt)?;
     // Unguessable enough for a demo on one machine.
     let token = format!(

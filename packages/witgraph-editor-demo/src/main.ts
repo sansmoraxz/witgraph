@@ -486,7 +486,8 @@ const lines: GraphJson = {
       label: 'First',
       attrs: { 'inject.in': '5' },
     },
-    { id: 'second', component: lineWalkRef, label: 'Second' },
+    // `scale` runs `scale.rs`, the guest's second file: a breakpoint there has something to stop.
+    { id: 'second', component: lineWalkRef, label: 'Second', attrs: { 'inject.scale': '2' } },
   ],
   connections: [
     {
@@ -511,7 +512,13 @@ const cLines: GraphJson = {
       label: 'Rust',
       attrs: { 'inject.in': '5' },
     },
-    { id: 'c', component: cWalkRef, label: 'C', attrs: { 'inject.kinds': '4' } },
+    // `scale` runs `scale.c`, the guest's second file.
+    {
+      id: 'c',
+      component: cWalkRef,
+      label: 'C',
+      attrs: { 'inject.kinds': '4', 'inject.scale': '2' },
+    },
   ],
   connections: [
     {

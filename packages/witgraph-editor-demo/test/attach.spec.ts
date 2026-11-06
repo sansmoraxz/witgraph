@@ -120,7 +120,18 @@ test("the editor stops on a line of the program's guest written in C", async ({ 
   await expect(source.locator('.row.current')).toContainText('mark: add-body');
   await expect(source.locator('.frames .frame').first()).toContainText('add');
 
+  // And in its second file, which the program runs.
   await row.locator('.gutter').click();
+  await source.locator('select.file').selectOption({ label: 'c-walk/src/scale.c' });
+  const scaleRow = source.locator('.row', { hasText: 'mark: scale-add' });
+  await scaleRow.locator('.gutter').click();
+  await page.locator('witgraph-controls').locator('button.resume').click();
+  await expect(source.locator('.row.current')).toContainText('mark: scale-add', {
+    timeout: 20_000,
+  });
+  await expect(source.locator('.where')).toContainText('in c-walker');
+
+  await scaleRow.locator('.gutter').click();
   await page.locator('witgraph-controls').locator('button.resume').click();
   await expect(page.locator('witgraph-controls').locator('.badge')).toHaveText('Attached');
 });
