@@ -751,6 +751,59 @@ test('a breakpoint for a node stops only it, and one for every node all of them'
   assert.deepEqual(await whoStops([b], [b]), []);
 });
 
+/**
+ * The lines the C guest stops on, run a second time, given 5, with a breakpoint on every line of
+ * its own. If `zigToo`, the Zig guest beside it has one on every line of its own as well, for the
+ * first run of both, cleared before the second.
+ */
+async function cStops(zigToo: boolean) {
+  const loaded = await load([
+    ['c', 'c-walk'],
+    ['zig', 'zig-walk'],
+  ]);
+  const { session, lines } = loaded;
+  // One wait for a stop, kept from one run to the next: a stop goes to the first waiting.
+  let next = loaded.nextStop();
+  const runThrough = async () => {
+    const done = session
+      .tick()
+      .then(() => session.settle())
+      .then(() => null);
+    const stops: LineStop[] = [];
+    for (;;) {
+      const stop = await Promise.race([next, done]);
+      if (!stop) return stops;
+      next = loaded.nextStop();
+      stops.push(stop);
+      lines.resume();
+    }
+  };
+  const every = (node: string) =>
+    lines.filesOf(node).flatMap((file) => lines.lines(file).map((line) => [file, line] as const));
+  const zig = zigToo ? every('zig') : [];
+  for (const [file, line] of [...every('c'), ...zig]) lines.setBreakpoint('every-node', file, line);
+  const first = await runThrough();
+  assert.ok(first.some((stop) => stop.node === 'c'));
+  assert.equal(
+    first.some((stop) => stop.node === 'zig'),
+    zigToo,
+  );
+  for (const [file, line] of zig) lines.clearBreakpoint('every-node', file, line);
+  await session.graph.inject('c', 'in', 5);
+  const second = await runThrough();
+  assert.equal(await session.graph.readOutput('c', 'out'), 8);
+  assert.ok(second.every((stop) => stop.node === 'c'));
+  return second.map((stop) => `${stop.file}:${stop.line}`);
+}
+
+// On wasmtime, a graph's core modules are compiled as one, and the C and Zig guests have lines at
+// the same offsets in their modules: here, each module has probes of its own.
+test("clearing one guest's breakpoints keeps another's at the same offset", async () => {
+  const alone = await cStops(false);
+  assert.ok(alone.length > 0);
+  assert.deepEqual(await cStops(true), alone);
+});
+
 // A breakpoint that never stops would leave it waiting: it fails in time instead.
 test("a node's breakpoint stays through a rebuild, for it alone", { timeout: 20_000 }, async () => {
   const { session, lines, nextStop, file } = await load(

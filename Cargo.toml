@@ -52,9 +52,10 @@ sha2 = "0.11"
 # forks.
 #
 # wasmtime's is on upstream main, for the fix for a table leak in
-# guest-to-guest async calls, not in 50.0.1, and keeps a component's
-# breakpoints when single-stepping ends.
-wasmtime = { git = "https://github.com/sansmoraxz/wasmtime", rev = "3c0a67c7a5fc006e642b4287d21b13ba7fed618a", default-features = false }
+# guest-to-guest async calls, not in 50.0.1, keeps a component's
+# breakpoints when single-stepping ends, and keeps each core module's
+# breakpoints to that module.
+wasmtime = { git = "https://github.com/sansmoraxz/wasmtime", rev = "83c30cf0f266dd2d214479b152af6ae145e1fc4f", default-features = false }
 wit-parser = "0.263"
 wit-component = "0.263"
 wasmparser = { version = "0.263", default-features = false }
