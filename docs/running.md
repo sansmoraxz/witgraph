@@ -255,8 +255,10 @@ A group starts only once every member's required inputs have values, so compilin
 rejects one with a required input that is only written after the group has run.
 
 When a group's runs have all returned its writers may still be going, so it can't
-start again until no guest work is left anywhere in the graph. Beside an endless
-stream, then, a stream group never re-runs: stop the graph to restart it.
+start again until the guest work those runs left is over. Its members stay running
+until then, and keep their resource claims. Both hosts tell each group's work apart,
+so an endless stream in one group doesn't hold up another; a group whose own stream
+never ends never re-runs: stop the graph to restart it.
 
 `CompiledGraph::stream_groups()` lists them.
 

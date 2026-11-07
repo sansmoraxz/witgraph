@@ -35,8 +35,11 @@
 //!   owed, and the node re-runs after it returns. A node reads its inputs when it
 //!   starts.
 //! - A stream group whose `run`s have all returned is *draining*: its writers may
-//!   be going on. It cannot start again until no guest work is left in the whole
-//!   instance, so beside an endless stream it never re-runs.
+//!   be going on. It cannot start again until the guest work its `run`s left is
+//!   over, which the data plane tells ([`Command::AwaitDrained`]), whatever else
+//!   goes on beside it. A data plane that cannot tell whose work is whose drains
+//!   it only once no guest work is left in the whole instance, so beside an
+//!   endless stream it never re-runs there.
 //! - A Value output is delivered as soon as its `run` returns. One reaching a
 //!   member of the same group over a non-feedback connection owes nothing: it is
 //!   part of the group's run.
