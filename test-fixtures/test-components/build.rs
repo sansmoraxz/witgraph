@@ -148,7 +148,6 @@ fn main() {
         // Directories are scanned recursively, so `wit/deps` is covered.
         println!("cargo::rerun-if-changed=guests/{name}/src");
         println!("cargo::rerun-if-changed=guests/{name}/wit");
-        println!("cargo::rerun-if-changed=guests/{name}/Cargo.toml");
 
         let debug = WITH_DEBUG_INFO.contains(&name);
         let component = if C_GUESTS.contains(&name) {
@@ -164,6 +163,8 @@ fn main() {
             println!("cargo::rerun-if-env-changed=ZIG");
             build_zig_guest(name, root, &guest_dir, &out_dir)
         } else {
+            // Only a Rust guest has one: Cargo takes a missing file as changed, every build.
+            println!("cargo::rerun-if-changed=guests/{name}/Cargo.toml");
             build_guest(name, &guest_dir, &target_dir, debug)
         };
         let wasm_dst = out_dir.join(format!("{name}.wasm"));
