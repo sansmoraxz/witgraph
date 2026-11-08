@@ -226,8 +226,8 @@ importers:
   packages/witgraph-loader:
     dependencies:
       '@bytecodealliance/jco-transpile':
-        specifier: git+https://github.com/sansmoraxz/jco.git#484de59a374db14a02fcb99c32dfe80005110bba&path:packages/jco-transpile
-        version: https://codeload.github.com/sansmoraxz/jco/tar.gz/484de59a374db14a02fcb99c32dfe80005110bba#path:packages/jco-transpile
+        specifier: git+https://github.com/sansmoraxz/jco.git#21846de26f13eac9008ec54e7575487eae9c93bc&path:packages/jco-transpile
+        version: https://codeload.github.com/sansmoraxz/jco/tar.gz/21846de26f13eac9008ec54e7575487eae9c93bc#path:packages/jco-transpile
       '@bytecodealliance/wrpc':
         specifier: git+https://github.com/sansmoraxz/wrpc.git#d536f195fb5a25bb2df59f875c19f2ca6921b503&path:js
         version: https://codeload.github.com/sansmoraxz/wrpc/tar.gz/d536f195fb5a25bb2df59f875c19f2ca6921b503#path:js
@@ -366,8 +366,8 @@ packages:
     resolution: {integrity: sha512-yxvqQreNcOQdMsEKZomkSqThtkxrAz3f1Cmy8BsV0UHi9saa2/D1KDB14IAXPYwDq/maS6lCzS+MuMQx6QkUgA==}
     engines: {node: '>=20'}
 
-  '@bytecodealliance/jco-transpile@https://codeload.github.com/sansmoraxz/jco/tar.gz/484de59a374db14a02fcb99c32dfe80005110bba#path:packages/jco-transpile':
-    resolution: {gitHosted: true, integrity: sha512-CAJ3Idrx7pONTGYCPRTkpH3ac5HPD3keN745Ci/u6BIZzeIGNR5wMuJ1Ao1rM2BqthQ4lHHzSUgySs9xZ6V5uw==, path: packages/jco-transpile, tarball: https://codeload.github.com/sansmoraxz/jco/tar.gz/484de59a374db14a02fcb99c32dfe80005110bba}
+  '@bytecodealliance/jco-transpile@https://codeload.github.com/sansmoraxz/jco/tar.gz/21846de26f13eac9008ec54e7575487eae9c93bc#path:packages/jco-transpile':
+    resolution: {gitHosted: true, integrity: sha512-VGNq2+mhcRrnlVZMD5zzAxzRM2njhWrHV6Iy552OA9WApQi7K/iq64v2bf71ZYQKbMBIKBo+g9dXoZGn5rEyWw==, path: packages/jco-transpile, tarball: https://codeload.github.com/sansmoraxz/jco/tar.gz/21846de26f13eac9008ec54e7575487eae9c93bc}
     version: 0.23.0
 
   '@bytecodealliance/preview2-shim@0.31.0':
@@ -1212,7 +1212,7 @@ snapshots:
       '@bytecodealliance/jco-node-fs-win32-arm64-msvc': 0.3.2
       '@bytecodealliance/jco-node-fs-win32-x64-msvc': 0.3.2
 
-  '@bytecodealliance/jco-transpile@https://codeload.github.com/sansmoraxz/jco/tar.gz/484de59a374db14a02fcb99c32dfe80005110bba#path:packages/jco-transpile':
+  '@bytecodealliance/jco-transpile@https://codeload.github.com/sansmoraxz/jco/tar.gz/21846de26f13eac9008ec54e7575487eae9c93bc#path:packages/jco-transpile':
     dependencies:
       '@bytecodealliance/preview2-shim': 0.31.0
       '@bytecodealliance/preview3-shim': 0.13.0

@@ -31,7 +31,7 @@
     "typecheck": "tsc -p ."
   },
   "dependencies": {
-    "@bytecodealliance/jco-transpile": "git+https://github.com/sansmoraxz/jco.git#484de59a374db14a02fcb99c32dfe80005110bba&path:packages/jco-transpile",
+    "@bytecodealliance/jco-transpile": "git+https://github.com/sansmoraxz/jco.git#21846de26f13eac9008ec54e7575487eae9c93bc&path:packages/jco-transpile",
     "@bytecodealliance/wrpc": "git+https://github.com/sansmoraxz/wrpc.git#d536f195fb5a25bb2df59f875c19f2ca6921b503&path:js"
   },
   "devDependencies": {
