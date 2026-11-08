@@ -203,6 +203,11 @@ fn build_guest(name: &str, guest_dir: &Path, target_dir: &Path, debug: bool) -> 
         // The outer build's flags target the host, not the guest.
         .env_remove("RUSTFLAGS")
         .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        // Plain rustc: a caching wrapper may record the guest's sources under another path
+        // (kache gives `/proc/self/cwd`), and the line debugging tests read them from its DWARF.
+        // An empty value overrides a `build.rustc-wrapper` in Cargo config too.
+        .env("RUSTC_WRAPPER", "")
+        .env("RUSTC_WORKSPACE_WRAPPER", "")
         .envs(
             debug
                 .then_some([
