@@ -195,6 +195,29 @@ async fn a_breakpoint_stops_on_its_line_naming_the_node_and_resuming_goes_on() {
 }
 
 /// How many stops a breakpoint on `line` of `file` has, with the guest's input already written.
+#[tokio::test]
+async fn a_stop_reaches_everyone_waiting_for_it_even_with_one_whose_caller_is_gone() {
+    let (mut rt, lines) = line_walk(&["a"]).await;
+    let file = file_of(&lines);
+    lines.set_breakpoint(&EVERY, &file, mark("walk-first"));
+    // A remote debugger's call that timed out still waits, where it was served.
+    let mut gone = Box::pin(lines.next_stop());
+    let mut waiting = Box::pin(lines.next_stop());
+    assert!(futures::poll!(gone.as_mut()).is_pending());
+    assert!(futures::poll!(waiting.as_mut()).is_pending());
+    inject(&mut rt, "a", "in", "5").await;
+    settling(&mut rt, async {
+        let stop = waiting.await;
+        assert_eq!(stop.line, mark("walk-first"));
+        assert_eq!(gone.await, stop, "both were told of it");
+        lines.resume();
+        // Taken by both, it is not told of again.
+        let later = tokio::time::timeout(Duration::from_millis(200), lines.next_stop()).await;
+        assert!(later.is_err(), "told twice: {later:?}");
+    })
+    .await;
+}
+
 async fn count_stops(
     rt: &mut RuntimeGraph<Perf>,
     lines: &RuntimeLines,

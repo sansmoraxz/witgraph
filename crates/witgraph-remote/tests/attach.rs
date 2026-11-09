@@ -405,8 +405,10 @@ async fn a_breakpoint_for_one_node_stops_only_it() {
     lines::set_breakpoint(&wrpc, (), &other, &file, line)
         .await
         .unwrap();
-    let early = tokio::time::timeout(Duration::from_secs(1), lines::next_stop(&wrpc, ())).await;
-    assert!(early.is_err(), "stopped for another node: {early:?}");
+    // Asked by `stopped`: a `next_stop` given up on would still wait where it was served.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let early = lines::stopped(&wrpc, ()).await.unwrap();
+    assert!(early.is_none(), "stopped for another node: {early:?}");
 
     let walker = BreakpointScope::Node("walker".into());
     lines::set_breakpoint(&wrpc, (), &walker, &file, line)

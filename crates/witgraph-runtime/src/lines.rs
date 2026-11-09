@@ -97,8 +97,15 @@ struct State {
     stopped_at: Option<StoppedAt>,
     /// What lets the guest stopped go on.
     go: Option<oneshot::Sender<()>>,
-    /// Stops the host has not been told of.
+    /// Stops made while no one waited for one, for the next to ask.
     unseen: VecDeque<LineStop>,
+    /// Stops made while some waited, by number, for each of them to take: one waiting may be a
+    /// call whose caller has gone, and must not take a stop from the others.
+    told: VecDeque<(u64, LineStop)>,
+    /// Stops made so far.
+    made: u64,
+    /// [`NextStop`]s waiting.
+    waiting: usize,
     wakers: Vec<Waker>,
     /// What the live Store has set.
     set: BTreeSet<(usize, ProbeId)>,
@@ -379,7 +386,17 @@ impl Shared {
             });
         }
         state.go = Some(go);
-        state.unseen.push_back(stop);
+        state.made += 1;
+        if state.waiting == 0 {
+            state.unseen.push_back(stop);
+        } else {
+            let made = state.made;
+            state.told.push_back((made, stop));
+            // Each needs a resume, so only a few are ever outstanding.
+            while state.told.len() > TOLD {
+                state.told.pop_front();
+            }
+        }
         for waker in state.wakers.drain(..) {
             waker.wake();
         }
@@ -483,6 +500,60 @@ fn read_variables<D: 'static>(
 }
 
 /// Calls [`Shared`] with the Store, when a guest gives it up.
+/// Stops kept for those waiting: more than can be outstanding, as each waits for a resume.
+const TOLD: usize = 16;
+
+/// The next stop: one made before it was asked for and not yet taken, else the first made while
+/// it waits, which every [`NextStop`] waiting then gets.
+struct NextStop {
+    shared: Arc<Shared>,
+    /// Once waiting, the stops made before it began.
+    after: Option<u64>,
+}
+
+impl Future for NextStop {
+    type Output = LineStop;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> Poll<LineStop> {
+        let shared = self.shared.clone();
+        let mut state = shared.state();
+        let after = match self.after {
+            Some(after) => after,
+            None => {
+                if let Some(stop) = state.unseen.pop_front() {
+                    return Poll::Ready(stop);
+                }
+                state.waiting += 1;
+                self.after = Some(state.made);
+                state.made
+            }
+        };
+        let stop = state
+            .told
+            .iter()
+            .find(|(made, _)| *made > after)
+            .map(|(_, stop)| stop.clone());
+        if let Some(stop) = stop {
+            state.waiting -= 1;
+            self.after = None;
+            return Poll::Ready(stop);
+        }
+        state.wakers.push(context.waker().clone());
+        Poll::Pending
+    }
+}
+
+impl Drop for NextStop {
+    fn drop(&mut self) {
+        if self.after.is_some() {
+            self.shared.state().waiting -= 1;
+        }
+    }
+}
+
 struct Handler<D>(Arc<Shared>, PhantomData<fn() -> D>);
 
 impl<D> Clone for Handler<D> {
@@ -650,15 +721,10 @@ impl LineDebugger for RuntimeLines {
     }
 
     fn next_stop(&self) -> impl Future<Output = LineStop> + MaybeSend {
-        let shared = self.shared.clone();
-        futures::future::poll_fn(move |context| {
-            let mut state = shared.state();
-            if let Some(stop) = state.unseen.pop_front() {
-                return Poll::Ready(stop);
-            }
-            state.wakers.push(context.waker().clone());
-            Poll::Pending
-        })
+        NextStop {
+            shared: self.shared.clone(),
+            after: None,
+        }
     }
 
     fn set_breakpoint(&self, scope: &BreakpointScope, file: &str, line: u32) -> Option<u32> {
