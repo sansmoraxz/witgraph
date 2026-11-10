@@ -2,9 +2,8 @@ import { createElement, History, Trash2 } from 'lucide';
 import type { Diagnostic } from 'witgraph-loader';
 import type { EditorController } from '../controller/editor-controller.ts';
 import type { NodeVisual, PortVisual } from '../controller/types.ts';
-import { defaultViewer, describeHandle } from '../controller/visual.ts';
-import { weight } from '../util/weight.ts';
-import { summarize } from '../viewers/text.ts';
+import { defaultViewer } from '../controller/visual.ts';
+import { MAX_WAVE_BYTES, outputText } from '../util/output-text.ts';
 import { adoptStyles } from './shared-styles.ts';
 
 const PHASE_BG: Record<string, string> = {
@@ -24,9 +23,6 @@ const KIND_BG: Record<string, string> = {
 
 const BTN =
   'bg-wg-surface text-wg-text border border-wg-text-dim rounded px-2 py-1 cursor-pointer text-xs hover:bg-wg-surface-hover transition-all shadow-sm';
-
-/** The biggest value the inspector writes out as WAVE text, in bytes. */
-const MAX_WAVE_BYTES = 64 * 1024;
 
 const EXTRA_CSS = `
   :host { display: block; height: 100%; overflow-y: auto; overflow-x: hidden; background-color: var(--wg-bg);
@@ -193,34 +189,8 @@ export class WitgraphInspector extends HTMLElement {
     return node ? this.#buildInspector(node) : this.#buildGraphProperties();
   }
 
-  /**
-   * A Value output as WAVE text, or a summary of it when it is too big to
-   * write out (its text could take seconds, and hundreds of megabytes).
-   */
   #outputText(node: string, port: string): string {
-    const value = this.#controller?.latestOutput(node, port);
-    const visual = this.#controller?.nodes.get(node);
-    const output = visual?.outputs.find((p) => p.name === port);
-    // What moves to its reader has no value to read: say what it is doing instead.
-    if (output?.kind === 'stream' || output?.kind === 'future') {
-      if (visual?.phase === 'pending') return '-';
-      const running = visual?.phase === 'running';
-      const doing =
-        output.kind === 'stream'
-          ? running
-            ? 'streaming'
-            : 'stream ended'
-          : running
-            ? 'waiting'
-            : 'settled';
-      return value === undefined ? doing : `${doing}, latest: ${summarize(value)}`;
-    }
-    if (value === undefined) return '-';
-    const handle = output?.handle;
-    // A handle has no text: its object may describe itself.
-    if (handle) return describeHandle(value, handle.resource);
-    if (weight(value) > MAX_WAVE_BYTES) return `${summarize(value)} (too large to show as WAVE)`;
-    return this.#controller?.outputWave(node, port) ?? '…';
+    return this.#controller ? outputText(this.#controller, node, port) : '-';
   }
 
   /** What compiling says of what is shown, if anything. */
@@ -997,8 +967,7 @@ export class WitgraphInspector extends HTMLElement {
 
       if (direction === 'input') {
         card.appendChild(this.#buildConnectionSelector(node, port));
-        const connected = this.#controller?.isPortConnected(node.id, port.name) ?? false;
-        if (!connected && port.kind === 'value') {
+        if (this.#controller?.isInjectable(node.id, port.name)) {
           card.appendChild(this.#buildInjectForm(node, port));
         }
       }

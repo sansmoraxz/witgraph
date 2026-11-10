@@ -15,7 +15,7 @@ import {
   RemoteSession,
   type SessionWorker,
 } from 'witgraph-loader';
-import { NODE_HEADER_HEIGHT } from '../components/styles.ts';
+import { portOffset } from '../util/svg.ts';
 import { weight } from '../util/weight.ts';
 import { autoLayout, type LayoutEdge, type LayoutNode } from './layout.ts';
 import type {
@@ -329,12 +329,16 @@ export class EditorController extends EventTarget {
 
   /**
    * Whether what `node`'s output `port` carries is kept: when the node
-   * previews it, or the node is selected (the inspector shows its outputs).
+   * previews it, the node is selected (the inspector shows its outputs), or
+   * it is a Value output feeding a Value input, which its node shows.
    * Nothing else is recorded or read back, so an output nobody looks at
    * costs nothing however much it carries.
    */
   isObserved(node: string, port: string): boolean {
-    return this.#selectedNode === node || this.#nodes.get(node)?.preview?.port === port;
+    const visual = this.#nodes.get(node);
+    if (this.#selectedNode === node || visual?.preview?.port === port) return true;
+    if (visual?.outputs.find((p) => p.name === port)?.kind !== 'value') return false;
+    return this.#edges.some((e) => e.fromNode === node && e.fromPort === port && !e.feedback);
   }
 
   /**
@@ -744,6 +748,17 @@ export class EditorController extends EventTarget {
 
   isPortConnected(node: string, port: string): boolean {
     return this.#edges.some((e) => e.toNode === node && e.toPort === port);
+  }
+
+  /**
+   * Whether a Value input takes a value injected into it: when no connection
+   * feeds it, or only one from the previous tick, which has none to give on
+   * the first.
+   */
+  isInjectable(node: string, port: string): boolean {
+    const input = this.#nodes.get(node)?.inputs.find((p) => p.name === port);
+    if (input?.kind !== 'value') return false;
+    return this.connectionForInput(node, port)?.feedback ?? true;
   }
 
   connectionForInput(node: string, port: string): EdgeVisual | undefined {
@@ -2494,9 +2509,8 @@ export class EditorController extends EventTarget {
       id: n.id,
       width: n.width,
       height: n.height,
-      portsBottom: NODE_HEADER_HEIGHT + n.portsHeight,
-      inputs: n.inputs.map((p) => ({ name: p.name })),
-      outputs: n.outputs.map((p) => ({ name: p.name })),
+      inputs: n.inputs.map((p) => ({ name: p.name, y: portOffset(n, 'input', p.name)?.y })),
+      outputs: n.outputs.map((p) => ({ name: p.name, y: portOffset(n, 'output', p.name)?.y })),
     }));
     const layoutEdges: LayoutEdge[] = this.#edges.map((e) => ({
       id: e.id,

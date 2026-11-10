@@ -8,8 +8,9 @@ export interface LayoutNode {
   height: number;
   /** Down to the bottom of the ports band: see {@link portPosition}. Defaults to `height`. */
   portsBottom?: number;
-  inputs: { name: string }[];
-  outputs: { name: string }[];
+  /** Each port, with where it sits below the node's top if not spread over its ports band. */
+  inputs: { name: string; y?: number }[];
+  outputs: { name: string; y?: number }[];
 }
 
 export interface LayoutEdge {
@@ -26,7 +27,7 @@ function portId(nodeId: string, side: 'in' | 'out', name: string): string {
 
 function buildPorts(
   nodeId: string,
-  ports: { name: string }[],
+  ports: { name: string; y?: number }[],
   side: 'in' | 'out',
   nodeWidth: number,
   portsBottom: number,
@@ -36,7 +37,8 @@ function buildPorts(
   const x = side === 'in' ? 0 : nodeWidth;
 
   return ports.map((p, i) => {
-    const y = NODE_HEADER_HEIGHT + ((portsBottom - NODE_HEADER_HEIGHT) * (i + 1)) / (count + 1);
+    const y =
+      p.y ?? NODE_HEADER_HEIGHT + ((portsBottom - NODE_HEADER_HEIGHT) * (i + 1)) / (count + 1);
     return {
       id: portId(nodeId, side, p.name),
       x,

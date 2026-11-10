@@ -204,6 +204,34 @@ test('run settles the graph', async () => {
   assert.equal(await controller.readOutputWave('b', 'out'), '5');
 });
 
+test('a Value input takes an injected value unless a connection of this tick feeds it', async () => {
+  const controller = await loadController(
+    [
+      ['a', 'relay'],
+      ['b', 'relay'],
+    ],
+    [
+      ['loop', 'a.out', 'a.in', true],
+      ['c', 'a.out', 'b.in'],
+    ],
+  );
+  // Fed by nothing, or only from the previous tick, which gives nothing on the first.
+  assert.equal(controller.isInjectable('a', 'add'), true);
+  assert.equal(controller.isInjectable('a', 'in'), true);
+  assert.equal(controller.isInjectable('b', 'in'), false);
+  assert.equal(controller.isInjectable('b', 'out'), false);
+
+  // What feeds a Value input is read, for the node to show, previewed or not.
+  controller.setPreview('a', 'none');
+  controller.select(null);
+  assert.equal(controller.nodes.get('a')?.preview, undefined);
+  assert.equal(controller.isObserved('a', 'out'), true);
+  await controller.injectValue('a', 'in', '1');
+  await controller.injectValue('a', 'add', '2');
+  await controller.tick();
+  assert.equal(controller.latestOutput('a', 'out'), 3);
+});
+
 test('breakpoint pauses execution', async () => {
   const controller = await loadController([['a', 'echo']]);
   controller.toggleBreakpoint('a');

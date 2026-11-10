@@ -656,6 +656,46 @@ test.describe('WIT Graph Editor Demo', () => {
     const text = await inspector.evaluate((el: HTMLElement) => el.shadowRoot?.textContent ?? '');
     expect(text).toContain('Injected');
   });
+
+  test('a node shows each Value input: a box to type in, or what its connection gives', async ({
+    page,
+  }) => {
+    const canvas = page.locator('witgraph-canvas');
+    const field = (node: string, port: string) =>
+      canvas.locator(`.node-group[data-node-id="${node}"] .node-field[data-field-port="${port}"]`);
+    // Injected from its attrs; `relay-a.in` is fed only by feedback, so it takes one too.
+    await expect(field('relay-a', 'add').locator('input')).toHaveValue('1');
+    await expect(field('relay-a', 'in').locator('input')).toHaveValue('0');
+    // Fed by `relay-a`, `relay-b.in` shows what it gives, once there is something.
+    const fed = field('relay-b', 'in').locator('.node-field-value');
+    await expect(fed).toHaveText('-');
+    await canvas.evaluate((el: WitgraphCanvas) => el.controller?.tick());
+    await expect(fed).toHaveText('1');
+
+    // Typed in, a value is injected on Enter; a bad one is refused, and marked.
+    const add = field('relay-b', 'add').locator('input');
+    await add.fill('7');
+    await add.press('Enter');
+    await expect
+      .poll(() =>
+        canvas.evaluate((el: WitgraphCanvas) => el.controller?.getInjectedValue('relay-b', 'add')),
+      )
+      .toBe('7');
+    await add.fill('nope');
+    await add.press('Enter');
+    await expect(add).toHaveClass(/invalid/);
+    // Escape puts back what is injected.
+    await add.press('Escape');
+    await expect(add).toHaveValue('7');
+    await expect(add).not.toHaveClass(/invalid/);
+    // Typing does not reach the canvas's shortcuts: Delete removes a character, not the node.
+    await add.focus();
+    await add.press('End');
+    await add.press('Backspace');
+    await add.press('Delete');
+    await expect(add).toHaveValue('');
+    await expect(canvas.locator('svg .node-group')).toHaveCount(16);
+  });
 });
 
 test.describe('Video pipeline demo', () => {

@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
   computeNodeHeight,
+  FIELD_ROW_HEIGHT,
+  fieldsHeight,
   MIN_NODE_WIDTH,
   MIN_PREVIEW_HEIGHT,
   NODE_HEADER_HEIGHT,
@@ -10,11 +12,12 @@ import {
   PORT_SPACING,
   PREVIEW_HEIGHT,
   portsBandHeight,
+  slotsHeight,
 } from '../src/components/styles.ts';
 import { autoLayout } from '../src/controller/layout.ts';
 import type { OutputView, PortVisual } from '../src/controller/types.ts';
 import { choosePreview, defaultViewer, nodeSize, nodeVisual } from '../src/controller/visual.ts';
-import { edgePath, portPosition } from '../src/util/svg.ts';
+import { edgePath, portOffset, portPosition } from '../src/util/svg.ts';
 import { asImage, sniffImageType } from '../src/viewers/image.ts';
 import { numeric, plotPoints } from '../src/viewers/series.ts';
 import { describe, summarize } from '../src/viewers/text.ts';
@@ -213,6 +216,37 @@ test('portPosition keeps ports in the band above the preview region', () => {
     const { y } = portPosition(0, 0, node.width, bottom, i, 2, 'input');
     assert.ok(y > NODE_HEADER_HEIGHT && y < bottom, `port ${i} at ${y}`);
   }
+});
+
+test('each Value input has a row of its own, below the ports spread over the slots', () => {
+  const value = (name: string): PortVisual => ({
+    ...port(name),
+    kind: 'value',
+    typeDisplay: 'u32',
+  });
+  const inputs = [value('a'), port('frames'), value('b')];
+  const outputs = [port('out')];
+  const node = { ...nodeSize(inputs, outputs), inputs, outputs };
+  // The slots hold one row, for `frames` and `out`; then a row for each field.
+  const slots = slotsHeight(1, 1, 2);
+  assert.equal(node.portsHeight, slots + fieldsHeight(2));
+  assert.equal(node.height, computeNodeHeight(1, 1, 0, 2));
+
+  const at = (side: 'input' | 'output', name: string) => portOffset(node, side, name)?.y;
+  assert.equal(at('input', 'frames'), NODE_HEADER_HEIGHT + slots / 2);
+  assert.equal(at('output', 'out'), NODE_HEADER_HEIGHT + slots / 2);
+  assert.equal(at('input', 'a'), NODE_HEADER_HEIGHT + slots + FIELD_ROW_HEIGHT / 2);
+  assert.equal(at('input', 'b'), NODE_HEADER_HEIGHT + slots + (FIELD_ROW_HEIGHT * 3) / 2);
+  assert.equal(portOffset(node, 'input', 'b')?.x, 0);
+  assert.equal(portOffset(node, 'output', 'out')?.x, node.width);
+  assert.equal(portOffset(node, 'input', 'missing'), undefined);
+  // Every row is above the bottom of the ports band.
+  assert.ok((at('input', 'b') ?? Infinity) < NODE_HEADER_HEIGHT + node.portsHeight);
+
+  // A node of fields alone has hardly any slots.
+  const sink = { ...nodeSize([value('a')], []), inputs: [value('a')], outputs: [] };
+  assert.equal(sink.portsHeight, slotsHeight(0, 0, 1) + FIELD_ROW_HEIGHT + NODE_PADDING / 2);
+  assert.ok(slotsHeight(0, 0, 1) < slotsHeight(0, 0));
 });
 
 test('encoded images are known by their leading bytes', () => {

@@ -2,12 +2,19 @@ import type { Diagnostic } from 'witgraph-loader';
 import type { EditorController } from '../controller/editor-controller.ts';
 import type { EdgeVisual, NodePreview, NodeVisual } from '../controller/types.ts';
 import { makeDraggable } from '../util/drag.ts';
-import { edgePath, portPosition } from '../util/svg.ts';
+import { outputText } from '../util/output-text.ts';
+import { edgePath, hasField, portOffset } from '../util/svg.ts';
 import { viewerFor } from '../viewers/registry.ts';
 import type { ViewerInstance } from '../viewers/types.ts';
 import { ContextMenu, type MenuItem } from './context-menu.ts';
 import { adoptStyles } from './shared-styles.ts';
-import { MIN_NODE_WIDTH, MIN_PREVIEW_HEIGHT, NODE_HEADER_HEIGHT, PORT_RADIUS } from './styles.ts';
+import {
+  FIELD_ROW_HEIGHT,
+  MIN_NODE_WIDTH,
+  MIN_PREVIEW_HEIGHT,
+  NODE_HEADER_HEIGHT,
+  PORT_RADIUS,
+} from './styles.ts';
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
 
@@ -99,6 +106,22 @@ const SVG_CSS = `
   .preview-series-label { font: 10px ui-monospace, monospace; color: var(--wg-text-dim);
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
+  /* Fields: a Value input's value on its node, typed in or, when a connection feeds it, shown. */
+  .node-field-row { box-sizing: border-box; display: flex; align-items: center; gap: 6px;
+    width: 100%; height: 100%; font-size: 10px; }
+  .node-field-name { flex: 0 0 auto; width: var(--_name-width); max-width: 45%; color: var(--wg-text); font-weight: 500;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .node-field-input, .node-field-value { flex: 1; min-width: 0; box-sizing: border-box; height: 100%;
+    margin: 0; padding: 0 6px; font: 10px ui-monospace, monospace; border-radius: 4px;
+    border: 1px solid var(--wg-surface-hover); }
+  .node-field-input { background: var(--wg-bg); color: var(--wg-text); outline: none; cursor: text;
+    user-select: text; -webkit-user-select: text; }
+  .node-field-input:focus { border-color: var(--wg-primary); }
+  .node-field-input::placeholder { color: var(--wg-text-muted); }
+  .node-field-input.invalid { border-color: var(--wg-error); }
+  .node-field-value { display: block; line-height: ${FIELD_ROW_HEIGHT - 6}px; color: var(--wg-text-dim);
+    border-style: dashed; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
   /* Resize handle: a corner to grab, and a grip drawn inside the node's rounded one */
   .node-resize { fill: transparent; cursor: nwse-resize; }
   .node-resize-grip { fill: none; stroke: var(--wg-text-muted); stroke-width: 1.25; stroke-linecap: round;
@@ -121,7 +144,15 @@ function layoutKey(node: NodeVisual): string {
   ]);
 }
 
-/** Where a node's ports band ends: see {@link portPosition}. */
+/** Where a node's field rows start: past its input ports and their rings. */
+const FIELD_X = PORT_RADIUS + 4;
+
+/** How wide a node's fields are, from {@link FIELD_X} to just short of its right edge. */
+function fieldWidth(nodeWidth: number): number {
+  return nodeWidth - FIELD_X - 6;
+}
+
+/** Where a node's ports band ends: see {@link portOffset}. */
 function portsBottom(node: NodeVisual): number {
   return NODE_HEADER_HEIGHT + node.portsHeight;
 }
@@ -140,6 +171,8 @@ export class WitgraphCanvas extends HTMLElement {
   #dragCleanups = new Map<string, () => void>();
   /** Each previewing node's viewer, with the output it shows. */
   #previews = new Map<string, { port: string; viewer: ViewerInstance }>();
+  /** What each field showing a connection's value was filled from, so a redraw reads it only when it is new. */
+  #fieldShown = new WeakMap<Element, { value: unknown; text: string }>();
   /** The node being resized: left alone by redraws until the drag ends. */
   #resizing: string | null = null;
 
@@ -463,6 +496,7 @@ export class WitgraphCanvas extends HTMLElement {
 
     this.#appendPorts(g, node, 'input');
     this.#appendPorts(g, node, 'output');
+    this.#appendFields(g, node);
     if (node.breakpoint) g.appendChild(this.#makeBreakpoint(node.width));
     if (node.preview) this.#appendPreview(g, node, node.preview);
     this.#appendResizeHandle(g, node);
@@ -541,6 +575,9 @@ export class WitgraphCanvas extends HTMLElement {
         g.querySelector('.node-header')?.setAttribute('width', String(width));
         const fo = g.querySelector('.node-preview');
         fo?.setAttribute('width', String(width));
+        for (const field of g.querySelectorAll('.node-field')) {
+          field.setAttribute('width', String(fieldWidth(width)));
+        }
         fo?.setAttribute('height', String(height - portsBottom(node)));
         place(width, height);
       },
@@ -559,12 +596,10 @@ export class WitgraphCanvas extends HTMLElement {
 
   #appendPorts(g: SVGGElement, node: NodeVisual, side: 'input' | 'output'): void {
     const ports = side === 'input' ? node.inputs : node.outputs;
-    for (let i = 0; i < ports.length; i++) {
-      const port = ports[i];
-      const localX = side === 'input' ? 0 : node.width;
-      const localY =
-        NODE_HEADER_HEIGHT +
-        ((portsBottom(node) - NODE_HEADER_HEIGHT) * (i + 1)) / (ports.length + 1);
+    for (const port of ports) {
+      const at = portOffset(node, side, port.name);
+      if (!at) continue;
+      const { x: localX, y: localY } = at;
 
       const circle = document.createElementNS(SVG_NS, 'circle');
       circle.classList.add('port', `port-${port.kind}`);
@@ -584,6 +619,8 @@ export class WitgraphCanvas extends HTMLElement {
       });
       g.appendChild(circle);
 
+      // An input with a field is named in it.
+      if (side === 'input' && hasField(port)) continue;
       const lbl = document.createElementNS(SVG_NS, 'text');
       lbl.classList.add('port-label');
       lbl.setAttribute('dominant-baseline', 'central');
@@ -598,6 +635,131 @@ export class WitgraphCanvas extends HTMLElement {
       lbl.textContent = port.name;
       g.appendChild(lbl);
     }
+  }
+
+  /** A row for each Value input, beside its port: its name, then its value. */
+  #appendFields(g: SVGGElement, node: NodeVisual): void {
+    // The names take the width of the longest, so that the values line up.
+    const longest = Math.max(0, ...node.inputs.filter(hasField).map((p) => p.name.length));
+    for (const port of node.inputs) {
+      if (!hasField(port)) continue;
+      const at = portOffset(node, 'input', port.name);
+      if (!at) continue;
+      const fo = document.createElementNS(SVG_NS, 'foreignObject');
+      fo.classList.add('node-field');
+      fo.setAttribute('x', String(FIELD_X));
+      fo.setAttribute('y', String(at.y - FIELD_ROW_HEIGHT / 2 + 2));
+      fo.setAttribute('width', String(fieldWidth(node.width)));
+      fo.setAttribute('height', String(FIELD_ROW_HEIGHT - 4));
+      fo.setAttribute('data-field-port', port.name);
+      const row = document.createElement('div');
+      row.className = 'node-field-row';
+      row.style.setProperty('--_name-width', `${longest}ch`);
+      const name = document.createElement('span');
+      name.className = 'node-field-name';
+      name.textContent = port.name;
+      name.title = `${port.name}: ${port.typeDisplay}${port.docs ? `\n${port.docs}` : ''}`;
+      row.appendChild(name);
+      fo.appendChild(row);
+      // The rest of the node drags it: in a field, the pointer is the field's.
+      fo.addEventListener('pointerdown', (e) => e.stopPropagation());
+      fo.addEventListener('contextmenu', (e) => e.stopPropagation());
+      g.appendChild(fo);
+    }
+    this.#updateFields(g, node);
+  }
+
+  /**
+   * Fills each of a node's fields as its input is now: a box to type a value into when
+   * the input takes one, or else the value its connection gives it.
+   */
+  #updateFields(g: SVGGElement, node: NodeVisual): void {
+    const controller = this.#controller;
+    if (!controller) return;
+    for (const fo of g.querySelectorAll<SVGForeignObjectElement>('.node-field')) {
+      const port = node.inputs.find((p) => p.name === fo.dataset.fieldPort);
+      const row = fo.firstElementChild;
+      if (!port || !row) continue;
+      const slot = row.children[1] as HTMLElement | undefined;
+      if (controller.isInjectable(node.id, port.name)) {
+        let input = slot instanceof HTMLInputElement ? slot : undefined;
+        if (!input) {
+          input = this.#makeFieldInput(node.id, port.name, port.typeDisplay);
+          slot?.remove();
+          row.appendChild(input);
+        }
+        // Not while it is typed in, nor over what failed to inject.
+        if (input.classList.contains('invalid')) continue;
+        input.title = controller.isPortConnected(node.id, port.name)
+          ? 'Its value on the first tick, before its feedback connection gives it one'
+          : '';
+        if (this.shadowRoot?.activeElement !== input) {
+          input.value = controller.getInjectedValue(node.id, port.name) ?? '';
+        }
+      } else {
+        let shown = slot?.classList.contains('node-field-value') ? slot : undefined;
+        if (!shown) {
+          shown = document.createElement('span');
+          shown.className = 'node-field-value';
+          slot?.remove();
+          row.appendChild(shown);
+        }
+        const from = controller.connectionForInput(node.id, port.name);
+        const value = from ? controller.latestOutput(from.fromNode, from.fromPort) : undefined;
+        const before = this.#fieldShown.get(shown);
+        // Its text is made again only for a new value, or one whose text was still coming.
+        if (before && before.value === value && before.text !== '…') continue;
+        const text = from ? outputText(controller, from.fromNode, from.fromPort) : '-';
+        this.#fieldShown.set(shown, { value, text });
+        shown.textContent = text;
+        shown.title = from ? `${text}\nfrom ${from.fromNode}.${from.fromPort}` : text;
+      }
+    }
+  }
+
+  /**
+   * A box for an input's value as WAVE text: Enter, or leaving it, injects what it holds,
+   * and an empty one clears the input. Escape puts back what is injected.
+   */
+  #makeFieldInput(node: string, port: string, type: string): HTMLInputElement {
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'node-field-input';
+    input.placeholder = type;
+    input.spellcheck = false;
+    input.autocomplete = 'off';
+    const commit = async () => {
+      const controller = this.#controller;
+      if (!controller) return;
+      const text = input.value.trim();
+      const injected = controller.getInjectedValue(node, port);
+      if (text === (injected ?? '')) {
+        input.classList.remove('invalid');
+        return;
+      }
+      try {
+        if (text === '') await controller.clearInput(node, port);
+        else await controller.injectValue(node, port, text);
+        input.classList.remove('invalid');
+      } catch (error) {
+        input.classList.add('invalid');
+        input.title = error instanceof Error ? error.message : String(error);
+      }
+    };
+    input.addEventListener('keydown', (e) => {
+      // The debugger's F keys work from here too; the canvas's shortcuts would edit the graph.
+      if (!/^F\d+$/.test(e.key)) e.stopPropagation();
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        void commit();
+      } else if (e.key === 'Escape') {
+        input.classList.remove('invalid');
+        input.value = this.#controller?.getInjectedValue(node, port) ?? '';
+        input.blur();
+      }
+    });
+    input.addEventListener('blur', () => void commit());
+    return input;
   }
 
   #makeBreakpoint(nodeWidth: number): SVGPolygonElement {
@@ -623,6 +785,7 @@ export class WitgraphCanvas extends HTMLElement {
     const bp = g.querySelector('.breakpoint');
     if (node.breakpoint && !bp) g.appendChild(this.#makeBreakpoint(node.width));
     else if (!node.breakpoint && bp) bp.remove();
+    this.#updateFields(g, node);
   }
 
   #edgePortKind(edge: EdgeVisual): string {
@@ -637,28 +800,10 @@ export class WitgraphCanvas extends HTMLElement {
     const src = nodes.get(edge.fromNode);
     const tgt = nodes.get(edge.toNode);
     if (!src || !tgt) return null;
-    const fi = src.outputs.findIndex((p) => p.name === edge.fromPort);
-    const ti = tgt.inputs.findIndex((p) => p.name === edge.toPort);
-    if (fi < 0 || ti < 0) return null;
-    const from = portPosition(
-      src.x,
-      src.y,
-      src.width,
-      portsBottom(src),
-      fi,
-      src.outputs.length,
-      'output',
-    );
-    const to = portPosition(
-      tgt.x,
-      tgt.y,
-      tgt.width,
-      portsBottom(tgt),
-      ti,
-      tgt.inputs.length,
-      'input',
-    );
-    return edgePath(from.x, from.y, to.x, to.y);
+    const from = portOffset(src, 'output', edge.fromPort);
+    const to = portOffset(tgt, 'input', edge.toPort);
+    if (!from || !to) return null;
+    return edgePath(src.x + from.x, src.y + from.y, tgt.x + to.x, tgt.y + to.y);
   }
 
   #attachNodeDrag(nodeId: string, group: SVGGElement): void {

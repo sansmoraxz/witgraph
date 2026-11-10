@@ -119,8 +119,13 @@ Put them anywhere on your page. They all share one `EditorController`.
 - **Values.** Select a node to see the current value of each output port.
 - **Previews.** A node can show one of its outputs inside it, as it changes:
   see [Previews](#previews).
-- **Inputs.** Give a node an `inject.<port>` attribute to feed that input a
-  fixed value.
+- **Inputs.** Each Value input has a row on its node, beside its port. One fed by a
+  connection shows the value it is given. One fed by nothing has a box: type a value in it
+  as WAVE text and press Enter, or leave the box, to inject it, and empty the box to
+  clear it. A value it refuses marks the box, with why in its tooltip, and Escape puts
+  back what is injected. An input fed only by feedback has a box too, for its value on
+  the first tick. What is injected is kept as the node's `inject.<port>` attribute, and
+  the inspector can inject it as well.
 - **Resources.** In the inspector, a node's _Resources_ say how much of a named
   resource it claims, and with nothing selected, the graph's say how much there is of
   each and how much is claimed. A node waits to start until its claim is free, and a

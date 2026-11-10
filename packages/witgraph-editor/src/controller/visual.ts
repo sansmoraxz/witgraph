@@ -8,6 +8,7 @@ import {
   PREVIEW_HEIGHT,
   portsBandHeight,
 } from '../components/styles.ts';
+import { hasField } from '../util/svg.ts';
 import type { NodePhase, NodePreview, NodeVisual, PortVisual } from './types.ts';
 
 /** A contract's port as the editor shows it. */
@@ -65,10 +66,16 @@ export function nodeSize(
   attrs: Readonly<Record<string, string>> = {},
 ): { width: number; height: number; portsHeight: number; preview?: NodePreview } {
   const width = Math.max(MIN_NODE_WIDTH, numberAttr(attrs, 'editor.w') ?? NODE_WIDTH);
-  const portsHeight = portsBandHeight(inputs.length, outputs.length);
+  const fields = inputs.filter(hasField).length;
+  const slotted = inputs.length - fields;
+  const portsHeight = portsBandHeight(slotted, outputs.length, fields);
   const chosen = choosePreview(outputs, attrs);
   if (!chosen) {
-    return { width, portsHeight, height: computeNodeHeight(inputs.length, outputs.length) };
+    return {
+      width,
+      portsHeight,
+      height: computeNodeHeight(slotted, outputs.length, 0, fields),
+    };
   }
   const resized = numberAttr(attrs, 'editor.h');
   const previewHeight = Math.max(
@@ -78,7 +85,7 @@ export function nodeSize(
   return {
     width,
     portsHeight,
-    height: computeNodeHeight(inputs.length, outputs.length, previewHeight),
+    height: computeNodeHeight(slotted, outputs.length, previewHeight, fields),
     preview: { ...chosen, height: previewHeight },
   };
 }
