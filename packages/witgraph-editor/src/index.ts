@@ -1,5 +1,6 @@
 export type { Diagnostic } from 'witgraph-loader';
 export {
+  type AttachedEditing,
   type CompatibleOutput,
   type ConnectionCheck,
   EditorController,

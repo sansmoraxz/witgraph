@@ -1,6 +1,7 @@
 import {
   AttachedSession,
   type BreakpointScope,
+  type ComponentSource,
   type Contract,
   type DebugLines,
   type DebugSession,
@@ -93,6 +94,24 @@ interface Observation {
 /** The most edits undo goes back over. */
 const MAX_UNDO = 50;
 
+/**
+ * How a graph attached to is edited: by the program that runs it. Each edit is handed to it,
+ * which loads the graph edited in place of its own (or refuses it, saying why), and the editor
+ * attaches to that. Nothing runs in the page.
+ */
+export interface AttachedEditing {
+  /** The program's components, in the order of the graph's component table, for the catalog. */
+  components: ComponentSource[];
+  /**
+   * Loads `graph` in place of the graph attached to, stopped as that is (it is edited only
+   * while stopped: `Debuggee::stop` in `witgraph-remote`). Resolves with where to attach to
+   * it, or `null` if the graph is the same but for its layout, and is served as it was.
+   */
+  apply(
+    graph: GraphJson,
+  ): Promise<{ url: string; certificateHash: Uint8Array<ArrayBuffer> } | null>;
+}
+
 /** Whether a connection may be, and if not, why, in the compiler's words. */
 export interface ConnectionCheck {
   ok: boolean;
@@ -129,6 +148,13 @@ export class EditorController extends EventTarget {
   /** By file, its text as asked of `sources` once per load. */
   #sourceTexts = new Map<string, Promise<string | undefined>>();
   #originalOptions: EditorLoadOptions | null = null;
+  /** How the graph attached to is edited, if it is. */
+  #editing: AttachedEditing | null = null;
+
+  /** The components graphs are made of: those loaded, or the program's attached to. */
+  #components(): ComponentSource[] | undefined {
+    return this.#originalOptions?.components ?? this.#editing?.components;
+  }
   #graphJson: GraphJson | null = null;
   #dirty = false;
 
@@ -279,7 +305,9 @@ export class EditorController extends EventTarget {
    * using: they are refused until it stops, with a warning in the trace.
    */
   get editable(): boolean {
-    if (this.#attached) return false;
+    // An attached graph is edited by its program, if it lets it, and only while stopped:
+    // the program loads each edit in place of the graph running.
+    if (this.#attached) return this.#editing !== null && this.#mode === 'idle';
     return this.#mode !== 'running' && this.#mode !== 'paused';
   }
 
@@ -490,8 +518,7 @@ export class EditorController extends EventTarget {
       // An attached graph's components are the program's: their contracts say what they are,
       // named as a page's own are, without their content hash.
       const id =
-        this.#originalOptions?.components[compIdx]?.id ??
-        this.#session.contracts.get(nodeId)?.id.split('#')[0];
+        this.#components()?.[compIdx]?.id ?? this.#session.contracts.get(nodeId)?.id.split('#')[0];
       if (!id) continue;
       result.push({
         id,
@@ -504,10 +531,11 @@ export class EditorController extends EventTarget {
 
     // Also include components not yet used by any node — derive ports
     // from the component's WIT contract so the catalog and paste show them.
-    if (!this.#originalOptions) return result;
-    for (let i = 0; i < this.#originalOptions.components.length; i++) {
+    const components = this.#components();
+    if (!components) return result;
+    for (let i = 0; i < components.length; i++) {
       if (seen.has(i)) continue;
-      const comp = this.#originalOptions.components[i];
+      const comp = components[i];
       let contract = this.#componentContracts.get(i);
       if (!contract) {
         try {
@@ -543,8 +571,9 @@ export class EditorController extends EventTarget {
 
   addNodeFromCatalog(componentIndex: number, x: number, y: number): void {
     if (this.#locked()) return;
-    if (!this.#graphJson || !this.#originalOptions) throw new Error('no graph loaded');
-    const comp = this.#originalOptions.components[componentIndex];
+    const components = this.#components();
+    if (!this.#graphJson || !components) throw new Error('no graph loaded');
+    const comp = components[componentIndex];
     if (!comp) throw new Error(`no component at index ${componentIndex}`);
     const compRef = this.#graphJson.components[componentIndex];
     if (!compRef) throw new Error(`no component ref at index ${componentIndex}`);
@@ -808,9 +837,10 @@ export class EditorController extends EventTarget {
   /** What compiles graphs against the loaded components, once one has loaded. */
   #graphChecker(): GraphChecker | null {
     if (this.#checker) return this.#checker;
-    if (!this.#originalOptions) return null;
+    const components = this.#components();
+    if (!components) return null;
     try {
-      this.#checker = new GraphChecker(this.#originalOptions.components);
+      this.#checker = new GraphChecker(components);
     } catch {
       // The module has yet to load, or a load will say what is wrong with them.
       return null;
@@ -1164,13 +1194,19 @@ export class EditorController extends EventTarget {
    * URL and certificate hash it printed. The program ticks it: from here, nodes are held,
    * guests stopped on lines, outputs read and inputs written, and the graph is not changed.
    */
-  async attach(options: { url: string; certificateHash: Uint8Array<ArrayBuffer> }): Promise<void> {
+  async attach(options: {
+    url: string;
+    certificateHash: Uint8Array<ArrayBuffer>;
+    /** Lets the graph be edited, by the program: without, it is read as it is. */
+    editing?: AttachedEditing;
+  }): Promise<void> {
     this.#session?.dispose();
     this.#session = null;
     this.#attached = null;
     this.#endWorker();
     this.#forgetChecker();
     this.#originalOptions = null;
+    this.#editing = options.editing ?? null;
     let session: AttachedSession | null = null;
     session = await AttachedSession.attach({
       ...options,
@@ -2870,7 +2906,9 @@ export class EditorController extends EventTarget {
   #locked(): boolean {
     if (this.editable) return false;
     const message = this.#attached
-      ? "An attached graph is the program's: it cannot be edited from here"
+      ? this.#editing
+        ? 'The graph cannot be edited until it is stopped: stop it first'
+        : "An attached graph is the program's: it cannot be edited from here"
       : 'The graph cannot be edited while it runs: stop it first';
     const last = this.#traceEvents.at(-1);
     // A key held down, say, says it once.
@@ -2893,6 +2931,10 @@ export class EditorController extends EventTarget {
 
   async #reload(): Promise<void> {
     await this.#stopping;
+    if (this.#attached && this.#editing && this.#graphJson) {
+      await this.#applyAttached(this.#editing, this.#graphJson);
+      return;
+    }
     if (!this.#originalOptions || !this.#graphJson) return;
     const oldSession = this.#session;
     this.#session = null;
@@ -2905,6 +2947,24 @@ export class EditorController extends EventTarget {
       this.#dirty = true;
       throw err;
     }
+  }
+
+  /**
+   * Hands `draft` to the program attached to, which runs it, and attaches to that. Edits made
+   * meanwhile stay, to be handed over next.
+   */
+  async #applyAttached(editing: AttachedEditing, draft: GraphJson): Promise<void> {
+    const sent = JSON.stringify(draft);
+    const next = await editing.apply(JSON.parse(sent) as GraphJson);
+    if (next) {
+      const selected = this.#selectedNode;
+      await this.attach({ ...next, editing });
+      // Drawn where the editor had them, edits made meanwhile with them.
+      this.#graphJson = draft;
+      this.#buildVisuals();
+      if (selected && this.#nodes.has(selected)) this.#selectedNode = selected;
+    }
+    this.#dirty = JSON.stringify(draft) !== sent;
   }
 
   #reloading = false;
