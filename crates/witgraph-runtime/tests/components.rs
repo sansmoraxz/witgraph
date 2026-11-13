@@ -141,9 +141,24 @@ async fn load<F>(
 where
     F: Fn(&mut Linker<HostState>) -> wasmtime::Result<()> + Send + 'static,
 {
-    let graph = Graph::builder("t")
-        .add_component(contract)
-        .add_node("n", contract.id.clone())
+    load_as(&["n"], contract, bytes, linker).await
+}
+
+/// [`load`], as each of `nodes`.
+async fn load_as<F>(
+    nodes: &[&str],
+    contract: &ComponentContract,
+    bytes: &[u8],
+    linker: F,
+) -> Result<RuntimeGraph<witgraph_runtime::Perf, Linking<F>>, LoadError>
+where
+    F: Fn(&mut Linker<HostState>) -> wasmtime::Result<()> + Send + 'static,
+{
+    let graph = nodes
+        .iter()
+        .fold(Graph::builder("t").add_component(contract), |b, node| {
+            b.add_node(*node, contract.id.clone())
+        })
         .build();
     let compiled = graph
         .compile(std::slice::from_ref(contract))
@@ -457,6 +472,52 @@ async fn an_interface_used_only_for_types_is_not_required() {
     load(&contract(wit, "w"), &bytes, no_capabilities)
         .await
         .expect("the component imports only `clock`'s types");
+}
+
+#[tokio::test]
+async fn types_of_another_interface_stay_unnamed_by_the_node() {
+    // `outputs` reaches `level` and `reading` only through `sample`: the node's
+    // instance exports `sample`, never them.
+    let wit = "package demo:shared@0.1.0;
+        interface shapes {
+            enum level { low, high }
+            record reading { level: level, at: u64 }
+            record sample { io: string, reading: option<reading> }
+        }
+        world w {
+            export node: interface {
+                use shapes.{sample};
+                record inputs { io: option<string> }
+                record outputs { sample: option<sample>, all: list<sample> }
+                run: async func(inputs: inputs) -> outputs;
+            }
+        }";
+    let bytes = component(wit, "w", "w");
+    load(&contract(wit, "w"), &bytes, no_capabilities)
+        .await
+        .expect("the hub matches the node's instance");
+}
+
+#[tokio::test]
+async fn nodes_share_the_types_of_another_interface() {
+    // Each of the two prints `sample`'s types, which the hub holds once.
+    let wit = "package demo:shared@0.1.0;
+        interface shapes {
+            enum level { low, high }
+            record reading { level: level, at: u64 }
+            record sample { io: string, reading: option<reading> }
+        }
+        world w {
+            export node: interface {
+                use shapes.{sample, level};
+                record outputs { sample: option<sample>, level: level }
+                run: async func() -> outputs;
+            }
+        }";
+    let bytes = component(wit, "w", "w");
+    load_as(&["a", "b"], &contract(wit, "w"), &bytes, no_capabilities)
+        .await
+        .expect("the hub matches both nodes' instances");
 }
 
 #[tokio::test]

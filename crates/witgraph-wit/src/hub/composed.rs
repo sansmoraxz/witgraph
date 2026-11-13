@@ -118,14 +118,20 @@ pub fn compose_graph(
                 .map_err(|e| compose(format!("`{}`: {e:#}", member.node)))?;
             graph
                 .set_instantiation_argument(instance, &name, import)
-                .map_err(|e| compose(format!("`{}`: {e:#}", member.node)))?;
+                .map_err(|e| compose(format!("`{}`: {}", member.node, causes(&e))))?;
         }
         let export = graph
             .alias_instance_export(instance, member.export)
             .map_err(|e| compose(format!("`{}`: {e:#}", member.node)))?;
         graph
             .set_instantiation_argument(hub, &format!("m{position}"), export)
-            .map_err(|e| compose(format!("`{}` as an import of the hub: {e:#}", member.node)))?;
+            .map_err(|e| {
+                compose(format!(
+                    "`{}` as an import of the hub: {}",
+                    member.node,
+                    causes(&e)
+                ))
+            })?;
     }
     for interface in [CONTROL_INTERFACE, PORTS_INTERFACE] {
         let export = graph
@@ -140,7 +146,7 @@ pub fn compose_graph(
             validate: true,
             ..EncodeOptions::default()
         })
-        .map_err(|e| compose(format!("{e:#}")))?;
+        .map_err(|e| compose(causes(&e)))?;
     let instantiated = generated
         .order
         .iter()
@@ -152,4 +158,17 @@ pub fn compose_graph(
         components,
         instantiated,
     })
+}
+
+/// `error`, and what caused it, down to the first cause: an argument's
+/// mismatch says which of its exports does not match.
+fn causes(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut cause = error.source();
+    while let Some(at) = cause {
+        text.push_str(": ");
+        text.push_str(&at.to_string());
+        cause = at.source();
+    }
+    text
 }

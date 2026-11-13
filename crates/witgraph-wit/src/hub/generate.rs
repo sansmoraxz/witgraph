@@ -7,7 +7,7 @@ use wasm_encoder::{Instruction as I, ValType};
 use wit_component::{ComponentEncoder, StringEncoding, embed_component_metadata};
 use wit_parser::abi::{AbiVariant, WasmSignature, WasmType};
 use wit_parser::{
-    Function, FutureIntrinsic, Int, LiftLowerAbi, Mangling, ManglingAndAbi, Resolve,
+    Function, FutureIntrinsic, Int, InterfaceId, LiftLowerAbi, Mangling, ManglingAndAbi, Resolve,
     ResourceIntrinsic, StreamIntrinsic, Type, TypeDefKind, TypeId, WasmExport, WasmExportKind,
     WasmImport, WorldId, WorldItem, WorldKey,
 };
@@ -21,7 +21,7 @@ use super::module::{
     AddingFuncs, Body, EqFn, FuncIdx, HEAP_TOP, Helper, Import, Local, ModuleBuilder, Offset,
     Place, Sig, Size, Static,
 };
-use super::text::{Printer, Resources};
+use super::text::{Printer, Shared};
 use super::{
     CONTROL_INTERFACE, ControlFunc, HubError, HubMember, LEND_INTERFACE, PORTS_INTERFACE,
     get_feedback, get_input, get_output, give_stream, lend_handle, read_handle, set_feedback,
@@ -56,6 +56,8 @@ pub(super) struct Generated<'a> {
 /// A member's WIT, as its node manifest's WIT declares its world.
 struct Decoded<'a> {
     resolve: &'a Resolve,
+    /// The interface `run` is of.
+    interface: InterfaceId,
     run: Function,
 }
 
@@ -67,17 +69,22 @@ fn read_member<'a>(member: &HubMember<'a>) -> Result<Decoded<'a>, HubError> {
     let world = crate::lower::find_world(member.wit, member.world)
         .ok_or_else(|| failed(format!("its WIT has no world `{}`", member.world)))?;
     let resolve = &member.wit.resolve;
-    let run = resolve.worlds[world]
+    let (interface, run) = resolve.worlds[world]
         .exports
         .iter()
         .find_map(|(key, item)| match item {
             WorldItem::Interface { id, .. } if resolve.name_world_key(key) == member.export => {
-                resolve.interfaces[*id].functions.get("run").cloned()
+                let run = resolve.interfaces[*id].functions.get("run").cloned()?;
+                Some((*id, run))
             }
             _ => None,
         })
         .ok_or_else(|| failed(format!("`{}` exports no `run`", member.export)))?;
-    Ok(Decoded { resolve, run })
+    Ok(Decoded {
+        resolve,
+        interface,
+        run,
+    })
 }
 
 /// The fields of a `run`'s `inputs` record, in `resolve`.
@@ -150,11 +157,12 @@ fn world_text(
     order: &[HubMember<'_>],
     decoded: &[Decoded<'_>],
 ) -> Result<String, HubError> {
-    let mut resources = Resources::default();
     // Once to find every resource's newest version, then for real.
+    let mut first = Shared::default();
     for member in decoded {
-        Printer::new("", member.resolve, &mut resources).run(&member.run)?;
+        Printer::member(member.resolve, &mut first, member.interface).run(&member.run)?;
     }
+    let mut shared = first.learnt();
 
     let mut imports = String::new();
     let mut port_defs = String::new();
@@ -165,7 +173,7 @@ fn world_text(
     let mut feedback: BTreeMap<usize, String> = BTreeMap::new();
     for (at, (member, node)) in decoded.iter().zip(order).enumerate() {
         let resolve = &member.resolve;
-        let mut printer = Printer::new("", resolve, &mut resources);
+        let mut printer = Printer::member(resolve, &mut shared, member.interface);
         let run = printer.run(&member.run)?;
         let _ = writeln!(
             imports,
@@ -174,7 +182,7 @@ fn world_text(
         );
 
         let contract = contract_of(compiled, node.node)?;
-        let mut printer = Printer::new(&format!("m{at}-"), resolve, &mut resources);
+        let mut printer = Printer::new(&format!("m{at}-"), resolve, &mut shared);
         for (name, ty) in input_fields(resolve, &member.run) {
             let port = PortName::from(name);
             let Some(def) = contract.inputs.iter().find(|p| p.name == port) else {
@@ -240,7 +248,7 @@ fn world_text(
             }
         }
         port_defs.push_str(printer.defs());
-        let mut lender = Printer::new(&format!("l{at}-"), resolve, &mut resources);
+        let mut lender = Printer::new(&format!("l{at}-"), resolve, &mut shared);
         for (output, resource) in handles {
             let name = lender.resource_name(resource)?;
             let _ = writeln!(
@@ -269,12 +277,13 @@ fn world_text(
     world.push_str("  export control;\n  export ports;\n}\n");
     let mut text = String::from("package witgraph:hub@0.1.0;\n");
     text.push_str(CONTROL_WIT);
+    text.push_str(&shared.interfaces());
     let _ = writeln!(text, "interface ports {{\n{port_defs}{port_funcs}}}");
     if lend {
         let _ = writeln!(text, "interface lend {{\n{lend_defs}{lend_funcs}}}");
     }
     text.push_str(&world);
-    text.push_str(&resources.packages());
+    text.push_str(&shared.packages());
     Ok(text)
 }
 
