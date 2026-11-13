@@ -25,7 +25,7 @@ import {
   type WitgraphSource,
   type WitgraphTimeline,
 } from 'witgraph-editor';
-import type { ComponentSource } from 'witgraph-loader';
+import { type ComponentSource, nodeDescription } from 'witgraph-loader';
 import { serveCameraFrames } from './data/camera-page.ts';
 import { tensorViewer } from './data/viewer.ts';
 
@@ -549,7 +549,7 @@ async function sources(file: string): Promise<string | undefined> {
   return response.ok && !type.includes('html') ? response.text() : undefined;
 }
 
-/** A guest's node manifest and WIT, beside its bytes. */
+/** A guest's description (from its node manifest) and WIT, beside its bytes. */
 async function fetchGuest(name: string, debug: boolean): Promise<ComponentSource> {
   const fetched = async (file: string) => {
     const url = new URL(/* @vite-ignore */ `../components/${file}`, import.meta.url);
@@ -559,9 +559,9 @@ async function fetchGuest(name: string, debug: boolean): Promise<ComponentSource
     }
     return resp;
   };
-  const manifest = await (await fetched(`${name}.node.json`)).json();
+  const description = nodeDescription(await (await fetched(`${name}.node.json`)).json());
   const wit = new Uint8Array(await (await fetched(`${name}.wit.wasm`)).arrayBuffer());
-  return { name, manifest, wit, bytes: await fetchWasm(name, debug) };
+  return { name, description, wit, bytes: await fetchWasm(name, debug) };
 }
 
 /** A guest, as built with debug info if `debug`: those are big, so left out of a built page. */

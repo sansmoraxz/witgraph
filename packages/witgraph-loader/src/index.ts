@@ -38,7 +38,7 @@ export interface Port {
   docs?: string;
   /**
    * Output ports only: how an editor should preview the port (`image`,
-   * say), as the component's node manifest declares it.
+   * say), as the component's node description declares it.
    */
   viewer?: string;
 }
@@ -72,22 +72,26 @@ export interface Contract {
 }
 
 /**
- * What a component is: its node manifest. `wit_source` and `component` say
- * where its WIT and bytes are, as paths (relative to the manifest) or
- * `oci://` references; a browser is given those as they are, and needs only
- * the rest.
+ * What a component is: the WIT package its worlds are in, the worlds it
+ * provides, and how an editor previews their outputs. Where its WIT and bytes
+ * are is the host's business.
  */
-export interface NodeManifest {
+export interface NodeDescription {
   /** The WIT package its worlds are in, `namespace:name@version`. */
   wit: string;
-  /** Where that WIT is. */
-  wit_source?: string;
   /** Every world of `wit` it provides, `namespace:name/world@version`. */
   worlds: string[];
-  /** Where its bytes are. */
-  component?: string;
   /** How an editor previews outputs: per world, output port to viewer. */
   viewers?: Record<string, Record<string, string>>;
+}
+
+/**
+ * The description in a node manifest (`*.node.json`), without where its
+ * files are.
+ */
+export function nodeDescription(manifest: NodeDescription): NodeDescription {
+  const { wit, worlds, viewers } = manifest;
+  return viewers ? { wit, worlds, viewers } : { wit, worlds };
 }
 
 /**
@@ -107,14 +111,14 @@ export interface Capability {
 }
 
 /**
- * A component the graph is composed of. What it is comes from its manifest
- * and WIT alone; its bytes are checked to target the worlds nodes run of it.
+ * A component the graph is composed of. What it is comes from its
+ * description and WIT alone; its bytes are checked to target the worlds nodes run of it.
  */
 export interface ComponentSource {
   /** Its name in the graph's component table. */
   name: string;
-  /** Its node manifest. */
-  manifest: NodeManifest;
+  /** What it is. */
+  description: NodeDescription;
   /** Its WIT, as one wasm-encoded package (`wasm-tools component wit --wasm`). */
   wit: Uint8Array;
   /** The encoded component: what runs. Not needed to describe or check a graph. */
@@ -360,18 +364,18 @@ function initialisedOrThrow(): void {
 }
 
 /**
- * Describes a component as the editor catalog does, from its manifest and WIT
+ * Describes a component as the editor catalog does, from its description and WIT
  * (no bytes): one contract per node world it provides, its named types and
  * warnings included. `name` is its name in the graph's component table. Needs
  * {@link init}.
  */
 export function describeComponent(
   name: string,
-  manifest: NodeManifest,
+  description: NodeDescription,
   wit: Uint8Array,
 ): Contract[] {
   initialisedOrThrow();
-  return describeRaw(name, manifest, wit) as Contract[];
+  return describeRaw(name, description, wit) as Contract[];
 }
 
 /**

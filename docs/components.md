@@ -236,43 +236,88 @@ Zig's standard library is not the guest's own. Zig works out at compile time wha
 such a value is no variable once the guest runs: make it a `var` to see it. Zig 0.17 is what
 `test-fixtures/test-components/guests/zig-walk` is built with, by the fixtures' build script.
 
-## Node manifests
+## Nodes
 
-A component's bytes say nothing about it that witgraph reads: what it is comes
-from its **node manifest**, a JSON file beside it (or an OCI artifact of its
-own):
+A component's bytes say nothing about it that witgraph reads. What it is comes
+from its **description**: the WIT package its worlds are in, the worlds it
+provides, and how an editor previews their outputs. A node is that, its WIT
+and its builds, packed as files or as one OCI artifact.
+
+### As files: node manifests
+
+A node manifest (`*.node.json`) is the description, and where its WIT and
+builds are, relative to it:
 
 ```json
 {
   "wit": "demo:graph@0.1.0",
   "wit_source": "wit",
   "worlds": ["demo:graph/sensor@0.1.0"],
-  "component": "sensor.wasm",
+  "component": { "release": "out/sensor.wasm", "debug": "out/sensor.debug.wasm" },
   "viewers": { "demo:graph/sensor@0.1.0": { "samples": "series" } }
 }
 ```
 
 - `wit` is the WIT package its worlds are in, as WIT writes it.
-- `wit_source` is where that WIT is: a directory or `.wit` file (with its
-  `deps/`, as `wkg wit fetch` fills it), or a wasm-encoded WIT package: a
-  `.wasm` file as `wkg wit build` writes one, or an OCI artifact as `wkg
-  publish` pushes one. A component is no WIT source: its WIT is never read
+- `wit_source` is where that WIT is: a directory or `.wit` file, with its
+  `deps/` as `wkg fetch` fills it, or the package encoded in one `.wasm` file,
+  as `wkg build` writes it. A component is no WIT source: its WIT is never read
   out of it.
 - `worlds` lists every world of `wit` the component provides. A node runs one
   of them. A link's provider lists the world it exports, which need not be a
   node's.
-- `component` is where its bytes are: a file, or an OCI artifact as `wkg oci
-  push` pushes one.
+- `component` is its build: one path, or a path per profile (below).
 - `viewers` says how an editor previews outputs (see below).
 
-Locations are paths, relative to the manifest, or OCI artifacts, written
-explicitly: `oci://ghcr.io/demo/sensor:0.1.0`, or pinned,
-`oci://ghcr.io/demo/sensor@sha256:…`. A manifest pulled over OCI (a layer of
-media type `application/vnd.witgraph.node.v1+json`) may name only `oci://`
-artifacts. A graph's component table names each component's manifest
-([graphs](graphs.md)).
+A node manifest names files only: a node goes into a registry whole.
 
-The contracts are lowered from the WIT, and the bytes are checked to target
+### As an OCI artifact
+
+A node in a registry is one artifact, in the repository of its builds:
+
+```text
+node manifest   artifactType  application/vnd.witgraph.node.v1
+  config        application/vnd.witgraph.node.config.v1+json   the description
+  layers        application/wasm                               its WIT package, encoded
+  subject ────► image index                                    its builds
+                  ├─ Wasm OCI artifact   annotation io.github.sansmoraxz.witgraph.profile = release
+                  └─ Wasm OCI artifact   annotation io.github.sansmoraxz.witgraph.profile = debug
+```
+
+Each build is a component as the CNCF Wasm OCI Artifact spec has it (config
+`application/vnd.wasm.config.v0+json`, one `application/wasm` layer), as `wkg
+oci push` pushes one. The node names them by digest, so the node's own digest
+pins its description, its WIT and every build. Since the node names its
+builds as its `subject`, registries that answer the referrers API list the
+nodes built on a component.
+
+`Resolver::push` packs a node manifest's files into one, after checking it as a
+resolve does, and tags it:
+
+```rust
+let pushed = Resolver::new()
+    .base(dir)
+    .push(Path::new("sensor.node.json"), "oci://ghcr.io/demo/sensor:0.1.0-node")
+    .await?;
+// pushed.reference: ghcr.io/demo/sensor@sha256:…, to pin a graph to.
+```
+
+Pushed again from the same files, a node is the same artifact, with the same
+digest.
+
+### Profiles
+
+A node may have a build per profile: `release`, and `debug`, built with debug
+info and without optimizing, for a debugger to stop on its lines. A resolver
+resolves the build of its profile (`Resolver::profile`, `release` unless told)
+and pulls only that one. A node of one build has it used whatever the profile;
+one with builds for other profiles only fails, naming those it has. Every
+build is checked to target every world listed: they share one description and
+one WIT, so one contract.
+
+### Checks
+
+The contracts are lowered from the WIT, and the build is checked to target
 each world listed, with wit-component's `targets`: the same check `wasm-tools
 component targets` makes. Nothing else is read out of the bytes, so nothing a
 guest embeds in them (a custom section, say) means anything to witgraph.

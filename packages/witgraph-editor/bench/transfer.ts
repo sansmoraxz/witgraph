@@ -10,7 +10,7 @@
 import { execFileSync } from 'node:child_process';
 import { readdir, readFile, stat } from 'node:fs/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { type ComponentSource, Session } from 'witgraph-loader';
+import { type ComponentSource, nodeDescription, Session } from 'witgraph-loader';
 import { EditorController } from '../src/controller/editor-controller.ts';
 import type { GraphJson } from '../src/controller/types.ts';
 
@@ -43,7 +43,9 @@ const components: ComponentSource[] = await Promise.all(
     const read = async (file: string) => new Uint8Array(await readFile(new URL(file, guests)));
     return {
       name,
-      manifest: JSON.parse(await readFile(new URL(`${name}.node.json`, guests), 'utf8')),
+      description: nodeDescription(
+        JSON.parse(await readFile(new URL(`${name}.node.json`, guests), 'utf8')),
+      ),
       wit: await read(`${name}.wit.wasm`),
       bytes: await read(`${name}.wasm`),
     };

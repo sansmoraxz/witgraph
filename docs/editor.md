@@ -164,7 +164,7 @@ say, is let go at once.
 
 A node shows one of its outputs in a region below its ports: the frames of a
 video stream as they arrive, say. Which output, and how, is up to the
-component: its node manifest names a viewer for its outputs ([Previewing outputs](components.md#previewing-outputs)), and the
+component: its description names a viewer for its outputs ([Previewing outputs](components.md#previewing-outputs)), and the
 node previews the first one it names.
 
 - **Choosing.** _Preview_ in the inspector picks another output, or none. An
@@ -238,7 +238,7 @@ is bounded (120 values, about 8 MiB).
 ## Saving and loading
 
 _Load_ opens a graph from a JSON file, and _JSON_ downloads the current one.
-_Bundle_ downloads the graph together with its components (their manifests,
+_Bundle_ downloads the graph together with its components (their descriptions,
 WIT and bytes), so it can be
 opened without anything else. Graph and node attributes (`attrs`) are kept in
 the JSON.

@@ -107,7 +107,7 @@ pub struct GraphChecker {
 #[wasm_bindgen]
 impl GraphChecker {
     /// `components` as `WebGraph.load` takes them, bytes or none: their contracts
-    /// are their manifests' and WIT's. One that does not describe is left out: a
+    /// are their descriptions' and WIT's. One that does not describe is left out: a
     /// graph with a node of it says so.
     #[wasm_bindgen(constructor)]
     pub fn new(components: Array) -> Result<GraphChecker, JsError> {

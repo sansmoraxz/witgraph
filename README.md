@@ -56,8 +56,8 @@ data over time. See [docs/components.md](docs/components.md) for the full rules.
 
 ## A graph
 
-A graph lists the components it uses, by name with where each one's node
-manifest is, the nodes (each runs one world of one component), and the
+A graph lists the components it uses, by name with where each one's node is
+(a node manifest, or an OCI node artifact), the nodes (each runs one world of one component), and the
 connections between their ports. It is plain serializable data and holds no
 contracts. Compiling it looks the contracts up
 and reports every problem it finds: mismatched types, unconnected required
@@ -67,10 +67,10 @@ inputs, cycles without a feedback edge, and so on.
 let compiled = graph.compile(&contracts)?;
 ```
 
-`witgraph-wit` lowers the contracts from WIT: a component's node manifest names
-its WIT package and the worlds it provides, and its bytes are only checked to
+`witgraph-wit` lowers the contracts from WIT: a node's description names its
+WIT package and the worlds it provides, and its builds are only checked to
 target them. See [docs/graphs.md](docs/graphs.md) and
-[docs/components.md](docs/components.md#node-manifests).
+[docs/components.md](docs/components.md#nodes).
 
 ## Running it
 
@@ -118,7 +118,7 @@ nodes, snapshots, undo and redo, and JSON import and export. See
 | `witgraph-runtime`              | The scheduler on wasmtime.                                                        |
 | `witgraph-web`                  | The scheduler for JavaScript hosts, via `wasm-bindgen`.                           |
 | `witgraph-probes`               | Reads a guest's lines and variables from its DWARF, and puts probes on its lines. |
-| `witgraph-source`               | Fetches component bytes from files and OCI registries, pinned by digest.          |
+| `witgraph-source`               | Resolves nodes from files and OCI node artifacts, by profile; pushes them.        |
 | `packages/witgraph-loader`      | TypeScript loader that runs a graph in a browser or Node.                         |
 | `packages/witgraph-editor`      | Web Components for editing, running and debugging graphs visually.                |
 | `packages/witgraph-editor-demo` | Demo app for the editor.                                                          |

@@ -22,15 +22,16 @@ through the hub, and sees a value only when it asks for one.
 ## Loading
 
 `RuntimeGraph::load` takes the compiled graph and, by name, each component of
-its table: its bytes, with the WIT its node manifest names (an `Artifact`).
-They can come from anywhere. `witgraph-source` resolves a graph's component
-table: it fetches each node manifest, its WIT and its bytes, from files or
-OCI registries, and caches what it pulls:
+its table: its build, with its WIT (an `Artifact`). They can come from
+anywhere. `witgraph-source` resolves a graph's component table: it fetches each
+[node](components.md#nodes), from its node manifest's files or an OCI node
+artifact, with the build of its profile, and caches what it pulls:
 
 ```rust
 let components = Resolver::new()
     .base(dir)
     .cache(cache_dir)
+    .profile(Profile::Release)
     .resolve(&graph.components)
     .await?;
 let compiled = graph.compile(&components)?;
@@ -38,7 +39,9 @@ let rt = RuntimeGraph::load(compiled, &components.artifacts(), config, Perf).awa
 ```
 
 An `oci://` reference with a digest (`oci://ghcr.io/demo/sensor@sha256:…`)
-names one artifact for good, and is read from the cache once pulled.
+names one node for good, builds included, and is read from the cache once
+pulled. A tag is pulled each time; if its registry can't be reached, it is the
+node it held when last pulled, marked `offline`.
 
 Loading checks that each component's bytes target the world its nodes run
 (wit-component's `targets`), and fails with a named error if they don't, then generates the hub, composes it with the

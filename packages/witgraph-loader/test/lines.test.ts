@@ -12,6 +12,7 @@ import {
   endWorker,
   type LineDebugger,
   type LineStop,
+  nodeDescription,
   RemoteSession,
   type RemoteSessionOptions,
   Session,
@@ -93,7 +94,9 @@ async function options(
         const read = async (name: string) => new Uint8Array(await readFile(new URL(name, guests)));
         return {
           name: guest,
-          manifest: JSON.parse(await readFile(new URL(`${guest}.node.json`, guests), 'utf8')),
+          description: nodeDescription(
+            JSON.parse(await readFile(new URL(`${guest}.node.json`, guests), 'utf8')),
+          ),
           wit: await read(`${guest}.wit.wasm`),
           bytes: await read(`${guest}.wasm`),
         };

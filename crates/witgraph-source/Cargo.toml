@@ -1,6 +1,6 @@
 [package]
 name = "witgraph-source"
-description = "Resolving witgraph component bytes from files and OCI registries"
+description = "Resolving witgraph nodes from files and OCI registries, and pushing them"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -25,6 +25,7 @@ oci-client = { version = "0.18", default-features = false, features = ["rustls-t
 tokio = { version = "1", features = ["fs", "io-util", "rt", "macros"] }
 futures = "0.3"
 bytes = "1"
+http = "1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

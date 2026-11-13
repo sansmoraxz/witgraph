@@ -14,7 +14,7 @@
 )]
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use tokio::time::sleep;
@@ -29,7 +29,7 @@ use witgraph_runtime::{
     CapabilityPlugin, OutputReader, Perf, PluginData, Plugins, PortVersion, PreparedGraph,
     RunningGraph, RuntimeConfig, RuntimeGraph, StoreData, TickResult, Val as _, ValReader, shared,
 };
-use witgraph_source::{Digest, Resolver};
+use witgraph_source::{Digest, Profile, Resolver};
 
 /// A capability, for the snippet that adds some.
 struct Clock;

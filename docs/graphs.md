@@ -3,8 +3,8 @@
 A graph is plain, serializable data:
 
 - its component table: each component it uses, by a name, with where that
-  component's [node manifest](components.md#node-manifests) is (a path, or an
-  `oci://` reference);
+  component's [node](components.md#nodes) is (its node manifest's path, or an
+  `oci://` node artifact);
 - nodes, each running one world of one of those components;
 - connections from an output port to an input port;
 - links, which supply a node's imports from another component.
@@ -12,7 +12,7 @@ A graph is plain, serializable data:
 ```json
 {
   "metadata": { "name": "demo" },
-  "components": { "sensor": "oci://ghcr.io/demo/sensor.node:0.1.0" },
+  "components": { "sensor": "oci://ghcr.io/demo/sensor:0.1.0-node" },
   "nodes": [{ "id": "s", "component": "sensor", "world": "demo:graph/sensor@0.1.0" }],
   "connections": []
 }
@@ -33,7 +33,7 @@ bytes.
 or an encoded WIT package and returns a contract for each component world in
 it, as the component `name` provides it. `witgraph_wit::lower_world(&source,
 &id)` lowers the one world a `ContractId` (component and world) names.
-`witgraph-source` does this for a whole graph, from its node manifests.
+`witgraph-source` does this for a whole graph, from its nodes.
 
 ## Compiling
 
@@ -79,7 +79,7 @@ instance. This works the same in a browser or Node.js: the loader gets the
 composed component and runs that. The `compose` feature of `witgraph-wit` does
 the composition, and `witgraph-runtime` and `witgraph-web` turn it on.
 Providers are listed in the component table like any other component, by
-name, and need not be nodes: a provider's node manifest lists the world it
+name, and need not be nodes: a provider's description lists the world it
 exports, and what that world imports is asked of the host.
 
 ## Editor catalog

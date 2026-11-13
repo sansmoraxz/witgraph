@@ -1,5 +1,5 @@
 // A page for `lines.spec.ts`: a session in a worker, driven from here.
-import { type LineDebugger, type LineStop, RemoteSession } from 'witgraph-loader';
+import { type LineDebugger, type LineStop, nodeDescription, RemoteSession } from 'witgraph-loader';
 
 let frames = 0;
 const frame = () => {
@@ -27,9 +27,11 @@ const session = await RemoteSession.load(
     components: [
       {
         name: 'line-walk',
-        manifest: await (
-          await fetch(new URL('../../components/line-walk.node.json', import.meta.url))
-        ).json(),
+        description: nodeDescription(
+          await (
+            await fetch(new URL('../../components/line-walk.node.json', import.meta.url))
+          ).json(),
+        ),
         wit: await fetched(new URL('../../components/line-walk.wit.wasm', import.meta.url)),
         bytes: await fetched(new URL('../../components/line-walk.wasm', import.meta.url)),
       },

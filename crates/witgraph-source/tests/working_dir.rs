@@ -3,9 +3,9 @@
 #![cfg(unix)]
 #![allow(missing_docs)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use witgraph_source::{Location, Resolver, SourceError};
+use witgraph_source::{Resolver, SourceError};
 
 #[tokio::test]
 async fn a_symbolic_link_out_of_the_working_directory_is_refused() {
@@ -20,16 +20,14 @@ async fn a_symbolic_link_out_of_the_working_directory_is_refused() {
 
     // No base: relative paths are the working directory's.
     let resolver = Resolver::new();
-    let evil = Location::File("evil.wasm".into());
-    let err = resolver.fetch(&evil).await.err();
+    let err = resolver.read_file(Path::new("evil.wasm")).await.err();
     assert!(
         matches!(err, Some(SourceError::OutsideBase { .. })),
         "{err:?}"
     );
-    let inside = Location::File("inside.wasm".into());
-    let inside = resolver
-        .fetch(&inside)
+    let (inside, _) = resolver
+        .read_file(Path::new("inside.wasm"))
         .await
         .expect("a file inside is read");
-    assert_eq!(&*inside.bytes, b"inside");
+    assert_eq!(&*inside, b"inside");
 }

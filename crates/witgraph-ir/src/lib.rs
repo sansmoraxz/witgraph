@@ -14,6 +14,7 @@ pub mod graph;
 pub mod id;
 pub mod index;
 pub mod interface;
+pub mod node;
 pub mod partition;
 pub mod port;
 mod topo;
@@ -37,6 +38,7 @@ pub use index::{
     FeedbackEntry, FeedbackIdx, Idx, IndexVec, InputIdx, NodeIdx, OutputIdx, PortEntry, PortSet,
     PortTable,
 };
+pub use node::NodeDescription;
 pub use port::{Carried, HandleType, NodeShape, PortDef, PortDirection, PortKind, PortType};
 pub use wasm_wave;
 pub use wasm_wave::value::Type;

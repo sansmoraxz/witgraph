@@ -13,6 +13,7 @@ import {
   type Endpoint,
   endWorker,
   type HandleView,
+  nodeDescription,
   RemoteSession,
   type RemoteSessionOptions,
   type ServeOptions,
@@ -72,7 +73,9 @@ async function options(
         const read = async (name: string) => new Uint8Array(await readFile(new URL(name, guests)));
         return {
           name: guest,
-          manifest: JSON.parse(await readFile(new URL(`${guest}.node.json`, guests), 'utf8')),
+          description: nodeDescription(
+            JSON.parse(await readFile(new URL(`${guest}.node.json`, guests), 'utf8')),
+          ),
           wit: await read(`${guest}.wit.wasm`),
           bytes: await read(`${guest}.wasm`),
         };

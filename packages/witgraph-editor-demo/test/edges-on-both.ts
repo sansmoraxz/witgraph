@@ -1,6 +1,6 @@
 // Loaded in the page, through Vite, by accelerators.spec.ts.
 import { monotonicClock } from '@bytecodealliance/preview3-shim/clocks';
-import { type Capability, Session } from 'witgraph-loader';
+import { type Capability, nodeDescription, Session } from 'witgraph-loader';
 import { cpu } from '/src/accel/cnn.ts';
 import { webgpu } from '/src/accel/webgpu.ts';
 
@@ -26,7 +26,7 @@ export async function edgesOnBoth(frames: number): Promise<number> {
         new Uint8Array(await (await fetch(`/components/${file}`)).arrayBuffer());
       return {
         name: guest,
-        manifest: await (await fetch(`/components/${guest}.node.json`)).json(),
+        description: nodeDescription(await (await fetch(`/components/${guest}.node.json`)).json()),
         wit: await bytes(`${guest}.wit.wasm`),
         bytes: await bytes(`${guest}.wasm`),
       };

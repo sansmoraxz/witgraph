@@ -96,7 +96,7 @@ interface Observation {
 const MAX_UNDO = 50;
 
 /** The version of the bundles {@link EditorController.downloadBundle} writes. */
-const BUNDLE_VERSION = 2;
+const BUNDLE_VERSION = 3;
 
 /** An entry of the catalog: a world, as a component provides it. */
 export interface CatalogEntry {
@@ -545,7 +545,7 @@ export class EditorController extends EventTarget {
 
   /**
    * What the catalog offers: each world a component provides, as a node of it runs it,
-   * described from the component's manifest and WIT. `index` is its place in this list.
+   * described from the component's description and WIT. `index` is its place in this list.
    */
   get componentSources(): readonly CatalogEntry[] {
     const components = this.#components();
@@ -555,9 +555,9 @@ export class EditorController extends EventTarget {
       let contracts = this.#componentContracts.get(component.name);
       if (!contracts) {
         try {
-          contracts = describeComponent(component.name, component.manifest, component.wit);
+          contracts = describeComponent(component.name, component.description, component.wit);
         } catch {
-          /* a component whose manifest or WIT does not describe */
+          /* a component whose description or WIT does not describe */
           contracts = [];
         }
         this.#componentContracts.set(component.name, contracts);
@@ -1143,7 +1143,7 @@ export class EditorController extends EventTarget {
       graph: GraphJson;
       components: {
         name: string;
-        manifest: import('witgraph-loader').NodeManifest;
+        description: import('witgraph-loader').NodeDescription;
         wit: string;
         bytes?: string;
       }[];
@@ -1154,7 +1154,7 @@ export class EditorController extends EventTarget {
     const components = bundle.components.map(
       (c): ComponentSource => ({
         name: c.name,
-        manifest: c.manifest,
+        description: c.description,
         wit: fromBase64(c.wit),
         ...(c.bytes ? { bytes: fromBase64(c.bytes) } : {}),
       }),
@@ -2651,7 +2651,7 @@ export class EditorController extends EventTarget {
     const graph = JSON.parse(this.exportGraph());
     const components = this.#originalOptions.components.map((c) => ({
       name: c.name,
-      manifest: c.manifest,
+      description: c.description,
       wit: toBase64(c.wit),
       ...(c.bytes ? { bytes: toBase64(c.bytes) } : {}),
     }));

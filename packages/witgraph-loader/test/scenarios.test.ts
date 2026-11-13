@@ -8,7 +8,7 @@ import { readdir, readFile, stat } from 'node:fs/promises';
 import { test } from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-import { type ComponentSource, Session } from '../src/index.ts';
+import { type ComponentSource, nodeDescription, Session } from '../src/index.ts';
 
 const root = new URL('../../../', import.meta.url);
 
@@ -71,7 +71,9 @@ async function load(scenario: Scenario): Promise<Session> {
       const read = async (name: string) => new Uint8Array(await readFile(new URL(name, guests)));
       return {
         name: guest,
-        manifest: JSON.parse(await readFile(new URL(`${guest}.node.json`, guests), 'utf8')),
+        description: nodeDescription(
+          JSON.parse(await readFile(new URL(`${guest}.node.json`, guests), 'utf8')),
+        ),
         wit: await read(`${guest}.wit.wasm`),
         bytes: await read(`${guest}.wasm`),
       };

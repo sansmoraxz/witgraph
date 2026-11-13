@@ -1,5 +1,5 @@
 // Spike: how fast frames move through a stream of handles in a browser.
-import { type Capability, type ComponentSource, Session } from 'witgraph-loader';
+import { type Capability, type ComponentSource, nodeDescription, Session } from 'witgraph-loader';
 import { camera } from './data/camera.ts';
 import { cameraFrames } from './data/camera-page.ts';
 import { type Backend, cpu as cpuTensors, tensors } from './data/tensors.ts';
@@ -17,7 +17,7 @@ async function component(guest: string): Promise<ComponentSource> {
   };
   return {
     name: guest,
-    manifest: await (await fetched(`${guest}.node.json`)).json(),
+    description: nodeDescription(await (await fetched(`${guest}.node.json`)).json()),
     wit: new Uint8Array(await (await fetched(`${guest}.wit.wasm`)).arrayBuffer()),
     bytes: new Uint8Array(await (await fetched(`${guest}.wasm`)).arrayBuffer()),
   };

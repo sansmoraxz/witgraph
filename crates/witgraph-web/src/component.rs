@@ -1,32 +1,23 @@
-//! The components `load` and the editor are given: each `{ name, manifest,
-//! wit, bytes? }`, its node manifest (as JSON), its WIT (a wasm-encoded
-//! package) and, to run it, its bytes.
+//! The components `load` and the editor are given: each `{ name,
+//! description, wit, bytes? }`, its node description (`wit`, `worlds`,
+//! `viewers`), its WIT (a wasm-encoded package) and, to run it, its bytes.
 //!
-//! What a component is comes from its manifest and WIT alone: its worlds'
+//! What a component is comes from its description and WIT alone: its worlds'
 //! contracts are lowered from the WIT, never read out of its bytes, which are
 //! only checked to target the worlds nodes run of them.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use js_sys::{Reflect, Uint8Array};
 use sha2::{Digest, Sha256};
 use wasm_bindgen::prelude::*;
-use witgraph_ir::{Capability, ComponentContract, ComponentName, ContractId, WitRef, WorldRef};
+use witgraph_ir::{
+    Capability, ComponentContract, ComponentName, ContractId, NodeDescription, WorldRef,
+};
 use witgraph_wit::load::WitSource;
 
 use crate::graph::{error, text};
-
-/// What of a node manifest a browser uses: its locations are the host's
-/// business.
-#[derive(serde::Deserialize)]
-struct Manifest {
-    wit: WitRef,
-    worlds: Vec<WorldRef>,
-    #[serde(default)]
-    viewers: BTreeMap<WorldRef, BTreeMap<String, String>>,
-}
 
 /// A node world of a component, lowered.
 #[derive(Clone)]
@@ -38,7 +29,7 @@ pub(crate) struct Lowered {
     pub(crate) lowered: witgraph_wit::lower::Lowered,
 }
 
-/// What a component is, from its manifest and WIT.
+/// What a component is, from its description and WIT.
 pub(crate) struct Described {
     /// Its WIT.
     pub(crate) wit: WitSource,
@@ -75,11 +66,11 @@ impl Entry {
 }
 
 /// What a description is made from: the component's name and the SHA-256 of
-/// its manifest's JSON and of its WIT.
+/// its description's JSON and of its WIT.
 #[derive(PartialEq, Eq)]
 struct Key {
     name: ComponentName,
-    manifest: [u8; 32],
+    description: [u8; 32],
     wit: [u8; 32],
 }
 
@@ -122,20 +113,20 @@ pub(crate) fn entry(entry: &JsValue) -> Result<Entry, JsError> {
         .ok_or_else(|| error("a component needs a `name`"))?
         .parse()
         .map_err(error)?;
-    let manifest = field(entry, "manifest")
-        .ok_or_else(|| error(format!("component `{name}` needs a `manifest`")))?;
-    let manifest = match manifest.as_string() {
+    let description = field(entry, "description")
+        .ok_or_else(|| error(format!("component `{name}` needs a `description`")))?;
+    let description = match description.as_string() {
         Some(text) => text,
-        None => js_sys::JSON::stringify(&manifest)
+        None => js_sys::JSON::stringify(&description)
             .ok()
             .and_then(|text| text.as_string())
-            .ok_or_else(|| error(format!("the manifest of `{name}` is not JSON")))?,
+            .ok_or_else(|| error(format!("the description of `{name}` is not JSON")))?,
     };
     let wit = field(entry, "wit")
         .and_then(bytes_of)
         .ok_or_else(|| error(format!("component `{name}` needs its `wit`, encoded")))?;
     let bytes = field(entry, "bytes").and_then(bytes_of).map(Rc::new);
-    let described = describe(&name, &manifest, &wit)?;
+    let described = describe(&name, &description, &wit)?;
     Ok(Entry {
         name,
         described,
@@ -143,12 +134,12 @@ pub(crate) fn entry(entry: &JsValue) -> Result<Entry, JsError> {
     })
 }
 
-/// What component `name` is, from its manifest and WIT: as a load described it
+/// What component `name` is, from its description and WIT: as a load described it
 /// before, else now.
-fn describe(name: &ComponentName, manifest: &str, wit: &[u8]) -> Result<Rc<Described>, JsError> {
+fn describe(name: &ComponentName, description: &str, wit: &[u8]) -> Result<Rc<Described>, JsError> {
     let key = Key {
         name: name.clone(),
-        manifest: Sha256::digest(manifest).into(),
+        description: Sha256::digest(description).into(),
         wit: Sha256::digest(wit).into(),
     };
     let cached = DESCRIBED.with_borrow_mut(|cache| {
@@ -161,7 +152,7 @@ fn describe(name: &ComponentName, manifest: &str, wit: &[u8]) -> Result<Rc<Descr
     if let Some(described) = cached {
         return Ok(described);
     }
-    let described = Rc::new(described_now(name, manifest, wit)?);
+    let described = Rc::new(described_now(name, description, wit)?);
     DESCRIBED.with_borrow_mut(|cache| {
         cache.push((key, described.clone()));
         if cache.len() > CACHED {
@@ -171,19 +162,23 @@ fn describe(name: &ComponentName, manifest: &str, wit: &[u8]) -> Result<Rc<Descr
     Ok(described)
 }
 
-fn described_now(name: &ComponentName, manifest: &str, wit: &[u8]) -> Result<Described, JsError> {
+fn described_now(
+    name: &ComponentName,
+    description: &str,
+    wit: &[u8],
+) -> Result<Described, JsError> {
     let failed = |message: String| error(format!("component `{name}`: {message}"));
-    let manifest: Manifest =
-        serde_json::from_str(manifest).map_err(|e| failed(format!("its manifest: {e}")))?;
+    let description: NodeDescription =
+        serde_json::from_str(description).map_err(|e| failed(format!("its description: {e}")))?;
     let wit = witgraph_wit::load::load_encoded(wit).map_err(|e| failed(format!("its WIT: {e}")))?;
     let mut worlds = Vec::new();
     let mut capabilities = Vec::new();
     let mut warnings = Vec::new();
-    for world in &manifest.worlds {
-        if world.package != manifest.wit {
+    for world in &description.worlds {
+        if world.package != description.wit {
             return Err(failed(format!(
                 "world `{world}` is not in its package `{}`",
-                manifest.wit
+                description.wit
             )));
         }
         let id = witgraph_wit::lower::find_world(&wit, world)
@@ -194,7 +189,7 @@ fn described_now(name: &ComponentName, manifest: &str, wit: &[u8]) -> Result<Des
         );
         match witgraph_wit::lower_world(&wit, &ContractId::new(name.clone(), world.clone())) {
             Ok(mut lowered) => {
-                if let Some(hints) = manifest.viewers.get(world) {
+                if let Some(hints) = description.viewers.get(world) {
                     warnings.extend(witgraph_wit::viewer::apply(&mut lowered.contract, hints));
                 }
                 worlds.push(Lowered {
@@ -243,13 +238,17 @@ pub(crate) fn check_targets(entry: &Entry, world: &WorldRef) -> Result<(), JsErr
 /// Describes a component as the editor catalog does: one entry per node world
 /// it provides (`{ id, component, world, package, docs, inputs, outputs,
 /// capabilities, types }`, a port being `{ name, kind, type_display, handle?,
-/// optional, docs?, viewer? }`), from its `manifest` (JSON) and `wit` (an
+/// optional, docs?, viewer? }`), from its `description` and `wit` (an
 /// encoded WIT package). No bytes are needed.
 #[wasm_bindgen(js_name = describeComponent)]
-pub fn describe_component(name: &str, manifest: JsValue, wit: &[u8]) -> Result<JsValue, JsError> {
+pub fn describe_component(
+    name: &str,
+    description: JsValue,
+    wit: &[u8],
+) -> Result<JsValue, JsError> {
     let object = js_sys::Object::new();
     Reflect::set(&object, &text("name"), &text(name)).map_err(|_| error("no object"))?;
-    Reflect::set(&object, &text("manifest"), &manifest).map_err(|_| error("no object"))?;
+    Reflect::set(&object, &text("description"), &description).map_err(|_| error("no object"))?;
     Reflect::set(&object, &text("wit"), &Uint8Array::from(wit)).map_err(|_| error("no object"))?;
     let entry = entry(&object)?;
     let lowered: Vec<witgraph_wit::lower::Lowered> = entry

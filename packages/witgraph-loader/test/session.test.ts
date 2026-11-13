@@ -22,6 +22,7 @@ import {
   GraphChecker,
   init,
   jsName,
+  nodeDescription,
   Session,
   type SessionOptions,
   type StreamItem,
@@ -300,7 +301,7 @@ async function guestSource(guest: string): Promise<ComponentSource> {
   if (written) {
     return {
       name: guest,
-      manifest: { wit: packageOf(written.id), worlds: [written.id] },
+      description: { wit: packageOf(written.id), worlds: [written.id] },
       wit: encodeWit(`${guest}.wit`, written.wit),
       bytes: written.bytes,
     };
@@ -308,7 +309,9 @@ async function guestSource(guest: string): Promise<ComponentSource> {
   const read = async (name: string) => new Uint8Array(await readFile(new URL(name, guests)));
   return {
     name: guest,
-    manifest: JSON.parse(await readFile(new URL(`${guest}.node.json`, guests), 'utf8')),
+    description: nodeDescription(
+      JSON.parse(await readFile(new URL(`${guest}.node.json`, guests), 'utf8')),
+    ),
     wit: await read(`${guest}.wit.wasm`),
     bytes: await read(`${guest}.wasm`),
   };
@@ -485,10 +488,10 @@ test('viewers come from the node manifest', async () => {
       { id: 'a', from: { node: 'source', port: 'frames' }, to: { node: 'gray', port: 'frames' } },
     ],
   };
-  const plain = { ...gray.manifest, viewers: {} };
+  const plain = { ...gray.description, viewers: {} };
   const session = await loaded({
     graph,
-    components: [source, { ...gray, manifest: plain }],
+    components: [source, { ...gray, description: plain }],
     wasm,
     capabilities: clock,
   });
@@ -497,12 +500,12 @@ test('viewers come from the node manifest', async () => {
 });
 
 test('a wrong viewer hint is a warning, not a failed load', async () => {
-  // `video-source` with a manifest naming an output it lacks.
+  // `video-source` with a description naming an output it lacks.
   const source = await guestSource('video-source');
   const id = ids['video-source'];
   const stale = {
     ...source,
-    manifest: { ...source.manifest, viewers: { [id]: { frame: 'image' } } },
+    description: { ...source.description, viewers: { [id]: { frame: 'image' } } },
   };
   const warned: unknown[] = [];
   const warn = console.warn;
@@ -814,7 +817,7 @@ test('a paused tick can be inspected', async () => {
   assert.equal(await session.graph.readInput('a', 'in'), 1);
 });
 
-test('the bytes of a component must target the world its manifest names', async () => {
+test('the bytes of a component must target the world its description names', async () => {
   const echo = await guestSource('echo');
   const relay = await guestSource('relay');
   const graph = {
@@ -1961,9 +1964,9 @@ test('a node importing a component is refused, and the next graph loads', async 
   assert.deepEqual(session.graph.takeFaults(), []);
 });
 
-test('a component is described from its manifest and WIT, without bytes', async () => {
-  const { manifest, wit } = await guestSource('frame-grayscale');
-  const [contract, ...rest] = describeComponent('gray', manifest, wit);
+test('a component is described from its description and WIT, without bytes', async () => {
+  const { description, wit } = await guestSource('frame-grayscale');
+  const [contract, ...rest] = describeComponent('gray', description, wit);
   assert.deepEqual(rest, []);
   assert.equal(contract.id, `gray/${ids['frame-grayscale']}`);
   assert.equal(contract.component, 'gray');
@@ -1971,10 +1974,14 @@ test('a component is described from its manifest and WIT, without bytes', async 
   assert.equal(contract.outputs[0].viewer, 'image');
   // A provider's world is no node's.
   const math = await guestSource('math');
-  assert.deepEqual(describeComponent('math', math.manifest, math.wit), []);
+  assert.deepEqual(describeComponent('math', math.description, math.wit), []);
   assert.throws(
     () =>
-      describeComponent('bad', { ...manifest, worlds: ['test:frame-grayscale/nope@0.1.0'] }, wit),
+      describeComponent(
+        'bad',
+        { ...description, worlds: ['test:frame-grayscale/nope@0.1.0'] },
+        wit,
+      ),
     /has no world/,
   );
 });
