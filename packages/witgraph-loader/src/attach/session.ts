@@ -23,7 +23,7 @@ import * as lines from './bindings/witgraph/debug/lines.js';
  * The version of witgraph's debug protocol this speaks, as `PROTOCOL` in `witgraph-remote` has
  * it: a program speaking another is refused, as calls one side does not know would fail.
  */
-export const PROTOCOL = 2;
+export const PROTOCOL = 3;
 
 /** How long a program has to say which protocol it speaks: one too old to know never says. */
 const PROTOCOL_WAIT_MS = 5000;
