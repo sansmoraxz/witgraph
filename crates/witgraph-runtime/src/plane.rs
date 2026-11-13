@@ -96,6 +96,8 @@ pub(crate) struct HubExports {
     set_input: IndexVec<InputIdx, Option<ComponentExportIndex>>,
     get_feedback: IndexVec<FeedbackIdx, Option<ComponentExportIndex>>,
     set_feedback: IndexVec<FeedbackIdx, Option<ComponentExportIndex>>,
+    take_stream: IndexVec<InputIdx, Option<ComponentExportIndex>>,
+    give_stream: IndexVec<InputIdx, Option<ComponentExportIndex>>,
 }
 
 impl HubExports {
@@ -134,6 +136,12 @@ impl HubExports {
             }),
             set_feedback: IndexVec::from_fn(ports.feedback().len(), |at| {
                 of_ports(hub::set_feedback(at))
+            }),
+            take_stream: IndexVec::from_fn(ports.inputs().len(), |at| {
+                of_ports(hub::take_stream(at))
+            }),
+            give_stream: IndexVec::from_fn(ports.inputs().len(), |at| {
+                of_ports(hub::give_stream(at))
             }),
         })
     }
@@ -561,6 +569,7 @@ struct ServerArgs<D: StoreData> {
     retained: Retained<D>,
     settings: StoreSettings,
     holds: crate::holds::RuntimeHolds,
+    previews: Option<crate::previews::StreamPreviews>,
     serving: Serving,
     requests: UnboundedReceiver<Request<D>>,
 }
@@ -583,6 +592,7 @@ async fn serve_hub<D: StoreData>(args: ServerArgs<D>) -> Outcome {
         retained,
         settings,
         holds,
+        previews,
         serving,
         requests,
     } = args;
@@ -641,6 +651,7 @@ async fn serve_hub<D: StoreData>(args: ServerArgs<D>) -> Outcome {
             let starts = RunStarts {
                 settings,
                 holds: &holds,
+                previews: previews.as_ref(),
             };
             serve_commands(acc, &hub, &ports, starts, commands, requests, &send).await
         })
@@ -652,6 +663,32 @@ async fn serve_hub<D: StoreData>(args: ServerArgs<D>) -> Outcome {
             Err(classify(&e, fatal))
         }
     }
+}
+
+/// Learns which stream each of `node`'s stream outputs wrote: each is in the hub, in the input
+/// reading it, until that reader starts; taken from there and given back unread.
+async fn watch_streams<D: StoreData>(
+    acc: &Accessor<D>,
+    hub: &LiveHub,
+    ports: &PortTable,
+    previews: &crate::previews::StreamPreviews,
+    node: NodeIdx,
+) -> wasmtime::Result<()> {
+    for (port, input) in previews.edges_of(node) {
+        let take = hub.func(acc, hub.exports.take_stream[*input])?;
+        let give = hub.func(acc, hub.exports.give_stream[*input])?;
+        let mut taken = [Val::Bool(false)];
+        take.call_concurrent(acc, &[], &mut taken).await?;
+        let [Val::Option(Some(stream))] = taken else {
+            continue;
+        };
+        if let Val::Stream(any) = &*stream {
+            let id = acc.with(|mut access| any.id(access.as_context_mut()))?;
+            previews.watch(id, ports.node_id(node).clone(), port.clone());
+        }
+        give.call_concurrent(acc, &[*stream], &mut []).await?;
+    }
+    Ok(())
 }
 
 /// Which host calls still have guest work under them, as wasmtime reports it: a call's task
@@ -720,6 +757,7 @@ impl TaskGroupHook for GroupWatch {
 struct RunStarts<'a> {
     settings: StoreSettings,
     holds: &'a crate::holds::RuntimeHolds,
+    previews: Option<&'a crate::previews::StreamPreviews>,
 }
 
 async fn serve_commands<D: StoreData>(
@@ -746,7 +784,15 @@ async fn serve_commands<D: StoreData>(
     // By node, its last run; and the stream groups waiting for those to be over.
     let mut last_runs: HashMap<NodeIdx, GroupRun> = HashMap::new();
     let mut drains: Vec<(usize, u64, Box<[NodeIdx]>)> = Vec::new();
-    let RunStarts { settings, holds } = starts;
+    let RunStarts {
+        settings,
+        holds,
+        previews,
+    } = starts;
+    if let Some(previews) = previews {
+        let observer = previews.observer();
+        acc.with(|mut access| access.as_context_mut().stream_observer(observer));
+    }
     let budget = settings.budget();
     let run_fn = hub.run;
     let (latch_fn, drop_fn) = (hub.latch_feedback, hub.drop_feedback);
@@ -785,7 +831,14 @@ async fn serve_commands<D: StoreData>(
             last_runs.insert(node, lock(&groups).started(call.group()));
         }
         Box::pin(async move {
-            let called = async { run_fn.finish_call_concurrent(acc, call?).await };
+            let called = async {
+                let returned = run_fn.finish_call_concurrent(acc, call?).await?;
+                // The streams it wrote are in the hub until their readers start: learnt now.
+                if let Some(previews) = previews {
+                    watch_streams(acc, hub, ports, previews, node).await?;
+                }
+                Ok(returned)
+            };
             (node, called.await)
         })
     };
@@ -905,6 +958,7 @@ pub(crate) struct Blueprint<H: Host> {
     pub(crate) settings: StoreSettings,
     pub(crate) lines: MaybeLines,
     pub(crate) holds: crate::holds::RuntimeHolds,
+    pub(crate) previews: Option<crate::previews::StreamPreviews>,
     pub(crate) max_memory: Option<usize>,
     pub(crate) components: usize,
     pub(crate) shared_memory: Arc<SharedMemory>,
@@ -973,6 +1027,7 @@ impl<H: Host> DataPlane for HubPlane<H> {
             retained: self.retained.clone(),
             settings: blueprint.settings,
             holds: blueprint.holds.clone(),
+            previews: blueprint.previews.clone(),
             serving,
             requests,
         }));

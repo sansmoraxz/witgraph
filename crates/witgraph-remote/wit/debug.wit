@@ -39,6 +39,16 @@ interface graph {
         restarted(string),
     }
 
+    /// What a stream output carried since it was last asked.
+    record stream-items {
+        node: string,
+        port: string,
+        /// Its latest items, oldest first, as WAVE text: at most 64.
+        items: list<string>,
+        /// How many items it carried, those not kept too.
+        count: u64,
+    }
+
     /// The version of this protocol the program speaks: a debugger speaking another refuses it.
     protocol: func() -> u32;
     /// The graph, as the JSON a `witgraph_ir::Graph` serializes to.
@@ -58,6 +68,9 @@ interface graph {
     /// What the scheduler did since this was last asked, oldest first: the latest thousand
     /// at most, from before the debugger attached too.
     take-trace: func() -> list<trace-event>;
+    /// What the streams between nodes carried since this was last asked, output by output:
+    /// none unless the program watches them (witgraph-runtime's `stream_previews`).
+    take-stream-items: func() -> list<stream-items>;
     /// Writes a Value input port, from WAVE text.
     inject: func(node: string, port: string, wave: string) -> result<_, string>;
     /// Clears what was written to an input port.

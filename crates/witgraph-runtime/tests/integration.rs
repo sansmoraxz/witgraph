@@ -617,6 +617,42 @@ async fn stream_producer_consumer_share_an_group() {
 }
 
 #[tokio::test]
+async fn stream_previews_see_every_item_and_the_reader_still_gets_them() {
+    let kit = Kit::new(&[STREAM_PRODUCER, STREAM_CONSUMER]);
+    let config = RuntimeConfig {
+        stream_previews: true,
+        ..RuntimeConfig::default()
+    };
+    let mut rt = kit.load(pipeline(&kit), config, Trace::new()).await;
+    let previews = rt.stream_previews().expect("previews were asked for");
+    feed_pipeline(&mut rt, Some(100), None).await;
+    settle(&mut rt).await;
+
+    assert_eq!(read_u32(&mut rt, "cons", "count").await, 100);
+    assert_eq!(
+        read_u32(&mut rt, "cons", "total").await,
+        (0..100).sum::<u32>()
+    );
+    let seen = previews.take();
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    let prod = &seen[0];
+    assert_eq!((prod.node.as_str(), prod.port.as_str()), ("prod", "items"));
+    assert_eq!(prod.count, 100);
+    let kept: Vec<String> = (36..100).map(|i| i.to_string()).collect();
+    assert_eq!(prod.items, kept, "the latest 64, oldest first");
+    assert!(previews.take().is_empty(), "taken once");
+}
+
+#[tokio::test]
+async fn without_stream_previews_none_are_kept() {
+    let kit = Kit::new(&[STREAM_PRODUCER, STREAM_CONSUMER]);
+    let rt = kit
+        .load(pipeline(&kit), RuntimeConfig::default(), Trace::new())
+        .await;
+    assert!(rt.stream_previews().is_none());
+}
+
+#[tokio::test]
 async fn backpressure_slow_consumer_gets_every_item() {
     let kit = Kit::new(&[STREAM_PRODUCER, STREAM_CONSUMER]);
     let mut rt = kit

@@ -24,7 +24,7 @@ import { fromWave } from './wave.ts';
  * The version of witgraph's debug protocol this speaks, as `PROTOCOL` in `witgraph-remote` has
  * it: a program speaking another is refused, as calls one side does not know would fail.
  */
-export const PROTOCOL = 4;
+export const PROTOCOL = 5;
 
 /** How long a program has to say which protocol it speaks: one too old to know never says. */
 const PROTOCOL_WAIT_MS = 5000;
@@ -40,6 +40,12 @@ export interface AttachOptions {
   onStop?: (stop: LineStop) => void;
   /** Node states moved, or the program's graph was stopped or run. */
   onState?: () => void;
+  /**
+   * What a stream between nodes carried since the last poll: its latest items, oldest first,
+   * read as the graph's `readOutput` reads values, and how many it carried in all.
+   * Only for a program that watches its streams (witgraph-runtime's `stream_previews`).
+   */
+  onStreamItem?: (item: { node: string; port: string; items: unknown[]; count: number }) => void;
   /** What was asked of the program failed: a breakpoint it did not set, say. */
   onError?: (message: string) => void;
   /** How often node states are asked for, in milliseconds. 250 by default. */
@@ -107,6 +113,15 @@ export class AttachedSession implements DebugSession {
         .then(graph.takeTrace)
         .catch(() => []);
       trace.push(...taken.map(traceEntry));
+      if (options.onStreamItem) {
+        const streams = await open()
+          .then(graph.takeStreamItems)
+          .catch(() => []);
+        for (const { node, port, items, count } of streams) {
+          const read = items.map((wave) => fromWave(wave) ?? wave);
+          options.onStreamItem({ node, port, items: read, count: Number(count) });
+        }
+      }
       await Promise.all(
         [...contracts.keys()].map(async (node) => {
           const state = await graph.nodeState(await open(), node).catch(() => undefined);

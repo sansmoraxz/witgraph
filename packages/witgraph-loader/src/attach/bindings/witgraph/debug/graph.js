@@ -5,6 +5,7 @@ export const State = $t.record({ "phase": $t.string, "fault": $t.option($t.strin
 export const Transition = $t.record({ "node": $t.string, "before": $t.string, "after": $t.string });
 export const NodeFault = $t.record({ "node": $t.string, "kind": $t.string, "message": $t.string });
 export const TraceEvent = $t.variant({ "run-started": $t.string, "run-returned": $t.string, "group-drained": $t.list($t.string), "phase-transition": Transition, "fault": NodeFault, "cancelled": $t.string, "restarted": $t.string });
+export const StreamItems = $t.record({ "node": $t.string, "port": $t.string, "items": $t.list($t.string), "count": $t.u64 });
 export async function protocol(transport) {
   const $r = await $invoke(transport, "witgraph:debug/graph@0.1.0", "protocol", [], [], [$t.u32]);
   await $r.finished;
@@ -47,6 +48,11 @@ export async function readInput(transport, node, port) {
 }
 export async function takeTrace(transport) {
   const $r = await $invoke(transport, "witgraph:debug/graph@0.1.0", "take-trace", [], [], [$t.list(TraceEvent)]);
+  await $r.finished;
+  return $r.results[0];
+}
+export async function takeStreamItems(transport) {
+  const $r = await $invoke(transport, "witgraph:debug/graph@0.1.0", "take-stream-items", [], [], [$t.list(StreamItems)]);
   await $r.finished;
   return $r.results[0];
 }

@@ -1243,6 +1243,12 @@ export class EditorController extends EventTarget {
       onError: (message: string): void => {
         if (this.#session === session) this.#warn(message);
       },
+      onStreamItem: ({ node, port, items, count }): void => {
+        if (this.#session !== session) return;
+        // Those the program did not keep are counted, not seen.
+        this.#observation(node, port).count += Math.max(0, count - items.length);
+        this.#recordItems(node, port, items);
+      },
     });
     this.#attached = session;
     this.#session = session;

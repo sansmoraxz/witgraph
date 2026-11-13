@@ -132,6 +132,10 @@ pub struct RuntimeConfig {
     /// which of a guest's lines count as its own.
     #[cfg(feature = "debug")]
     pub debug_lines: Option<witgraph_traits::lines::OwnLines>,
+    /// Watch what streams between nodes carry, for previews: [`RuntimeGraph::stream_previews`].
+    /// Each item a watched stream carries is lifted and written as WAVE text once more, so
+    /// streams cost more; off by default.
+    pub stream_previews: bool,
     /// The wasmtime engine to load the graph into: one from
     /// [`RuntimeConfig::new_engine`], or another graph's
     /// [`engine`](RuntimeGraph::engine), so several graphs share one. It is
@@ -157,6 +161,7 @@ impl Default for RuntimeConfig {
             memory_reservation: None,
             #[cfg(feature = "debug")]
             debug_lines: None,
+            stream_previews: false,
             engine: None,
         }
     }
@@ -753,6 +758,12 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
     /// held until it is asked to.
     pub fn holds(&self) -> crate::holds::RuntimeHolds {
         self.core.plane.blueprint.holds.clone()
+    }
+
+    /// What streams between the graph's nodes carry, if it was loaded with
+    /// [`RuntimeConfig::stream_previews`].
+    pub fn stream_previews(&self) -> Option<crate::previews::StreamPreviews> {
+        self.core.plane.blueprint.previews.clone()
     }
 
     /// The wasmtime engine the graph runs on; pass it as

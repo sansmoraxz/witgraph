@@ -50,6 +50,7 @@ mod holds;
 pub mod lines;
 pub(crate) mod plane;
 pub mod plugin;
+mod previews;
 pub mod shared;
 
 pub use engine::{CapabilityGap, Host, HostState, NoCapabilities, StoreData};
@@ -64,6 +65,7 @@ pub use holds::RuntimeHolds;
 #[cfg(feature = "debug")]
 pub use lines::RuntimeLines;
 pub use plugin::{CapabilityPlugin, Extensions, PluginData, Plugins};
+pub use previews::{StreamItems, StreamPreviews};
 pub use shared::Shared;
 pub use wasmtime::component::Val;
 pub use witgraph_sched::{

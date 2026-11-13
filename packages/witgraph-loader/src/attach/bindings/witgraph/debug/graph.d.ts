@@ -22,6 +22,11 @@ export declare const NodeFault: $wrpc.Type;
 export type TraceEvent = { kind: "run-started"; value: string } | { kind: "run-returned"; value: string } | { kind: "group-drained"; value: globalThis.Array<string> } | { kind: "phase-transition"; value: Transition } | { kind: "fault"; value: NodeFault } | { kind: "cancelled"; value: string } | { kind: "restarted"; value: string };
 export declare const TraceEvent: $wrpc.Type;
 /**
+ * What a stream output carried since it was last asked.
+ */
+export type StreamItems = { node: string; port: string; items: globalThis.Array<string>; count: bigint };
+export declare const StreamItems: $wrpc.Type;
+/**
  * The version of this protocol the program speaks: a debugger speaking another refuses it.
  */
 export function protocol(transport: $wrpc.Transport): globalThis.Promise<number>;
@@ -58,6 +63,11 @@ export function readInput(transport: $wrpc.Transport, node: string, port: string
  * at most, from before the debugger attached too.
  */
 export function takeTrace(transport: $wrpc.Transport): globalThis.Promise<globalThis.Array<TraceEvent>>;
+/**
+ * What the streams between nodes carried since this was last asked, output by output:
+ * none unless the program watches them (witgraph-runtime's `stream_previews`).
+ */
+export function takeStreamItems(transport: $wrpc.Transport): globalThis.Promise<globalThis.Array<StreamItems>>;
 /**
  * Writes a Value input port, from WAVE text.
  */

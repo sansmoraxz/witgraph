@@ -114,6 +114,7 @@ struct Inner<M: RuntimeMode, H: Host> {
     reader: ValReader,
     trace: Arc<Trace>,
     holds: RuntimeHolds,
+    previews: Option<witgraph_runtime::StreamPreviews>,
     lines: Option<RuntimeLines>,
     described: String,
     contracts: String,
@@ -124,7 +125,7 @@ struct Inner<M: RuntimeMode, H: Host> {
 /// speaks another refuses to attach, as calls the other side does not know would fail. It moves on
 /// with each change to the protocol, which a test makes sure of, and with each change to what its
 /// JSON says (the contracts' shape, say), which none can.
-pub const PROTOCOL: u32 = 4;
+pub const PROTOCOL: u32 = 5;
 
 /// A graph a debugger can attach to. Tick it through this, not the graph itself.
 pub struct Debuggee<M: RuntimeMode, H: Host> {
@@ -173,6 +174,7 @@ impl<M: RuntimeMode, H: Host> Debuggee<M, H> {
                 reader: graph.reader(),
                 trace: graph.mode().trace.clone(),
                 holds: graph.holds(),
+                previews: graph.stream_previews(),
                 lines: graph.lines(),
                 graph: tokio::sync::Mutex::new(graph),
                 jobs: Mutex::new(Vec::new()),
@@ -442,6 +444,22 @@ impl<C: Send + Sync, M: RuntimeMode, H: Host> graph::Handler<C> for Handler<M, H
             .read_output_wave(&NodeId::from(node), &PortName::from(port))
             .await;
         Ok(read.map_err(|e| e.to_string()))
+    }
+
+    async fn take_stream_items(&self, _: C) -> anyhow::Result<Vec<graph::StreamItems>> {
+        let Some(previews) = &self.inner().previews else {
+            return Ok(Vec::new());
+        };
+        Ok(previews
+            .take()
+            .into_iter()
+            .map(|seen| graph::StreamItems {
+                node: seen.node.to_string(),
+                port: seen.port.to_string(),
+                items: seen.items,
+                count: seen.count,
+            })
+            .collect())
     }
 
     async fn read_input(
@@ -954,7 +972,7 @@ mod protocol_tests {
         let wit = include_str!("../wit/debug.wit");
         assert_eq!(
             (PROTOCOL, fnv1a(wit)),
-            (4, 0x73b9_6b16_538b_e724),
+            (5, 0x79b6_f145_716a_2173),
             "`wit/debug.wit` changed: move `PROTOCOL` on, here and as `PROTOCOL` in \
              `packages/witgraph-loader/src/attach/session.ts`, and record the new hash here"
         );

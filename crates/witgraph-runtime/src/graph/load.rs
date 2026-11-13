@@ -482,6 +482,9 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
             settings,
             lines,
             holds: crate::holds::RuntimeHolds::default(),
+            previews: config
+                .stream_previews
+                .then(|| crate::previews::StreamPreviews::new(&compiled, &ports)),
             max_memory,
             components,
             shared_memory,

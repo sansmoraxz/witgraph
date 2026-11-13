@@ -54,8 +54,9 @@ sha2 = "0.11"
 # wasmtime's is on upstream main, for the fix for a table leak in
 # guest-to-guest async calls, not in 50.0.1, and for keeping a component's
 # breakpoints when single-stepping ends. Its patch keeps each core module's
-# breakpoints to that module, inlined code's too.
-wasmtime = { git = "https://github.com/sansmoraxz/wasmtime", rev = "88ec9c81cc14d825ca3c64b31930d23e743971e4", default-features = false }
+# breakpoints to that module, inlined code's too; another lets the runtime
+# observe what streams between nodes carry, for previews.
+wasmtime = { git = "https://github.com/sansmoraxz/wasmtime", rev = "8d0f6f96da38de2cb74c1c2171fa563726461033", default-features = false }
 wit-parser = "0.263"
 wit-component = "0.263"
 wasmparser = { version = "0.263", default-features = false }
