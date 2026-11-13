@@ -53,14 +53,14 @@ sha2 = "0.11"
 #
 # wasmtime's is on upstream main, for the fix for a table leak in
 # guest-to-guest async calls, not in 50.0.1, and for keeping a component's
-# breakpoints when single-stepping ends. Its patches keep each core module's
+# breakpoints when single-stepping ends. Its patch keeps each core module's
 # breakpoints to that module, inlined code's too.
-wasmtime = { git = "https://github.com/sansmoraxz/wasmtime", rev = "584ad0534f3bf50ff19de90a3e4053f2c2fa2772", default-features = false }
+wasmtime = { git = "https://github.com/sansmoraxz/wasmtime", rev = "88ec9c81cc14d825ca3c64b31930d23e743971e4", default-features = false }
 wit-parser = "0.263"
 wit-component = "0.263"
 wasmparser = { version = "0.263", default-features = false }
 wasm-encoder = "0.263"
-wac-graph = { git = "https://github.com/sansmoraxz/wac", rev = "05bcb89620a17b2c8d14d0c6bb0a516dd8daed5b" }
+wac-graph = { git = "https://github.com/sansmoraxz/wac", rev = "3aa69f0f2b7feb2779c2a85d5afccb06aac1ea9a" }
 wasm-wave = { version = "0.263", default-features = false, features = ["std"] }
 
 [profile.dev.package."*"]
