@@ -291,7 +291,8 @@ witgraph adds is in annotations, which registries keep as they are given, so a
 registry that only takes media types it knows (GitLab's does) holds nodes as it
 holds any other artifact, and wkg can pull each entry on its own. The index
 names its entries by digest, so the node's digest pins its description, its
-WIT and every build.
+WIT and every build. Each entry's config says `"os": "wasip3"`: a node runs on
+WASI 0.3, whose async component model its contract needs, whatever it imports.
 
 `Resolver::push` packs a node manifest's files into one, after checking it as a
 resolve does, and tags it:

@@ -19,6 +19,10 @@ use crate::{Digest, Location, Node, Profile, Resolver, SourceError};
 /// again from the same files is the same artifact, with the same digest.
 const CREATED: &str = "1970-01-01T00:00:00Z";
 
+/// The `os` every config pushed says: WASI 0.3, whose async component model
+/// every node needs (its `run`, streams and futures), whatever it imports.
+const OS: &str = "wasip3";
+
 /// What [`Resolver::push`] pushed.
 #[derive(Debug, Clone)]
 pub struct Pushed {
@@ -153,7 +157,7 @@ impl Resolver {
             &json!({
                 "created": CREATED,
                 "architecture": "wasm",
-                "os": "wasip2",
+                "os": OS,
                 "layerDigests": [Digest::of(&bytes).to_string()],
                 "component": component,
             }),

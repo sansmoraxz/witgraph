@@ -57,6 +57,9 @@ async fn a_pushed_node_is_an_index_of_standard_wasm_artifacts() {
         let manifest =
             registry.manifest(&format!("test/echo:{}", entry["digest"].as_str().unwrap()));
         assert_eq!(manifest["config"]["mediaType"], WASM_CONFIG_MEDIA_TYPE);
+        let config = registry.blob(manifest["config"]["digest"].as_str().unwrap());
+        assert_eq!(config["os"], "wasip3", "nodes run on WASI 0.3");
+        assert_eq!(config["architecture"], "wasm");
         assert_eq!(manifest["layers"].as_array().unwrap().len(), 1);
         assert_eq!(manifest["layers"][0]["mediaType"], WASM_LAYER_MEDIA_TYPE);
     }

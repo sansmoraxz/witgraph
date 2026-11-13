@@ -319,6 +319,12 @@ impl Registry {
         serde_json::from_slice(&state.manifests[key].1).unwrap()
     }
 
+    /// The blob `digest`, as JSON.
+    pub fn blob(&self, digest: &str) -> serde_json::Value {
+        let state = self.state.lock().unwrap();
+        serde_json::from_slice(&state.blobs[digest]).unwrap()
+    }
+
     /// Stores `manifest` (JSON) at `repository:reference` and by its digest,
     /// as a push would; returns its digest.
     pub fn put_manifest(
