@@ -4,13 +4,11 @@
 #![cfg(feature = "debug")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, missing_docs)]
 
-use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::time::Duration;
 
 use test_components::{C_WALK, Guest, LINE_WALK, ZIG_WALK};
 use witgraph_ir::{NodeId, PortName, PortRef};
-use witgraph_probes::{core_modules, source_lines};
 use witgraph_runtime::{
     BreakpointScope, LineDebugger, LineStop, OwnLines, Perf, RunningGraph, RuntimeConfig,
     RuntimeGraph, RuntimeLines, StopReason, TickResult,
@@ -337,116 +335,4 @@ async fn rust_c_and_zig_guests_are_debugged_side_by_side() {
     })
     .await;
     assert_eq!(output(&mut rt, "zig").await.as_deref(), Some("14"));
-}
-
-/// Where wasmtime is asked to break for each of `guest`'s own lines, by file and line: offsets
-/// from the start of its one core module with lines.
-fn sites(guest: Guest) -> HashMap<(String, u32), Vec<u32>> {
-    let mut with_lines = core_modules(guest.wasm)
-        .unwrap()
-        .into_iter()
-        .map(|module| source_lines(module, &OwnLines::default()).unwrap())
-        .filter(|probes| !probes.is_empty());
-    let probes = with_lines.next().expect("a module with lines");
-    assert!(with_lines.next().is_none(), "one module with lines");
-    let mut sites: HashMap<(String, u32), Vec<u32>> = HashMap::new();
-    for probe in probes {
-        sites
-            .entry((probe.file, probe.line))
-            .or_default()
-            .push(probe.offset.0);
-    }
-    sites
-}
-
-/// Ticks until the graph is idle, going on from every stop, and says where each was.
-async fn run_through(rt: &mut RuntimeGraph<Perf>, lines: &RuntimeLines) -> Vec<LineStop> {
-    let mut stops = Vec::new();
-    let ticking = async {
-        loop {
-            match rt.tick().await {
-                TickResult::Idle => break,
-                TickResult::Progress | TickResult::StepLimitReached => {}
-                other => panic!("a tick went wrong: {other:?}"),
-            }
-        }
-    };
-    let stopping = async {
-        loop {
-            stops.push(lines.next_stop().await);
-            lines.resume();
-        }
-    };
-    tokio::time::timeout(Duration::from_secs(60), async {
-        tokio::select! {
-            () = ticking => {}
-            () = stopping => {}
-        }
-    })
-    .await
-    .expect("it never finished");
-    stops
-}
-
-/// The lines the C guest stops on, run a second time, given 5, with a breakpoint on every line of
-/// its own. If `zig_too`, the Zig guest beside it has one on every line of its own as well, for
-/// the first run of both, cleared before the second.
-async fn c_stops(zig_too: bool) -> Vec<(String, u32)> {
-    let (mut rt, lines) = load(&[("c", C_WALK), ("zig", ZIG_WALK)], &[]).await;
-    let every = |node: &str| -> Vec<(String, u32)> {
-        lines
-            .files_of(&NodeId::from(node))
-            .into_iter()
-            .flat_map(|file| {
-                let at = lines.lines(&file);
-                at.into_iter().map(move |line| (file.clone(), line))
-            })
-            .collect()
-    };
-    let zig = if zig_too { every("zig") } else { Vec::new() };
-    for (file, line) in every("c").iter().chain(&zig) {
-        lines.set_breakpoint(&EVERY, file, *line);
-    }
-    // Stopping is what has the Store set them: until then, setting and clearing come to nothing.
-    let first = run_through(&mut rt, &lines).await;
-    let stopped = |node: &str| {
-        first
-            .iter()
-            .any(|stop| stop.node == Some(NodeId::from(node)))
-    };
-    assert!(stopped("c"));
-    assert_eq!(stopped("zig"), zig_too);
-    for (file, line) in &zig {
-        lines.clear_breakpoint(&EVERY, file, *line);
-    }
-    inject(&mut rt, "c", "in", "5").await;
-    let second = run_through(&mut rt, &lines).await;
-    assert_eq!(output(&mut rt, "c").await.as_deref(), Some("8"));
-    second
-        .into_iter()
-        .map(|stop| {
-            assert_eq!(stop.node, Some(NodeId::from("c")));
-            (stop.file, stop.line)
-        })
-        .collect()
-}
-
-/// A composed graph's core modules are compiled as one: a breakpoint set and cleared in the Zig
-/// guest's module must leave the C guest's at the same offset in its own.
-#[tokio::test]
-async fn clearing_one_guests_breakpoints_keeps_anothers_at_the_same_offset() {
-    let alone = c_stops(false).await;
-    assert!(!alone.is_empty());
-    // Some line it stops on breaks only where the Zig guest also has a line, or this proves
-    // nothing: clang's and zig's builds decide that.
-    let c = sites(C_WALK);
-    let zig: HashSet<u32> = sites(ZIG_WALK).into_values().flatten().collect();
-    assert!(
-        alone
-            .iter()
-            .any(|stop| c[stop].iter().all(|site| zig.contains(site))),
-        "no line the C guest stops on shares all its offsets with the Zig guest's lines: \
-         find two guests that do"
-    );
-    assert_eq!(c_stops(true).await, alone);
 }

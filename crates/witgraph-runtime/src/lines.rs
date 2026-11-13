@@ -55,7 +55,10 @@ struct ModuleLines {
     names: HashMap<u32, String>,
     /// How many functions it imports: a defined function's index comes after those.
     imported: u32,
-    /// The node of each of its instances, in order.
+    /// What tells it from another module: one of the same bytes, of another component, is
+    /// another module of the Store, its instances another of these nodes.
+    print: u64,
+    /// The node of each instance of it, or of a module of the same bytes, in order.
     nodes: Vec<NodeId>,
 }
 
@@ -216,18 +219,28 @@ impl Shared {
         }
     }
 
-    /// The node whose guest `instance` of `module` is, by its place among the module's instances.
+    /// The node whose guest `instance` of `module` is, by its place among the instances of
+    /// every module of the same bytes: two components may well hold one module.
     fn node_of<D: 'static>(
+        &self,
         store: &mut StoreContextMut<'_, D>,
         module: &ModuleLines,
-        module_id: u64,
         instance: Instance,
     ) -> Option<NodeId> {
+        let same: Vec<u64> = self
+            .state()
+            .modules
+            .iter()
+            .filter(|known| known.print == module.print)
+            .map(|known| known.module.debug_index_in_engine())
+            .collect();
         let ordinal = store
             .as_context_mut()
             .debug_all_instances()
             .into_iter()
-            .filter(|other| other.module(store.as_context()).debug_index_in_engine() == module_id)
+            .filter(|other| {
+                same.contains(&other.module(store.as_context()).debug_index_in_engine())
+            })
             .position(|other| other == instance)?;
         module.nodes.get(ordinal).cloned()
     }
@@ -288,7 +301,7 @@ impl Shared {
         // Found only when it matters: single-stepping comes here at every line.
         let mut node = None;
         if armed {
-            let found = Self::node_of(store, &module, module_id, instance);
+            let found = self.node_of(store, &module, instance);
             // Set for the module, which another node's guest may be.
             armed = self
                 .state()
@@ -335,7 +348,7 @@ impl Shared {
 
         let node = match node {
             Some(node) => node,
-            None => Self::node_of(store, &module, module_id, instance),
+            None => self.node_of(store, &module, instance),
         };
         let stop = LineStop {
             reason,
@@ -669,6 +682,7 @@ impl RuntimeLines {
                         .map(|(node, _)| node.clone())
                         .collect(),
                     module: module.clone(),
+                    print,
                 }));
             }
         }

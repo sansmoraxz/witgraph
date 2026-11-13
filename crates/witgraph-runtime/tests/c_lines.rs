@@ -8,7 +8,7 @@ use std::future::Future;
 use std::time::Duration;
 
 use test_components::{C_WALK, Guest, LINE_WALK};
-use witgraph_ir::{NodeId, PortName, PortRef};
+use witgraph_ir::{ContractId, NodeId, PortName, PortRef};
 use witgraph_runtime::{
     BreakpointScope, LineDebugger, LineStop, OwnLines, OwnRules, PathPattern, Perf, RunningGraph,
     RuntimeConfig, RuntimeGraph, RuntimeLines, StopReason, TickResult,
@@ -453,4 +453,127 @@ async fn a_breakpoint_in_a_second_c_file_stops_there() {
     })
     .await;
     assert_eq!(output(&mut rt, "c").await.as_deref(), Some("11"));
+}
+
+/// `C_WALK` as a component of its own, `c-twin`: its bytes and a custom section more, so its
+/// core modules are the C guest's, byte for byte, and every line of it is at the same offsets.
+fn with_twin() -> (test_components::Kit, ContractId, ContractId) {
+    let mut kit = test_components::Kit::new(&[C_WALK]);
+    let mut bytes = C_WALK.wasm.to_vec();
+    // A custom section (id 0) named `twin`, empty.
+    bytes.extend([0, 5, 4, b't', b'w', b'i', b'n']);
+    kit.add_as("c-twin".parse().unwrap(), bytes, C_WALK.wit_source());
+    let c = kit.get(C_WALK);
+    let twin = kit
+        .contracts
+        .iter()
+        .find(|contract| contract.id.component.as_str() == "c-twin")
+        .unwrap()
+        .id
+        .clone();
+    (kit, c, twin)
+}
+
+/// Ticks until the graph is idle, going on from every stop, and says where each was.
+async fn run_through(rt: &mut RuntimeGraph<Perf>, lines: &RuntimeLines) -> Vec<LineStop> {
+    let mut stops = Vec::new();
+    let ticking = async {
+        loop {
+            match rt.tick().await {
+                TickResult::Idle => break,
+                TickResult::Progress | TickResult::StepLimitReached => {}
+                other => panic!("a tick went wrong: {other:?}"),
+            }
+        }
+    };
+    let stopping = async {
+        loop {
+            stops.push(lines.next_stop().await);
+            lines.resume();
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(60), async {
+        tokio::select! {
+            () = ticking => {}
+            () = stopping => {}
+        }
+    })
+    .await
+    .expect("it never finished");
+    stops
+}
+
+/// The lines the node `c` stops on, run a second time, given 5, with a breakpoint on every line
+/// of its own. If `twin_too`, its twin beside it has one on every line as well, for the first
+/// run of both, cleared before the second.
+async fn c_stops(twin_too: bool) -> Vec<(String, u32)> {
+    let (kit, c, twin) = with_twin();
+    let compiled = kit
+        .builder("twins")
+        .add_node("c", c)
+        .add_node("twin", twin)
+        .build()
+        .compile(&kit.contracts)
+        .expect("graph compiles");
+    let config = RuntimeConfig {
+        debug_lines: Some(OwnLines::default()),
+        ..RuntimeConfig::default()
+    };
+    let mut rt = RuntimeGraph::load(compiled, &kit.artifacts(), config, Perf)
+        .await
+        .expect("graph loads");
+    let lines = rt.lines().expect("loaded to debug");
+    let every = |node: &str| -> Vec<(String, u32)> {
+        lines
+            .files_of(&NodeId::from(node))
+            .into_iter()
+            .flat_map(|file| {
+                let at = lines.lines(&file);
+                at.into_iter().map(move |line| (file.clone(), line))
+            })
+            .collect()
+    };
+    let (on_c, on_twin) = (
+        BreakpointScope::Node(NodeId::from("c")),
+        BreakpointScope::Node(NodeId::from("twin")),
+    );
+    let twin = if twin_too { every("twin") } else { Vec::new() };
+    for (file, line) in every("c") {
+        lines.set_breakpoint(&on_c, &file, line);
+    }
+    for (file, line) in &twin {
+        lines.set_breakpoint(&on_twin, file, *line);
+    }
+    // Stopping is what has the Store set them: until then, setting and clearing come to nothing.
+    let first = run_through(&mut rt, &lines).await;
+    let stopped = |node: &str| {
+        first
+            .iter()
+            .any(|stop| stop.node == Some(NodeId::from(node)))
+    };
+    assert!(stopped("c"));
+    assert_eq!(stopped("twin"), twin_too);
+    for (file, line) in &twin {
+        lines.clear_breakpoint(&on_twin, file, *line);
+    }
+    inject(&mut rt, "c", "in", "5").await;
+    let second = run_through(&mut rt, &lines).await;
+    assert_eq!(output(&mut rt, "c").await.as_deref(), Some("8"));
+    second
+        .into_iter()
+        .map(|stop| {
+            assert_eq!(stop.node, Some(NodeId::from("c")));
+            (stop.file, stop.line)
+        })
+        .collect()
+}
+
+/// A composed graph's core modules are compiled as one: breakpoints set and cleared in one
+/// guest's module must leave another's at the same offsets in its own. A twin of the guest has
+/// every line at the same offsets, whatever the compiler made of them.
+#[tokio::test]
+async fn clearing_one_guests_breakpoints_keeps_anothers_at_the_same_offset() {
+    let alone = c_stops(false).await;
+    assert!(!alone.is_empty());
+    assert_eq!(c_stops(true).await, alone);
 }
