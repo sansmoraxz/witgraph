@@ -270,6 +270,19 @@ impl<M: RuntimeMode, H: Host> Debuggee<M, H> {
         self.inner.stopped.store(false, Ordering::SeqCst);
     }
 
+    /// Lets go of what a debugger that went held: runs held, guests stopped on lines and
+    /// breakpoints, and runs the graph again if it stopped it, what the stop cancelled too: the
+    /// program is not left waiting on a debugger that is gone. [`serve`] does it as each goes;
+    /// a program serving the calls itself ([`handle`]) does it.
+    pub fn debugger_gone(&self) {
+        self.inner.holds.release();
+        if let Some(lines) = &self.inner.lines {
+            lines.release();
+        }
+        let debuggee = self.clone();
+        tokio::spawn(async move { debuggee.run_again().await });
+    }
+
     /// Does `work` on the graph, between ticks or by ending one early: as the program running
     /// it writes its inputs, say.
     pub async fn with<T: Send + 'static>(
@@ -803,33 +816,14 @@ pub async fn serve<M: RuntimeMode, H: Host>(
         .context("failed to read the bound address")?;
 
     let server = Arc::new(wrpc_webtransport::Server::new());
-    let handler = Handler { debuggee };
-    let left = Left {
-        holds: handler.debuggee.inner.holds.clone(),
-        lines: handler.debuggee.inner.lines.clone(),
-        run_again: {
-            let debuggee = handler.debuggee.clone();
-            Arc::new(move || {
-                let debuggee = debuggee.clone();
-                Box::pin(async move { debuggee.run_again().await }) as BoxFuture<'static, ()>
-            })
-        },
-    };
-    let invocations = bindings::serve(server.as_ref(), handler)
-        .await
-        .context("failed to serve the debugger's calls")?;
-    let invocations = select_all(
-        invocations
-            .into_iter()
-            .map(|(instance, name, calls)| calls.map(move |call| (instance, name, call))),
-    );
+    let calls = handle(debuggee.clone(), server.as_ref()).await?;
 
     let host = match bound.ip() {
         std::net::IpAddr::V6(ip) => format!("[{ip}]"),
         ip => ip.to_string(),
     };
     let url = format!("https://{host}:{}/?token={token}", bound.port());
-    let task = tokio::spawn(run(endpoint, server, invocations, token.clone(), left));
+    let task = tokio::spawn(run(endpoint, server, calls, token.clone(), debuggee));
     Ok(Served {
         url,
         certificate_hash,
@@ -838,66 +832,74 @@ pub async fn serve<M: RuntimeMode, H: Host>(
     })
 }
 
-async fn run(
+/// Answers the debug protocol's calls for `debuggee` that `server` takes: a wRPC server on any
+/// transport. [`serve`] does so on a WebTransport endpoint of its own; a program serving one
+/// itself, beside its web UI say, does so with this, and tells `debuggee` when a debugger goes
+/// ([`Debuggee::debugger_gone`]).
+///
+/// Gives what answers them, to run for as long as they are to be answered.
+///
+/// # Errors
+///
+/// If `server` cannot take the protocol's calls.
+pub async fn handle<S, M, H>(
+    debuggee: Debuggee<M, H>,
+    server: &S,
+) -> anyhow::Result<impl Future<Output = ()> + Send + 'static>
+where
+    S: wrpc_transport::Serve,
+    M: RuntimeMode,
+    H: Host,
+{
+    let invocations = bindings::serve(server, Handler { debuggee })
+        .await
+        .context("failed to serve the debugger's calls")?;
+    let mut invocations = select_all(invocations.into_iter().map(|(_, _, calls)| calls));
+    Ok(async move {
+        let mut calls = tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {
+                Some(call) = invocations.next() => {
+                    if let Ok(call) = call {
+                        calls.spawn(call);
+                    }
+                }
+                Some(_) = calls.join_next() => {}
+                else => return,
+            }
+        }
+    })
+}
+
+async fn run<M: RuntimeMode, H: Host>(
     endpoint: quinn::Endpoint,
     server: Arc<wrpc_webtransport::Server>,
-    mut invocations: impl futures::Stream<
-        Item = (
-            &'static str,
-            &'static str,
-            anyhow::Result<impl std::future::Future<Output = anyhow::Result<()>> + Send + 'static>,
-        ),
-    > + Unpin,
+    calls: impl Future<Output = ()> + Send + 'static,
     token: String,
-    left: Left,
+    debuggee: Debuggee<M, H>,
 ) -> anyhow::Result<()> {
+    let calls = tokio::spawn(calls);
     let mut sessions = tokio::task::JoinSet::new();
-    let mut calls = tokio::task::JoinSet::new();
-    loop {
+    let result = loop {
         tokio::select! {
-            Some((_, _, call)) = invocations.next() => {
-                if let Ok(call) = call {
-                    calls.spawn(call);
-                }
-            }
             Some(connecting) = endpoint.accept() => {
                 let (server, token) = (server.clone(), token.clone());
-                let left = left.clone();
+                let debuggee = debuggee.clone();
                 sessions.spawn(async move {
                     let attached = session(connecting, server, token).await;
                     // Whatever ended it, a debugger gone holds nothing and stops nothing.
                     if matches!(attached, Ok(true) | Err(_)) {
-                        left.release();
+                        debuggee.debugger_gone();
                     }
                     attached
                 });
             }
-            Some(_) = calls.join_next() => {}
             Some(_) = sessions.join_next() => {}
-            else => return Ok(()),
+            else => break Ok(()),
         }
-    }
-}
-
-/// What a debugger leaves behind, to let go of when it goes.
-#[derive(Clone)]
-struct Left {
-    holds: RuntimeHolds,
-    lines: Option<RuntimeLines>,
-    /// Runs the graph again, as `run` does.
-    run_again: Arc<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>,
-}
-
-impl Left {
-    fn release(&self) {
-        self.holds.release();
-        if let Some(lines) = &self.lines {
-            lines.release();
-        }
-        // A graph a debugger stopped runs again, what the stop cancelled too: the program is
-        // not left waiting on it.
-        tokio::spawn((self.run_again)());
-    }
+    };
+    calls.abort();
+    result
 }
 
 /// Serves one debugger, if it presents the token: says whether it did, once it has gone.
