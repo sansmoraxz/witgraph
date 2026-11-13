@@ -4165,6 +4165,7 @@ dependencies = [
  "bytes",
  "futures",
  "hex",
+ "http",
  "libc",
  "oci-client",
  "serde",
