@@ -17,6 +17,7 @@ import type { DebugGraph, DebugLines, DebugSession } from '../remote.ts';
 import * as graph from './bindings/witgraph/debug/graph.js';
 import * as holds from './bindings/witgraph/debug/holds.js';
 import * as lines from './bindings/witgraph/debug/lines.js';
+import { fromWave } from './wave.ts';
 
 /** Where to attach, as the program serving the graph printed it. */
 /**
@@ -386,9 +387,15 @@ function attachedGraph(
     injectWave: async (node, port, wave) => done(graph.inject(await open(), node, port, wave)),
     clearInput: async (node, port) => done(graph.clearInput(await open(), node, port)),
     rerun: async (node) => done(graph.rerun(await open(), node)),
-    // Values cross as WAVE text: a host's values are its own.
+    // Values cross as WAVE text: a host's values are its own. Read as values, they take the
+    // shapes a graph run in the page gives, for viewers to read alike; text that does not
+    // parse stays text.
     readInputWave: async (node, port) => ok(graph.readInput(await open(), node, port)),
-    readOutput: async (node, port) => ok(graph.readOutput(await open(), node, port)),
+    readOutput: async (node, port) => {
+      const wave = await ok(graph.readOutput(await open(), node, port));
+      if (wave === undefined) return undefined;
+      return fromWave(wave) ?? wave;
+    },
     readOutputWave: async (node, port) => ok(graph.readOutput(await open(), node, port)),
     readHandle: async (node, port) => ok(graph.readOutput(await open(), node, port)),
     nodeState: (node) => {

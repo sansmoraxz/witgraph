@@ -19,7 +19,7 @@ import type { OutputView, PortVisual } from '../src/controller/types.ts';
 import { choosePreview, defaultViewer, nodeSize, nodeVisual } from '../src/controller/visual.ts';
 import { edgePath, portOffset, portPosition } from '../src/util/svg.ts';
 import { asImage, sniffImageType } from '../src/viewers/image.ts';
-import { numeric, plotPoints } from '../src/viewers/series.ts';
+import { numeric, plotPoints, plotted } from '../src/viewers/series.ts';
 import { describe, summarize } from '../src/viewers/text.ts';
 
 // --- edgePath ----------------------------------------------------------------
@@ -326,4 +326,18 @@ test("the series viewer plots numbers, records' first numbers and bools", () => 
   assert.equal(plotPoints([4]), '0,20 100,20', 'one value is a level line');
   assert.equal(plotPoints([0, 5, 10]), '0,40 50,20 100,0');
   assert.equal(plotPoints([2, 2]), '0,20 100,20', 'a flat line in the middle');
+});
+
+test('the series viewer looks into a record with no number of its own, and plots a list whole', () => {
+  // A sample, as jco lifts it: its value is a variant's payload.
+  const sample = (v: number) => ({ io: 'T1', quality: 'good', value: { tag: 'float', val: v } });
+  assert.equal(numeric(sample(22.5)), 22.5);
+  assert.equal(numeric({ source: 'write', sample: sample(3) }), 3, 'a record in a record');
+  assert.equal(numeric({ io: 'T3', quality: 'bad' }), undefined);
+  assert.equal(numeric({ count: 2, value: { tag: 'float', val: 9 } }), 2, 'its own number first');
+  // A Value output that is a list is one line; anything else, a point per value.
+  const history = [sample(1), sample(2), { io: 'T1', quality: 'bad' }, sample(3)];
+  assert.deepEqual(plotted({ kind: 'value', latest: history, recent: [history] }), [1, 2, 3]);
+  assert.deepEqual(plotted({ kind: 'value', latest: 5, recent: [4, 5] }), [4, 5]);
+  assert.deepEqual(plotted({ kind: 'stream', latest: [7], recent: [[6], [7]] }), []);
 });

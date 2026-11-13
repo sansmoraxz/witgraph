@@ -1,3 +1,4 @@
+import type { OutputView } from '../controller/types.ts';
 import type { PortViewer } from './types.ts';
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
@@ -7,26 +8,46 @@ const HEIGHT = 40;
 
 /**
  * `value` as a number to plot: a number, a `BigInt`, a bool (0 or 1), or a
- * record's first field that is one of those. `undefined` for anything else.
+ * record's first field that is one of those. A record with none is looked into: its
+ * first record or variant (`{ tag, val }`) holding one, as a sample's value is
+ * in a `float(…)` case. `undefined` for anything else.
  */
 export function numeric(value: unknown): number | undefined {
   if (typeof value === 'number') return Number.isFinite(value) ? value : undefined;
   if (typeof value === 'bigint') return Number(value);
   if (typeof value === 'boolean') return value ? 1 : 0;
   // A record, not a list: a list is no one number.
-  if (
+  if (!isRecord(value)) return undefined;
+  const fields = Object.values(value);
+  for (const field of fields) {
+    if (typeof field === 'object') continue;
+    const n = numeric(field);
+    if (n !== undefined) return n;
+  }
+  for (const field of fields) {
+    if (!isRecord(field)) continue;
+    const n = numeric(field);
+    if (n !== undefined) return n;
+  }
+  return undefined;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return (
     typeof value === 'object' &&
     value !== null &&
     !Array.isArray(value) &&
     !ArrayBuffer.isView(value)
-  ) {
-    for (const field of Object.values(value)) {
-      if (typeof field === 'object') continue;
-      const n = numeric(field);
-      if (n !== undefined) return n;
-    }
-  }
-  return undefined;
+  );
+}
+
+/**
+ * What to plot of an output: a Value output's list, as its points (a history,
+ * oldest first), or else its recent values, one point each.
+ */
+export function plotted(view: Pick<OutputView, 'kind' | 'latest' | 'recent'>): number[] {
+  const points = view.kind === 'value' && Array.isArray(view.latest) ? view.latest : view.recent;
+  return points.map(numeric).filter((n): n is number => n !== undefined);
 }
 
 /** `values` as a polyline's points, scaled to fill the plot. One value is a level line. */
@@ -54,7 +75,8 @@ function label(n: number): string {
 
 /**
  * A line of an output's recent values: one point per tick for a Value
- * output, per item for a stream. The latest value, the range and the count
+ * output, per item for a stream; a Value output that is a list (a history) is
+ * its own line, a point an element. The latest value, the range and the count
  * are written below it; the line's point count is in `data-points`.
  */
 export const seriesViewer: PortViewer = {
@@ -76,7 +98,7 @@ export const seriesViewer: PortViewer = {
     host.appendChild(root);
     return {
       update(view) {
-        const values = view.recent.map(numeric).filter((n): n is number => n !== undefined);
+        const values = plotted(view);
         const points = plotPoints(values);
         line.setAttribute('points', points);
         area.setAttribute('points', points ? `0,${HEIGHT} ${points} ${WIDTH},${HEIGHT}` : '');
