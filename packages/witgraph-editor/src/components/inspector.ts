@@ -103,20 +103,38 @@ export class WitgraphInspector extends HTMLElement {
   #onStateChanged = () => this.render();
   /** What is shown: its {@link signature}, and what it inspects. */
   #shown: { signature: string; subject: string } | null = null;
-  /** A render put off while a field here was being edited. */
+  /** A render put off while a field here was being edited, or a button pressed. */
   #deferred = false;
+  /**
+   * Whether a pointer is pressed here: what it pressed is not swapped out before its click,
+   * as pressing a button leaves the field the button acts on.
+   */
+  #pressing = false;
 
   constructor() {
     super();
     const shadow = this.attachShadow({ mode: 'open' });
     adoptStyles(shadow, EXTRA_CSS);
-    // A render put off for a field being edited happens once it is left.
+    // A render put off for a field being edited happens once it is left, unless for a button
+    // pressed: then once the button has been clicked.
     shadow.addEventListener('focusout', () => {
-      if (!this.#deferred) return;
+      if (!this.#deferred || this.#pressing) return;
       this.#deferred = false;
       queueMicrotask(() => this.render());
     });
+    shadow.addEventListener('pointerdown', () => {
+      this.#pressing = true;
+    });
   }
+
+  /** A pointer let go, here or anywhere: a render put off for it happens after its click. */
+  #onRelease = () => {
+    if (!this.#pressing) return;
+    this.#pressing = false;
+    if (!this.#deferred) return;
+    this.#deferred = false;
+    setTimeout(() => this.render(), 0);
+  };
 
   set controller(ctrl: EditorController) {
     this.#controller?.removeEventListener('state-changed', this.#onStateChanged);
@@ -126,10 +144,14 @@ export class WitgraphInspector extends HTMLElement {
   }
 
   connectedCallback(): void {
+    window.addEventListener('pointerup', this.#onRelease, true);
+    window.addEventListener('pointercancel', this.#onRelease, true);
     this.render();
   }
 
   disconnectedCallback(): void {
+    window.removeEventListener('pointerup', this.#onRelease, true);
+    window.removeEventListener('pointercancel', this.#onRelease, true);
     this.#controller?.removeEventListener('state-changed', this.#onStateChanged);
   }
 
@@ -146,7 +168,11 @@ export class WitgraphInspector extends HTMLElement {
     const shown = { signature: signature(next), subject };
     const old = root.querySelector('.inspector-root');
     if (old && this.#shown?.signature === shown.signature) return;
-    if (old && this.#shown?.subject === subject && isEditable(root.activeElement)) {
+    if (
+      old &&
+      this.#shown?.subject === subject &&
+      (this.#pressing || isEditable(root.activeElement))
+    ) {
       this.#deferred = true;
       return;
     }
