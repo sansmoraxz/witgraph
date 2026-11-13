@@ -15,6 +15,7 @@ import {
   type PortValues,
   RemoteSession,
   type SessionWorker,
+  type Wasm,
 } from 'witgraph-loader';
 import { portOffset } from '../util/svg.ts';
 import { weight } from '../util/weight.ts';
@@ -1210,6 +1211,8 @@ export class EditorController extends EventTarget {
     certificateHash: Uint8Array<ArrayBuffer>;
     /** Lets the graph be edited, by the program: without, it is read as it is. */
     editing?: AttachedEditing;
+    /** The compiled `witgraph-web` module, when editing: see {@link init}. */
+    wasm?: Wasm;
   }): Promise<void> {
     this.#session?.dispose();
     this.#session = null;
@@ -1218,6 +1221,8 @@ export class EditorController extends EventTarget {
     this.#forgetChecker();
     this.#originalOptions = null;
     this.#editing = options.editing ?? null;
+    // Edits are checked, and the catalog described, on this thread.
+    if (this.#editing) await init(options.wasm);
     let session: AttachedSession | null = null;
     session = await AttachedSession.attach({
       ...options,

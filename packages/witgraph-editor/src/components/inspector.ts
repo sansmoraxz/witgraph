@@ -680,26 +680,16 @@ export class WitgraphInspector extends HTMLElement {
     const graphNode = (
       (this.#controller?.graphJson as Record<string, unknown>)?.nodes as Array<{
         id: string;
-        component: Record<string, unknown>;
+        component: string;
+        world: string;
         attrs?: Record<string, string>;
       }>
     )?.find((n) => n.id === node.id);
     if (graphNode?.component) {
-      const comp = graphNode.component as {
-        package?: { namespace?: string; name?: string; version?: string };
-        world?: string;
-      };
       const compInfo = this.#el('div', 'p-2 bg-wg-surface rounded-md text-xs');
       compInfo.appendChild(this.#el('div', 'text-wg-text-dim mb-1', 'Component'));
-      const compId = [
-        comp.package?.namespace,
-        ':',
-        comp.package?.name,
-        comp.world ? `/${comp.world}` : '',
-        comp.package?.version ? `@${comp.package.version}` : '',
-      ]
-        .filter(Boolean)
-        .join('');
+      // Its name in the graph's table, then the world of it the node runs.
+      const compId = `${graphNode.component} · ${graphNode.world}`;
       compInfo.appendChild(this.#el('div', 'font-mono text-wg-primary truncate', compId));
       if (node.docs)
         compInfo.appendChild(this.#el('div', 'node-docs text-wg-text mt-1', node.docs));
