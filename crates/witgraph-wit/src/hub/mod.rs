@@ -23,7 +23,7 @@ mod module;
 mod text;
 
 #[cfg(feature = "compose")]
-pub use composed::{ComposedGraph, HubError, HubMember, compose_graph};
+pub use composed::{ComposedGraph, HubError, HubMember, HubOptions, compose_graph};
 use witgraph_ir::{FeedbackIdx, Idx, InputIdx, OutputIdx};
 
 /// The interface the host drives a hub with.
@@ -32,6 +32,9 @@ pub const CONTROL_INTERFACE: &str = "witgraph:hub/control@0.1.0";
 pub const PORTS_INTERFACE: &str = "witgraph:hub/ports@0.1.0";
 /// The interface a hub imports to show the host a handle.
 pub const LEND_INTERFACE: &str = "witgraph:hub/lend@0.1.0";
+/// The interface a hub with stream taps ([`HubOptions::stream_taps`]) imports to show the host
+/// what its streams carry.
+pub const PREVIEW_INTERFACE: &str = "witgraph:hub/preview@0.1.0";
 
 /// A function of [`CONTROL_INTERFACE`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,6 +115,25 @@ pub fn give_stream(input: InputIdx) -> String {
     format!("give-stream-{}", input.position())
 }
 
+/// The name of the function tapping a stream input, with [`HubOptions::stream_taps`]:
+/// `() -> u32`. The stream its writer gave the input stays in the hub, and the input holds a
+/// new one in its place, which [`pump_stream`] feeds: the tap it returns, or 0 for none.
+pub fn tap_stream(input: InputIdx) -> String {
+    format!("tap-stream-{}", input.position())
+}
+
+/// The name of the function moving a tap's items on to its reader, telling the host of each
+/// chunk through [`stream_items`]: `async (tap: u32)`, returning once either end is dropped.
+pub fn pump_stream(input: InputIdx) -> String {
+    format!("pump-stream-{}", input.position())
+}
+
+/// The name of the function a hub imports from [`PREVIEW_INTERFACE`], told of what a tapped
+/// stream input carries, a chunk at a time: `(items: list<T>)`.
+pub fn stream_items(input: InputIdx) -> String {
+    format!("stream-items-{}", input.position())
+}
+
 /// The name of the function lending the host a handle output, through the
 /// import of [`lend_handle`]: `()`.
 pub fn read_handle(output: OutputIdx) -> String {
@@ -144,7 +166,7 @@ pub enum CompositeImport<'a> {
     Member(usize),
     /// A node's `witgraph:runtime/host` ([`host_import`]).
     Host(usize),
-    /// Anything else: [`LEND_INTERFACE`], or a capability.
+    /// Anything else: [`LEND_INTERFACE`], [`PREVIEW_INTERFACE`], or a capability.
     Other(&'a str),
 }
 

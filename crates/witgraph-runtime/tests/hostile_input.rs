@@ -199,7 +199,7 @@ fn compose_case(
         mocked: false,
     }];
     no_panic(seed, "composing a hub", &[], || {
-        if hub::compose_graph(&compiled, &members).is_ok() {
+        if hub::compose_graph(&compiled, &members, hub::HubOptions::default()).is_ok() {
             count(&REACHED.composed);
         }
     });

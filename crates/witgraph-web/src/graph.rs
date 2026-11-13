@@ -1378,7 +1378,8 @@ fn compose(
             mocked: is_mocked,
         });
     }
-    let composed = hub::compose_graph(compiled, &members).map_err(error)?;
+    let composed =
+        hub::compose_graph(compiled, &members, hub::HubOptions::default()).map_err(error)?;
     let mut module_nodes: BTreeMap<String, Vec<NodeId>> = BTreeMap::new();
     if debug {
         for node in &composed.instantiated {

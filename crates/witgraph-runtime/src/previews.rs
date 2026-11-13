@@ -1,16 +1,15 @@
 //! What streams between nodes carry, for previews: [`StreamPreviews`].
 //!
 //! A stream passes from one node's output to another's input inside the composed graph; the
-//! host never holds it. To see its items, the plane learns which stream each output's is, as
-//! the hub holds it between the writer's run returning and the reader's starting (it takes it
-//! from the hub and gives it back unread), and wasmtime tells a [`StreamObserver`] of each
-//! item it copies from writer to reader. Nothing is read twice and nothing is held up: the
-//! reader gets every item as it would have.
+//! host never holds it. Composed with stream taps, the hub moves each stream's items on itself
+//! (`witgraph_wit::hub::tap_stream`), and shows the host each chunk through its
+//! `witgraph:hub/preview` import, which this implements. The reader gets every item as it
+//! would have, and a write still waits for it.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use wasmtime::component::{StreamId, StreamObserver, Val};
+use wasmtime::component::Val;
 use witgraph_ir::{CompiledGraph, InputIdx, NodeId, NodeIdx, PortName, PortTable};
 
 /// How many items of each output are kept, the latest.
@@ -32,8 +31,6 @@ pub struct StreamItems {
 
 #[derive(Default)]
 struct State {
-    /// The streams watched, and the output each is.
-    watched: HashMap<StreamId, (NodeId, PortName)>,
     /// By output, what came since it was last taken.
     seen: BTreeMap<(NodeId, PortName), (VecDeque<String>, u64)>,
 }
@@ -45,14 +42,17 @@ struct State {
 #[derive(Clone)]
 pub struct StreamPreviews {
     state: Arc<Mutex<State>>,
-    /// By writing node, each stream output it has and the input reading it.
-    edges: Arc<HashMap<NodeIdx, Vec<(PortName, InputIdx)>>>,
+    /// By writing node, the stream inputs its outputs feed.
+    edges: Arc<HashMap<NodeIdx, Vec<InputIdx>>>,
+    /// By stream input, the output feeding it.
+    writers: Arc<HashMap<InputIdx, (NodeId, PortName)>>,
 }
 
 impl StreamPreviews {
     /// The previews of `compiled`'s streams, numbered as `ports` has it.
     pub(crate) fn new(compiled: &CompiledGraph, ports: &PortTable) -> Self {
-        let mut edges: HashMap<NodeIdx, Vec<(PortName, InputIdx)>> = HashMap::new();
+        let mut edges: HashMap<NodeIdx, Vec<InputIdx>> = HashMap::new();
+        let mut writers = HashMap::new();
         for resolved in compiled.connections() {
             let conn = resolved.connection;
             if !matches!(resolved.from.kind(), witgraph_ir::PortKind::Stream) {
@@ -62,15 +62,14 @@ impl StreamPreviews {
                 ports.node(&conn.from.node),
                 ports.input(&conn.to.node, &conn.to.port),
             ) {
-                edges
-                    .entry(node)
-                    .or_default()
-                    .push((conn.from.port.clone(), input));
+                edges.entry(node).or_default().push(input);
+                writers.insert(input, (conn.from.node.clone(), conn.from.port.clone()));
             }
         }
         Self {
             state: Arc::new(Mutex::new(State::default())),
             edges: Arc::new(edges),
+            writers: Arc::new(writers),
         }
     }
 
@@ -89,35 +88,23 @@ impl StreamPreviews {
             .collect()
     }
 
-    /// The stream outputs of `node`, and the input reading each.
-    pub(crate) fn edges_of(&self, node: NodeIdx) -> &[(PortName, InputIdx)] {
+    /// The stream inputs `node`'s outputs feed.
+    pub(crate) fn inputs_fed_by(&self, node: NodeIdx) -> &[InputIdx] {
         self.edges.get(&node).map_or(&[], Vec::as_slice)
     }
 
-    /// `stream` is `node`'s output `port`'s, from now on.
-    pub(crate) fn watch(&self, stream: StreamId, node: NodeId, port: PortName) {
-        lock(&self.state).watched.insert(stream, (node, port));
+    /// The stream inputs, and the output feeding each.
+    pub(crate) fn writers(&self) -> impl Iterator<Item = (InputIdx, &(NodeId, PortName))> {
+        self.writers.iter().map(|(input, at)| (*input, at))
     }
 
-    /// What tells this of the items wasmtime copies.
-    pub(crate) fn observer(&self) -> impl StreamObserver {
-        Observer(self.state.clone())
-    }
-}
-
-struct Observer(Arc<Mutex<State>>);
-
-impl StreamObserver for Observer {
-    fn observes(&mut self, stream: StreamId) -> bool {
-        lock(&self.0).watched.contains_key(&stream)
-    }
-
-    fn items(&mut self, stream: StreamId, items: &[Val]) {
-        let mut state = lock(&self.0);
-        let Some(at) = state.watched.get(&stream).cloned() else {
+    /// `items` passed on to `input`: of the output feeding it, which keeps the latest.
+    pub(crate) fn record(&self, input: InputIdx, items: &[Val]) {
+        let Some(at) = self.writers.get(&input) else {
             return;
         };
-        let (kept, count) = state.seen.entry(at).or_default();
+        let mut state = lock(&self.state);
+        let (kept, count) = state.seen.entry(at.clone()).or_default();
         *count += items.len() as u64;
         for item in items.iter().rev().take(KEPT).rev() {
             let text = item.to_wave().unwrap_or_else(|e| format!("<{e}>"));

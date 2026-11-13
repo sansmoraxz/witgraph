@@ -643,6 +643,63 @@ async fn stream_previews_see_every_item_and_the_reader_still_gets_them() {
     assert!(previews.take().is_empty(), "taken once");
 }
 
+fn previewing() -> RuntimeConfig {
+    RuntimeConfig {
+        stream_previews: true,
+        ..RuntimeConfig::default()
+    }
+}
+
+#[tokio::test]
+async fn a_reader_dropping_a_previewed_stream_stops_an_endless_producer() {
+    let kit = Kit::new(&[STREAM_PRODUCER, STREAM_CONSUMER]);
+    let mut rt = kit.load(pipeline(&kit), previewing(), Trace::new()).await;
+    feed_pipeline(&mut rt, None, Some(3)).await;
+    settle(&mut rt).await;
+    assert_eq!(read_u32(&mut rt, "cons", "count").await, 3);
+    assert_eq!(phase(&rt, "prod"), NodePhase::Idle);
+    let seen = rt.stream_previews().unwrap().take();
+    assert!(seen[0].count >= 3, "{seen:?}");
+}
+
+#[tokio::test]
+async fn both_legs_of_a_relayed_stream_are_previewed() {
+    let kit = Kit::new(&[STREAM_PRODUCER, STREAM_RELAY, STREAM_CONSUMER]);
+    let mut rt = kit.load(relayed(&kit), previewing(), Trace::new()).await;
+    feed_pipeline(&mut rt, Some(100_000), None).await;
+    settle(&mut rt).await;
+    assert_eq!(read_u32(&mut rt, "cons", "count").await, 100_000);
+    let total = (0..100_000u32).fold(0u32, u32::wrapping_add);
+    assert_eq!(read_u32(&mut rt, "cons", "total").await, total);
+    let seen = rt.stream_previews().unwrap().take();
+    let counts: Vec<(&str, u64)> = seen.iter().map(|s| (s.node.as_str(), s.count)).collect();
+    assert_eq!(counts, [("prod", 100_000), ("relay", 100_000)]);
+    assert_eq!(seen[1].items.last().map(String::as_str), Some("99999"));
+}
+
+#[tokio::test]
+async fn previews_need_a_graph_prepared_with_taps() {
+    let kit = Kit::new(&[STREAM_PRODUCER, STREAM_CONSUMER]);
+    let engine = RuntimeConfig::default().new_engine().unwrap();
+    let graph = pipeline(&kit).compile(&kit.contracts).expect("compiles");
+    let load = async |prepared: &PreparedGraph| {
+        RuntimeGraph::load_prepared(
+            graph.clone(),
+            prepared,
+            previewing(),
+            Perf,
+            witgraph_runtime::NoCapabilities,
+        )
+        .await
+    };
+    let untapped = PreparedGraph::new(&engine, &graph, &kit.artifacts()).unwrap();
+    let err = load(&untapped).await.err().expect("not tapped");
+    assert!(err.to_string().contains("with_stream_taps"), "{err}");
+    let tapped = PreparedGraph::with_stream_taps(&engine, &graph, &kit.artifacts()).unwrap();
+    let rt = load(&tapped).await.expect("tapped");
+    assert!(rt.stream_previews().is_some());
+}
+
 #[tokio::test]
 async fn without_stream_previews_none_are_kept() {
     let kit = Kit::new(&[STREAM_PRODUCER, STREAM_CONSUMER]);
@@ -920,6 +977,17 @@ async fn video(
     frames: u32,
     fps: Option<u32>,
 ) -> RuntimeGraph<Perf, Clock> {
+    video_with(kit, filters, frames, fps, RuntimeConfig::default()).await
+}
+
+/// As [`video`], with `config`.
+async fn video_with(
+    kit: &Kit,
+    filters: &[(&str, Guest)],
+    frames: u32,
+    fps: Option<u32>,
+    config: RuntimeConfig,
+) -> RuntimeGraph<Perf, Clock> {
     let mut builder = kit
         .builder("video")
         .add_node("source", kit.get(VIDEO_SOURCE))
@@ -937,15 +1005,9 @@ async fn video(
         .connect("to-sink", port(from, "frames"), port("sink", "frames"))
         .build();
     let compiled = graph.compile(&kit.contracts).expect("compiles");
-    let mut rt = RuntimeGraph::load_with_host(
-        compiled,
-        &kit.artifacts(),
-        RuntimeConfig::default(),
-        Perf,
-        Clock,
-    )
-    .await
-    .expect("loads with the clock");
+    let mut rt = RuntimeGraph::load_with_host(compiled, &kit.artifacts(), config, Perf, Clock)
+        .await
+        .expect("loads with the clock");
     inject(&mut rt, "source", "frames", Val::U32(frames)).await;
     if let Some(fps) = fps {
         inject(&mut rt, "source", "fps", Val::U32(fps)).await;
@@ -983,6 +1045,44 @@ async fn a_video_pipeline_filters_frames_as_they_stream() {
     settle(&mut rt).await;
     assert_eq!(read_u32(&mut rt, "sink", "count").await, 3);
     assert!(!read_bool(&mut rt, "sink", "gray").await);
+}
+
+#[tokio::test]
+async fn previewed_frames_reach_the_sink_as_they_were() {
+    let kit = Kit::new(&[VIDEO_SOURCE, FRAME_INVERT, VIDEO_SINK]);
+    let filters = [("invert", FRAME_INVERT)];
+    let mut plain = video(&kit, &filters, 300, None).await;
+    settle(&mut plain).await;
+    let config = RuntimeConfig {
+        stream_previews: true,
+        ..RuntimeConfig::default()
+    };
+    let mut rt = video_with(&kit, &filters, 300, None, config).await;
+    settle(&mut rt).await;
+    assert_eq!(read_u32(&mut rt, "sink", "count").await, 300);
+    assert_eq!(
+        read_u32(&mut rt, "sink", "first-pixel").await,
+        read_u32(&mut plain, "sink", "first-pixel").await,
+    );
+    let seen = rt.stream_previews().unwrap().take();
+    let counts: Vec<(&str, u64)> = seen.iter().map(|s| (s.node.as_str(), s.count)).collect();
+    assert_eq!(counts, [("invert", 300), ("source", 300)]);
+    assert_eq!(seen[1].items.len(), 64);
+    assert!(seen[1].items[0].starts_with("{width: 96, height: 64, pixels: ["));
+}
+
+#[tokio::test]
+async fn a_tap_frees_the_frames_it_passes_on() {
+    // 1000 frames of 24 KiB each: kept by the hub, they would outgrow the limit.
+    let kit = Kit::new(&[VIDEO_SOURCE, VIDEO_SINK]);
+    let config = RuntimeConfig {
+        stream_previews: true,
+        max_memory: Some(witgraph_runtime::ByteCount(16 << 20)),
+        ..RuntimeConfig::default()
+    };
+    let mut rt = video_with(&kit, &[], 1000, None, config).await;
+    settle(&mut rt).await;
+    assert_eq!(read_u32(&mut rt, "sink", "count").await, 1000);
 }
 
 /// `test:accel/cnn`'s types, as the host sees them.

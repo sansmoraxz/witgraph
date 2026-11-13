@@ -28,6 +28,15 @@ pub struct HubMember<'a> {
     pub mocked: bool,
 }
 
+/// What a hub does beyond moving values.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HubOptions {
+    /// Taps the streams between nodes whose items are values (no handles), so that a host can
+    /// see what they carry: [`tap_stream`](super::tap_stream). Each item is then copied
+    /// through the hub, and once more to the host.
+    pub stream_taps: bool,
+}
+
 /// A graph as one component.
 #[derive(Debug, Clone)]
 pub struct ComposedGraph {
@@ -71,8 +80,9 @@ pub enum HubError {
 pub fn compose_graph(
     compiled: &CompiledGraph,
     members: &[HubMember<'_>],
+    options: HubOptions,
 ) -> Result<ComposedGraph, HubError> {
-    let generated = generate::hub(compiled, members)?;
+    let generated = generate::hub(compiled, members, options)?;
     let compose = |e: String| HubError::Compose(e);
     let mut graph = CompositionGraph::new();
     let hub = Package::from_bytes("witgraph:hub", None, generated.bytes, graph.types_mut())

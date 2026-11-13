@@ -70,6 +70,9 @@ struct Parts {
     /// How many components an instance holds: the hub, each node, and each
     /// provider composed in.
     components: usize,
+    /// Whether its hub taps the streams between nodes, for
+    /// [`RuntimeConfig::stream_previews`].
+    stream_taps: bool,
     /// A hash of the bytes and links it was prepared from, when they were
     /// given: what tells a saved graph from one rebuilt with the same contracts.
     #[cfg(feature = "precompiled")]
@@ -142,7 +145,18 @@ impl PreparedGraph {
         compiled: &CompiledGraph,
         components: &HashMap<ComponentName, Artifact<'_>>,
     ) -> Result<Self, LoadError> {
-        Self::checked(engine, compiled, components, |_, _| Ok(()))
+        Self::checked(engine, compiled, components, false, |_, _| Ok(()))
+    }
+
+    /// As [`new`](Self::new), with the streams between nodes tapped, so that a graph loaded
+    /// from it with [`RuntimeConfig::stream_previews`] shows what they carry. Each of their
+    /// items is copied through the hub then, and once more as text.
+    pub fn with_stream_taps(
+        engine: &Engine,
+        compiled: &CompiledGraph,
+        components: &HashMap<ComponentName, Artifact<'_>>,
+    ) -> Result<Self, LoadError> {
+        Self::checked(engine, compiled, components, true, |_, _| Ok(()))
     }
 
     /// As [`new`](Self::new), asking `check` about each node's imports before
@@ -151,6 +165,7 @@ impl PreparedGraph {
         engine: &Engine,
         compiled: &'a CompiledGraph,
         components: &'a HashMap<ComponentName, Artifact<'a>>,
+        stream_taps: bool,
         check: impl Fn(&NodeId, &[Capability]) -> Result<(), LoadError>,
     ) -> Result<Self, LoadError> {
         validate_engine(engine)?;
@@ -218,8 +233,8 @@ impl PreparedGraph {
                 mocked: false,
             })
             .collect();
-        let composed =
-            hub::compose_graph(compiled, &members).map_err(|e| LoadError::Composition {
+        let composed = hub::compose_graph(compiled, &members, hub::HubOptions { stream_taps })
+            .map_err(|e| LoadError::Composition {
                 message: e.to_string(),
             })?;
         let component =
@@ -238,6 +253,7 @@ impl PreparedGraph {
                     .map(|&(node, at)| (node.clone(), checked[at].capabilities.clone()))
                     .collect(),
                 components: composed.components + providers,
+                stream_taps,
                 #[cfg(feature = "precompiled")]
                 source: Some(precompiled::source_hash(components)),
             },
@@ -356,10 +372,13 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
         };
         validate_engine(&engine)?;
         check_shared(&host, &compiled)?;
-        let prepared =
-            PreparedGraph::checked(&engine, &compiled, components, |node, capabilities| {
-                check_host(&host, node, capabilities)
-            })?;
+        let prepared = PreparedGraph::checked(
+            &engine,
+            &compiled,
+            components,
+            config.stream_previews,
+            |node, capabilities| check_host(&host, node, capabilities),
+        )?;
         Self::link_and_build(compiled, &prepared, config, engine, mode, host).await
     }
 
@@ -388,6 +407,13 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
         if !Engine::same(prepared.engine(), &engine) {
             return Err(LoadError::Runtime(RuntimeError::InvalidConfig {
                 message: "the graph was prepared on another engine".into(),
+            }));
+        }
+        if config.stream_previews && !prepared.parts.stream_taps {
+            return Err(LoadError::Runtime(RuntimeError::InvalidConfig {
+                message: "stream previews need a graph prepared with its streams tapped \
+                          (`PreparedGraph::with_stream_taps`)"
+                    .into(),
             }));
         }
         if prepared.parts.graph != fingerprint(&compiled) {
@@ -431,7 +457,10 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
             &mut capabilities,
             prepared.parts.capabilities.iter().flat_map(|(_, c)| c),
         );
-        let linker = engine::graph_linker(&engine, &ports, &capabilities, &host)
+        let previews = config
+            .stream_previews
+            .then(|| crate::previews::StreamPreviews::new(&compiled, &ports));
+        let linker = engine::graph_linker(&engine, &ports, &capabilities, previews.as_ref(), &host)
             .map_err(|e| instantiation(format!("{:#}", e.context("linker"))))?;
         let pre = linker
             .instantiate_pre(&prepared.component)
@@ -482,9 +511,7 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
             settings,
             lines,
             holds: crate::holds::RuntimeHolds::default(),
-            previews: config
-                .stream_previews
-                .then(|| crate::previews::StreamPreviews::new(&compiled, &ports)),
+            previews,
             max_memory,
             components,
             shared_memory,

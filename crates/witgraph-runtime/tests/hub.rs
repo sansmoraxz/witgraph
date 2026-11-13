@@ -67,7 +67,9 @@ fn compose(compiled: &CompiledGraph, guests: &[(&str, Guest)]) -> Vec<u8> {
             mocked: false,
         })
         .collect();
-    hub::compose_graph(compiled, &members).unwrap().bytes
+    hub::compose_graph(compiled, &members, hub::HubOptions::default())
+        .unwrap()
+        .bytes
 }
 
 struct Hub {

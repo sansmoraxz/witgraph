@@ -503,7 +503,8 @@ async fn build(engine: &Engine, ty: &Ty) -> Case {
             mocked: true,
         },
     ];
-    let composed = hub::compose_graph(&compiled, &members).expect("composes");
+    let composed =
+        hub::compose_graph(&compiled, &members, hub::HubOptions::default()).expect("composes");
     let component = Component::new(engine, &composed.bytes).expect("compiles");
     let given = Arc::new(Mutex::new(Vec::new()));
     let mut linker = Linker::<HubMemory>::new(engine);

@@ -235,6 +235,28 @@ if rt.output_version(&node, &port)? != seen {
 engine stops the Store: a `Val` costs about 48 bytes per byte of a list, so bind a
 large port instead.
 
+### What streams carry
+
+A stream between two nodes is copied from one to the other inside the graph, so the host
+never sees its items. With `RuntimeConfig::stream_previews`, the hub taps each stream between
+nodes whose items are values (no handles): it moves the items on itself, a chunk at a time, and
+shows the host each chunk. `rt.stream_previews()` then has what each stream output carried
+since it was last asked, its latest 64 items as WAVE text and how many in all:
+
+```rust
+let config = RuntimeConfig { stream_previews: true, ..RuntimeConfig::default() };
+let rt = RuntimeGraph::load(compiled, &artifacts, config, Perf).await?;
+let previews = rt.stream_previews().expect("asked for");
+// later, now and then
+for seen in previews.take() {
+    println!("{}.{}: {} items, latest {:?}", seen.node, seen.port, seen.count, seen.items.last());
+}
+```
+
+The reader still gets every item, and a write still waits for it, but each item is copied
+through the hub and once more as text, so keep it for debugging. A graph you prepare yourself
+needs its streams tapped then: `PreparedGraph::with_stream_taps`, not `new`.
+
 ### Spinning guests
 
 A read or write waits for the guest to suspend, because nothing else runs in the
@@ -444,8 +466,8 @@ loop {
 A debugger presents the token in the URL, and pins the server's self-signed certificate by
 the hash, as a browser does with `serverCertificateHashes`: anyone with the token can pause
 the guests and read their memory, so keep it secret. It can stop the graph and run it again, hold nodes, stop on lines (with
-`debug_lines` set), read inputs and outputs, write inputs and rerun nodes, but not change the
-graph. Stopped, `debuggee.tick()` does what the debugger asks, advances nothing, and says
+`debug_lines` set), read inputs and outputs, see what streams carry (with `stream_previews`
+set), write inputs and rerun nodes, but not change the graph. Stopped, `debuggee.tick()` does what the debugger asks, advances nothing, and says
 `Idle`, until the debugger runs it again or goes; `debuggee.stopped()` says whether it is.
 Your own calls on the graph go through `debuggee.with(...)`. What it asks that needs the
 graph while a tick runs ends that tick early, is done, and the tick goes on, so a debugger

@@ -96,8 +96,9 @@ pub(crate) struct HubExports {
     set_input: IndexVec<InputIdx, Option<ComponentExportIndex>>,
     get_feedback: IndexVec<FeedbackIdx, Option<ComponentExportIndex>>,
     set_feedback: IndexVec<FeedbackIdx, Option<ComponentExportIndex>>,
-    take_stream: IndexVec<InputIdx, Option<ComponentExportIndex>>,
-    give_stream: IndexVec<InputIdx, Option<ComponentExportIndex>>,
+    /// Per stream input the hub taps: its tap and its pump.
+    tap_stream: IndexVec<InputIdx, Option<ComponentExportIndex>>,
+    pump_stream: IndexVec<InputIdx, Option<ComponentExportIndex>>,
 }
 
 impl HubExports {
@@ -137,11 +138,9 @@ impl HubExports {
             set_feedback: IndexVec::from_fn(ports.feedback().len(), |at| {
                 of_ports(hub::set_feedback(at))
             }),
-            take_stream: IndexVec::from_fn(ports.inputs().len(), |at| {
-                of_ports(hub::take_stream(at))
-            }),
-            give_stream: IndexVec::from_fn(ports.inputs().len(), |at| {
-                of_ports(hub::give_stream(at))
+            tap_stream: IndexVec::from_fn(ports.inputs().len(), |at| of_ports(hub::tap_stream(at))),
+            pump_stream: IndexVec::from_fn(ports.inputs().len(), |at| {
+                of_ports(hub::pump_stream(at))
             }),
         })
     }
@@ -665,30 +664,29 @@ async fn serve_hub<D: StoreData>(args: ServerArgs<D>) -> Outcome {
     }
 }
 
-/// Learns which stream each of `node`'s stream outputs wrote: each is in the hub, in the input
-/// reading it, until that reader starts; taken from there and given back unread.
-async fn watch_streams<D: StoreData>(
+/// Taps the streams `node`'s run just gave the inputs they feed, while the hub holds them:
+/// before their readers can start. What each tap's pump is then called with.
+async fn tap_streams<D: StoreData>(
     acc: &Accessor<D>,
     hub: &LiveHub,
-    ports: &PortTable,
     previews: &crate::previews::StreamPreviews,
     node: NodeIdx,
-) -> wasmtime::Result<()> {
-    for (port, input) in previews.edges_of(node) {
-        let take = hub.func(acc, hub.exports.take_stream[*input])?;
-        let give = hub.func(acc, hub.exports.give_stream[*input])?;
-        let mut taken = [Val::Bool(false)];
-        take.call_concurrent(acc, &[], &mut taken).await?;
-        let [Val::Option(Some(stream))] = taken else {
+) -> wasmtime::Result<Vec<(InputIdx, u32)>> {
+    let mut taps = Vec::new();
+    for input in previews.inputs_fed_by(node) {
+        let Some(at) = hub.exports.tap_stream[*input] else {
             continue;
         };
-        if let Val::Stream(any) = &*stream {
-            let id = acc.with(|mut access| any.id(access.as_context_mut()))?;
-            previews.watch(id, ports.node_id(node).clone(), port.clone());
+        let tap = hub.func(acc, Some(at))?;
+        let mut tapped = [Val::U32(0)];
+        tap.call_concurrent(acc, &[], &mut tapped).await?;
+        if let [Val::U32(id)] = tapped
+            && id != 0
+        {
+            taps.push((*input, id));
         }
-        give.call_concurrent(acc, &[*stream], &mut []).await?;
     }
-    Ok(())
+    Ok(taps)
 }
 
 /// Which host calls still have guest work under them, as wasmtime reports it: a call's task
@@ -769,9 +767,20 @@ async fn serve_commands<D: StoreData>(
     mut requests: UnboundedReceiver<Request<D>>,
     send: &(impl Fn(ControlKind) + Send + Sync),
 ) -> wasmtime::Result<()> {
+    // A run's return, and the streams it gave that were tapped.
+    type Ran = ((RawReturned,), Vec<(InputIdx, u32)>);
     type RunFuture<'a> =
-        Pin<Box<dyn Future<Output = (NodeIdx, wasmtime::Result<(RawReturned,)>)> + Send + 'a>>;
+        Pin<Box<dyn Future<Output = (NodeIdx, wasmtime::Result<Ran>)> + Send + 'a>>;
     let mut runs: FuturesUnordered<RunFuture<'_>> = FuturesUnordered::new();
+    // Tapped streams' pumps, each until its stream ends.
+    type PumpFuture<'a> = Pin<Box<dyn Future<Output = wasmtime::Result<()>> + Send + 'a>>;
+    let mut pumps: FuturesUnordered<PumpFuture<'_>> = FuturesUnordered::new();
+    let pump = |input: InputIdx, tap: u32| -> PumpFuture<'_> {
+        Box::pin(async move {
+            let pump = hub.func(acc, hub.exports.pump_stream[input])?;
+            pump.call_concurrent(acc, &[Val::U32(tap)], &mut []).await
+        })
+    };
     // Runs held before they start, until they are let go.
     type ParkedFuture = Pin<Box<dyn Future<Output = (NodeIdx, crate::holds::Parked)> + Send>>;
     let mut parked: FuturesUnordered<ParkedFuture> = FuturesUnordered::new();
@@ -789,10 +798,6 @@ async fn serve_commands<D: StoreData>(
         holds,
         previews,
     } = starts;
-    if let Some(previews) = previews {
-        let observer = previews.observer();
-        acc.with(|mut access| access.as_context_mut().stream_observer(observer));
-    }
     let budget = settings.budget();
     let run_fn = hub.run;
     let (latch_fn, drop_fn) = (hub.latch_feedback, hub.drop_feedback);
@@ -833,11 +838,11 @@ async fn serve_commands<D: StoreData>(
         Box::pin(async move {
             let called = async {
                 let returned = run_fn.finish_call_concurrent(acc, call?).await?;
-                // The streams it wrote are in the hub until their readers start: learnt now.
-                if let Some(previews) = previews {
-                    watch_streams(acc, hub, ports, previews, node).await?;
-                }
-                Ok(returned)
+                let taps = match previews {
+                    Some(previews) => tap_streams(acc, hub, previews, node).await?,
+                    None => Vec::new(),
+                };
+                Ok((returned, taps))
             };
             (node, called.await)
         })
@@ -904,15 +909,24 @@ async fn serve_commands<D: StoreData>(
                 }
             }
             while let Poll::Ready(Some((node, result))) = runs.poll_next_unpin(cx) {
-                let (raw,) = match result {
-                    Ok(returned) => returned,
+                let ((raw,), taps) = match result {
+                    Ok(ran) => ran,
                     Err(e) => return Poll::Ready(Err(e)),
                 };
+                for (input, tap) in taps {
+                    pumps.push(pump(input, tap));
+                }
                 let returned = match raw.decode(ports) {
                     Ok(returned) => returned,
                     Err(e) => return Poll::Ready(Err(e)),
                 };
                 send(ControlKind::RunReturned { node, returned });
+                progressed = true;
+            }
+            while let Poll::Ready(Some(pumped)) = pumps.poll_next_unpin(cx) {
+                if let Err(e) = pumped {
+                    return Poll::Ready(Err(e));
+                }
                 progressed = true;
             }
             if !drains.is_empty() {
@@ -934,6 +948,7 @@ async fn serve_commands<D: StoreData>(
             }
             if let Some(at) = quiet_at
                 && runs.is_empty()
+                && pumps.is_empty()
                 && lane.is_none()
                 && jobs.is_empty()
                 && acc.poll_no_interesting_tasks(cx).is_ready()

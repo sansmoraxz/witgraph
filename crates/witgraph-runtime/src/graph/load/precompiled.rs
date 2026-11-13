@@ -37,6 +37,8 @@ struct Saved {
     graph: String,
     capabilities: Vec<(NodeId, Vec<Capability>)>,
     components: usize,
+    #[serde(default)]
+    stream_taps: bool,
     source: Option<String>,
 }
 
@@ -61,6 +63,7 @@ impl PreparedGraph {
             graph: parts.graph.clone(),
             capabilities: parts.capabilities.clone(),
             components: parts.components,
+            stream_taps: parts.stream_taps,
             source: parts.source.clone(),
         })
         .map_err(|e| bad("its description", &e))?;
@@ -116,6 +119,7 @@ impl PreparedGraph {
                 graph: saved.graph,
                 capabilities: saved.capabilities,
                 components: saved.components,
+                stream_taps: saved.stream_taps,
                 source: saved.source,
             },
             component,

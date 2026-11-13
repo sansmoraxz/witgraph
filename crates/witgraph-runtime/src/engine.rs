@@ -403,11 +403,12 @@ fn engine_config(memory_reservation: Option<u64>) -> wasmtime::Result<wasmtime::
 
 /// A linker for a composed graph: each node's own `witgraph:runtime/host`
 /// (whose `fatal` knows which node called it), what lends the host a handle,
-/// and the host's capabilities.
+/// what shows it the items of tapped streams, and the host's capabilities.
 pub(crate) fn graph_linker<H: Host>(
     engine: &Engine,
     ports: &PortTable,
     capabilities: &[Capability],
+    previews: Option<&crate::previews::StreamPreviews>,
     host: &H,
 ) -> wasmtime::Result<Linker<H::Data>> {
     let mut linker = Linker::new(engine);
@@ -440,6 +441,22 @@ pub(crate) fn graph_linker<H: Host>(
                 state.lent = Some(shared);
                 Ok(())
             })?;
+        }
+    }
+    if let Some(previews) = previews {
+        let mut preview = linker.instance(witgraph_wit::hub::PREVIEW_INTERFACE)?;
+        for (input, _) in previews.writers() {
+            let previews = previews.clone();
+            preview.func_new(
+                &witgraph_wit::hub::stream_items(input),
+                move |_, _, params, _| {
+                    let Some(Val::List(items)) = params.first() else {
+                        wasmtime::bail!("a stream's items are a list");
+                    };
+                    previews.record(input, items);
+                    Ok(())
+                },
+            )?;
         }
     }
     host.link(capabilities, &mut linker)?;

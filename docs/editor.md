@@ -156,7 +156,7 @@ own: the components panel lists the graph's components, the timeline shows what 
 did (the latest thousand events, from before attaching too), and node breakpoints, _Pause_,
 _Continue_, _Next node_, the source panel (its text comes from the program's machine), _Inject_
 and rerunning a node work. Previews of streams between nodes show what they carried, polled
-with the states, if the program watches them (`RuntimeConfig::stream_previews` in
+with the states, if the program taps them (`RuntimeConfig::stream_previews` in
 witgraph-runtime): the latest 64 items of each, and how many in all. Previews of handles are not
 shown. A debugger that goes
 lets go of what it held and stopped, and its breakpoints, and lets the graph run if it had
