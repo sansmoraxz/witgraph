@@ -1237,6 +1237,7 @@ export class EditorController extends EventTarget {
     this.#attached = session;
     this.#session = session;
     this.#graphJson = JSON.parse(session.described) as GraphJson;
+    this.#adoptInjections(this.#graphJson);
     this.#streamGroups = session.graph.streamGroups();
     this.#compileDiagnostics = [];
     this.#compileError = null;
@@ -2259,6 +2260,7 @@ export class EditorController extends EventTarget {
       if (!graphNode.attrs) graphNode.attrs = {};
       graphNode.attrs[`inject.${port}`] = wave;
     }
+    this.#handOverInjection();
     this.#dispatch('state-changed');
   }
 
@@ -2270,7 +2272,36 @@ export class EditorController extends EventTarget {
     if (graphNode?.attrs) {
       delete graphNode.attrs[`inject.${port}`];
     }
+    this.#handOverInjection();
     this.#dispatch('state-changed');
+  }
+
+  /**
+   * Takes the values `graph` says are injected (its nodes' `inject.<port>` attributes) as
+   * those injected: an attached graph's program injects them itself, so they show here.
+   */
+  #adoptInjections(graph: GraphJson): void {
+    this.#injectedValues.clear();
+    for (const node of graph.nodes) {
+      for (const [key, value] of Object.entries(node.attrs ?? {})) {
+        if (!key.startsWith('inject.')) continue;
+        let ports = this.#injectedValues.get(node.id);
+        if (!ports) {
+          ports = new Map();
+          this.#injectedValues.set(node.id, ports);
+        }
+        ports.set(key.slice('inject.'.length), value);
+      }
+    }
+  }
+
+  /**
+   * Hands an attached graph's program the graph with a value injected, or cleared, there:
+   * it is the graph's (an `inject.<port>` attribute), so the program keeps it with the graph.
+   * It is injected already, so the program need not load the graph again.
+   */
+  #handOverInjection(): void {
+    if (this.#attached && this.#editing) void this.#reloadAfterEdit();
   }
 
   getInjectedValue(node: string, port: string): string | undefined {
