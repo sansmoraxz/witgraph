@@ -13,40 +13,52 @@ use test_components::ECHO;
 use witgraph_ir::{ContractId, ContractSource, Graph};
 use witgraph_runtime::{Perf, RunningGraph, RuntimeConfig, RuntimeGraph, TickResult, Val};
 use witgraph_source::oci::{
-    NODE_ARTIFACT_TYPE, NODE_CONFIG_MEDIA_TYPE, PROFILE_ANNOTATION, WASM_CONFIG_MEDIA_TYPE,
+    NODE_ANNOTATION, PROFILE_ANNOTATION, ROLE_ANNOTATION, WASM_CONFIG_MEDIA_TYPE,
     WASM_LAYER_MEDIA_TYPE,
 };
 use witgraph_source::{Digest, Profile, SourceError};
 
 #[tokio::test]
-async fn a_pushed_node_is_one_artifact_its_builds_standard_wasm_artifacts() {
+async fn a_pushed_node_is_an_index_of_standard_wasm_artifacts() {
     let (host, registry, digest) = echo_registry(true).await;
     let node = registry.manifest(&format!("test/echo:{digest}"));
-    assert_eq!(node["artifactType"], NODE_ARTIFACT_TYPE);
-    assert_eq!(node["config"]["mediaType"], NODE_CONFIG_MEDIA_TYPE);
-    let layers = node["layers"].as_array().unwrap();
-    assert_eq!(layers.len(), 1, "its WIT");
-    assert_eq!(layers[0]["mediaType"], WASM_LAYER_MEDIA_TYPE);
     assert_eq!(registry.manifest("test/echo:1.0"), node, "tagged");
+    assert_eq!(node["mediaType"], "application/vnd.oci.image.index.v1+json");
+    assert!(
+        node.get("artifactType").is_none(),
+        "no type a registry may not know"
+    );
+    let description: serde_json::Value =
+        serde_json::from_str(node["annotations"][NODE_ANNOTATION].as_str().unwrap()).unwrap();
+    assert_eq!(description["wit"], "test:echo@0.1.0");
+    assert_eq!(description["worlds"][0], ECHO_WORLD);
 
-    // The subject: an index of the builds, each annotated with its profile.
-    let index = registry.manifest(&format!(
-        "test/echo:{}",
-        node["subject"]["digest"].as_str().unwrap()
-    ));
-    let entries = index["manifests"].as_array().unwrap();
-    let profiles: Vec<&str> = entries
+    // Its WIT, then its builds, each annotated with its profile.
+    let entries = node["manifests"].as_array().unwrap();
+    let roles: Vec<(&str, Option<&str>)> = entries
         .iter()
-        .map(|e| e["annotations"][PROFILE_ANNOTATION].as_str().unwrap())
+        .map(|e| {
+            (
+                e["annotations"][ROLE_ANNOTATION].as_str().unwrap(),
+                e["annotations"][PROFILE_ANNOTATION].as_str(),
+            )
+        })
         .collect();
-    assert_eq!(profiles, ["release", "debug"]);
+    assert_eq!(
+        roles,
+        [
+            ("wit", None),
+            ("build", Some("release")),
+            ("build", Some("debug"))
+        ]
+    );
     for entry in entries {
-        // A build is a component as wkg pushes one.
-        let build = registry.manifest(&format!("test/echo:{}", entry["digest"].as_str().unwrap()));
-        assert_eq!(build["config"]["mediaType"], WASM_CONFIG_MEDIA_TYPE);
-        assert_eq!(build["layers"].as_array().unwrap().len(), 1);
-        assert_eq!(build["layers"][0]["mediaType"], WASM_LAYER_MEDIA_TYPE);
-        assert!(build.get("subject").is_none());
+        // Each is a Wasm OCI artifact, as wkg pushes one.
+        let manifest =
+            registry.manifest(&format!("test/echo:{}", entry["digest"].as_str().unwrap()));
+        assert_eq!(manifest["config"]["mediaType"], WASM_CONFIG_MEDIA_TYPE);
+        assert_eq!(manifest["layers"].as_array().unwrap().len(), 1);
+        assert_eq!(manifest["layers"][0]["mediaType"], WASM_LAYER_MEDIA_TYPE);
     }
 
     // Pushed again from the same files, it is the same artifact.
@@ -91,11 +103,9 @@ async fn a_node_is_pulled_with_the_build_of_its_profile() {
 async fn a_node_of_one_build_has_it_used_whatever_the_profile() {
     let (host, registry, digest) = echo_registry(false).await;
     let node = registry.manifest(&format!("test/echo:{digest}"));
-    let index = registry.manifest(&format!(
-        "test/echo:{}",
-        node["subject"]["digest"].as_str().unwrap()
-    ));
-    assert!(index["manifests"][0].get("annotations").is_none());
+    let build = &node["manifests"][1]["annotations"];
+    assert_eq!(build[ROLE_ANNOTATION], "build");
+    assert!(build.get(PROFILE_ANNOTATION).is_none());
     let debug = resolver(&host)
         .profile(Profile::Debug)
         .component(&echo(), &format!("oci://{host}/test/echo:1.0"))
@@ -276,27 +286,45 @@ async fn an_artifact_that_is_not_a_node_is_refused() {
         .err();
     assert!(matches!(err, Some(SourceError::NotANode { .. })), "{err:?}");
 
-    // A node of two WIT layers: which is its WIT?
-    let description = registry.put_blob(br#"{"wit":"test:echo@0.1.0","worlds":[]}"#);
-    let wit = registry.put_blob(&witgraph_wit::load::encode(&ECHO.wit_source()).unwrap());
-    let wasm = |digest: &str| serde_json::json!({ "mediaType": WASM_LAYER_MEDIA_TYPE, "digest": digest, "size": 1 });
+    // An index without a description is no node either.
     registry.put_manifest(
         "test/echo",
         "2.0",
         &serde_json::json!({
             "schemaVersion": 2,
-            "mediaType": "application/vnd.oci.image.manifest.v1+json",
-            "artifactType": NODE_ARTIFACT_TYPE,
-            "config": { "mediaType": NODE_CONFIG_MEDIA_TYPE, "digest": description, "size": 38 },
-            "layers": [wasm(&wit), wasm(&wit)],
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "manifests": [],
         }),
     );
     let err = resolver(&host)
         .component(&echo(), &format!("oci://{host}/test/echo:2.0"))
         .await
         .err();
+    assert!(matches!(err, Some(SourceError::NotANode { .. })), "{err:?}");
+
+    // A node of two WIT packages: which is its WIT?
+    let wit = serde_json::json!({
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "digest": registry.put_manifest("test/echo", "3.0-wit", &serde_json::json!({})),
+        "size": 2,
+        "annotations": { ROLE_ANNOTATION: "wit" },
+    });
+    registry.put_manifest(
+        "test/echo",
+        "3.0",
+        &serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "manifests": [wit, wit],
+            "annotations": { NODE_ANNOTATION: r#"{"wit":"test:echo@0.1.0","worlds":[]}"# },
+        }),
+    );
+    let err = resolver(&host)
+        .component(&echo(), &format!("oci://{host}/test/echo:3.0"))
+        .await
+        .err();
     assert!(
-        matches!(&err, Some(SourceError::Artifact { message, .. }) if message.contains("several")),
+        matches!(&err, Some(SourceError::Artifact { message, .. }) if message.contains("two WIT")),
         "{err:?}"
     );
 }

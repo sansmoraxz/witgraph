@@ -31,10 +31,11 @@
 //! fills it), or the package encoded, as `wkg build` writes it. `component`
 //! is one build, or one per [`Profile`].
 //!
-//! Over OCI, a node is one artifact (see [`oci`]): its description is the
-//! config, its WIT the one layer, and its builds the subject, an index of
-//! Wasm OCI artifacts as `wkg oci push` pushes them. [`Resolver::push`] packs
-//! a node's files into one.
+//! Over OCI, a node is an image index (see [`oci`]) of Wasm OCI artifacts:
+//! its WIT package, as `wkg publish` pushes one, and its builds, as `wkg oci
+//! push` pushes them; its description is in the index's annotations. Only
+//! standard media types are used. [`Resolver::push`] packs a node's files
+//! into one.
 //!
 //! # Profiles
 //!
@@ -296,16 +297,14 @@ pub enum SourceError {
         /// The registry client's error.
         message: String,
     },
-    /// An OCI artifact is not a node.
+    /// An OCI artifact is not a node: not an image index with a description.
     #[error(
-        "`{reference}` is not a node artifact: its artifactType is `{found}`, not `{}`",
-        oci::NODE_ARTIFACT_TYPE
+        "`{reference}` is not a node: not an image index annotated `{}`",
+        oci::NODE_ANNOTATION
     )]
     NotANode {
         /// The artifact.
         reference: String,
-        /// Its artifactType.
-        found: String,
     },
     /// A node artifact is not as a node artifact is made.
     #[error("the node artifact `{reference}`: {message}")]

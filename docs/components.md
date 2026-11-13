@@ -273,23 +273,25 @@ A node manifest names files only: a node goes into a registry whole.
 
 ### As an OCI artifact
 
-A node in a registry is one artifact, in the repository of its builds:
+A node in a registry is an OCI image index of Wasm OCI artifacts, its
+description in the index's annotations:
 
 ```text
-node manifest   artifactType  application/vnd.witgraph.node.v1
-  config        application/vnd.witgraph.node.config.v1+json   the description
-  layers        application/wasm                               its WIT package, encoded
-  subject ────► image index                                    its builds
-                  ├─ Wasm OCI artifact   annotation io.github.sansmoraxz.witgraph.profile = release
-                  └─ Wasm OCI artifact   annotation io.github.sansmoraxz.witgraph.profile = debug
+image index   annotation  io.github.sansmoraxz.witgraph.node = {"wit":…,"worlds":…,"viewers":…}
+  ├─ Wasm OCI artifact   role = wit                       its WIT package, as `wkg publish` pushes one
+  ├─ Wasm OCI artifact   role = build, profile = release  a build, as `wkg oci push` pushes one
+  └─ Wasm OCI artifact   role = build, profile = debug
 ```
 
-Each build is a component as the CNCF Wasm OCI Artifact spec has it (config
-`application/vnd.wasm.config.v0+json`, one `application/wasm` layer), as `wkg
-oci push` pushes one. The node names them by digest, so the node's own digest
-pins its description, its WIT and every build. Since the node names its
-builds as its `subject`, registries that answer the referrers API list the
-nodes built on a component.
+(`role` and `profile` are `io.github.sansmoraxz.witgraph.role` and
+`io.github.sansmoraxz.witgraph.profile`.) Every media type is a standard one:
+the OCI index and manifests, and the CNCF Wasm OCI Artifact spec's config
+(`application/vnd.wasm.config.v0+json`) and layer (`application/wasm`). What
+witgraph adds is in annotations, which registries keep as they are given, so a
+registry that only takes media types it knows (GitLab's does) holds nodes as it
+holds any other artifact, and wkg can pull each entry on its own. The index
+names its entries by digest, so the node's digest pins its description, its
+WIT and every build.
 
 `Resolver::push` packs a node manifest's files into one, after checking it as a
 resolve does, and tags it:

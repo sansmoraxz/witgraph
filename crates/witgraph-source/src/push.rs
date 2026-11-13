@@ -9,8 +9,8 @@ use serde_json::json;
 use witgraph_ir::ComponentName;
 
 use crate::oci::{
-    Descriptor, IMAGE_INDEX, IMAGE_MANIFEST, ImageIndex, ImageManifest, NODE_ARTIFACT_TYPE,
-    NODE_CONFIG_MEDIA_TYPE, PROFILE_ANNOTATION, Repository, WASM_CONFIG_MEDIA_TYPE,
+    Descriptor, IMAGE_INDEX, IMAGE_MANIFEST, ImageIndex, ImageManifest, NODE_ANNOTATION,
+    PROFILE_ANNOTATION, ROLE_ANNOTATION, ROLE_BUILD, ROLE_WIT, Repository, WASM_CONFIG_MEDIA_TYPE,
     WASM_LAYER_MEDIA_TYPE,
 };
 use crate::{Digest, Location, Node, Profile, Resolver, SourceError};
@@ -86,73 +86,48 @@ impl Resolver {
             )
             .await
             .map_err(|e| pushed(&repository, e))?;
-        // What the builds' configs say they are, from the WIT: what each
-        // world imports and exports, as wkg says it.
+        // The WIT package, as `wkg publish` pushes one: what its config says
+        // it exports, from the WIT.
+        let wit = witgraph_wit::load::encode(&read.wit).map_err(|e| SourceError::Wit {
+            location: Location::File(read.wit_at.clone()),
+            message: e.to_string(),
+        })?;
+        let wit = self
+            .push_wasm_artifact(&repository, wit.into(), &package_component(&read.wit))
+            .await?;
+        let mut entries = vec![entry(wit.0, wit.1, ROLE_WIT, None)];
+
+        // The builds, as `wkg oci push` pushes them: what each world imports
+        // and exports, from the WIT.
         let (imports, exports) = interface_names(&read.wit, &description.worlds);
         let target_world = match description.worlds.as_slice() {
             [world] => Some(world.to_string()),
             _ => None,
         };
-        let mut entries = Vec::new();
+        let component = json!({ "imports": imports, "exports": exports, "target": target_world });
         let mut pushed_builds = Vec::new();
-        for (profile, bytes, digest) in &builds {
-            let config = json_bytes(
-                &repository,
-                &json!({
-                    "created": CREATED,
-                    "architecture": "wasm",
-                    "os": "wasip2",
-                    "layerDigests": [digest.to_string()],
-                    "component": { "imports": imports, "exports": exports, "target": target_world },
-                }),
-            )?;
-            let config = self.push_blob(&repository, config.into()).await?;
-            let layer = self.push_blob(&repository, bytes.clone()).await?;
-            let manifest = ImageManifest {
-                schema_version: 2,
-                media_type: Some(IMAGE_MANIFEST.into()),
-                artifact_type: None,
-                config: Descriptor::new(WASM_CONFIG_MEDIA_TYPE, &config.0, config.1),
-                layers: vec![Descriptor::new(WASM_LAYER_MEDIA_TYPE, &layer.0, layer.1)],
-                subject: None,
-            };
+        for (profile, bytes, _) in &builds {
             let (digest, size) = self
-                .push_manifest(&repository, &manifest, IMAGE_MANIFEST, None)
+                .push_wasm_artifact(&repository, bytes.clone(), &component)
                 .await?;
-            let mut entry = Descriptor::new(IMAGE_MANIFEST, &digest, size);
-            if let Some(profile) = profile {
-                entry.annotations =
-                    BTreeMap::from([(PROFILE_ANNOTATION.to_string(), profile.to_string())]);
-            }
-            entries.push(entry);
+            entries.push(entry(digest.clone(), size, ROLE_BUILD, *profile));
             pushed_builds.push((*profile, digest));
         }
+
         let index = ImageIndex {
             schema_version: 2,
             media_type: Some(IMAGE_INDEX.into()),
             manifests: entries,
-        };
-        let (index_digest, index_size) = self
-            .push_manifest(&repository, &index, IMAGE_INDEX, None)
-            .await?;
-
-        let wit = witgraph_wit::load::encode(&read.wit).map_err(|e| SourceError::Wit {
-            location: Location::File(read.wit_at.clone()),
-            message: e.to_string(),
-        })?;
-        let wit = self.push_blob(&repository, wit.into()).await?;
-        let config = json_bytes(&repository, &description)?;
-        let config = self.push_blob(&repository, config.into()).await?;
-        let node = ImageManifest {
-            schema_version: 2,
-            media_type: Some(IMAGE_MANIFEST.into()),
-            artifact_type: Some(NODE_ARTIFACT_TYPE.into()),
-            config: Descriptor::new(NODE_CONFIG_MEDIA_TYPE, &config.0, config.1),
-            layers: vec![Descriptor::new(WASM_LAYER_MEDIA_TYPE, &wit.0, wit.1)],
-            subject: Some(Descriptor::new(IMAGE_INDEX, &index_digest, index_size)),
+            annotations: BTreeMap::from([(
+                NODE_ANNOTATION.to_string(),
+                serde_json::to_string(&description).map_err(|e| SourceError::Push {
+                    reference: repository.reference.clone(),
+                    message: e.to_string(),
+                })?,
+            )]),
         };
         let (digest, _) = self
-            .push_manifest(&repository, &node, IMAGE_MANIFEST, Some(&repository.parsed))
+            .push_manifest(&repository, &index, IMAGE_INDEX, Some(&repository.parsed))
             .await?;
         Ok(Pushed {
             reference: format!(
@@ -163,6 +138,36 @@ impl Resolver {
             digest,
             builds: pushed_builds,
         })
+    }
+
+    /// Pushes `bytes` as a Wasm OCI artifact whose config says it is
+    /// `component`; its manifest's digest and size.
+    async fn push_wasm_artifact(
+        &self,
+        repository: &Repository,
+        bytes: Bytes,
+        component: &serde_json::Value,
+    ) -> Result<(Digest, usize), SourceError> {
+        let config = json_bytes(
+            repository,
+            &json!({
+                "created": CREATED,
+                "architecture": "wasm",
+                "os": "wasip2",
+                "layerDigests": [Digest::of(&bytes).to_string()],
+                "component": component,
+            }),
+        )?;
+        let config = self.push_blob(repository, config.into()).await?;
+        let layer = self.push_blob(repository, bytes).await?;
+        let manifest = ImageManifest {
+            schema_version: 2,
+            media_type: Some(IMAGE_MANIFEST.into()),
+            config: Descriptor::new(WASM_CONFIG_MEDIA_TYPE, &config.0, config.1),
+            layers: vec![Descriptor::new(WASM_LAYER_MEDIA_TYPE, &layer.0, layer.1)],
+        };
+        self.push_manifest(repository, &manifest, IMAGE_MANIFEST, None)
+            .await
     }
 
     /// Pushes `bytes` as a blob of `repository`; their digest and size.
@@ -220,6 +225,52 @@ fn pushed(repository: &Repository, e: oci_client::errors::OciDistributionError) 
         reference: repository.reference.clone(),
         message: e.to_string(),
     }
+}
+
+/// An entry of a node's index: the manifest `digest`, in `role`, of
+/// `profile` if given.
+fn entry(digest: Digest, size: usize, role: &str, profile: Option<Profile>) -> Descriptor {
+    let mut entry = Descriptor::new(IMAGE_MANIFEST, &digest, size);
+    entry
+        .annotations
+        .insert(ROLE_ANNOTATION.to_string(), role.to_string());
+    if let Some(profile) = profile {
+        entry
+            .annotations
+            .insert(PROFILE_ANNOTATION.to_string(), profile.to_string());
+    }
+    entry
+}
+
+/// What a WIT package's config says it is, as wkg says it: everything its
+/// worlds export, the worlds themselves, and its interfaces; no imports.
+fn package_component(wit: &witgraph_wit::load::WitSource) -> serde_json::Value {
+    let resolve = &wit.resolve;
+    let mut exports = Vec::new();
+    for &id in wit.packages.first().into_iter() {
+        let package = &resolve.packages[id];
+        for &world_id in package.worlds.values() {
+            let world = &resolve.worlds[world_id];
+            exports.extend(world.exports.keys().map(|key| resolve.name_world_key(key)));
+            let mut name = format!(
+                "{}:{}/{}",
+                package.name.namespace, package.name.name, world.name
+            );
+            if let Some(version) = &package.name.version {
+                name.push_str(&format!("@{version}"));
+            }
+            exports.push(name);
+        }
+        exports.extend(
+            package
+                .interfaces
+                .values()
+                .filter_map(|&id| resolve.id_of(id)),
+        );
+    }
+    exports.sort();
+    exports.dedup();
+    json!({ "exports": exports, "imports": [], "target": null })
 }
 
 /// What `worlds` import and export, by name, as wkg names them.

@@ -1,22 +1,26 @@
 //! A node packed as an OCI artifact, and pulling one.
 //!
+//! A node is an OCI image index of Wasm OCI artifacts, its description in
+//! the index's annotations:
+//!
 //! ```text
-//! node manifest   artifactType  application/vnd.witgraph.node.v1
-//!   config        application/vnd.witgraph.node.config.v1+json   the node's description
-//!   layers        application/wasm                               its WIT package, encoded
-//!   subject ────► image index                                    its builds
-//!                   ├─ Wasm OCI artifact   annotation <profile> = release
-//!                   └─ Wasm OCI artifact   annotation <profile> = debug
+//! image index   annotation  io.github.sansmoraxz.witgraph.node = {"wit":…,"worlds":…,"viewers":…}
+//!   ├─ Wasm OCI artifact   role = wit                      its WIT package, as `wkg publish` pushes one
+//!   ├─ Wasm OCI artifact   role = build, profile = release  a build, as `wkg oci push` pushes one
+//!   └─ Wasm OCI artifact   role = build, profile = debug
 //! ```
 //!
-//! Each build is a component as the CNCF Wasm OCI Artifact spec has it
-//! (config `application/vnd.wasm.config.v0+json`, one `application/wasm`
-//! layer), as `wkg oci push` pushes one. An index of one build may leave it
-//! unannotated: that build is used whatever profile is asked for.
+//! Every media type is a standard one: an OCI index and manifests, and the
+//! CNCF Wasm OCI Artifact spec's config (`application/vnd.wasm.config.v0+json`)
+//! and layer (`application/wasm`). What witgraph adds is in annotations, which
+//! registries keep as they are given; a registry that checks media types (as
+//! GitLab's does) takes a node as any other artifact. A node of one build may
+//! leave it without a profile: that build is used whatever profile is asked
+//! for.
 //!
-//! Everything below the node manifest is named by digest: once the node
-//! manifest is known, the rest is read from the cache if it is there, and
-//! checked against its digest either way.
+//! Everything below the index is named by digest: once the index is known,
+//! the rest is read from the cache if it is there, and checked against its
+//! digest either way.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -30,23 +34,30 @@ use witgraph_ir::NodeDescription;
 use crate::files::{Capped, read};
 use crate::{Digest, Location, Node, Profile, Resolver, SourceError};
 
-/// The `artifactType` of a node artifact.
-pub const NODE_ARTIFACT_TYPE: &str = "application/vnd.witgraph.node.v1";
+/// The annotation on a node's index holding its description, as JSON: what
+/// makes an index a node.
+pub const NODE_ANNOTATION: &str = "io.github.sansmoraxz.witgraph.node";
 
-/// The media type of a node artifact's config: its description.
-pub const NODE_CONFIG_MEDIA_TYPE: &str = "application/vnd.witgraph.node.config.v1+json";
+/// The annotation on an entry of a node's index saying what it is:
+/// [`ROLE_WIT`] or [`ROLE_BUILD`].
+pub const ROLE_ANNOTATION: &str = "io.github.sansmoraxz.witgraph.role";
+
+/// The role of a node's WIT package.
+pub const ROLE_WIT: &str = "wit";
+
+/// The role of a node's build.
+pub const ROLE_BUILD: &str = "build";
+
+/// The annotation naming a build's [`Profile`].
+pub const PROFILE_ANNOTATION: &str = "io.github.sansmoraxz.witgraph.profile";
 
 /// The media type of a WebAssembly layer, in the CNCF Wasm OCI Artifact
 /// spec: a component's, or an encoded WIT package's.
 pub const WASM_LAYER_MEDIA_TYPE: &str = "application/wasm";
 
-/// The media type of a component's config, in the CNCF Wasm OCI Artifact
-/// spec.
+/// The media type of a Wasm OCI artifact's config, in the CNCF Wasm OCI
+/// Artifact spec.
 pub const WASM_CONFIG_MEDIA_TYPE: &str = "application/vnd.wasm.config.v0+json";
-
-/// The annotation naming a build's [`Profile`], on its entry in a node's
-/// index.
-pub const PROFILE_ANNOTATION: &str = "io.github.sansmoraxz.witgraph.profile";
 
 /// An OCI image manifest.
 pub(crate) const IMAGE_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
@@ -86,13 +97,17 @@ pub(crate) struct ImageManifest {
     pub(crate) schema_version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) media_type: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) artifact_type: Option<String>,
     pub(crate) config: Descriptor,
     #[serde(default)]
     pub(crate) layers: Vec<Descriptor>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) subject: Option<Descriptor>,
+}
+
+/// What a manifest or index says it is.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MediaType {
+    #[serde(default)]
+    media_type: Option<String>,
 }
 
 /// An OCI image index.
@@ -103,6 +118,8 @@ pub(crate) struct ImageIndex {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) media_type: Option<String>,
     pub(crate) manifests: Vec<Descriptor>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) annotations: BTreeMap<String, String>,
 }
 
 /// A parsed reference, and its registry and repository, to name content in
@@ -177,147 +194,134 @@ enum Content<'a> {
 }
 
 impl Resolver {
-    /// The node artifact `reference` names, with its build for the
-    /// resolver's profile.
+    /// The node `reference` names, with its build for the resolver's
+    /// profile.
     pub(crate) async fn pull_node(&self, reference: &str) -> Result<Node, SourceError> {
         let repository = Repository::parse(reference)?;
-        let (bytes, node_digest, offline) = self.node_manifest(&repository).await?;
-        let manifest: ImageManifest = serde_json::from_slice(&bytes)
-            .map_err(|e| repository.bad(format!("its manifest does not parse: {e}")))?;
-        if manifest.artifact_type.as_deref() != Some(NODE_ARTIFACT_TYPE) {
-            return Err(SourceError::NotANode {
-                reference: reference.to_string(),
-                found: manifest.artifact_type.unwrap_or_default(),
-            });
+        let (bytes, node_digest, offline) = self.node_index(&repository).await?;
+        // A manifest (a component, say) is no node, nor an index without a
+        // description.
+        let not_a_node = || SourceError::NotANode {
+            reference: reference.to_string(),
+        };
+        let kind: MediaType = serde_json::from_slice(&bytes).map_err(|_| not_a_node())?;
+        if kind.media_type.as_deref() != Some(IMAGE_INDEX) {
+            return Err(not_a_node());
         }
-
-        if manifest.config.media_type != NODE_CONFIG_MEDIA_TYPE {
-            return Err(repository.bad(format!(
-                "its config is `{}`, not `{NODE_CONFIG_MEDIA_TYPE}`",
-                manifest.config.media_type
-            )));
-        }
-        let config = self
-            .content(
-                &repository,
-                &manifest.config,
-                Content::Blob(&manifest.config),
-            )
-            .await?;
-        let description: NodeDescription = serde_json::from_slice(&config)
+        let index: ImageIndex = serde_json::from_slice(&bytes)
+            .map_err(|e| repository.bad(format!("its index does not parse: {e}")))?;
+        let description = index
+            .annotations
+            .get(NODE_ANNOTATION)
+            .ok_or_else(not_a_node)?;
+        let description: NodeDescription = serde_json::from_str(description)
             .map_err(|e| repository.bad(format!("its description does not parse: {e}")))?;
 
-        let wit_layer = one_wasm_layer(&repository, &manifest.layers, "its WIT")?;
+        let mut wit = None;
+        let mut builds = Vec::new();
+        for entry in index.manifests {
+            match entry.annotations.get(ROLE_ANNOTATION).map(String::as_str) {
+                Some(ROLE_WIT) if wit.is_none() => wit = Some(entry),
+                Some(ROLE_WIT) => return Err(repository.bad("it holds two WIT packages")),
+                Some(ROLE_BUILD) => builds.push(entry),
+                Some(other) => return Err(repository.bad(format!("an entry's role is `{other}`"))),
+                // Something else beside the node (a signature, say).
+                None => {}
+            }
+        }
+        let wit_entry = wit.ok_or_else(|| repository.bad("it holds no WIT package"))?;
         let wit_bytes = self
-            .content(&repository, wit_layer, Content::Blob(wit_layer))
+            .wasm_artifact(&repository, &wit_entry, "its WIT")
             .await?;
-        let wit_location = repository.location(&digest_of(&repository, wit_layer)?);
+        let wit_location = repository.location(&digest_of(&repository, &wit_entry)?);
         let wit = witgraph_wit::load::load_encoded(&wit_bytes).map_err(|e| SourceError::Wit {
             location: wit_location.clone(),
             message: e.to_string(),
         })?;
 
-        let subject = manifest
-            .subject
-            .as_ref()
-            .ok_or_else(|| repository.bad("it has no subject: its builds"))?;
-        let (profile, build) = match subject.media_type.as_str() {
-            IMAGE_INDEX => {
-                let index = self
-                    .content(&repository, subject, Content::Manifest(&[IMAGE_INDEX]))
-                    .await?;
-                let index: ImageIndex = serde_json::from_slice(&index)
-                    .map_err(|e| repository.bad(format!("its index does not parse: {e}")))?;
-                self.pick(&repository, index)?
-            }
-            IMAGE_MANIFEST => (None, subject.clone()),
-            other => return Err(repository.bad(format!("its subject is `{other}`"))),
-        };
-        let component = self
-            .content(&repository, &build, Content::Manifest(&[IMAGE_MANIFEST]))
-            .await?;
-        let component: ImageManifest = serde_json::from_slice(&component)
-            .map_err(|e| repository.bad(format!("a build's manifest does not parse: {e}")))?;
-        if component.config.media_type != WASM_CONFIG_MEDIA_TYPE {
-            return Err(repository.bad(format!(
-                "a build is not a Wasm OCI artifact: its config is `{}`",
-                component.config.media_type
-            )));
-        }
-        let layer = one_wasm_layer(&repository, &component.layers, "a build")?;
-        let bytes = self
-            .content(&repository, layer, Content::Blob(layer))
-            .await?;
+        let (profile, build) = self.pick(&repository, builds)?;
+        let bytes = self.wasm_artifact(&repository, &build, "a build").await?;
         Ok(Node {
             description,
             wit,
             wit_location,
             profile,
-            digest: digest_of(&repository, layer)?,
+            digest: Digest::of(&bytes),
             bytes,
             artifact: Some(node_digest),
             offline,
         })
     }
 
-    /// The build in `index` for the resolver's profile.
+    /// The one layer of the Wasm OCI artifact `entry` names.
+    async fn wasm_artifact(
+        &self,
+        repository: &Repository,
+        entry: &Descriptor,
+        what: &str,
+    ) -> Result<Bytes, SourceError> {
+        let manifest = self
+            .content(repository, entry, Content::Manifest(&[IMAGE_MANIFEST]))
+            .await?;
+        let manifest: ImageManifest = serde_json::from_slice(&manifest)
+            .map_err(|e| repository.bad(format!("{what}'s manifest does not parse: {e}")))?;
+        if manifest.config.media_type != WASM_CONFIG_MEDIA_TYPE {
+            return Err(repository.bad(format!(
+                "{what} is not a Wasm OCI artifact: its config is `{}`",
+                manifest.config.media_type
+            )));
+        }
+        let layer = one_wasm_layer(repository, &manifest.layers, what)?;
+        self.content(repository, layer, Content::Blob(layer)).await
+    }
+
+    /// The build of `builds` for the resolver's profile, and its profile:
+    /// none for a node's one build left without one.
     fn pick(
         &self,
         repository: &Repository,
-        index: ImageIndex,
+        builds: Vec<Descriptor>,
     ) -> Result<(Option<Profile>, Descriptor), SourceError> {
-        let profiles: Vec<Option<Profile>> = index
-            .manifests
-            .iter()
-            .map(|entry| {
-                entry
-                    .annotations
-                    .get(PROFILE_ANNOTATION)
-                    .map(|p| {
-                        p.parse::<Profile>()
-                            .map_err(|_| repository.bad(format!("a build's profile is `{p}`")))
-                    })
-                    .transpose()
-            })
-            .collect::<Result<_, _>>()?;
-        let entries: Vec<(Option<Profile>, Descriptor)> =
-            profiles.into_iter().zip(index.manifests).collect();
-        let one = entries.len() == 1;
+        let one = builds.len() == 1;
         let mut found: Vec<Profile> = Vec::new();
         let mut chosen = None;
-        for (profile, entry) in entries {
-            let Some(profile) = profile else {
+        for build in builds {
+            let Some(profile) = build.annotations.get(PROFILE_ANNOTATION) else {
                 // The one build, whatever the profile.
                 if one {
-                    return Ok((None, entry));
+                    return Ok((None, build));
                 }
-                return Err(repository
-                    .bad("its index holds several builds, not each annotated with its profile"));
+                return Err(
+                    repository.bad("it holds several builds, not each annotated with its profile")
+                );
             };
+            let profile: Profile = profile
+                .parse()
+                .map_err(|_| repository.bad(format!("a build's profile is `{profile}`")))?;
             if found.contains(&profile) {
-                return Err(repository.bad(format!("its index holds two {profile} builds")));
+                return Err(repository.bad(format!("it holds two {profile} builds")));
             }
             found.push(profile);
             if profile == self.profile {
-                chosen = Some(entry);
+                chosen = Some(build);
             }
         }
         if found.is_empty() {
-            return Err(repository.bad("its index holds no build"));
+            return Err(repository.bad("it holds no build"));
         }
         found.sort();
-        let entry = chosen.ok_or_else(|| SourceError::NoBuild {
+        let build = chosen.ok_or_else(|| SourceError::NoBuild {
             location: Location::Oci(repository.reference.clone()),
             profile: self.profile,
             found,
         })?;
-        Ok((Some(self.profile), entry))
+        Ok((Some(self.profile), build))
     }
 
-    /// The node manifest `repository` names, its digest, and whether it is
+    /// The node index `repository` names, its digest, and whether it is
     /// what a tag held when last pulled, as its registry could not be
     /// reached.
-    async fn node_manifest(
+    async fn node_index(
         &self,
         repository: &Repository,
     ) -> Result<(Bytes, Digest, bool), SourceError> {
@@ -326,7 +330,7 @@ impl Resolver {
                 .parse()
                 .map_err(|_| repository.bad(format!("`{digest}` is not a sha256 digest")))?;
             let bytes = self
-                .manifest(repository, &digest, &[IMAGE_MANIFEST])
+                .manifest(repository, &digest, &[IMAGE_INDEX, IMAGE_MANIFEST])
                 .await?;
             return Ok((bytes, digest, false));
         }
@@ -335,13 +339,13 @@ impl Resolver {
             .pull_manifest_raw(
                 &repository.parsed,
                 self.auth_for(&repository.parsed),
-                &[IMAGE_MANIFEST],
+                &[IMAGE_INDEX, IMAGE_MANIFEST],
             )
             .await
         {
             Ok((bytes, _)) => {
                 if bytes.len() > MAX_MANIFEST_BYTES {
-                    return Err(repository.bad("its manifest is too large"));
+                    return Err(repository.bad("its index is too large"));
                 }
                 let digest = Digest::of(&bytes);
                 self.store(&digest, bytes.clone()).await;
