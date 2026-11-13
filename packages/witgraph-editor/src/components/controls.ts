@@ -452,11 +452,10 @@ export class WitgraphControls extends HTMLElement {
     this.#btnSnapRestore.disabled =
       !this.#controller || this.#controller.savedSnapshots.length === 0 || mode === 'running';
     // An attached graph is the program's to rebuild and change: here it is run, stopped and
-    // debugged.
+    // debugged, and restarted if its program can.
     const attached = this.#controller?.attached ?? false;
-    for (const button of [this.#btnRestart, this.#btnReset]) {
-      button.toggleAttribute('hidden', attached);
-    }
+    this.#btnRestart.toggleAttribute('hidden', !(this.#controller?.restartable ?? true));
+    this.#btnReset.toggleAttribute('hidden', attached);
     // Its program sets how fast it ticks.
     this.#rateGroup?.toggleAttribute('hidden', attached);
     for (const button of [this.#btnLoad, this.#btnSnapSave, this.#btnSnapRestore]) {

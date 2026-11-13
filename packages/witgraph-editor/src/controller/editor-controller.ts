@@ -110,6 +110,12 @@ export interface AttachedEditing {
   apply(
     graph: GraphJson,
   ): Promise<{ url: string; certificateHash: Uint8Array<ArrayBuffer> } | null>;
+  /**
+   * Loads the graph attached to afresh, as it is, and runs it: Restart, as for a graph run in
+   * the page. Resolves with where to attach to it. Without it, an attached graph is not
+   * restarted from here.
+   */
+  restart?(): Promise<{ url: string; certificateHash: Uint8Array<ArrayBuffer> }>;
 }
 
 /** Whether a connection may be, and if not, why, in the compiler's words. */
@@ -1564,9 +1570,42 @@ export class EditorController extends EventTarget {
     this.#dispatch('state-changed');
   }
 
-  /** Stops what is running and runs the graph again from the top, keeping its inputs. */
+  /** Whether {@link restart} can: always, but for an attached graph its program cannot restart. */
+  get restartable(): boolean {
+    return !this.#attached || this.#editing?.restart !== undefined;
+  }
+
+  /**
+   * Stops what is running and runs the graph again from the top, keeping its inputs. An
+   * attached graph its program restarts: loaded afresh, and run.
+   */
   async restart(): Promise<void> {
-    if (this.#attached) return;
+    if (this.#attached) {
+      const editing = this.#editing;
+      if (!editing?.restart) return;
+      if (this.#reloading) {
+        this.#warn('The graph is being changed: restart it once that is done');
+        return;
+      }
+      this.#reloading = true;
+      try {
+        const draft = this.#graphJson;
+        const selected = this.#selectedNode;
+        await this.attach({ ...(await editing.restart()), editing });
+        // Drawn where the editor had them.
+        if (draft) {
+          this.#graphJson = draft;
+          this.#buildVisuals();
+        }
+        if (selected && this.#nodes.has(selected)) this.#selectedNode = selected;
+      } catch (err) {
+        this.#pushError(`Cannot restart: ${err instanceof Error ? err.message : String(err)}`);
+      } finally {
+        this.#reloading = false;
+      }
+      this.#dispatch('state-changed');
+      return;
+    }
     await this.stop();
     await this.#runLoop;
     await this.run();
