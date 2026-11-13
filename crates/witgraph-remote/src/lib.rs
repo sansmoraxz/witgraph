@@ -212,13 +212,62 @@ impl<M: RuntimeMode, H: Host> Debuggee<M, H> {
         self.inner.stopped.load(Ordering::SeqCst)
     }
 
-    /// Stops the graph as a debugger does: its ticks advance nothing until a debugger runs it.
-    /// For a program that loads a graph in place of one a debugger stopped, say, to keep it
-    /// stopped.
+    /// Stops the graph: its ticks advance nothing until a debugger runs it. Nothing is under
+    /// way in a graph just loaded, which a program loading one in place of a graph a debugger
+    /// stopped keeps stopped so; a debugger's `stop` also cancels what is
+    /// ([`stop_and_cancel`](Self::stop_and_cancel)).
     pub fn stop(&self) {
         self.inner.stopped.store(true, Ordering::SeqCst);
-        // The tick under way ends now, leaving what it runs where it is.
+        // The tick under way ends now.
         self.inner.asked.notify_one();
+    }
+
+    /// Stops the graph as a debugger's `stop` does, as a graph run in the editor's page stops:
+    /// its ticks advance nothing, and what is under way is cancelled (its nodes say so), to run
+    /// again on their latched inputs once the graph runs ([`run_again`](Self::run_again)).
+    pub async fn stop_and_cancel(&self) {
+        self.stop();
+        // What a debugger holds, a run before it starts or a guest on a line, is let go, as the
+        // tick under way waits on it: then it ends, and what it ran is cancelled. Breakpoints
+        // go too; a debugger sets its own again when it runs the graph.
+        for run in self.inner.holds.held() {
+            self.inner.holds.resume(run.id);
+        }
+        if let Some(lines) = &self.inner.lines {
+            lines.release();
+        }
+        self.with(|graph| {
+            Box::pin(async move {
+                graph.shutdown();
+            })
+        })
+        .await;
+    }
+
+    /// Runs the graph again, as a debugger's `run` does: the nodes a stop cancelled run again
+    /// on their latched inputs, and its ticks advance it.
+    pub async fn run_again(&self) {
+        self.with(|graph| {
+            Box::pin(async move {
+                let cancelled: Vec<NodeId> = graph
+                    .compiled()
+                    .graph()
+                    .nodes
+                    .iter()
+                    .map(|node| node.id.clone())
+                    .filter(|node| {
+                        graph
+                            .node_state(node)
+                            .is_ok_and(|state| state.phase() == NodePhase::Cancelled)
+                    })
+                    .collect();
+                for node in cancelled {
+                    let _ = graph.rerun(&node);
+                }
+            })
+        })
+        .await;
+        self.inner.stopped.store(false, Ordering::SeqCst);
     }
 
     /// Does `work` on the graph, between ticks or by ending one early: as the program running
@@ -455,14 +504,12 @@ impl<C: Send + Sync, M: RuntimeMode, H: Host> graph::Handler<C> for Handler<M, H
     }
 
     async fn run(&self, _: C) -> anyhow::Result<()> {
-        self.inner().stopped.store(false, Ordering::SeqCst);
+        self.debuggee.run_again().await;
         Ok(())
     }
 
     async fn stop(&self, _: C) -> anyhow::Result<()> {
-        self.inner().stopped.store(true, Ordering::SeqCst);
-        // The tick under way ends now, leaving what it runs where it is.
-        self.inner().asked.notify_one();
+        self.debuggee.stop_and_cancel().await;
         Ok(())
     }
 
@@ -760,7 +807,13 @@ pub async fn serve<M: RuntimeMode, H: Host>(
     let left = Left {
         holds: handler.debuggee.inner.holds.clone(),
         lines: handler.debuggee.inner.lines.clone(),
-        stopped: handler.debuggee.inner.stopped.clone(),
+        run_again: {
+            let debuggee = handler.debuggee.clone();
+            Arc::new(move || {
+                let debuggee = debuggee.clone();
+                Box::pin(async move { debuggee.run_again().await }) as BoxFuture<'static, ()>
+            })
+        },
     };
     let invocations = bindings::serve(server.as_ref(), handler)
         .await
@@ -831,17 +884,19 @@ async fn run(
 struct Left {
     holds: RuntimeHolds,
     lines: Option<RuntimeLines>,
-    stopped: Arc<AtomicBool>,
+    /// Runs the graph again, as `run` does.
+    run_again: Arc<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>,
 }
 
 impl Left {
     fn release(&self) {
-        // A graph a debugger stopped runs again: the program is not left waiting on it.
-        self.stopped.store(false, Ordering::SeqCst);
         self.holds.release();
         if let Some(lines) = &self.lines {
             lines.release();
         }
+        // A graph a debugger stopped runs again, what the stop cancelled too: the program is
+        // not left waiting on it.
+        tokio::spawn((self.run_again)());
     }
 }
 

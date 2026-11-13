@@ -75,11 +75,14 @@ export function rerun(transport: $wrpc.Transport, node: string): globalThis.Prom
  */
 export function running(transport: $wrpc.Transport): globalThis.Promise<boolean>;
 /**
- * Lets the program's ticks advance the graph again.
+ * Lets the program's ticks advance the graph again: the nodes a stop cancelled run again,
+ * on their latched inputs.
  */
 export function run(transport: $wrpc.Transport): globalThis.Promise<void>;
 /**
- * Stops the graph: the tick under way ends, and the program's ticks advance nothing, what
- * was under way waiting where it is, until `run`. A debugger going lets it run again.
+ * Stops the graph, as one run in the editor's page stops: what is under way is cancelled
+ * (its nodes' phase says so), runs held and a guest stopped on a line are let go, with the
+ * breakpoints, and the program's ticks advance nothing until `run`. A debugger going runs
+ * it again.
  */
 export function stop(transport: $wrpc.Transport): globalThis.Promise<void>;

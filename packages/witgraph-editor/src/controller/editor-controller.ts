@@ -2018,9 +2018,9 @@ export class EditorController extends EventTarget {
   }
 
   /**
-   * Stops the program's graph: its ticks advance nothing until it is run again. What it was
-   * held at, a node or a line, is let go, to go on once it runs: as here, its breakpoints are
-   * set again then.
+   * Stops the program's graph, as one run here stops: what is under way is cancelled, and its
+   * ticks advance nothing until it is run again, the cancelled nodes first. What it was held
+   * at, a node or a line, is let go: as here, its breakpoints are set again when it runs.
    */
   async #stopAttached(session: AttachedSession): Promise<void> {
     const stopped = session.stop();

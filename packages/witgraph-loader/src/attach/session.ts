@@ -234,8 +234,9 @@ export class AttachedSession implements DebugSession {
   }
 
   /**
-   * Stops the program's graph: the tick under way ends, and its ticks advance nothing until
-   * {@link run}, what was under way waiting where it is. Going lets it run again.
+   * Stops the program's graph, as one run in the page stops: what is under way is cancelled,
+   * and its ticks advance nothing until {@link run}, which runs the cancelled nodes again.
+   * Going runs it again.
    */
   stop(): Promise<void> {
     this.#running = false;

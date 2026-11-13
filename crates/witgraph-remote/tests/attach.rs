@@ -439,6 +439,12 @@ async fn a_debugger_stops_the_programs_graph_and_runs_it_again() {
 
     graph::stop(&wrpc, ()).await.unwrap();
     assert!(!graph::running(&wrpc, ()).await.unwrap());
+    // As a graph run in the editor's page stops: what was under way is cancelled.
+    let state = graph::node_state(&wrpc, (), "counter")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(state.phase, "cancelled");
     let stopped = counted().await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(counted().await, stopped, "no tick advances it");
