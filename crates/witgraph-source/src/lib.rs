@@ -42,10 +42,11 @@
 //! # Cache
 //!
 //! With a cache directory ([`Resolver::cache`]), every blob pulled from a
-//! registry is stored under its digest, and each pinned reference with the
-//! digest of what it held, so a pinned reference is read from disk without
-//! contacting the registry again. Cached bytes are checked against their
-//! digest.
+//! registry is stored under its digest, and each reference with the digest of
+//! what it held. A pinned reference is then read from disk without contacting
+//! the registry again; a tag is pulled, and if its registry cannot be reached,
+//! what it held when last pulled is used, marked [`offline`](Component::offline).
+//! Cached bytes are checked against their digest.
 //!
 //! # OCI artifacts
 //!
@@ -287,6 +288,14 @@ pub enum SourceError {
         /// The registry client's error.
         message: String,
     },
+    /// An OCI artifact's registry could not be reached.
+    #[error("failed to reach the registry of `{reference}`: {message}")]
+    Unreachable {
+        /// The artifact.
+        reference: String,
+        /// The registry client's error.
+        message: String,
+    },
     /// An OCI artifact holds no layer of the kind wanted, or several.
     #[error("`{reference}` holds {found} {what} layers; it should hold one")]
     Layers {
@@ -368,6 +377,9 @@ pub struct Fetched {
     pub bytes: Bytes,
     /// Their sha-256.
     pub digest: Digest,
+    /// Whether they are what a tag held when last pulled, from the cache, as its registry could
+    /// not be reached: they may since have moved on.
+    pub offline: bool,
 }
 
 /// One component, resolved: what its node manifest says it is.
@@ -392,6 +404,9 @@ pub struct Component {
     pub capabilities: Vec<Capability>,
     /// What was wrong but did not stop it resolving: viewers skipped.
     pub warnings: Vec<String>,
+    /// Whether some of it (its manifest, WIT or bytes) is what a tag held when last pulled,
+    /// as its registry could not be reached.
+    pub offline: bool,
 }
 
 impl Component {
@@ -637,8 +652,10 @@ impl Resolver {
             })?;
         let bytes_at = location.join(&manifest.component)?;
         let wit_at = location.join(&manifest.wit_source)?;
+        let manifest_offline = fetched.offline;
         let (fetched, wit) = futures::join!(self.fetch(&bytes_at), self.wit(&wit_at));
-        let (fetched, wit) = (fetched?, wit?);
+        let (fetched, (wit, wit_offline)) = (fetched?, wit?);
+        let offline = manifest_offline || wit_offline || fetched.offline;
         let wit_error = |message: String| SourceError::Wit {
             location: wit_at.clone(),
             message,
@@ -715,12 +732,13 @@ impl Resolver {
             contracts,
             capabilities,
             warnings,
+            offline,
         })
     }
 
     /// Loads the WIT at `location`: a directory or file, or an encoded
     /// package.
-    async fn wit(&self, location: &Location) -> Result<WitSource, SourceError> {
+    async fn wit(&self, location: &Location) -> Result<(WitSource, bool), SourceError> {
         let failed = |message: String| SourceError::Wit {
             location: location.clone(),
             message,
@@ -733,11 +751,13 @@ impl Resolver {
                 })
                 .await
                 .map_err(|e| failed(e.to_string()))?;
-                loaded.map_err(failed)
+                Ok((loaded.map_err(failed)?, false))
             }
             Location::Oci(_) => {
                 let fetched = self.fetch(location).await?;
-                witgraph_wit::load::load_encoded(&fetched.bytes).map_err(|e| failed(e.to_string()))
+                let wit = witgraph_wit::load::load_encoded(&fetched.bytes)
+                    .map_err(|e| failed(e.to_string()))?;
+                Ok((wit, fetched.offline))
             }
         }
     }
@@ -768,6 +788,7 @@ impl Resolver {
                 Ok(Fetched {
                     bytes: bytes.into(),
                     digest,
+                    offline: false,
                 })
             }
             Location::Oci(reference) => {
@@ -781,20 +802,30 @@ impl Resolver {
                 if pinned && let Some(fetched) = self.cached_reference(reference).await {
                     return Ok(fetched);
                 }
-                let (bytes, digest) = self
-                    .pull(reference, &parsed, layer)
-                    .await?
-                    .ok_or_else(too_large)?;
+                let (bytes, digest) = match self.pull(reference, &parsed, layer).await {
+                    Ok(pulled) => pulled.ok_or_else(too_large)?,
+                    // A tag whose registry could not be reached is what it held when last
+                    // pulled, if that is cached: marked so.
+                    Err(error @ SourceError::Unreachable { .. }) => {
+                        return match self.cached_reference(reference).await {
+                            Some(fetched) => Ok(Fetched {
+                                offline: true,
+                                ..fetched
+                            }),
+                            None => Err(error),
+                        };
+                    }
+                    Err(error) => return Err(error),
+                };
                 let fetched = Fetched {
                     bytes: bytes.into(),
                     digest,
+                    offline: false,
                 };
                 // Caching is best effort: the bytes are in hand whether or
                 // not they could be kept.
                 self.store(&fetched).await;
-                if pinned {
-                    self.store_reference(reference, &fetched.digest).await;
-                }
+                self.store_reference(reference, &fetched.digest).await;
                 Ok(fetched)
             }
         }
@@ -809,10 +840,11 @@ impl Resolver {
         (found == *digest).then(|| Fetched {
             bytes: bytes.into(),
             digest: found,
+            offline: false,
         })
     }
 
-    /// What a pinned reference held when it was last pulled, from the cache.
+    /// What a reference held when it was last pulled, from the cache.
     async fn cached_reference(&self, reference: &str) -> Option<Fetched> {
         let text = tokio::fs::read_to_string(self.reference_path(reference)?)
             .await
@@ -820,7 +852,7 @@ impl Resolver {
         self.cached(&text.trim().parse().ok()?).await
     }
 
-    /// Notes in the cache what a pinned reference held.
+    /// Notes in the cache what a reference held.
     async fn store_reference(&self, reference: &str, digest: &Digest) {
         let Some(path) = self.reference_path(reference) else {
             return;
@@ -972,9 +1004,16 @@ impl Resolver {
         parsed: &Reference,
         kind: Layer,
     ) -> Result<Option<(Vec<u8>, Digest)>, SourceError> {
-        let failed = |e: oci_client::errors::OciDistributionError| SourceError::Pull {
-            reference: reference.to_string(),
-            message: format!("{e}"),
+        let failed = |e: oci_client::errors::OciDistributionError| {
+            let (reference, message) = (reference.to_string(), format!("{e}"));
+            match &e {
+                oci_client::errors::OciDistributionError::RequestError(e)
+                    if e.is_connect() || e.is_timeout() =>
+                {
+                    SourceError::Unreachable { reference, message }
+                }
+                _ => SourceError::Pull { reference, message },
+            }
         };
         // The manifest first: an artifact may carry other layers (a
         // signature, say) beside the one wanted.

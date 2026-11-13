@@ -81,6 +81,8 @@ struct Registry {
     /// Blobs by digest (`sha256:…`).
     blobs: HashMap<String, Vec<u8>>,
     requests: AtomicUsize,
+    /// Stops it listening: a registry that cannot be reached.
+    stop: tokio::sync::Notify,
 }
 
 const MANIFEST_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
@@ -151,7 +153,14 @@ impl Registry {
         let host = listener.local_addr().unwrap().to_string();
         let served = registry.clone();
         tokio::spawn(async move {
-            while let Ok((mut socket, _)) = listener.accept().await {
+            loop {
+                let mut socket = tokio::select! {
+                    accepted = listener.accept() => match accepted {
+                        Ok((socket, _)) => socket,
+                        Err(_) => return,
+                    },
+                    () = served.stop.notified() => return,
+                };
                 let registry = served.clone();
                 tokio::spawn(async move {
                     let mut request = Vec::new();
@@ -352,7 +361,7 @@ async fn a_pinned_reference_in_the_cache_is_not_pulled_again() {
 
     // A tag may have moved: it is pulled.
     let tagged: Location = format!("oci://{host}/test/echo:1.0").parse().unwrap();
-    resolver.fetch(&tagged).await.unwrap();
+    assert!(!resolver.fetch(&tagged).await.unwrap().offline);
     assert!(registry.requests.load(Ordering::SeqCst) > pulled);
 
     // A damaged cache file is not trusted.
@@ -363,6 +372,38 @@ async fn a_pinned_reference_in_the_cache_is_not_pulled_again() {
     assert_eq!(*repaired.bytes, *ECHO.wasm);
     assert!(registry.requests.load(Ordering::SeqCst) > pulled);
     assert_eq!(std::fs::read(&file).unwrap(), ECHO.wasm);
+}
+
+#[tokio::test]
+async fn a_tag_whose_registry_is_gone_is_what_it_held_last_marked_offline() {
+    let (host, registry, _) = echo_registry().await;
+    let cache = scratch("offline-tag");
+    let tagged = table(&format!("oci://{host}/test/echo-node:1.0"));
+    let online = resolver(&host)
+        .cache(&cache)
+        .resolve(&tagged)
+        .await
+        .unwrap();
+    assert!(!online.get(&echo()).unwrap().offline);
+
+    registry.stop.notify_one();
+    let offline = resolver(&host)
+        .cache(&cache)
+        .resolve(&tagged)
+        .await
+        .unwrap();
+    let offline = offline.get(&echo()).unwrap();
+    assert!(offline.offline);
+    assert_eq!(*offline.bytes, *ECHO.wasm);
+
+    // With nothing cached, there is nothing to fall back on.
+    let err = resolver(&host)
+        .cache(scratch("offline-tag-empty"))
+        .resolve(&tagged)
+        .await
+        .err()
+        .unwrap();
+    assert!(err.to_string().contains("failed to reach"), "{err}");
 }
 
 #[tokio::test]
