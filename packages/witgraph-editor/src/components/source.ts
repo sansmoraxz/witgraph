@@ -57,9 +57,14 @@ const EXTRA_CSS = `
   .caller-note[hidden] { display: none; }
 `;
 
-const GUTTER_TITLE =
-  'Click: a breakpoint here (or on the next line with code), or none\n' +
-  'Right-click: only in this node, or in every node';
+/** What the gutter does, a click setting a breakpoint in every node, or only in this one. */
+function gutterTitle(clickScope: 'every-node' | 'node'): string {
+  return clickScope === 'node'
+    ? 'Click: a breakpoint here, only in this node (or on the next line with code), or none\n' +
+        'Right-click: in every node, or only in this one'
+    : 'Click: a breakpoint here (or on the next line with code), or none\n' +
+        'Right-click: only in this node, or in every node';
+}
 
 /** How a row shows the breakpoint on it, by whom it stops. */
 const BREAKPOINT_KINDS = ['breakpoint', 'breakpoint-node', 'breakpoint-other'] as const;
@@ -408,11 +413,11 @@ export class WitgraphSource extends HTMLElement {
       row.dataset.line = String(number);
       const gutter = document.createElement('span');
       gutter.className = 'gutter';
-      gutter.title = GUTTER_TITLE;
+      gutter.title = gutterTitle(controller.breakpointClickScope);
       const dot = document.createElement('span');
       dot.className = 'dot';
       gutter.appendChild(dot);
-      gutter.addEventListener('click', () => controller.toggleLineBreakpoint(file, number));
+      gutter.addEventListener('click', () => this.#toggle(file, number));
       gutter.addEventListener('contextmenu', (event) => {
         event.preventDefault();
         this.#breakpointMenu(event, file, number);
@@ -432,6 +437,28 @@ export class WitgraphSource extends HTMLElement {
   }
 
   /**
+   * Sets a breakpoint on a line, as a click does (see
+   * {@link EditorController.breakpointClickScope}), or takes away the one there.
+   */
+  #toggle(file: string, line: number): void {
+    const controller = this.#controller;
+    if (!controller) return;
+    if (controller.lineBreakpointAt(file, line)) {
+      controller.setLineBreakpoint(file, line, null);
+    } else {
+      controller.setLineBreakpoint(file, line, this.#clickScope());
+    }
+  }
+
+  /** The scope a click sets: the node on show's if the controller says so and there is one. */
+  #clickScope(): BreakpointScope {
+    const node = this.#node;
+    return this.#controller?.breakpointClickScope === 'node' && node !== null
+      ? { node }
+      : 'every-node';
+  }
+
+  /**
    * Offers what can be done with the breakpoint on a line: set it, take it away, or have it stop
    * only the node on show, or every node.
    */
@@ -447,10 +474,16 @@ export class WitgraphSource extends HTMLElement {
     const remove = (label: string) => ({ label, shortcut: 'Click', action: to(null) });
     let items: MenuItem[];
     if (set === undefined) {
-      items = [
-        { label: 'Add breakpoint', shortcut: 'Click', action: to('every-node') },
-        { label: `Add breakpoint only in ${node}`, action: to({ node }) },
-      ];
+      items =
+        controller.breakpointClickScope === 'node'
+          ? [
+              { label: `Add breakpoint only in ${node}`, shortcut: 'Click', action: to({ node }) },
+              { label: 'Add breakpoint in every node', action: to('every-node') },
+            ]
+          : [
+              { label: 'Add breakpoint', shortcut: 'Click', action: to('every-node') },
+              { label: `Add breakpoint only in ${node}`, action: to({ node }) },
+            ];
     } else if (set === 'every-node') {
       items = [remove('Remove breakpoint'), only];
     } else if (set.node === node) {
@@ -489,7 +522,8 @@ export class WitgraphSource extends HTMLElement {
         const set = kinds.get(number);
         for (const kind of BREAKPOINT_KINDS) row.classList.toggle(kind, set?.kind === kind);
         const gutter = row.querySelector<HTMLElement>('.gutter');
-        if (gutter) gutter.title = set ? `${set.title}\n${GUTTER_TITLE}` : GUTTER_TITLE;
+        const title = gutterTitle(controller.breakpointClickScope);
+        if (gutter) gutter.title = set ? `${set.title}\n${title}` : title;
         row.classList.toggle('current', number === current);
         row.classList.toggle('frame-line', number === this.#frameLine);
       }

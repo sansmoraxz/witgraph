@@ -1488,6 +1488,13 @@ export class EditorController extends EventTarget {
    * As a click in a debugger's gutter: takes away the breakpoint on `line` of `file`, or the next
    * line with code, whichever nodes it stops, or with none there sets one that stops every node.
    */
+  /**
+   * What a click on a line in the Source panel sets: a breakpoint in every node that runs the
+   * line (`'every-node'`, the default, as in most debuggers), or only in the node whose source
+   * is on show (`'node'`). The panel's menu offers the other either way.
+   */
+  breakpointClickScope: 'every-node' | 'node' = 'every-node';
+
   toggleLineBreakpoint(file: string, line: number): void {
     this.setLineBreakpoint(file, line, this.lineBreakpointAt(file, line) ? null : 'every-node');
   }
