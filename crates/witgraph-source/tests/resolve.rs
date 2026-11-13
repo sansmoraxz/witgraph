@@ -12,7 +12,7 @@ use tokio::net::TcpListener;
 use witgraph_ir::{ComponentName, ContractId, ContractSource, Graph};
 use witgraph_runtime::{Perf, RunningGraph, RuntimeConfig, RuntimeGraph, TickResult, Val};
 use witgraph_source::{
-    Digest, Location, MANIFEST_MEDIA_TYPE, Resolver, SourceError, WASM_LAYER_MEDIA_TYPES,
+    Digest, Location, MANIFEST_MEDIA_TYPE, Resolver, SourceError, WASM_LAYER_MEDIA_TYPE,
 };
 
 /// A fresh directory under the test target directory.
@@ -459,8 +459,13 @@ async fn an_artifact_holds_exactly_one_layer_of_its_kind() {
         "test/signed:1.0",
         &[
             ("application/vnd.dev.sigstore.bundle+json", b"{}"),
-            (WASM_LAYER_MEDIA_TYPES[1], ECHO.wasm),
+            (WASM_LAYER_MEDIA_TYPE, ECHO.wasm),
         ],
+    );
+    // A layer of a type the spec does not have is none.
+    registry.artifact(
+        "test/other:1.0",
+        &[("application/vnd.wasm.content.layer.v1+wasm", ECHO.wasm)],
     );
     let (host, _registry) = registry.serve().await;
     let fetch = async |name: &str| {
@@ -479,6 +484,11 @@ async fn an_artifact_holds_exactly_one_layer_of_its_kind() {
     );
     // A layer of another media type is not the component's.
     assert_eq!(*fetch("signed").await.unwrap().bytes, *ECHO.wasm);
+    let other = fetch("other").await.err();
+    assert!(
+        matches!(&other, Some(SourceError::Layers { found: 0, .. })),
+        "{other:?}"
+    );
 }
 
 #[tokio::test]

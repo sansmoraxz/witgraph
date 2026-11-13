@@ -51,9 +51,9 @@
 //! # OCI artifacts
 //!
 //! An artifact holds exactly one layer of the kind wanted: a component or
-//! an encoded WIT package in a WebAssembly layer
-//! ([`WASM_LAYER_MEDIA_TYPES`]), as `wkg oci push` and `wash push` produce
-//! them; a node manifest in a [`MANIFEST_MEDIA_TYPE`] layer. Layers of
+//! an encoded WIT package in a [`WASM_LAYER_MEDIA_TYPE`] layer, as the CNCF
+//! Wasm OCI Artifact spec has it (and `wkg oci push` and `wkg publish` push
+//! them); a node manifest in a [`MANIFEST_MEDIA_TYPE`] layer. Layers of
 //! other media types are ignored.
 
 use std::collections::{BTreeMap, HashMap};
@@ -82,12 +82,9 @@ pub const MANIFEST_MEDIA_TYPE: &str = "application/vnd.witgraph.node.v1+json";
 /// The prefix of an OCI location.
 pub const OCI_SCHEME: &str = "oci://";
 
-/// The layer media types an OCI artifact may carry a component under.
-pub const WASM_LAYER_MEDIA_TYPES: [&str; 3] = [
-    "application/wasm",
-    "application/vnd.wasm.content.layer.v1+wasm",
-    "application/vnd.bytecodealliance.wasm.component.layer.v0+wasm",
-];
+/// The media type of a WebAssembly layer, in the CNCF Wasm OCI Artifact
+/// spec: a component's, or an encoded WIT package's.
+pub const WASM_LAYER_MEDIA_TYPE: &str = "application/wasm";
 
 /// The sha-256 of a component's bytes, written `sha256:<64 lowercase hex
 /// digits>`.
@@ -494,7 +491,7 @@ enum Layer {
 impl Layer {
     fn accepts(self, media_type: &str) -> bool {
         match self {
-            Self::Wasm => WASM_LAYER_MEDIA_TYPES.contains(&media_type),
+            Self::Wasm => media_type == WASM_LAYER_MEDIA_TYPE,
             Self::Manifest => media_type == MANIFEST_MEDIA_TYPE,
         }
     }
