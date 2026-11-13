@@ -212,6 +212,15 @@ impl<M: RuntimeMode, H: Host> Debuggee<M, H> {
         self.inner.stopped.load(Ordering::SeqCst)
     }
 
+    /// Stops the graph as a debugger does: its ticks advance nothing until a debugger runs it.
+    /// For a program that loads a graph in place of one a debugger stopped, say, to keep it
+    /// stopped.
+    pub fn stop(&self) {
+        self.inner.stopped.store(true, Ordering::SeqCst);
+        // The tick under way ends now, leaving what it runs where it is.
+        self.inner.asked.notify_one();
+    }
+
     /// Does `work` on the graph, between ticks or by ending one early: as the program running
     /// it writes its inputs, say.
     pub async fn with<T: Send + 'static>(
