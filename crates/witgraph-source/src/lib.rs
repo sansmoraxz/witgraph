@@ -747,6 +747,12 @@ impl Resolver {
             Location::File(path) => {
                 let full = self.confined(path).await?;
                 let loaded = tokio::task::spawn_blocking(move || {
+                    // A wasm file is an encoded WIT package (as `wkg wit build` writes one),
+                    // never a component to read WIT out of; anything else is WIT text.
+                    if full.is_file() && is_wasm(&full) {
+                        let bytes = std::fs::read(&full).map_err(|e| e.to_string())?;
+                        return witgraph_wit::load::load_encoded(&bytes).map_err(|e| e.to_string());
+                    }
                     witgraph_wit::load::load_path(full).map_err(|e| e.to_string())
                 })
                 .await
@@ -1046,6 +1052,15 @@ impl Resolver {
             Err(e) => Err(failed(e)),
         }
     }
+}
+
+/// Whether the file at `path` starts as WebAssembly does.
+fn is_wasm(path: &Path) -> bool {
+    use std::io::Read as _;
+    let mut magic = [0u8; 4];
+    std::fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut magic))
+        .is_ok_and(|()| magic == *b"\0asm")
 }
 
 impl Resolver {

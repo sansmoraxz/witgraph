@@ -254,12 +254,15 @@ own):
 
 - `wit` is the WIT package its worlds are in, as WIT writes it.
 - `wit_source` is where that WIT is: a directory or `.wit` file (with its
-  `deps/`), or a wasm-encoded WIT package (`wasm-tools component wit --wasm`,
-  or what `wkg` publishes).
+  `deps/`, as `wkg wit fetch` fills it), or a wasm-encoded WIT package: a
+  `.wasm` file as `wkg wit build` writes one, or an OCI artifact as `wkg
+  publish` pushes one. A component is no WIT source: its WIT is never read
+  out of it.
 - `worlds` lists every world of `wit` the component provides. A node runs one
   of them. A link's provider lists the world it exports, which need not be a
   node's.
-- `component` is where its bytes are.
+- `component` is where its bytes are: a file, or an OCI artifact as `wkg oci
+  push` pushes one.
 - `viewers` says how an editor previews outputs (see below).
 
 Locations are paths, relative to the manifest, or OCI artifacts, written

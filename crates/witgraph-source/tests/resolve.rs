@@ -256,6 +256,44 @@ async fn a_component_resolves_from_its_node_manifest() {
 }
 
 #[tokio::test]
+async fn a_wit_package_built_to_wasm_is_a_wit_source_and_a_component_is_not() {
+    // As `wkg wit build` writes the package: one wasm file.
+    let dir = project("encoded-wit", ECHO.wasm, &[ECHO_WORLD]);
+    let encoded = witgraph_wit::load::encode(&ECHO.wit_source()).unwrap();
+    std::fs::write(dir.join("echo-wit.wasm"), encoded).unwrap();
+    std::fs::write(
+        dir.join("echo.node.json"),
+        manifest("echo.wasm", "echo-wit.wasm", &[ECHO_WORLD]),
+    )
+    .unwrap();
+    let components = Resolver::new()
+        .base(&dir)
+        .resolve(&table("echo.node.json"))
+        .await
+        .unwrap();
+    let id: ContractId = format!("echo/{ECHO_WORLD}").parse().unwrap();
+    assert!(components.contract(&id).is_some());
+
+    // The component's own bytes: its WIT is never read out of it.
+    std::fs::write(
+        dir.join("echo.node.json"),
+        manifest("echo.wasm", "echo.wasm", &[ECHO_WORLD]),
+    )
+    .unwrap();
+    let err = Resolver::new()
+        .base(&dir)
+        .resolve(&table("echo.node.json"))
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        err.to_string().contains("not a WIT package")
+            || format!("{err:?}").contains("not a WIT package"),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_manifest_says_what_its_bytes_are_and_is_held_to_it() {
     let resolve = async |name: &str, bytes: &[u8], worlds: &[&str]| {
         let dir = project(name, bytes, worlds);
