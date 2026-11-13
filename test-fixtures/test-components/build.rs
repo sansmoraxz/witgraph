@@ -69,8 +69,8 @@ const WITH_DEBUG_INFO: [&str; 5] = [
     "zig-walk",
 ];
 
-/// The guests written in C, built with clang (`CLANG`, or `clang` on the path) and its
-/// `wasm-ld`: `src/*.c` is the guest's own code, `bindings/` what `wit-bindgen c` makes of its
+/// The guests written in C, built with clang (`CLANG`, or `clang` on the path) and
+/// `wasm-ld` (`WASM_LD`, or the one on the path, or else the one Rust ships): `src/*.c` is the guest's own code, `bindings/` what `wit-bindgen c` makes of its
 /// WIT, and `support/` the little of a C library the bindings use.
 const C_GUESTS: [&str; 1] = ["c-walk"];
 
@@ -443,7 +443,15 @@ fn c_files(dir: &Path) -> Vec<PathBuf> {
 /// project's build runs: the debug info says it was compiled there.
 fn clang(name: &str, dir: &Path, args: Vec<OsString>) {
     let clang = env::var("CLANG").unwrap_or_else(|_| "clang".into());
-    let status = Command::new(&clang)
+    let mut command = Command::new(&clang);
+    if let Some(ld) = wasm_ld() {
+        // Unused where it only compiles.
+        command.args([
+            format!("-fuse-ld={}", ld.display()),
+            "-Wno-unused-command-line-argument".into(),
+        ]);
+    }
+    let status = command
         .current_dir(dir)
         .args([
             "--target=wasm32-unknown-unknown",
@@ -456,6 +464,33 @@ fn clang(name: &str, dir: &Path, args: Vec<OsString>) {
             panic!("failed to run {clang} for the {name} guest, which needs clang and wasm-ld: {e}")
         });
     assert!(status.success(), "{clang} failed for the {name} guest");
+}
+
+/// The `wasm-ld` clang is to link with, if not the one on the path: `WASM_LD`, or, with none on
+/// the path, the one Rust's toolchain ships for its own wasm targets.
+fn wasm_ld() -> Option<PathBuf> {
+    println!("cargo::rerun-if-env-changed=WASM_LD");
+    if let Some(ld) = env::var_os("WASM_LD") {
+        return Some(PathBuf::from(ld));
+    }
+    let on_path = env::var_os("PATH")
+        .is_some_and(|path| env::split_paths(&path).any(|dir| dir.join("wasm-ld").is_file()));
+    if on_path {
+        return None;
+    }
+    let rustc = env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let sysroot = Command::new(rustc)
+        .args(["--print", "sysroot"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())?;
+    let sysroot = String::from_utf8(sysroot.stdout).ok()?;
+    let host = env::var("HOST").ok()?;
+    let ld = Path::new(sysroot.trim())
+        .join("lib/rustlib")
+        .join(host)
+        .join("bin/gcc-ld/wasm-ld");
+    ld.is_file().then_some(ld)
 }
 
 /// A guest's core module as a component, with its world's docs.
