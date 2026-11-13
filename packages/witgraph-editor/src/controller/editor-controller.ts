@@ -2219,14 +2219,18 @@ export class EditorController extends EventTarget {
     return this.#session.graph.readOutputWave(node, port);
   }
 
-  /** Per node and port, WAVE text fetched for what the port latches. */
-  #waves = new Map<string, { version: number; text?: string }>();
+  /**
+   * Per node and port, WAVE text fetched for what the port latches, and the text of the
+   * version before, shown until it is.
+   */
+  #waves = new Map<string, { version: number; text?: string; before?: string }>();
 
   /**
    * An output's latest value as WAVE text, for drawing: what was fetched
-   * for its latest version, or `undefined` while that is being fetched, with
-   * a `state-changed` when it is there. An error's message stands in for the
-   * text.
+   * for its latest version, with a `state-changed` when it is there. While that is
+   * being fetched, the text of the version before, so that a value changing at every
+   * tick goes on showing; `undefined` only before any. An error's message stands in
+   * for the text.
    */
   outputWave(node: string, port: string): string | undefined {
     const session = this.#session;
@@ -2239,8 +2243,11 @@ export class EditorController extends EventTarget {
       return error instanceof Error ? error.message : String(error);
     }
     const known = this.#waves.get(key);
-    if (known?.version === version) return known.text;
-    const entry: { version: number; text?: string } = { version };
+    if (known?.version === version) return known.text ?? known.before;
+    const entry: { version: number; text?: string; before?: string } = {
+      version,
+      before: known?.text ?? known?.before,
+    };
     this.#waves.set(key, entry);
     session.graph.readOutputWave(node, port).then(
       (text: string | undefined) => {
@@ -2252,7 +2259,7 @@ export class EditorController extends EventTarget {
         this.#dispatch('state-changed');
       },
     );
-    return known?.text;
+    return entry.before;
   }
 
   #injectedValues = new Map<string, Map<string, string>>();

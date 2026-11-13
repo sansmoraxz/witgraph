@@ -707,9 +707,10 @@ export class WitgraphCanvas extends HTMLElement {
         const from = controller.connectionForInput(node.id, port.name);
         const value = from ? controller.latestOutput(from.fromNode, from.fromPort) : undefined;
         const before = this.#fieldShown.get(shown);
-        // Its text is made again only for a new value, or one whose text was still coming.
-        if (before && before.value === value && before.text !== '…') continue;
+        // Its text is drawn again only when it changes: for a new value, or once the text of
+        // one that was coming is there.
         const text = from ? outputText(controller, from.fromNode, from.fromPort) : '-';
+        if (before && before.value === value && before.text === text) continue;
         this.#fieldShown.set(shown, { value, text });
         shown.textContent = text;
         shown.title = from ? `${text}\nfrom ${from.fromNode}.${from.fromPort}` : text;
