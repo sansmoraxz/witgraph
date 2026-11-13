@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use wasmtime::component::Val;
-use witgraph_ir::{CompiledGraph, InputIdx, NodeId, NodeIdx, PortName, PortTable};
+use witgraph_ir::{CompiledGraph, InputIdx, NodeId, NodeIdx, OutputIdx, PortName, PortTable};
 
 /// How many items of each output are kept, the latest.
 const KEPT: usize = 64;
@@ -42,18 +42,29 @@ struct State {
 #[derive(Clone)]
 pub struct StreamPreviews {
     state: Arc<Mutex<State>>,
-    /// By writing node, the stream inputs its outputs feed.
-    edges: Arc<HashMap<NodeIdx, Vec<InputIdx>>>,
-    /// By stream input, the output feeding it.
-    writers: Arc<HashMap<InputIdx, (NodeId, PortName)>>,
+    /// By writing node, where its stream outputs are tapped.
+    edges: Arc<HashMap<NodeIdx, Vec<Tapped>>>,
+    /// Where each stream is tapped, and the output writing it.
+    writers: Arc<HashMap<Tapped, (NodeId, PortName)>>,
+}
+
+/// Where the hub taps a stream: at the input reading it, or, nothing reading it, at its
+/// output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum Tapped {
+    Input(InputIdx),
+    Output(OutputIdx),
 }
 
 impl StreamPreviews {
     /// The previews of `compiled`'s streams, numbered as `ports` has it.
     pub(crate) fn new(compiled: &CompiledGraph, ports: &PortTable) -> Self {
-        let mut edges: HashMap<NodeIdx, Vec<InputIdx>> = HashMap::new();
+        let mut edges: HashMap<NodeIdx, Vec<Tapped>> = HashMap::new();
         let mut writers = HashMap::new();
+        let mut read = std::collections::HashSet::new();
         for resolved in compiled.connections() {
+            let from = &resolved.connection.from;
+            read.extend(ports.output(&from.node, &from.port));
             let conn = resolved.connection;
             if !matches!(resolved.from.kind(), witgraph_ir::PortKind::Stream) {
                 continue;
@@ -62,8 +73,23 @@ impl StreamPreviews {
                 ports.node(&conn.from.node),
                 ports.input(&conn.to.node, &conn.to.port),
             ) {
-                edges.entry(node).or_default().push(input);
-                writers.insert(input, (conn.from.node.clone(), conn.from.port.clone()));
+                edges.entry(node).or_default().push(Tapped::Input(input));
+                writers.insert(
+                    Tapped::Input(input),
+                    (conn.from.node.clone(), conn.from.port.clone()),
+                );
+            }
+        }
+        for (output, entry) in ports.outputs().iter_enumerated() {
+            if entry.kind == witgraph_ir::PortKind::Stream && !read.contains(&output) {
+                edges
+                    .entry(entry.node)
+                    .or_default()
+                    .push(Tapped::Output(output));
+                writers.insert(
+                    Tapped::Output(output),
+                    (entry.port.node.clone(), entry.port.port.clone()),
+                );
             }
         }
         Self {
@@ -88,19 +114,19 @@ impl StreamPreviews {
             .collect()
     }
 
-    /// The stream inputs `node`'s outputs feed.
-    pub(crate) fn inputs_fed_by(&self, node: NodeIdx) -> &[InputIdx] {
+    /// Where `node`'s stream outputs are tapped.
+    pub(crate) fn tapped_from(&self, node: NodeIdx) -> &[Tapped] {
         self.edges.get(&node).map_or(&[], Vec::as_slice)
     }
 
-    /// The stream inputs, and the output feeding each.
-    pub(crate) fn writers(&self) -> impl Iterator<Item = (InputIdx, &(NodeId, PortName))> {
-        self.writers.iter().map(|(input, at)| (*input, at))
+    /// Where each stream is tapped.
+    pub(crate) fn tapped(&self) -> impl Iterator<Item = Tapped> + '_ {
+        self.writers.keys().copied()
     }
 
-    /// `items` passed on to `input`: of the output feeding it, which keeps the latest.
-    pub(crate) fn record(&self, input: InputIdx, items: &[Val]) {
-        let Some(at) = self.writers.get(&input) else {
+    /// `items` a tapped stream carried: of the output writing it, which keeps the latest.
+    pub(crate) fn record(&self, tapped: Tapped, items: &[Val]) {
+        let Some(at) = self.writers.get(&tapped) else {
             return;
         };
         let mut state = lock(&self.state);

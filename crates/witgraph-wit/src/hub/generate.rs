@@ -25,8 +25,8 @@ use super::text::{Printer, Shared};
 use super::{
     CONTROL_INTERFACE, ControlFunc, HubError, HubMember, HubOptions, LEND_INTERFACE,
     PORTS_INTERFACE, PREVIEW_INTERFACE, get_feedback, get_input, get_output, give_stream,
-    lend_handle, pump_stream, read_handle, set_feedback, set_input, set_output, stream_items,
-    take_stream, tap_stream,
+    lend_handle, output_items, pump_output, pump_stream, read_handle, set_feedback, set_input,
+    set_output, stream_items, take_stream, tap_output, tap_stream,
 };
 
 /// The fixed part of a hub's world.
@@ -197,6 +197,14 @@ fn world_text(
     let mut lend_funcs = String::new();
     let mut preview_defs = String::new();
     let mut preview_funcs = String::new();
+    // The outputs something reads.
+    let read: std::collections::HashSet<OutputIdx> = compiled
+        .connections()
+        .filter_map(|resolved| {
+            let from = &resolved.connection.from;
+            ports.output(&from.node, &from.port)
+        })
+        .collect();
     // Each feedback connection's type, once its source's output is printed.
     let mut feedback: BTreeMap<usize, String> = BTreeMap::new();
     for (at, (member, node)) in decoded.iter().zip(order).enumerate() {
@@ -211,7 +219,7 @@ fn world_text(
 
         let contract = contract_of(compiled, node.node)?;
         let mut printer = Printer::new(&format!("m{at}-"), resolve, &mut shared);
-        // The stream inputs tapped, and their items' types.
+        // What the host is told of each tapped stream, and its items' type.
         let mut taps = Vec::new();
         for (name, ty) in input_fields(resolve, &member.run) {
             let port = PortName::from(name);
@@ -248,7 +256,7 @@ fn world_text(
                         tap_stream(input),
                         pump_stream(input),
                     );
-                    taps.push((input, item));
+                    taps.push((stream_items(input), item));
                 }
                 continue;
             }
@@ -287,7 +295,23 @@ fn world_text(
                     handles.push((output, resource));
                     let _ = writeln!(port_funcs, "  {}: func();", read_handle(output));
                 }
-                PortKind::Stream | PortKind::Future => {}
+                PortKind::Stream => {
+                    // Nothing reads it: tapped, the hub does.
+                    if options.stream_taps
+                        && !read.contains(&output)
+                        && let Some((_, item)) = stream_item(resolve, &ty)
+                        && plain_value(&Abi::new(resolve), &item)
+                    {
+                        let _ = writeln!(
+                            port_funcs,
+                            "  {}: func() -> u32;\n  {}: async func(tap: u32);",
+                            tap_output(output),
+                            pump_output(output),
+                        );
+                        taps.push((output_items(output), item));
+                    }
+                }
+                PortKind::Future => {}
             }
         }
         port_defs.push_str(printer.defs());
@@ -302,13 +326,9 @@ fn world_text(
         }
         lend_defs.push_str(lender.defs());
         let mut previewer = Printer::new(&format!("p{at}-"), resolve, &mut shared);
-        for (input, item) in taps {
+        for (name, item) in taps {
             let text = previewer.ty(&item)?;
-            let _ = writeln!(
-                preview_funcs,
-                "  {}: func(items: list<{text}>);",
-                stream_items(input)
-            );
+            let _ = writeln!(preview_funcs, "  {name}: func(items: list<{text}>);");
         }
         preview_defs.push_str(previewer.defs());
     }
@@ -503,28 +523,66 @@ struct Imports {
     subtask_drop: FuncIdx<Import>,
     context_get: FuncIdx<Import>,
     context_set: FuncIdx<Import>,
-    /// Per tapped stream input: what moves its items on.
-    taps: BTreeMap<InputIdx, TapImports>,
+    /// Per tapped stream: what moves its items on.
+    taps: BTreeMap<Tapped, TapImports>,
 }
 
-/// A stream input the hub taps: of which member, its stream type, and its items'.
+/// A stream the hub taps: one between nodes, at the input reading it, or an output nothing
+/// reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Tapped {
+    Input(InputIdx),
+    Output(OutputIdx),
+}
+
+impl Tapped {
+    fn tap_name(self) -> String {
+        match self {
+            Tapped::Input(input) => tap_stream(input),
+            Tapped::Output(output) => tap_output(output),
+        }
+    }
+
+    fn pump_name(self) -> String {
+        match self {
+            Tapped::Input(input) => pump_stream(input),
+            Tapped::Output(output) => pump_output(output),
+        }
+    }
+
+    fn items_name(self) -> String {
+        match self {
+            Tapped::Input(input) => stream_items(input),
+            Tapped::Output(output) => output_items(output),
+        }
+    }
+}
+
+/// A tapped stream: of which member and which of its fields, its stream type, and its items'.
 #[derive(Clone, Copy)]
 struct Tap {
     member: usize,
+    field: usize,
     stream: TypeId,
     item: Type,
 }
 
-/// What a tap calls.
+/// What a tap calls. A tapped output has no reader to write to.
 struct TapImports {
     tap: Tap,
-    new: FuncIdx<Import>,
     read: FuncIdx<Import>,
-    write: FuncIdx<Import>,
-    drop_writable: FuncIdx<Import>,
+    /// What gives the reader its new stream, writes to it, and drops it: a tapped input's.
+    passed_on: Option<PassedOn>,
     /// Tells the host of the items, a chunk at a time.
     items: FuncIdx<Import>,
     task_return: FuncIdx<Import>,
+}
+
+#[derive(Clone, Copy)]
+struct PassedOn {
+    new: FuncIdx<Import>,
+    write: FuncIdx<Import>,
+    drop_writable: FuncIdx<Import>,
 }
 
 struct Core<'a> {
@@ -551,6 +609,8 @@ struct Core<'a> {
     outputs_at: Static,
     feedback_at: Static,
     calls_at: Static,
+    /// Per output, a tapped stream output's stream, until the host taps it.
+    unread_at: Static,
     pins_at: Static,
     /// Per member, where its pins start.
     pin_offsets: Vec<u32>,
@@ -762,6 +822,7 @@ impl<'a> Core<'a> {
         let outputs_at = take(SLOT_SIZE * ports.outputs().len() as u32);
         let feedback_at = take(SLOT_SIZE * ports.feedback().len() as u32);
         let calls_at = take(CALL_SIZE * members.len() as u32);
+        let unread_at = take(4 * ports.outputs().len() as u32);
         let mut pin_offsets = Vec::with_capacity(members.len());
         let mut pins = 0;
         for member in &members {
@@ -804,6 +865,7 @@ impl<'a> Core<'a> {
             outputs_at,
             feedback_at,
             calls_at,
+            unread_at,
             pins_at,
             pin_offsets,
             lists,
@@ -983,23 +1045,31 @@ impl<'a> Core<'a> {
         })
     }
 
-    /// The stream inputs the hub taps: those its `ports` has a tap for.
-    fn taps(&self) -> BTreeMap<InputIdx, Tap> {
+    /// The streams the hub taps: those its `ports` has a tap for.
+    fn taps(&self) -> BTreeMap<Tapped, Tap> {
         let mut taps = BTreeMap::new();
         for (at, member) in self.members.iter().enumerate() {
-            for (index, field) in &member.inputs {
-                let Some(index) = index else { continue };
-                if field.kind != PortKind::Stream
-                    || self.func_of(&self.ports_key, &tap_stream(*index)).is_err()
+            let inputs = member.inputs.iter().map(|(index, field)| {
+                let ty = field.optional.map_or(field.ty, |(payload, _)| payload);
+                (index.map(Tapped::Input), field.kind, ty)
+            });
+            let outputs = member
+                .outputs
+                .iter()
+                .map(|(index, field)| (index.map(Tapped::Output), field.kind, field.ty));
+            for (field, (tapped, kind, ty)) in inputs.enumerate().chain(outputs.enumerate()) {
+                let Some(tapped) = tapped else { continue };
+                if kind != PortKind::Stream
+                    || self.func_of(&self.ports_key, &tapped.tap_name()).is_err()
                 {
                     continue;
                 }
-                let ty = field.optional.map_or(field.ty, |(payload, _)| payload);
                 if let Some((stream, item)) = stream_item(self.resolve, &ty) {
                     taps.insert(
-                        *index,
+                        tapped,
                         Tap {
                             member: at,
+                            field,
                             stream,
                             item,
                         },
@@ -1010,16 +1080,21 @@ impl<'a> Core<'a> {
         taps
     }
 
+    /// Where a tapped stream output's stream waits for the host to tap it.
+    fn unread_slot(&self, output: OutputIdx) -> Static {
+        Static(self.unread_at.0 + 4 * output.position() as u32)
+    }
+
     /// What each tap calls: its stream's built-ins, typed as its member's input, the host's
     /// `stream-items-N`, and its pump's `task.return`.
     fn tap_imports(
         &self,
         module: &mut ModuleBuilder<super::module::AddingImports>,
-    ) -> Result<BTreeMap<InputIdx, TapImports>, HubError> {
+    ) -> Result<BTreeMap<Tapped, TapImports>, HubError> {
         let callback = ManglingAndAbi::Legacy(LiftLowerAbi::AsyncCallback);
         let sync = ManglingAndAbi::Legacy(LiftLowerAbi::Sync);
         let mut imports = BTreeMap::new();
-        for (input, tap) in self.taps() {
+        for (tapped, tap) in self.taps() {
             let member = &self.members[tap.member];
             let mut stream = |intrinsic, async_, sig: Sig| {
                 let (from, name) = self.resolve.wasm_import_name(
@@ -1035,17 +1110,19 @@ impl<'a> Core<'a> {
                 );
                 module.import(&from, &name, &sig)
             };
-            let new = stream(
-                StreamIntrinsic::New,
-                false,
-                Sig {
-                    params: Vec::new(),
-                    results: vec![ValType::I64],
-                },
-            );
             let read = stream(StreamIntrinsic::Read, true, Sig::i32s(3, 1));
-            let write = stream(StreamIntrinsic::Write, true, Sig::i32s(3, 1));
-            let drop_writable = stream(StreamIntrinsic::DropWritable, false, Sig::i32s(1, 0));
+            let passed_on = matches!(tapped, Tapped::Input(_)).then(|| PassedOn {
+                new: stream(
+                    StreamIntrinsic::New,
+                    false,
+                    Sig {
+                        params: Vec::new(),
+                        results: vec![ValType::I64],
+                    },
+                ),
+                write: stream(StreamIntrinsic::Write, true, Sig::i32s(3, 1)),
+                drop_writable: stream(StreamIntrinsic::DropWritable, false, Sig::i32s(1, 0)),
+            });
             let key = self
                 .preview_key
                 .as_ref()
@@ -1057,8 +1134,8 @@ impl<'a> Core<'a> {
             };
             let func = self.resolve.interfaces[*id]
                 .functions
-                .get(&stream_items(input))
-                .ok_or_else(|| HubError::Generate(format!("no `{}`", stream_items(input))))?;
+                .get(&tapped.items_name())
+                .ok_or_else(|| HubError::Generate(format!("no `{}`", tapped.items_name())))?;
             let (from, name) = self.resolve.wasm_import_name(
                 sync,
                 WasmImport::Func {
@@ -1067,18 +1144,16 @@ impl<'a> Core<'a> {
                 },
             );
             let items = module.import(&from, &name, &Sig::i32s(2, 0));
-            let pump = self.func_of(&self.ports_key, &pump_stream(input))?;
+            let pump = self.func_of(&self.ports_key, &tapped.pump_name())?;
             let (from, name, sig) =
                 pump.task_return_import(self.resolve, Some(&self.ports_key), Mangling::Legacy);
             let task_return = module.import(&from, &name, &sig_of(&sig));
             imports.insert(
-                input,
+                tapped,
                 TapImports {
                     tap,
-                    new,
                     read,
-                    write,
-                    drop_writable,
+                    passed_on,
                     items,
                     task_return,
                 },
@@ -1210,8 +1285,8 @@ impl<'a> Core<'a> {
         self.write_run(&mut module, &imports, &starts, &completes)?;
         self.write_control(&mut module, rt, &types)?;
         self.write_ports(&mut module, rt, &imports, &types)?;
-        for (input, tap) in &imports.taps {
-            self.write_tap(&mut module, rt, &imports, *input, tap)?;
+        for (tapped, tap) in &imports.taps {
+            self.write_tap(&mut module, rt, &imports, *tapped, tap)?;
         }
 
         let realloc: FuncIdx<Helper> = module.declare(&Sig::i32s(4, 1));
@@ -2083,6 +2158,23 @@ impl<'a> Core<'a> {
                     Some(edge) => {
                         self.emit_edge(&mut b, rt, &counts, *edge, results, value);
                     }
+                    None if imports.taps.contains_key(&Tapped::Output(*index)) => {
+                        // Nothing reads it but the hub, once the host taps it. One the host
+                        // did not tap goes.
+                        let (unread, old) = (self.unread_slot(*index), b.int());
+                        b.load32(unread).set(old);
+                        if let Some(drop) = imports.drops[at].get(&field_at) {
+                            b.get(old).when(|b| {
+                                b.get(old).call(*drop);
+                            });
+                        }
+                        b.store32(unread, |b| {
+                            b.load32(value);
+                        });
+                        b.store32(value, |b| {
+                            b.int_const(0);
+                        });
+                    }
                     None => {
                         // Nothing reads it: its writes fail rather than block.
                         if let Some(drop) = imports.drops[at].get(&field_at) {
@@ -2273,26 +2365,30 @@ impl<'a> Core<'a> {
         Ok(())
     }
 
-    /// `tap-stream-N` and `pump-stream-N`. The tap keeps the stream the writer gave the input,
-    /// and puts a new one in its place; the pump reads the first a chunk at a time into the
-    /// hub, shows the host the chunk, writes it to the second, frees what it owns, and reads
-    /// again, until the writer is done or the reader gone. A write waits for the reader, so the
-    /// writer is held back as it was before.
+    /// A tap and its pump. Of a stream input (`tap-stream-N`, `pump-stream-N`), the tap keeps
+    /// the stream the writer gave the input, and puts a new one in its place; the pump reads
+    /// the first a chunk at a time into the hub, shows the host the chunk, writes it to the
+    /// second, frees what it owns, and reads again, until the writer is done or the reader
+    /// gone. A write waits for the reader, so the writer is held back as it was before. Of a
+    /// stream output nothing reads (`tap-output-N`, `pump-output-N`), the tap takes the stream
+    /// the hub kept, and the pump reads it as the reader would, writing it nowhere.
     fn write_tap(
         &self,
         module: &mut ModuleBuilder<AddingFuncs>,
         rt: Runtime,
         imports: &Imports,
-        input: InputIdx,
+        tapped: Tapped,
         tap: &TapImports,
     ) -> Result<(), HubError> {
         let item = tap.tap.item;
         let size = self.abi.size(&item).0;
         let capacity = (TAP_BYTES / size.max(1)).clamp(1, 256);
-        let drop_readable = *imports
-            .given_drops
-            .get(&input)
-            .ok_or_else(|| HubError::Generate(format!("no drop for stream input {input:?}")))?;
+        let drop_readable = match tapped {
+            Tapped::Input(input) => imports.given_drops.get(&input),
+            Tapped::Output(_) => imports.drops[tap.tap.member].get(&tap.tap.field),
+        }
+        .copied()
+        .ok_or_else(|| HubError::Generate(format!("no drop for the stream of {tapped:?}")))?;
         let field = |state: Local, at: Offset| Place::At(state, at);
         let wait = |b: &mut Body, set: Local| {
             b.get(set)
@@ -2328,7 +2424,9 @@ impl<'a> Core<'a> {
         let state = params[0];
         b.get(state).call(free);
         b.load32(field(state, TAP_FROM)).call(drop_readable);
-        b.load32(field(state, TAP_TO)).call(tap.drop_writable);
+        if let Some(on) = tap.passed_on {
+            b.load32(field(state, TAP_TO)).call(on.drop_writable);
+        }
         b.load32(field(state, TAP_SET)).call(imports.set_drop);
         b.load32(field(state, TAP_ITEMS)).call(rt.dealloc);
         b.get(state).call(rt.dealloc);
@@ -2365,37 +2463,39 @@ impl<'a> Core<'a> {
         let (left, rc, set) = (b.int(), b.int(), b.int());
         b.load32(field(state, TAP_SET)).set(set);
         b.op(I::Loop(wasm_encoder::BlockType::Empty));
-        b.load32(field(state, TAP_COUNT))
-            .load32(field(state, TAP_MOVED))
-            .op(I::I32Sub)
-            .set(left);
-        b.get(left).when(|b| {
-            b.load32(field(state, TAP_TO))
-                .load32(field(state, TAP_ITEMS))
+        if let Some(on) = tap.passed_on {
+            b.load32(field(state, TAP_COUNT))
                 .load32(field(state, TAP_MOVED))
-                .int_const(size)
-                .op(I::I32Mul)
-                .op(I::I32Add)
-                .get(left)
-                .call(tap.write)
-                .set(rc);
-            b.get(rc).int_const(BLOCKED).op(I::I32Eq).when(|b| {
-                b.load32(field(state, TAP_TO)).get(set).call(imports.join);
-                wait(b, set);
+                .op(I::I32Sub)
+                .set(left);
+            b.get(left).when(|b| {
+                b.load32(field(state, TAP_TO))
+                    .load32(field(state, TAP_ITEMS))
+                    .load32(field(state, TAP_MOVED))
+                    .int_const(size)
+                    .op(I::I32Mul)
+                    .op(I::I32Add)
+                    .get(left)
+                    .call(on.write)
+                    .set(rc);
+                b.get(rc).int_const(BLOCKED).op(I::I32Eq).when(|b| {
+                    b.load32(field(state, TAP_TO)).get(set).call(imports.join);
+                    wait(b, set);
+                });
+                b.store32(field(state, TAP_MOVED), |b| {
+                    b.load32(field(state, TAP_MOVED))
+                        .get(rc)
+                        .int_const(4)
+                        .op(I::I32ShrU)
+                        .op(I::I32Add);
+                });
+                // Dropped: the reader is gone, and so is the point.
+                b.get(rc).int_const(15).op(I::I32And).when(|b| {
+                    b.get(state).call(finish).ret();
+                });
+                b.op(I::Br(1));
             });
-            b.store32(field(state, TAP_MOVED), |b| {
-                b.load32(field(state, TAP_MOVED))
-                    .get(rc)
-                    .int_const(4)
-                    .op(I::I32ShrU)
-                    .op(I::I32Add);
-            });
-            // Dropped: the reader is gone, and so is the point.
-            b.get(rc).int_const(15).op(I::I32And).when(|b| {
-                b.get(state).call(finish).ret();
-            });
-            b.op(I::Br(1));
-        });
+        }
         b.get(state).call(free);
         b.store32(field(state, TAP_COUNT), |b| {
             b.int_const(0);
@@ -2418,34 +2518,64 @@ impl<'a> Core<'a> {
         b.op(I::Unreachable);
         module.define(step, b);
 
-        // tap-stream-N() -> tap
+        // The tap: () -> tap.
         let sig = Sig::i32s(0, 1);
         let f: FuncIdx<Helper> = module.declare(&sig);
         let (mut b, _) = Body::new(&sig);
-        let held = self.input_slot(input);
-        let (value, from, state, pair) = (b.int(), b.int(), b.int(), b.local(ValType::I64));
-        b.load32(held).op(I::I32Eqz).when(|b| {
-            b.int_const(0).ret();
-        });
-        b.load32(Place::Fixed(held).offset(Offset(4))).set(value);
-        b.load32(value).set(from);
-        b.get(from).op(I::I32Eqz).when(|b| {
-            b.int_const(0).ret();
-        });
-        b.call(tap.new).set(pair);
-        // The reader gets the new stream's readable end.
-        b.store32(value, |b| {
-            b.get(pair).op(I::I32WrapI64);
-        });
+        let (from, state) = (b.int(), b.int());
+        let to = match (tapped, tap.passed_on) {
+            (Tapped::Input(input), Some(on)) => {
+                let held = self.input_slot(input);
+                let (value, pair) = (b.int(), b.local(ValType::I64));
+                b.load32(held).op(I::I32Eqz).when(|b| {
+                    b.int_const(0).ret();
+                });
+                b.load32(Place::Fixed(held).offset(Offset(4))).set(value);
+                b.load32(value).set(from);
+                b.get(from).op(I::I32Eqz).when(|b| {
+                    b.int_const(0).ret();
+                });
+                b.call(on.new).set(pair);
+                // The reader gets the new stream's readable end.
+                b.store32(value, |b| {
+                    b.get(pair).op(I::I32WrapI64);
+                });
+                let to = b.int();
+                b.get(pair)
+                    .op(I::I64Const(32))
+                    .op(I::I64ShrU)
+                    .op(I::I32WrapI64)
+                    .set(to);
+                Some(to)
+            }
+            (Tapped::Output(output), None) => {
+                let unread = self.unread_slot(output);
+                b.load32(unread).set(from);
+                b.get(from).op(I::I32Eqz).when(|b| {
+                    b.int_const(0).ret();
+                });
+                b.store32(unread, |b| {
+                    b.int_const(0);
+                });
+                None
+            }
+            _ => {
+                return Err(HubError::Generate(format!(
+                    "a tap of {tapped:?} as of another"
+                )));
+            }
+        };
         b.int_const(TAP_SIZE).call(rt.alloc).set(state);
         b.store32(field(state, TAP_FROM), |b| {
             b.get(from);
         });
-        b.store32(field(state, TAP_TO), |b| {
-            b.get(pair)
-                .op(I::I64Const(32))
-                .op(I::I64ShrU)
-                .op(I::I32WrapI64);
+        b.store32(field(state, TAP_TO), |b| match to {
+            Some(to) => {
+                b.get(to);
+            }
+            None => {
+                b.int_const(0);
+            }
         });
         b.store32(field(state, TAP_ITEMS), |b| {
             b.int_const(capacity * size).call(rt.alloc);
@@ -2460,10 +2590,10 @@ impl<'a> Core<'a> {
         });
         b.get(state);
         module.define(f, b);
-        self.export_port(module, &tap_stream(input), f)?;
+        self.export_port(module, &tapped.tap_name(), f)?;
 
-        // pump-stream-N(tap), and its callback.
-        let pump = self.func_of(&self.ports_key, &pump_stream(input))?;
+        // The pump: async (tap), and its callback.
+        let pump = self.func_of(&self.ports_key, &tapped.pump_name())?;
         let export = |kind| {
             self.resolve.wasm_export_name(
                 ManglingAndAbi::Legacy(LiftLowerAbi::AsyncCallback),

@@ -404,6 +404,8 @@ fn engine_config(memory_reservation: Option<u64>) -> wasmtime::Result<wasmtime::
 /// A linker for a composed graph: each node's own `witgraph:runtime/host`
 /// (whose `fatal` knows which node called it), what lends the host a handle,
 /// what shows it the items of tapped streams, and the host's capabilities.
+use crate::previews::Tapped;
+
 pub(crate) fn graph_linker<H: Host>(
     engine: &Engine,
     ports: &PortTable,
@@ -445,18 +447,19 @@ pub(crate) fn graph_linker<H: Host>(
     }
     if let Some(previews) = previews {
         let mut preview = linker.instance(witgraph_wit::hub::PREVIEW_INTERFACE)?;
-        for (input, _) in previews.writers() {
+        for tapped in previews.tapped() {
+            let name = match tapped {
+                Tapped::Input(input) => witgraph_wit::hub::stream_items(input),
+                Tapped::Output(output) => witgraph_wit::hub::output_items(output),
+            };
             let previews = previews.clone();
-            preview.func_new(
-                &witgraph_wit::hub::stream_items(input),
-                move |_, _, params, _| {
-                    let Some(Val::List(items)) = params.first() else {
-                        wasmtime::bail!("a stream's items are a list");
-                    };
-                    previews.record(input, items);
-                    Ok(())
-                },
-            )?;
+            preview.func_new(&name, move |_, _, params, _| {
+                let Some(Val::List(items)) = params.first() else {
+                    wasmtime::bail!("a stream's items are a list");
+                };
+                previews.record(tapped, items);
+                Ok(())
+            })?;
         }
     }
     host.link(capabilities, &mut linker)?;

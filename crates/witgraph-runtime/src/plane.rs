@@ -99,6 +99,23 @@ pub(crate) struct HubExports {
     /// Per stream input the hub taps: its tap and its pump.
     tap_stream: IndexVec<InputIdx, Option<ComponentExportIndex>>,
     pump_stream: IndexVec<InputIdx, Option<ComponentExportIndex>>,
+    /// Per stream output nothing reads, that the hub taps: its tap and its pump.
+    tap_output: IndexVec<OutputIdx, Option<ComponentExportIndex>>,
+    pump_output: IndexVec<OutputIdx, Option<ComponentExportIndex>>,
+}
+
+impl HubExports {
+    /// The tap and the pump of a tapped stream, if the hub taps it.
+    fn tap_of(
+        &self,
+        tapped: crate::previews::Tapped,
+    ) -> Option<(ComponentExportIndex, Option<ComponentExportIndex>)> {
+        use crate::previews::Tapped;
+        match tapped {
+            Tapped::Input(input) => Some((self.tap_stream[input]?, self.pump_stream[input])),
+            Tapped::Output(output) => Some((self.tap_output[output]?, self.pump_output[output])),
+        }
+    }
 }
 
 impl HubExports {
@@ -141,6 +158,12 @@ impl HubExports {
             tap_stream: IndexVec::from_fn(ports.inputs().len(), |at| of_ports(hub::tap_stream(at))),
             pump_stream: IndexVec::from_fn(ports.inputs().len(), |at| {
                 of_ports(hub::pump_stream(at))
+            }),
+            tap_output: IndexVec::from_fn(ports.outputs().len(), |at| {
+                of_ports(hub::tap_output(at))
+            }),
+            pump_output: IndexVec::from_fn(ports.outputs().len(), |at| {
+                of_ports(hub::pump_output(at))
             }),
         })
     }
@@ -664,26 +687,26 @@ async fn serve_hub<D: StoreData>(args: ServerArgs<D>) -> Outcome {
     }
 }
 
-/// Taps the streams `node`'s run just gave the inputs they feed, while the hub holds them:
-/// before their readers can start. What each tap's pump is then called with.
+/// Taps the streams `node`'s run just returned, while the hub holds them: before their
+/// readers can start. Each tap's pump, and what it is called with.
 async fn tap_streams<D: StoreData>(
     acc: &Accessor<D>,
     hub: &LiveHub,
     previews: &crate::previews::StreamPreviews,
     node: NodeIdx,
-) -> wasmtime::Result<Vec<(InputIdx, u32)>> {
+) -> wasmtime::Result<Vec<(Option<ComponentExportIndex>, u32)>> {
     let mut taps = Vec::new();
-    for input in previews.inputs_fed_by(node) {
-        let Some(at) = hub.exports.tap_stream[*input] else {
+    for tapped in previews.tapped_from(node) {
+        let Some((tap, pump)) = hub.exports.tap_of(*tapped) else {
             continue;
         };
-        let tap = hub.func(acc, Some(at))?;
+        let tap = hub.func(acc, Some(tap))?;
         let mut tapped = [Val::U32(0)];
         tap.call_concurrent(acc, &[], &mut tapped).await?;
         if let [Val::U32(id)] = tapped
             && id != 0
         {
-            taps.push((*input, id));
+            taps.push((pump, id));
         }
     }
     Ok(taps)
@@ -768,16 +791,16 @@ async fn serve_commands<D: StoreData>(
     send: &(impl Fn(ControlKind) + Send + Sync),
 ) -> wasmtime::Result<()> {
     // A run's return, and the streams it gave that were tapped.
-    type Ran = ((RawReturned,), Vec<(InputIdx, u32)>);
+    type Ran = ((RawReturned,), Vec<(Option<ComponentExportIndex>, u32)>);
     type RunFuture<'a> =
         Pin<Box<dyn Future<Output = (NodeIdx, wasmtime::Result<Ran>)> + Send + 'a>>;
     let mut runs: FuturesUnordered<RunFuture<'_>> = FuturesUnordered::new();
     // Tapped streams' pumps, each until its stream ends.
     type PumpFuture<'a> = Pin<Box<dyn Future<Output = wasmtime::Result<()>> + Send + 'a>>;
     let mut pumps: FuturesUnordered<PumpFuture<'_>> = FuturesUnordered::new();
-    let pump = |input: InputIdx, tap: u32| -> PumpFuture<'_> {
+    let pump = |pump: Option<ComponentExportIndex>, tap: u32| -> PumpFuture<'_> {
         Box::pin(async move {
-            let pump = hub.func(acc, hub.exports.pump_stream[input])?;
+            let pump = hub.func(acc, pump)?;
             pump.call_concurrent(acc, &[Val::U32(tap)], &mut []).await
         })
     };
@@ -913,8 +936,8 @@ async fn serve_commands<D: StoreData>(
                     Ok(ran) => ran,
                     Err(e) => return Poll::Ready(Err(e)),
                 };
-                for (input, tap) in taps {
-                    pumps.push(pump(input, tap));
+                for (at, tap) in taps {
+                    pumps.push(pump(at, tap));
                 }
                 let returned = match raw.decode(ports) {
                     Ok(returned) => returned,

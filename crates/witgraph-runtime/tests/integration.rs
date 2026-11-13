@@ -701,6 +701,27 @@ async fn previews_need_a_graph_prepared_with_taps() {
 }
 
 #[tokio::test]
+async fn a_stream_output_nothing_reads_is_previewed() {
+    let kit = Kit::new(&[STREAM_PRODUCER]);
+    let graph = kit
+        .builder("alone")
+        .add_node("prod", kit.get(STREAM_PRODUCER))
+        .build();
+    let mut rt = kit.load(graph, previewing(), Trace::new()).await;
+    inject(&mut rt, "prod", "burst-size", Val::U32(50)).await;
+    settle(&mut rt).await;
+    assert_eq!(phase(&rt, "prod"), NodePhase::Idle);
+    let seen = rt.stream_previews().unwrap().take();
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    assert_eq!(
+        (seen[0].node.as_str(), seen[0].port.as_str()),
+        ("prod", "items")
+    );
+    assert_eq!(seen[0].count, 50, "every write went through, as if read");
+    assert_eq!(seen[0].items.last().map(String::as_str), Some("49"));
+}
+
+#[tokio::test]
 async fn without_stream_previews_none_are_kept() {
     let kit = Kit::new(&[STREAM_PRODUCER, STREAM_CONSUMER]);
     let rt = kit
@@ -1072,17 +1093,40 @@ async fn previewed_frames_reach_the_sink_as_they_were() {
 }
 
 #[tokio::test]
+async fn a_tap_frees_the_frames_nothing_reads() {
+    let kit = Kit::new(&[VIDEO_SOURCE]);
+    let graph = kit
+        .builder("unread")
+        .add_node("source", kit.get(VIDEO_SOURCE))
+        .build();
+    let compiled = graph.compile(&kit.contracts).expect("compiles");
+    let config = RuntimeConfig {
+        stream_previews: true,
+        max_memory: Some(witgraph_runtime::ByteCount(12 << 20)),
+        ..RuntimeConfig::default()
+    };
+    let mut rt = RuntimeGraph::load_with_host(compiled, &kit.artifacts(), config, Perf, Clock)
+        .await
+        .expect("loads with the clock");
+    inject(&mut rt, "source", "frames", Val::U32(700)).await;
+    settle(&mut rt).await;
+    assert_eq!(phase(&rt, "source"), NodePhase::Idle);
+    let seen = rt.stream_previews().unwrap().take();
+    assert_eq!(seen[0].count, 700, "{:?}", seen[0].port);
+}
+
+#[tokio::test]
 async fn a_tap_frees_the_frames_it_passes_on() {
-    // 1000 frames of 24 KiB each: kept by the hub, they would outgrow the limit.
+    // 700 frames of 24 KiB each: kept by the hub, they would outgrow the limit.
     let kit = Kit::new(&[VIDEO_SOURCE, VIDEO_SINK]);
     let config = RuntimeConfig {
         stream_previews: true,
-        max_memory: Some(witgraph_runtime::ByteCount(16 << 20)),
+        max_memory: Some(witgraph_runtime::ByteCount(12 << 20)),
         ..RuntimeConfig::default()
     };
-    let mut rt = video_with(&kit, &[], 1000, None, config).await;
+    let mut rt = video_with(&kit, &[], 700, None, config).await;
     settle(&mut rt).await;
-    assert_eq!(read_u32(&mut rt, "sink", "count").await, 1000);
+    assert_eq!(read_u32(&mut rt, "sink", "count").await, 700);
 }
 
 /// `test:accel/cnn`'s types, as the host sees them.

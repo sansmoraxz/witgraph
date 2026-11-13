@@ -134,6 +134,25 @@ pub fn stream_items(input: InputIdx) -> String {
     format!("stream-items-{}", input.position())
 }
 
+/// The name of the function tapping a stream output nothing reads, with
+/// [`HubOptions::stream_taps`]: `() -> u32`. The hub keeps the stream its writer returned, in
+/// place of dropping it, for [`pump_output`] to read: the tap it returns, or 0 for none.
+pub fn tap_output(output: OutputIdx) -> String {
+    format!("tap-output-{}", output.position())
+}
+
+/// The name of the function reading a tapped output's items, telling the host of each chunk
+/// through [`output_items`]: `async (tap: u32)`, returning once its writer is done.
+pub fn pump_output(output: OutputIdx) -> String {
+    format!("pump-output-{}", output.position())
+}
+
+/// The name of the function a hub imports from [`PREVIEW_INTERFACE`], told of what a tapped
+/// stream output nothing reads carries, a chunk at a time: `(items: list<T>)`.
+pub fn output_items(output: OutputIdx) -> String {
+    format!("output-items-{}", output.position())
+}
+
 /// The name of the function lending the host a handle output, through the
 /// import of [`lend_handle`]: `()`.
 pub fn read_handle(output: OutputIdx) -> String {

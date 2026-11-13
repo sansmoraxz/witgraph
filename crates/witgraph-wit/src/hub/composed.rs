@@ -33,7 +33,9 @@ pub struct HubMember<'a> {
 pub struct HubOptions {
     /// Taps the streams between nodes whose items are values (no handles), so that a host can
     /// see what they carry: [`tap_stream`](super::tap_stream). Each item is then copied
-    /// through the hub, and once more to the host.
+    /// through the hub, and once more to the host. A stream output nothing reads is read by
+    /// the hub ([`tap_output`](super::tap_output)) rather than dropped, so its writes go
+    /// through as if read.
     pub stream_taps: bool,
 }
 

@@ -254,7 +254,10 @@ for seen in previews.take() {
 ```
 
 The reader still gets every item, and a write still waits for it, but each item is copied
-through the hub and once more as text, so keep it for debugging. A graph you prepare yourself
+through the hub and once more as text, so keep it for debugging. A stream output nothing reads
+is tapped too: the hub reads it, rather than dropping it, so its writes go through as if read,
+where they would fail otherwise. A node that stops writing once nothing reads now writes on, an
+endless one for as long as it runs. A graph you prepare yourself
 needs its streams tapped then: `PreparedGraph::with_stream_taps`, not `new`.
 
 ### Spinning guests
