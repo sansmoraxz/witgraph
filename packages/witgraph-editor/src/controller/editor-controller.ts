@@ -116,6 +116,21 @@ export interface AttachedEditing {
    * restarted from here.
    */
   restart?(): Promise<{ url: string; certificateHash: Uint8Array<ArrayBuffer> }>;
+  /**
+   * Keeps `graph`, the graph running as the editor has it (its layout with it), where the
+   * program keeps its graph: Save. Resolves with where to attach, or `null` if the program
+   * loaded nothing again. Without it, an attached graph is not saved from here.
+   */
+  save?(
+    graph: GraphJson,
+  ): Promise<{ url: string; certificateHash: Uint8Array<ArrayBuffer> } | null>;
+  /**
+   * Loads the graph the program keeps in place of the one running, dropping what was changed
+   * since it was saved: Revert. Resolves with where to attach.
+   */
+  revert?(): Promise<{ url: string; certificateHash: Uint8Array<ArrayBuffer> }>;
+  /** Whether the graph running differs from the one the program keeps. */
+  unsaved?(): boolean;
 }
 
 /** Whether a connection may be, and if not, why, in the compiler's words. */
@@ -1589,34 +1604,81 @@ export class EditorController extends EventTarget {
    */
   async restart(): Promise<void> {
     if (this.#attached) {
-      const editing = this.#editing;
-      if (!editing?.restart) return;
-      if (this.#reloading) {
-        this.#warn('The graph is being changed: restart it once that is done');
-        return;
-      }
-      this.#reloading = true;
-      try {
-        const draft = this.#graphJson;
-        const selected = this.#selectedNode;
-        await this.attach({ ...(await editing.restart()), editing });
-        // Drawn where the editor had them.
-        if (draft) {
-          this.#graphJson = draft;
-          this.#buildVisuals();
-        }
-        if (selected && this.#nodes.has(selected)) this.#selectedNode = selected;
-      } catch (err) {
-        this.#pushError(`Cannot restart: ${err instanceof Error ? err.message : String(err)}`);
-      } finally {
-        this.#reloading = false;
-      }
-      this.#dispatch('state-changed');
+      const restart = this.#editing?.restart;
+      if (!restart) return;
+      await this.#changeAttached('restart', () => restart(), true);
       return;
     }
     await this.stop();
     await this.#runLoop;
     await this.run();
+  }
+
+  /** Whether an attached graph is saved from here, by its program: Save and Revert. */
+  get savable(): boolean {
+    return this.#attached !== null && this.#editing?.save !== undefined;
+  }
+
+  /** Whether an attached graph differs from the one its program keeps. */
+  get unsaved(): boolean {
+    return this.#editing?.unsaved?.() ?? false;
+  }
+
+  /** Has the program attached to keep the graph running, as here (its layout with it). */
+  async saveAttached(): Promise<void> {
+    const save = this.#editing?.save;
+    const graph = this.#graphJson;
+    if (!this.#attached || !save || !graph) return;
+    await this.#changeAttached('save', () => save(structuredClone(graph)), true);
+  }
+
+  /**
+   * Has the program attached to load the graph it keeps in place of the one running, dropping
+   * what was changed since: only while stopped, as an edit.
+   */
+  async revertAttached(): Promise<void> {
+    const revert = this.#editing?.revert;
+    if (!this.#attached || !revert || this.#locked()) return;
+    this.#undoStack = [];
+    this.#redoStack = [];
+    await this.#changeAttached('revert', () => revert(), false);
+  }
+
+  /**
+   * Asks the program attached to for `change`, and attaches to what it serves then, if it
+   * loaded the graph again: with the layout the editor had, if `keepLayout`.
+   */
+  async #changeAttached(
+    what: string,
+    change: () => Promise<{ url: string; certificateHash: Uint8Array<ArrayBuffer> } | null>,
+    keepLayout: boolean,
+  ): Promise<void> {
+    const editing = this.#editing;
+    if (!editing) return;
+    if (this.#reloading) {
+      this.#warn(`The graph is being changed: ${what} it once that is done`);
+      return;
+    }
+    this.#reloading = true;
+    try {
+      const draft = this.#graphJson;
+      const selected = this.#selectedNode;
+      const next = await change();
+      if (next) {
+        await this.attach({ ...next, editing });
+        // Drawn where the editor had them.
+        if (keepLayout && draft) {
+          this.#graphJson = draft;
+          this.#buildVisuals();
+        }
+        if (selected && this.#nodes.has(selected)) this.#selectedNode = selected;
+      }
+    } catch (err) {
+      this.#pushError(`Cannot ${what}: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      this.#reloading = false;
+    }
+    this.#dispatch('state-changed');
   }
 
   /** One tick, at most a slice long, whatever runs in it: no node is held for a step. */

@@ -318,8 +318,8 @@ export class WitgraphInspector extends HTMLElement {
       ),
     );
 
-    // Snapshots
-    wrap.appendChild(this.#buildSnapshotsSection());
+    // Snapshots, of a graph run here: an attached graph's program keeps its state.
+    if (!this.#controller?.attached) wrap.appendChild(this.#buildSnapshotsSection());
 
     // Hint
     wrap.appendChild(

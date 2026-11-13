@@ -15,6 +15,7 @@ import {
   RedoDot,
   RotateCcw,
   RotateCw,
+  Save,
   Square,
   StepForward,
   Undo2,
@@ -105,6 +106,7 @@ const ICONS: Record<string, unknown[]> = {
   package: Package,
   camera: Camera,
   history: History,
+  save: Save,
 };
 
 function iconEl(name: string): SVGSVGElement | null {
@@ -134,6 +136,8 @@ export class WitgraphControls extends HTMLElement {
   #btnLayout!: HTMLButtonElement;
   #btnSnapSave!: HTMLButtonElement;
   #btnSnapRestore!: HTMLButtonElement;
+  #btnSave!: HTMLButtonElement;
+  #btnRevert!: HTMLButtonElement;
   #btnLoad!: HTMLButtonElement;
   #badge!: HTMLSpanElement;
   /** Shows a tick rate on the slider; set once the toolbar is built. */
@@ -159,7 +163,9 @@ export class WitgraphControls extends HTMLElement {
       act(() => (controller.lineStop ? controller.stepOver() : controller.step()));
     } else if (key === 'F11' && shiftKey) act(() => controller.stepOut());
     else if (key === 'F11') act(() => controller.stepIn());
-    else if (key === 'F9' && controller.selectedNode) {
+    else if (key.toLowerCase() === 's' && (ctrlKey || metaKey) && controller.savable) {
+      act(() => controller.saveAttached());
+    } else if (key === 'F9' && controller.selectedNode) {
       const node = controller.selectedNode;
       act(() => controller.toggleBreakpoint(node));
     }
@@ -294,10 +300,22 @@ export class WitgraphControls extends HTMLElement {
 
     sep();
 
-    // Simulation group
+    // Simulation group: snapshots of a graph run here; an attached graph's program saves it.
     this.#btnSnapSave = mkBtn('snap-save', 'Save snapshot', 'camera', 'Save');
     this.#btnSnapRestore = mkBtn('snap-restore', 'Restore last snapshot', 'history', 'Restore');
-    group(this.#btnSnapSave, this.#btnSnapRestore);
+    this.#btnSave = mkBtn(
+      'save btn-primary',
+      'Save the graph where its program keeps it (Ctrl+S)',
+      'save',
+      'Save',
+    );
+    this.#btnRevert = mkBtn(
+      'revert',
+      'Load the graph its program keeps again, dropping the changes',
+      'rotate-ccw',
+      'Revert',
+    );
+    group(this.#btnSnapSave, this.#btnSnapRestore, this.#btnSave, this.#btnRevert);
 
     sep();
 
@@ -385,6 +403,8 @@ export class WitgraphControls extends HTMLElement {
         void this.#controller?.saveSnapshot();
       } catch {}
     });
+    this.#btnSave.addEventListener('click', () => void this.#controller?.saveAttached());
+    this.#btnRevert.addEventListener('click', () => void this.#controller?.revertAttached());
     this.#btnSnapRestore.addEventListener('click', () => {
       const snaps = this.#controller?.savedSnapshots ?? [];
       if (snaps.length > 0) {
@@ -458,9 +478,17 @@ export class WitgraphControls extends HTMLElement {
     this.#btnReset.toggleAttribute('hidden', attached);
     // Its program sets how fast it ticks.
     this.#rateGroup?.toggleAttribute('hidden', attached);
-    for (const button of [this.#btnLoad, this.#btnSnapSave, this.#btnSnapRestore]) {
-      if (attached) button.disabled = true;
-    }
+    if (attached) this.#btnLoad.disabled = true;
+    // An attached graph's program keeps its state: no snapshots of it are taken here. It is
+    // saved by its program, if that can.
+    this.#btnSnapSave.toggleAttribute('hidden', attached);
+    this.#btnSnapRestore.toggleAttribute('hidden', attached);
+    const savable = this.#controller?.savable ?? false;
+    const unsaved = this.#controller?.unsaved ?? false;
+    this.#btnSave.toggleAttribute('hidden', !savable);
+    this.#btnRevert.toggleAttribute('hidden', !savable);
+    this.#btnSave.disabled = !unsaved;
+    this.#btnRevert.disabled = !unsaved || !editable;
 
     // Between ticks too: a step can leave a stream going.
     const shown: EditorMode = mode === 'idle' && anyRunning ? 'running' : mode;
