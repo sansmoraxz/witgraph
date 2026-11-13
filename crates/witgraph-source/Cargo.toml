@@ -15,12 +15,14 @@ workspace = true
 
 [dependencies]
 witgraph-ir = { workspace = true }
+witgraph-wit = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true, features = ["std"] }
 sha2 = { workspace = true }
 hex = { workspace = true }
 oci-client = { version = "0.18", default-features = false, features = ["rustls-tls"] }
-tokio = { version = "1", features = ["fs", "io-util", "rt"] }
+tokio = { version = "1", features = ["fs", "io-util", "rt", "macros"] }
 futures = "0.3"
 bytes = "1"
 
@@ -28,7 +30,6 @@ bytes = "1"
 libc = "0.2"
 
 [dev-dependencies]
-serde_json = { workspace = true }
 tokio = { version = "1", features = ["rt", "macros", "net", "io-util", "time"] }
 witgraph-wit = { workspace = true }
 witgraph-runtime = { workspace = true }

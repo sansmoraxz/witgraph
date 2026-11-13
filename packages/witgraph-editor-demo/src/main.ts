@@ -51,70 +51,52 @@ catalog.controller = controller;
 
 // -- Component references -----------------------------------------------------
 
-const relayRef = {
-  package: { namespace: 'test', name: 'relay', version: '0.1.0' },
-  world: 'relay',
-};
+const relayRef = { component: 'relay', world: 'test:relay/relay@0.1.0' };
 
 const streamProducerRef = {
-  package: { namespace: 'test', name: 'stream-producer', version: '0.1.0' },
-  world: 'stream-producer',
+  component: 'stream-producer',
+  world: 'test:stream-producer/stream-producer@0.1.0',
 };
 
 const streamConsumerRef = {
-  package: { namespace: 'test', name: 'stream-consumer', version: '0.1.0' },
-  world: 'stream-consumer',
+  component: 'stream-consumer',
+  world: 'test:stream-consumer/stream-consumer@0.1.0',
 };
 
 const futureWriterRef = {
-  package: { namespace: 'test', name: 'future-writer', version: '0.1.0' },
-  world: 'future-writer',
+  component: 'future-writer',
+  world: 'test:future-writer/future-writer@0.1.0',
 };
 
 const futureReaderRef = {
-  package: { namespace: 'test', name: 'future-reader', version: '0.1.0' },
-  world: 'future-reader',
+  component: 'future-reader',
+  world: 'test:future-reader/future-reader@0.1.0',
 };
 
 const configurableRef = {
-  package: { namespace: 'test', name: 'configurable', version: '0.1.0' },
-  world: 'configurable',
+  component: 'configurable',
+  world: 'test:configurable/configurable@0.1.0',
 };
 
-const calcRef = {
-  package: { namespace: 'test', name: 'calc', version: '0.1.0' },
-  world: 'calc',
-};
+const calcRef = { component: 'calc', world: 'test:calc/calc@0.1.0' };
 
-const mqttNodeRef = {
-  package: { namespace: 'test', name: 'mqtt-node', version: '0.1.0' },
-  world: 'mqtt-node',
-};
+const mqttNodeRef = { component: 'mqtt-node', world: 'test:mqtt-node/mqtt-node@0.1.0' };
 
 const bytesConsumerRef = {
-  package: { namespace: 'test', name: 'bytes-consumer', version: '0.1.0' },
-  world: 'bytes-consumer',
+  component: 'bytes-consumer',
+  world: 'test:bytes-consumer/bytes-consumer@0.1.0',
 };
 
-const videoSourceRef = {
-  package: { namespace: 'test', name: 'video-source', version: '0.1.0' },
-  world: 'video-source',
-};
+const videoSourceRef = { component: 'video-source', world: 'test:video-source/video-source@0.1.0' };
 
 const frameGrayscaleRef = {
-  package: { namespace: 'test', name: 'frame-grayscale', version: '0.1.0' },
-  world: 'frame-grayscale',
+  component: 'frame-grayscale',
+  world: 'test:frame-grayscale/frame-grayscale@0.1.0',
 };
 
-const frameInvertRef = {
-  package: { namespace: 'test', name: 'frame-invert', version: '0.1.0' },
-  world: 'frame-invert',
-};
+const frameInvertRef = { component: 'frame-invert', world: 'test:frame-invert/frame-invert@0.1.0' };
 
-const videoSinkRef = {
-  package: { namespace: 'test', name: 'video-sink', version: '0.1.0' },
-  world: 'video-sink',
-};
+const videoSinkRef = { component: 'video-sink', world: 'test:video-sink/video-sink@0.1.0' };
 
 // -- Graph definitions --------------------------------------------------------
 
@@ -152,25 +134,14 @@ const GUESTS = [
   'camera-source',
 ];
 
-const allComponents = GUESTS.map((guest) => ({
-  package: { namespace: 'test', name: guest, version: '0.1.0' },
-  world: guest,
-}));
+/** The component table of every demo: each guest, by its name. */
+const allComponents = Object.fromEntries(GUESTS.map((guest) => [guest, guest]));
 
-const lineWalkRef = {
-  package: { namespace: 'test', name: 'line-walk', version: '0.1.0' },
-  world: 'line-walk',
-};
+const lineWalkRef = { component: 'line-walk', world: 'test:line-walk/line-walk@0.1.0' };
 
-const cWalkRef = {
-  package: { namespace: 'test', name: 'c-walk', version: '0.1.0' },
-  world: 'c-walk',
-};
+const cWalkRef = { component: 'c-walk', world: 'test:c-walk/c-walk@0.1.0' };
 
-const zigWalkRef = {
-  package: { namespace: 'test', name: 'zig-walk', version: '0.1.0' },
-  world: 'zig-walk',
-};
+const zigWalkRef = { component: 'zig-walk', world: 'test:zig-walk/zig-walk@0.1.0' };
 
 const portKinds: GraphJson = {
   metadata: {
@@ -183,48 +154,48 @@ const portKinds: GraphJson = {
     // Value chain
     {
       id: 'relay-a',
-      component: relayRef,
+      ...relayRef,
       label: 'Relay A',
       attrs: { 'inject.in': '0', 'inject.add': '1' },
     },
-    { id: 'relay-b', component: relayRef, label: 'Relay B', attrs: { 'inject.add': '0' } },
-    { id: 'relay-c', component: relayRef, label: 'Relay C', attrs: { 'inject.add': '0' } },
+    { id: 'relay-b', ...relayRef, label: 'Relay B', attrs: { 'inject.add': '0' } },
+    { id: 'relay-c', ...relayRef, label: 'Relay C', attrs: { 'inject.add': '0' } },
     // Stream group
     {
       id: 'producer',
-      component: streamProducerRef,
+      ...streamProducerRef,
       label: 'Producer',
       attrs: { 'inject.burst-size': '5' },
     },
-    { id: 'consumer', component: streamConsumerRef, label: 'Consumer' },
+    { id: 'consumer', ...streamConsumerRef, label: 'Consumer' },
     // Future group
-    { id: 'writer', component: futureWriterRef, label: 'Future Writer' },
-    { id: 'reader', component: futureReaderRef, label: 'Future Reader' },
+    { id: 'writer', ...futureWriterRef, label: 'Future Writer' },
+    { id: 'reader', ...futureReaderRef, label: 'Future Reader' },
     // Display relay
-    { id: 'display', component: relayRef, label: 'Display', attrs: { 'inject.add': '0' } },
+    { id: 'display', ...relayRef, label: 'Display', attrs: { 'inject.add': '0' } },
     // Configurable node (pure — no external capabilities)
     {
       id: 'configurable',
-      component: configurableRef,
+      ...configurableRef,
       label: 'Configurable',
       attrs: { 'inject.rate': '3', 'inject.gain': '2.5' },
     },
     // Calc node (imports test:math/ops — satisfied by JS capabilities callback)
-    { id: 'calc', component: calcRef, label: 'Calc (ext caps)', attrs: { 'inject.x': '5' } },
+    { id: 'calc', ...calcRef, label: 'Calc (ext caps)', attrs: { 'inject.x': '5' } },
     // MQTT node (imports test:mqtt/source — satisfied by JS capabilities callback)
-    { id: 'mqtt', component: mqttNodeRef, label: 'MQTT Sensor' },
+    { id: 'mqtt', ...mqttNodeRef, label: 'MQTT Sensor' },
     // Bytes consumer (receives mqtt stream)
-    { id: 'mqtt-sink', component: bytesConsumerRef, label: 'Msg Counter' },
+    { id: 'mqtt-sink', ...bytesConsumerRef, label: 'Msg Counter' },
     // Video group: frames streamed through a filter, each node previewing them
     {
       id: 'camera',
-      component: videoSourceRef,
+      ...videoSourceRef,
       label: 'Camera',
       attrs: { 'inject.fps': '20' },
     },
-    { id: 'grayscale', component: frameGrayscaleRef, label: 'Grayscale' },
-    { id: 'invert', component: frameInvertRef, label: 'Invert' },
-    { id: 'video-sink', component: videoSinkRef, label: 'Frame Sink' },
+    { id: 'grayscale', ...frameGrayscaleRef, label: 'Grayscale' },
+    { id: 'invert', ...frameInvertRef, label: 'Invert' },
+    { id: 'video-sink', ...videoSinkRef, label: 'Frame Sink' },
   ],
   connections: [
     {
@@ -274,9 +245,9 @@ const portKinds: GraphJson = {
 };
 
 /**
- * Two cameras streaming frames through image filters. Each component names
- * the viewer for its `frames` output in a `witgraph-viewer` custom section,
- * so every node but the sinks previews its frames as they stream.
+ * Two cameras streaming frames through image filters. Each component's node
+ * manifest names the viewer for its `frames` output, so every node but the
+ * sinks previews its frames as they stream.
  */
 const video: GraphJson = {
   metadata: {
@@ -287,21 +258,21 @@ const video: GraphJson = {
   nodes: [
     {
       id: 'camera',
-      component: videoSourceRef,
+      ...videoSourceRef,
       label: 'Camera',
       attrs: { 'inject.fps': '15' },
     },
-    { id: 'gray', component: frameGrayscaleRef, label: 'Grayscale' },
-    { id: 'gray-invert', component: frameInvertRef, label: 'Invert' },
-    { id: 'gray-sink', component: videoSinkRef, label: 'Sink' },
+    { id: 'gray', ...frameGrayscaleRef, label: 'Grayscale' },
+    { id: 'gray-invert', ...frameInvertRef, label: 'Invert' },
+    { id: 'gray-sink', ...videoSinkRef, label: 'Sink' },
     {
       id: 'camera-b',
-      component: videoSourceRef,
+      ...videoSourceRef,
       label: 'Camera B',
       attrs: { 'inject.fps': '10' },
     },
-    { id: 'invert', component: frameInvertRef, label: 'Invert' },
-    { id: 'sink', component: videoSinkRef, label: 'Sink' },
+    { id: 'invert', ...frameInvertRef, label: 'Invert' },
+    { id: 'sink', ...videoSinkRef, label: 'Sink' },
   ],
   connections: [
     {
@@ -335,7 +306,7 @@ const video: GraphJson = {
 /** The edge node of an accelerator: WebGPU's runs its own shaders on it. */
 const edgeDetectRef = (accelerator: string) => {
   const name = accelerator === 'WebGPU' ? 'edge-detect-webgpu' : 'edge-detect';
-  return { package: { namespace: 'test', name, version: '0.1.0' }, world: name };
+  return { component: name, world: `test:${name}/${name}@0.1.0` };
 };
 
 /**
@@ -353,9 +324,9 @@ function edgeGraph(accelerator: string): GraphJson {
     },
     components: allComponents,
     nodes: [
-      { id: 'camera', component: videoSourceRef, label: 'Camera', attrs: { 'inject.fps': '15' } },
-      { id: 'edges', component: edgeDetectRef(accelerator), label: `Edges (${accelerator})` },
-      { id: 'sink', component: videoSinkRef, label: 'Sink' },
+      { id: 'camera', ...videoSourceRef, label: 'Camera', attrs: { 'inject.fps': '15' } },
+      { id: 'edges', ...edgeDetectRef(accelerator), label: `Edges (${accelerator})` },
+      { id: 'sink', ...videoSinkRef, label: 'Sink' },
     ],
     connections: [
       {
@@ -372,10 +343,7 @@ function edgeGraph(accelerator: string): GraphJson {
   };
 }
 
-const tensorRef = (name: string) => ({
-  package: { namespace: 'test', name, version: '0.1.0' },
-  world: name,
-});
+const tensorRef = (name: string) => ({ component: name, world: `test:${name}/${name}@0.1.0` });
 
 /**
  * Tensors that stay where `where` keeps them: an image made once, its
@@ -390,10 +358,10 @@ function tensorGraph(where: string): GraphJson {
     },
     components: allComponents,
     nodes: [
-      { id: 'image', component: tensorRef('tensor-source'), label: 'Image' },
-      { id: 'edges', component: tensorRef('tensor-edge'), label: `Edges (${where})` },
-      { id: 'invert', component: tensorRef('tensor-invert'), label: 'Invert' },
-      { id: 'sum', component: tensorRef('tensor-sink'), label: 'Sum' },
+      { id: 'image', ...tensorRef('tensor-source'), label: 'Image' },
+      { id: 'edges', ...tensorRef('tensor-edge'), label: `Edges (${where})` },
+      { id: 'invert', ...tensorRef('tensor-invert'), label: 'Invert' },
+      { id: 'sum', ...tensorRef('tensor-sink'), label: 'Sum' },
     ],
     connections: [
       {
@@ -428,12 +396,12 @@ function cameraGraph(where: string): GraphJson {
     },
     components: allComponents,
     nodes: [
-      { id: 'camera', component: tensorRef('camera-source'), label: 'Camera' },
-      { id: 'edges', component: tensorRef('tensor-stream-edge'), label: `Edges (${where})` },
-      { id: 'invert', component: tensorRef('tensor-stream-invert'), label: 'Invert' },
+      { id: 'camera', ...tensorRef('camera-source'), label: 'Camera' },
+      { id: 'edges', ...tensorRef('tensor-stream-edge'), label: `Edges (${where})` },
+      { id: 'invert', ...tensorRef('tensor-stream-invert'), label: 'Invert' },
       {
         id: 'sink',
-        component: tensorRef('tensor-stream-sink'),
+        ...tensorRef('tensor-stream-sink'),
         label: 'Sink',
         attrs: { 'inject.read-last': 'true' },
       },
@@ -471,10 +439,8 @@ const spin: GraphJson = {
   nodes: [
     {
       id: 'busy',
-      component: {
-        package: { namespace: 'test', name: 'busy-loop', version: '0.1.0' },
-        world: 'busy-loop',
-      },
+      component: 'busy-loop',
+      world: 'test:busy-loop/busy-loop@0.1.0',
       label: 'Busy loop',
     },
   ],
@@ -488,12 +454,12 @@ const lines: GraphJson = {
   nodes: [
     {
       id: 'first',
-      component: lineWalkRef,
+      ...lineWalkRef,
       label: 'First',
       attrs: { 'inject.in': '5' },
     },
     // `scale` runs `scale.rs`, the guest's second file: a breakpoint there has something to stop.
-    { id: 'second', component: lineWalkRef, label: 'Second', attrs: { 'inject.scale': '2' } },
+    { id: 'second', ...lineWalkRef, label: 'Second', attrs: { 'inject.scale': '2' } },
   ],
   connections: [
     {
@@ -515,7 +481,7 @@ const cLines: GraphJson = {
   nodes: [
     {
       id: 'rust',
-      component: lineWalkRef,
+      ...lineWalkRef,
       label: 'Rust',
       // `scale` runs `scale.rs`, the guest's second file.
       attrs: { 'inject.in': '5', 'inject.scale': '2' },
@@ -523,14 +489,14 @@ const cLines: GraphJson = {
     // `scale` runs `scale.c`, the guest's second file.
     {
       id: 'c',
-      component: cWalkRef,
+      ...cWalkRef,
       label: 'C',
       attrs: { 'inject.kinds': '4', 'inject.scale': '2' },
     },
     // `scale` runs `scale.zig`, the guest's second file.
     {
       id: 'zig',
-      component: zigWalkRef,
+      ...zigWalkRef,
       label: 'Zig',
       attrs: { 'inject.kinds': '4', 'inject.scale': '2' },
     },
@@ -581,6 +547,21 @@ async function sources(file: string): Promise<string | undefined> {
   const response = await fetch(`/@fs${file}`);
   const type = response.headers.get('content-type') ?? '';
   return response.ok && !type.includes('html') ? response.text() : undefined;
+}
+
+/** A guest's node manifest and WIT, beside its bytes. */
+async function fetchGuest(name: string, debug: boolean): Promise<ComponentSource> {
+  const fetched = async (file: string) => {
+    const url = new URL(/* @vite-ignore */ `../components/${file}`, import.meta.url);
+    const resp = await fetch(url);
+    if (!resp.ok || (resp.headers.get('content-type') ?? '').includes('html')) {
+      throw new Error(`Could not fetch ${url.pathname} (${resp.status}). Run \`pnpm setup\`.`);
+    }
+    return resp;
+  };
+  const manifest = await (await fetched(`${name}.node.json`)).json();
+  const wit = new Uint8Array(await (await fetched(`${name}.wit.wasm`)).arrayBuffer());
+  return { name, manifest, wit, bytes: await fetchWasm(name, debug) };
 }
 
 /** A guest, as built with debug info if `debug`: those are big, so left out of a built page. */
@@ -659,10 +640,7 @@ async function loadDemo(): Promise<void> {
     const debug = new URLSearchParams(location.search).has('debug');
     const debugBuilds = debug && crossOriginIsolated;
     const components: ComponentSource[] = await Promise.all(
-      GUESTS.map(async (guest) => ({
-        id: `test:${guest}/${guest}@0.1.0`,
-        bytes: await fetchWasm(guest, debugBuilds),
-      })),
+      GUESTS.map((guest) => fetchGuest(guest, debugBuilds)),
     );
 
     statusEl.textContent = 'Loading graph (initialising runtime, transpiling components)...';

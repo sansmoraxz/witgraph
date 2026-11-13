@@ -9,18 +9,6 @@ use wasi::webgpu::webgpu::{
 };
 use witgraph::runtime::host;
 
-/// Declares how an editor previews this node's outputs (the
-/// `witgraph-viewer` custom section).
-macro_rules! viewer {
-    ($hints:literal) => {
-        #[used]
-        #[unsafe(link_section = "witgraph-viewer")]
-        static VIEWER: [u8; $hints.len()] = *$hints;
-    };
-}
-
-viewer!(b"output.edges=image\noutput.backend=text\n");
-
 /// A convolution: one invocation per output value.
 const CONV: &str = "
 struct Dims { in_c: u32, out_c: u32, h: u32, w: u32, k: u32 }

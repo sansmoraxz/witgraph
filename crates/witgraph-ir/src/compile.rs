@@ -14,7 +14,7 @@ use std::hash::BuildHasher;
 use crate::component::ComponentContract;
 use crate::diagnostics::{Diagnostic, Diagnostics};
 use crate::graph::{Connection, Graph, Link, Node};
-use crate::id::{ComponentRef, ConnectionId, NodeId, PackageRef, PortName, PortRef};
+use crate::id::{ComponentName, ConnectionId, ContractId, NodeId, PortName, PortRef};
 use crate::port::{PortDef, PortDirection, PortKind};
 use crate::topo;
 
@@ -39,194 +39,53 @@ pub struct CompilationFailure {
     pub diagnostics: Diagnostics,
 }
 
-/// Supplies the contracts for component references at compile time.
+/// Supplies the contracts nodes run at compile time: each world, as a
+/// component provides it.
 ///
-/// Contracts are re-derived from WIT rather than stored in the graph. A
-/// lookup matches on the full [`ComponentRef`], content hash included, so a
-/// graph pinned to one revision of a component never compiles against
-/// another. An unhashed reference resolves to the single contract with the
-/// same package, world and version, if exactly one exists: the
-/// *single-match rule*, [`resolve_contract`].
-///
-/// A source only lists [`candidates`](Self::candidates); compilation applies
-/// the rule itself, so it tells a missing component
-/// ([`Diagnostic::ContractNotFound`]) from an ambiguous one
-/// ([`Diagnostic::AmbiguousContract`]). It does not trust an implementation
-/// either: a candidate whose package, world, version or (for a pinned
-/// entry) content hash differs from the entry is ignored.
+/// Contracts are lowered from the components' WIT rather than stored in
+/// the graph. A lookup is exact: one [`ContractId`], one contract.
 ///
 /// The slice, array and `Vec` sources scan their contracts on every lookup;
-/// for a large source, use a [`ContractIndex`].
+/// for a large source, use a map.
 pub trait ContractSource {
-    /// Every contract this source holds that could resolve `id`: the same
-    /// package (version included) and world, and for a pinned `id` exactly
-    /// its content hash. The order should be deterministic; it is the
-    /// order an [`AmbiguousContract`](Diagnostic::AmbiguousContract) lists
-    /// them in.
-    fn candidates(&self, id: &ComponentRef) -> Vec<&ComponentContract>;
-
-    /// The contract `id` resolves to under the single-match rule, if any.
-    fn contract(&self, id: &ComponentRef) -> Option<&ComponentContract> {
-        match resolve_contract(id, self.candidates(id)) {
-            Resolution::Found(contract) => Some(contract),
-            Resolution::NotFound | Resolution::Ambiguous(_) => None,
-        }
-    }
-}
-
-/// Whether a contract with id `found` may resolve the table entry
-/// `requested`: the same package (version included) and world, and, when
-/// the entry is pinned, exactly its content hash.
-fn fits(requested: &ComponentRef, found: &ComponentRef) -> bool {
-    requested.package == found.package
-        && requested.world == found.world
-        && (requested.content_hash.is_none() || requested.content_hash == found.content_hash)
-}
-
-/// How a component reference resolves among candidate contracts.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Resolution<'a> {
-    /// Exactly one contract fits.
-    Found(&'a ComponentContract),
-    /// None does.
-    NotFound,
-    /// Several contracts fit an unhashed reference: their ids, sorted.
-    Ambiguous(Vec<ComponentRef>),
-}
-
-/// The single-match rule: the contract among `candidates` that `id`
-/// resolves to. Candidates that do not fit `id` are ignored, and copies
-/// count once: contracts with one content hash (which covers everything
-/// but doc comments), or hashless ones with one id that are equal but for
-/// their doc comments. Two hashless contracts with one id that differ
-/// otherwise are ambiguous. A pinned `id` therefore finds at most one.
-pub fn resolve_contract<'a>(
-    id: &ComponentRef,
-    candidates: impl IntoIterator<Item = &'a ComponentContract>,
-) -> Resolution<'a> {
-    // By id, the contracts found: one id is one content hash, or none on
-    // both, so copies are only among one id's.
-    let mut by_id: HashMap<&ComponentRef, Vec<&ComponentContract>> = HashMap::new();
-    for candidate in candidates.into_iter().filter(|c| fits(id, &c.id)) {
-        let same = by_id.entry(&candidate.id).or_default();
-        let copy = same
-            .iter()
-            .any(|f| candidate.id.content_hash.is_some() || same_but_docs(f, candidate));
-        if !copy {
-            same.push(candidate);
-        }
-    }
-    let found: Vec<&ComponentContract> = by_id.into_values().flatten().collect();
-    match found.as_slice() {
-        [] => Resolution::NotFound,
-        [only] => Resolution::Found(only),
-        many => {
-            let mut ids: Vec<ComponentRef> = many.iter().map(|c| c.id.clone()).collect();
-            ids.sort();
-            Resolution::Ambiguous(ids)
-        }
-    }
-}
-
-/// Whether two contracts are equal but for their doc comments: what a
-/// content hash covers.
-fn same_but_docs(a: &ComponentContract, b: &ComponentContract) -> bool {
-    let ports = |x: &[PortDef], y: &[PortDef]| {
-        x.len() == y.len()
-            && x.iter().zip(y).all(|(p, q)| {
-                p.name == q.name
-                    && p.kind() == q.kind()
-                    && p.ty() == q.ty()
-                    && p.handle_type() == q.handle_type()
-                    && p.is_optional() == q.is_optional()
-            })
-    };
-    a.id == b.id
-        && a.capabilities == b.capabilities
-        && ports(&a.inputs, &b.inputs)
-        && ports(&a.outputs, &b.outputs)
+    /// The contract of `id`'s world, as `id`'s component provides it.
+    fn contract(&self, id: &ContractId) -> Option<&ComponentContract>;
 }
 
 impl ContractSource for [ComponentContract] {
-    fn candidates(&self, id: &ComponentRef) -> Vec<&ComponentContract> {
-        self.iter().filter(|c| fits(id, &c.id)).collect()
+    fn contract(&self, id: &ContractId) -> Option<&ComponentContract> {
+        self.iter().find(|c| &c.id == id)
     }
 }
 
 impl<const N: usize> ContractSource for [ComponentContract; N] {
-    fn candidates(&self, id: &ComponentRef) -> Vec<&ComponentContract> {
-        self.as_slice().candidates(id)
+    fn contract(&self, id: &ContractId) -> Option<&ComponentContract> {
+        self.as_slice().contract(id)
     }
 }
 
 impl ContractSource for Vec<ComponentContract> {
-    fn candidates(&self, id: &ComponentRef) -> Vec<&ComponentContract> {
-        self.as_slice().candidates(id)
+    fn contract(&self, id: &ContractId) -> Option<&ComponentContract> {
+        self.as_slice().contract(id)
     }
 }
 
-impl<S: BuildHasher> ContractSource for HashMap<ComponentRef, ComponentContract, S> {
-    fn candidates(&self, id: &ComponentRef) -> Vec<&ComponentContract> {
-        // A pinned key is looked up directly; anything else (an unpinned
-        // key, or a contract stored under another key) needs a scan, sorted
-        // so the outcome does not depend on the map's iteration order.
-        if id.content_hash.is_some()
-            && let Some(contract) = self.get(id).filter(|c| fits(id, &c.id))
-        {
-            return vec![contract];
-        }
-        let mut found: Vec<&ComponentContract> =
-            self.values().filter(|c| fits(id, &c.id)).collect();
-        found.sort_by(|a, b| a.id.cmp(&b.id));
-        found
+impl<S: BuildHasher> ContractSource for HashMap<ContractId, ComponentContract, S> {
+    fn contract(&self, id: &ContractId) -> Option<&ComponentContract> {
+        // A source may hand back anything: only a contract of `id` counts.
+        self.get(id).filter(|c| &c.id == id)
     }
 }
 
-/// Contracts indexed by package (version included) and world: a
-/// [`ContractSource`] whose lookups cost the number of revisions of that
-/// one world, not the size of the source.
-#[derive(Debug, Clone, Default)]
-pub struct ContractIndex {
-    /// By package, then world: looked up by borrowing the id's parts.
-    by_world: HashMap<PackageRef, HashMap<String, Vec<ComponentContract>>>,
-}
-
-impl ContractIndex {
-    /// Indexes `contracts`.
-    pub fn new(contracts: impl IntoIterator<Item = ComponentContract>) -> Self {
-        contracts.into_iter().collect()
-    }
-
-    /// Adds a contract.
-    pub fn insert(&mut self, contract: ComponentContract) {
-        self.by_world
-            .entry(contract.id.package.clone())
-            .or_default()
-            .entry(contract.id.world.clone())
-            .or_default()
-            .push(contract);
+impl ContractSource for BTreeMap<ContractId, ComponentContract> {
+    fn contract(&self, id: &ContractId) -> Option<&ComponentContract> {
+        self.get(id).filter(|c| &c.id == id)
     }
 }
 
-impl FromIterator<ComponentContract> for ContractIndex {
-    fn from_iter<I: IntoIterator<Item = ComponentContract>>(iter: I) -> Self {
-        let mut index = Self::default();
-        for contract in iter {
-            index.insert(contract);
-        }
-        index
-    }
-}
-
-impl ContractSource for ContractIndex {
-    fn candidates(&self, id: &ComponentRef) -> Vec<&ComponentContract> {
-        self.by_world
-            .get(&id.package)
-            .and_then(|worlds| worlds.get(id.world.as_str()))
-            .into_iter()
-            .flatten()
-            .filter(|c| fits(id, &c.id))
-            .collect()
+impl<T: ContractSource + ?Sized> ContractSource for &T {
+    fn contract(&self, id: &ContractId) -> Option<&ComponentContract> {
+        (**self).contract(id)
     }
 }
 
@@ -259,7 +118,7 @@ impl RequiredCapability {
 }
 
 /// What identifies a link among a node's: its import, provider and export.
-pub type LinkKey = (String, ComponentRef, String);
+pub type LinkKey = (String, ComponentName, String);
 
 /// A graph that compiled successfully.
 ///
@@ -592,152 +451,44 @@ fn resolve_endpoint<'c>(
     None
 }
 
-/// How one node component reference resolves against the table.
-enum Reference<'c> {
-    /// No table entry matches it.
-    Unknown,
-    /// One does: its contract, if the entry resolved.
-    Bound(Option<&'c ComponentContract>),
-    /// Several distinct ones do: their ids, sorted.
-    Ambiguous(Vec<ComponentRef>),
-}
-
 /// Node id uniqueness + component resolution. Every node's component is
-/// resolved and diagnosed, duplicates included; only the first node with a
-/// given id claims the contract entry.
-///
-/// A node reference is matched against what each table entry *resolved
-/// to* (the contract's id, content hash included), falling back to the
-/// entry itself when it has no contract. A hashed reference needs exactly
-/// its hash: it never binds to a contract with another hash, nor to a
-/// hashless one, even through an unhashed entry (an unresolved unhashed
-/// entry, already diagnosed, still matches, so its nodes add no noise).
-/// Entries that resolved to the same contract are one match. Each distinct
-/// reference is resolved once, and an ambiguous one is reported once, with
-/// every node using it. Returns the known node ids and the contract of each
-/// uniquely resolvable node whose table entry has one.
+/// looked up in the table and diagnosed, duplicates included; only the
+/// first node with a given id claims the contract. Returns the known node
+/// ids and the contract of each node whose contract resolved.
 fn check_nodes<'g, 'c>(
     graph: &'g Graph,
-    table: &[Option<&'c ComponentContract>],
+    resolved: &HashMap<ContractId, Option<&'c ComponentContract>>,
     diagnostics: &mut Diagnostics,
 ) -> (
     HashSet<&'g NodeId>,
     HashMap<&'g NodeId, &'c ComponentContract>,
 ) {
-    let effective: Vec<&ComponentRef> = graph
-        .components
-        .iter()
-        .zip(table)
-        .map(|(entry, contract)| contract.map_or(entry, |c| &c.id))
-        .collect();
-    // Entries by package and world, so each reference looks at its own
-    // world's entries only.
-    let mut by_world: HashMap<(&PackageRef, &str), Vec<usize>> = HashMap::new();
-    for (i, id) in effective.iter().enumerate() {
-        by_world
-            .entry((&id.package, id.world.as_str()))
-            .or_default()
-            .push(i);
-    }
-    let resolve = |reference: &ComponentRef| -> Reference<'c> {
-        let entries = by_world
-            .get(&(&reference.package, reference.world.as_str()))
-            .map_or(&[][..], Vec::as_slice);
-        let mut matches: Vec<usize> = match &reference.content_hash {
-            None => entries.to_vec(),
-            Some(hash) => {
-                let exact: Vec<usize> = entries
-                    .iter()
-                    .copied()
-                    .filter(|&i| effective[i].content_hash.as_ref() == Some(hash))
-                    .collect();
-                if exact.is_empty() {
-                    entries
-                        .iter()
-                        .copied()
-                        .filter(|&i| table[i].is_none() && effective[i].content_hash.is_none())
-                        .collect()
-                } else {
-                    exact
-                }
-            }
-        };
-        let mut ids: Vec<&ComponentRef> = matches.iter().map(|&i| effective[i]).collect();
-        ids.sort();
-        ids.dedup();
-        match ids.as_slice() {
-            [] => Reference::Unknown,
-            [_] => {
-                matches.retain(|&i| table[i].is_some());
-                Reference::Bound(matches.first().and_then(|&i| table[i]))
-            }
-            many => Reference::Ambiguous(many.iter().map(|id| (*id).clone()).collect()),
-        }
-    };
-
     let mut node_ids: HashSet<&NodeId> = HashSet::new();
     let mut contracts: HashMap<&NodeId, &ComponentContract> = HashMap::new();
-    let mut references: HashMap<&ComponentRef, Reference<'c>> = HashMap::new();
-    // Ambiguous references, in order of first use, with their nodes.
-    let mut ambiguous: Vec<(&ComponentRef, Vec<NodeId>)> = Vec::new();
-    let mut ambiguous_at: HashMap<&ComponentRef, usize> = HashMap::new();
     for node in &graph.nodes {
         let fresh = node_ids.insert(&node.id);
         if !fresh {
             diagnostics.push(Diagnostic::DuplicateNodeId(node.id.clone()));
         }
-        let reference = references
-            .entry(&node.component)
-            .or_insert_with(|| resolve(&node.component));
-        match reference {
-            Reference::Unknown => diagnostics.push(Diagnostic::UnknownComponent {
+        if !graph.components.contains_key(&node.component) {
+            diagnostics.push(Diagnostic::UnknownComponent {
                 node: node.id.clone(),
                 component: node.component.clone(),
-            }),
-            Reference::Bound(contract) => {
-                if fresh && let Some(contract) = contract {
-                    contracts.insert(&node.id, contract);
-                }
-            }
-            Reference::Ambiguous(_) => {
-                let at = *ambiguous_at.entry(&node.component).or_insert_with(|| {
-                    ambiguous.push((&node.component, Vec::new()));
-                    ambiguous.len() - 1
-                });
-                ambiguous[at].1.push(node.id.clone());
-            }
-        }
-    }
-    for (component, nodes) in ambiguous {
-        if let Some(Reference::Ambiguous(matches)) = references.remove(component) {
-            diagnostics.push(Diagnostic::AmbiguousComponent {
-                nodes,
-                component: component.clone(),
-                matches,
             });
+            continue;
+        }
+        if fresh && let Some(Some(contract)) = resolved.get(&node.contract_id()) {
+            contracts.insert(&node.id, contract);
         }
     }
     (node_ids, contracts)
 }
 
-/// The component table is a registry: two entries with the same strict
-/// identity (hash included) are redundant at best and, when their ports
-/// differ, make every reference to that identity unresolvable.
-fn check_duplicate_components(graph: &Graph, diagnostics: &mut Diagnostics) {
-    let mut seen: HashSet<&ComponentRef> = HashSet::new();
-    for component in &graph.components {
-        if !seen.insert(component) {
-            diagnostics.push(Diagnostic::DuplicateComponent(component.clone()));
-        }
-    }
-}
-
-/// The table's resolved contracts, each once (entries resolving to the same
-/// contract are checked, and diagnosed, once).
+/// The contracts that resolved, each once.
 fn distinct<'c>(
     table: &[Option<&'c ComponentContract>],
 ) -> impl Iterator<Item = &'c ComponentContract> {
-    let mut seen: HashSet<&ComponentRef> = HashSet::new();
+    let mut seen: HashSet<&ContractId> = HashSet::new();
     table
         .iter()
         .flatten()
@@ -804,6 +555,12 @@ fn check_links(
         if !ids.insert(&link.id) {
             diagnostics.push(Diagnostic::DuplicateLinkId(link.id.clone()));
         }
+        if !graph.components.contains_key(&link.provider) {
+            diagnostics.push(Diagnostic::UnknownProvider {
+                link: link.id.clone(),
+                provider: link.provider.clone(),
+            });
+        }
         if !node_ids.contains(&link.node) {
             diagnostics.push(Diagnostic::LinkUnknownNode {
                 link: link.id.clone(),
@@ -813,9 +570,8 @@ fn check_links(
         }
         // A node whose contract did not resolve is already diagnosed. The
         // import is matched as loading matches it: by name, else a
-        // semver-compatible version, so the same link compiles against a
-        // contract lowered from WIT and one lowered from the bytes (where
-        // wit-component merged such versions into one import).
+        // semver-compatible version (which a component merges into one
+        // import).
         if let Some(contract) = node_contracts.get(&link.node)
             && !crate::interface::resolve_import(&contract.capabilities, &link.import)
                 .is_some_and(|c| c.is_interface())
@@ -1236,8 +992,9 @@ struct StreamGroups {
 }
 
 impl Graph {
-    /// Consuming typestate transition. Every component table entry is
-    /// resolved through `contracts`; an entry with no contract is diagnosed
+    /// Consuming typestate transition. Every contract a node runs (its
+    /// world, as the component it names provides it) is looked up in
+    /// `contracts`; one with no contract is diagnosed
     /// ([`Diagnostic::ContractNotFound`]). On failure the graph is handed
     /// back inside [`CompilationFailure`] together with every diagnostic
     /// found.
@@ -1247,38 +1004,28 @@ impl Graph {
     ) -> Result<CompiledGraph, CompilationFailure> {
         let mut diagnostics = Diagnostics::default();
 
-        // Each distinct entry is resolved, and diagnosed, once; a repeated
-        // entry (already a DuplicateComponent) gets the same outcome.
-        let mut resolved_entries: HashMap<&ComponentRef, Option<&ComponentContract>> =
-            HashMap::new();
-        let table: Vec<Option<&ComponentContract>> = self
-            .components
-            .iter()
-            .map(|id| {
-                *resolved_entries.entry(id).or_insert_with(|| {
-                    // A source may hand back anything; the rule only counts
-                    // candidates that fit the entry.
-                    match resolve_contract(id, contracts.candidates(id)) {
-                        Resolution::Found(contract) => Some(contract),
-                        Resolution::NotFound => {
-                            diagnostics.push(Diagnostic::ContractNotFound(id.clone()));
-                            None
-                        }
-                        Resolution::Ambiguous(matches) => {
-                            diagnostics.push(Diagnostic::AmbiguousContract {
-                                component: id.clone(),
-                                matches,
-                            });
-                            None
-                        }
-                    }
-                })
-            })
-            .collect();
+        // Each distinct contract nodes run is looked up, and diagnosed,
+        // once, in order of first use; a component not in the table is the
+        // node's diagnostic, not a missing contract.
+        let mut resolved: HashMap<ContractId, Option<&ComponentContract>> = HashMap::new();
+        let mut table: Vec<Option<&ComponentContract>> = Vec::new();
+        for node in &self.nodes {
+            if !self.components.contains_key(&node.component) {
+                continue;
+            }
+            let id = node.contract_id();
+            if let Entry::Vacant(entry) = resolved.entry(id) {
+                let contract = contracts.contract(entry.key());
+                if contract.is_none() {
+                    diagnostics.push(Diagnostic::ContractNotFound(entry.key().clone()));
+                }
+                table.push(contract);
+                entry.insert(contract);
+            }
+        }
 
-        check_duplicate_components(&self, &mut diagnostics);
         check_duplicate_port_names(&table, &mut diagnostics);
-        let (node_ids, node_contracts) = check_nodes(&self, &table, &mut diagnostics);
+        let (node_ids, node_contracts) = check_nodes(&self, &resolved, &mut diagnostics);
         check_port_flags(&table, &mut diagnostics);
         check_connection_ids(&self, &mut diagnostics);
         check_links(&self, &node_ids, &node_contracts, &mut diagnostics);
@@ -1315,7 +1062,7 @@ impl Graph {
             (Some(order), Some(groups), Some(ports)) if !diagnostics.has_errors() => {
                 // Compact the table to its resolved contracts (cloned once
                 // each) and point each node at its contract.
-                let mut compact: HashMap<&ComponentRef, usize> = HashMap::new();
+                let mut compact: HashMap<&ContractId, usize> = HashMap::new();
                 let mut resolved_contracts: Vec<ComponentContract> = Vec::new();
                 for contract in table.iter().flatten() {
                     compact.entry(&contract.id).or_insert_with(|| {
@@ -1381,8 +1128,8 @@ mod tests {
     use super::*;
     use crate::Type;
     use crate::component::Capability;
+    use crate::graph::ComponentEntry;
     use crate::graph::{Capacity, GraphBuilder, ResourceClaim};
-    use crate::id::ComponentRef;
     use crate::port::PortKind;
 
     /// A [`GraphBuilder`] that also keeps the contracts it registers, so the
@@ -1411,7 +1158,7 @@ mod tests {
             self
         }
 
-        fn add_node(mut self, id: &str, component: ComponentRef) -> Self {
+        fn add_node(mut self, id: &str, component: ContractId) -> Self {
             self.builder = self.builder.add_node(id, component);
             self
         }
@@ -1427,9 +1174,11 @@ mod tests {
         }
 
         fn link(mut self, id: &str, node: &str, import: &str) -> Self {
+            let provider: ComponentName = "provider".parse().unwrap();
             self.builder = self
                 .builder
-                .link(id, node, import, cref("provider"), "demo:caps/clock");
+                .add_component(ComponentEntry::new(provider.clone(), "provider"))
+                .link(id, node, import, provider, "demo:caps/clock");
             self
         }
 
@@ -1467,8 +1216,8 @@ mod tests {
         }
     }
 
-    fn cref(world: &str) -> ComponentRef {
-        format!("demo:graph/{world}@0.1.0").parse().unwrap()
+    fn cref(world: &str) -> ContractId {
+        format!("{world}/demo:graph/{world}@0.1.0").parse().unwrap()
     }
 
     fn contract(
@@ -1584,40 +1333,49 @@ mod tests {
     }
 
     #[test]
-    fn content_hash_mismatch_is_rejected() {
-        let mut pinned = cref("source");
-        pinned.content_hash = Some("bb".into());
-        let mut rebuilt = source();
-        rebuilt.id.content_hash = Some("aa".into());
+    fn a_world_the_component_does_not_provide_is_diagnosed() {
+        let other = ContractId::new(
+            cref("source").component,
+            "demo:graph/sink@0.1.0".parse().unwrap(),
+        );
         let graph = Graph::builder("t")
-            .add_component(pinned.clone())
-            .add_node("s", cref("source"))
+            .add_component(source())
+            .add_node("s", other.clone())
             .build();
         assert_eq!(
-            diags(graph.compile([rebuilt].as_slice())),
-            vec![Diagnostic::ContractNotFound(pinned)],
-            "a graph pinned to one revision never compiles against another"
+            diags(graph.compile([source()].as_slice())),
+            vec![Diagnostic::ContractNotFound(other)],
         );
     }
 
     #[test]
-    fn unhashed_entry_resolves_to_the_unique_hashed_contract() {
-        let mut hashed = source();
-        hashed.id.content_hash = Some("aa".into());
+    fn one_world_from_two_components_is_two_contracts() {
+        let mut other = source();
+        other.id.component = "other-source".parse().unwrap();
+        other.outputs.push(port("extra", PortKind::Value));
         let graph = Graph::builder("t")
-            .add_component(cref("source"))
-            .add_node("s", cref("source"))
+            .add_component(source())
+            .add_component(&other)
+            .add_node("a", cref("source"))
+            .add_node("b", other.id.clone())
             .build();
-        let compiled = graph.compile([hashed].as_slice()).expect("unique match");
+        let compiled = graph
+            .compile([source(), other.clone()].as_slice())
+            .expect("valid graph");
+        assert_eq!(compiled.contracts().len(), 2);
         assert_eq!(
-            compiled.contracts()[0].id.content_hash.as_deref(),
-            Some("aa")
+            compiled
+                .contract_for(&NodeId::from("b"))
+                .unwrap()
+                .outputs
+                .len(),
+            2
         );
     }
 
     #[test]
     fn hash_map_is_a_contract_source() {
-        let contracts: HashMap<ComponentRef, ComponentContract> = [source(), sink()]
+        let contracts: HashMap<ContractId, ComponentContract> = [source(), sink()]
             .into_iter()
             .map(|c| (c.id.clone(), c))
             .collect();
@@ -1642,7 +1400,7 @@ mod tests {
             diags(graph.compile()),
             vec![Diagnostic::UnknownComponent {
                 node: "n".into(),
-                component: cref("ghost"),
+                component: cref("ghost").component,
             }]
         );
     }
@@ -2432,89 +2190,6 @@ mod tests {
     }
 
     #[test]
-    fn a_hashed_node_never_binds_through_an_unhashed_entry_to_another_hash() {
-        let mut resolved = source();
-        resolved.id.content_hash = Some("aa".into());
-        let mut pinned = cref("source");
-        pinned.content_hash = Some("bb".into());
-        let graph = Graph::builder("t")
-            .add_component(cref("source"))
-            .add_node("n", pinned.clone())
-            .build();
-        assert_eq!(
-            diags(graph.compile([resolved.clone()].as_slice())),
-            vec![Diagnostic::UnknownComponent {
-                node: "n".into(),
-                component: pinned,
-            }],
-            "the entry resolved to `aa`, so a node pinned to `bb` matches nothing"
-        );
-
-        let mut same = cref("source");
-        same.content_hash = Some("aa".into());
-        let graph = Graph::builder("t")
-            .add_component(cref("source"))
-            .add_node("n", same)
-            .build();
-        let compiled = graph
-            .compile([resolved].as_slice())
-            .expect("the hash agrees with the resolved contract");
-        assert_eq!(
-            compiled
-                .contract_for(&NodeId::from("n"))
-                .unwrap()
-                .id
-                .content_hash
-                .as_deref(),
-            Some("aa")
-        );
-    }
-
-    #[test]
-    fn entries_resolving_to_one_contract_are_not_ambiguous() {
-        let mut hashed = source();
-        hashed.id.content_hash = Some("aa".into());
-        let graph = Graph::builder("t")
-            .add_component(cref("source"))
-            .add_component(hashed.id.clone())
-            .add_node("n", cref("source"))
-            .build();
-        graph
-            .compile([hashed].as_slice())
-            .expect("both entries are the same contract");
-    }
-
-    #[test]
-    fn a_source_returning_another_revision_is_not_trusted() {
-        let mut pinned = cref("source");
-        pinned.content_hash = Some("dead".into());
-        let mut other = source();
-        other.id.content_hash = Some("ff".into());
-        let contracts: HashMap<ComponentRef, ComponentContract> =
-            HashMap::from([(pinned.clone(), other)]);
-        let graph = Graph::builder("t")
-            .add_component(pinned.clone())
-            .add_node("s", pinned.clone())
-            .build();
-        assert_eq!(
-            diags(graph.compile(&contracts)),
-            vec![Diagnostic::ContractNotFound(pinned)]
-        );
-
-        let hashless = source();
-        let mut key = cref("source");
-        key.content_hash = Some("aa".into());
-        let contracts: HashMap<ComponentRef, ComponentContract> =
-            HashMap::from([(key.clone(), hashless)]);
-        let graph = Graph::builder("t").add_component(key.clone()).build();
-        assert_eq!(
-            diags(graph.compile(&contracts)),
-            vec![Diagnostic::ContractNotFound(key)],
-            "a pinned entry needs a contract with exactly that hash"
-        );
-    }
-
-    #[test]
     fn a_long_chain_compiles_without_deep_recursion() {
         let mut builder = builder("chain").add_component(pass_through());
         let n = 50_000;
@@ -2591,31 +2266,6 @@ mod tests {
             }],
             "only an optional input takes an option straight through"
         );
-    }
-
-    #[test]
-    fn a_hash_map_source_follows_the_single_match_rule() {
-        let mut aa = source();
-        aa.id.content_hash = Some("aa".into());
-        let mut bb = source();
-        bb.id.content_hash = Some("bb".into());
-        let (aa_id, bb_id) = (aa.id.clone(), bb.id.clone());
-        let contracts: HashMap<ComponentRef, ComponentContract> =
-            HashMap::from([(cref("source"), bb), (aa.id.clone(), aa)]);
-        let graph = Graph::builder("t").add_component(cref("source")).build();
-        match diags(graph.compile(&contracts)).as_slice() {
-            [Diagnostic::AmbiguousContract { component, matches }] => {
-                assert_eq!(component, &cref("source"));
-                let mut matches = matches.clone();
-                matches.sort();
-                assert_eq!(
-                    matches,
-                    vec![aa_id, bb_id],
-                    "two revisions match an unpinned entry, whatever key one is stored under"
-                );
-            }
-            other => panic!("{other:?}"),
-        }
     }
 
     #[test]
@@ -2738,7 +2388,7 @@ mod tests {
         }));
         assert!(diags.contains(&Diagnostic::UnknownComponent {
             node: "g".into(),
-            component: cref("ghost"),
+            component: cref("ghost").component,
         }));
         assert!(diags.contains(&Diagnostic::UnknownNode {
             conn: "c1".into(),
@@ -2753,8 +2403,13 @@ mod tests {
         assert_eq!(failure.graph.metadata.name, "hand-back");
         assert!(failure.to_string().contains("1 error"));
 
-        failure.graph.components.push(cref("source"));
-        failure.graph.nodes[0].component = cref("source");
+        let source_id = cref("source");
+        failure
+            .graph
+            .components
+            .insert(source_id.component.clone(), "source".into());
+        failure.graph.nodes[0].component = source_id.component;
+        failure.graph.nodes[0].world = source_id.world;
         (*failure.graph)
             .compile([source()].as_slice())
             .expect("corrected graph retries");
@@ -2768,33 +2423,22 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_component() {
-        let graph = builder("t")
-            .add_component(source())
-            .add_component(source())
-            .build();
-        assert_eq!(
-            diags(graph.compile()),
-            vec![Diagnostic::DuplicateComponent(cref("source"))]
-        );
-    }
-
-    #[test]
     fn duplicate_port_name() {
         let graph = builder("t")
             .add_component(contract(
                 "twice",
-                vec![port("in", PortKind::Value), port("in", PortKind::Stream)],
                 vec![],
+                vec![port("out", PortKind::Value), port("out", PortKind::Stream)],
                 &[],
             ))
+            .add_node("n", cref("twice"))
             .build();
         assert_eq!(
             diags(graph.compile()),
             vec![Diagnostic::DuplicatePortName {
                 component: cref("twice"),
-                direction: PortDirection::Input,
-                port: "in".into(),
+                direction: PortDirection::Output,
+                port: "out".into(),
             }]
         );
     }
@@ -2871,69 +2515,6 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_component() {
-        let mut a = source();
-        a.id.content_hash = Some("aa".into());
-        let mut b = source();
-        b.id.content_hash = Some("bb".into());
-        let graph = builder("t")
-            .add_component(a.clone())
-            .add_component(b.clone())
-            .add_node("n", cref("source"))
-            .build();
-        assert_eq!(
-            diags(graph.compile()),
-            vec![Diagnostic::AmbiguousComponent {
-                nodes: vec!["n".into()],
-                component: cref("source"),
-                matches: vec![a.id, b.id],
-            }]
-        );
-    }
-
-    #[test]
-    fn hashed_reference_disambiguates() {
-        let mut a = source();
-        a.id.content_hash = Some("aa".into());
-        let mut b = source();
-        b.id.content_hash = Some("bb".into());
-        let mut node_ref = cref("source");
-        node_ref.content_hash = Some("bb".into());
-        let graph = builder("t")
-            .add_component(a)
-            .add_component(b)
-            .add_node("n", node_ref)
-            .build();
-        graph
-            .compile()
-            .expect("hashed reference selects exactly one contract");
-    }
-
-    #[test]
-    fn hashed_reference_narrows_past_unhashed_entries() {
-        let mut hashed = source();
-        hashed.id.content_hash = Some("bb".into());
-        let mut node_ref = cref("source");
-        node_ref.content_hash = Some("bb".into());
-        let graph = Graph::builder("t")
-            .add_component(cref("source"))
-            .add_component(hashed.id.clone())
-            .add_node("n", node_ref)
-            .build();
-        let compiled = graph
-            .compile([hashed].as_slice())
-            .expect("an exact hash outranks a hashless match");
-        assert_eq!(
-            compiled
-                .contract_for(&NodeId::from("n"))
-                .unwrap()
-                .id
-                .content_hash,
-            Some("bb".into())
-        );
-    }
-
-    #[test]
     fn output_flags_rejected() {
         let flagged = contract(
             "flagged",
@@ -2997,21 +2578,6 @@ mod tests {
     }
 
     #[test]
-    fn an_unhashed_entry_needs_a_single_revision() {
-        let mut hashed = source();
-        hashed.id.content_hash = Some("h1".into());
-        let graph = Graph::builder("t").add_component(cref("source")).build();
-        assert_eq!(
-            diags(graph.compile([source(), hashed.clone()].as_slice())),
-            vec![Diagnostic::AmbiguousContract {
-                component: cref("source"),
-                matches: vec![cref("source"), hashed.id],
-            }],
-            "a hashless contract with the exact id is one of two revisions"
-        );
-    }
-
-    #[test]
     fn copies_of_one_contract_count_once_whatever_their_docs() {
         let mut documented = source();
         documented.docs = Some("Echoes x.".into());
@@ -3023,96 +2589,6 @@ mod tests {
             .clone()
             .compile(&vec![source(), documented])
             .expect("one id, so one contract");
-    }
-
-    #[test]
-    fn hashless_contracts_with_one_id_and_other_ports_are_ambiguous() {
-        let graph = Graph::builder("t")
-            .add_component(cref("source"))
-            .add_node("s", cref("source"))
-            .build();
-        let mut other = source();
-        other.outputs = vec![port("b", PortKind::Value)];
-        for source_order in [vec![source(), other.clone()], vec![other.clone(), source()]] {
-            let diagnostics = diags(graph.clone().compile(&source_order));
-            assert!(
-                matches!(
-                    diagnostics.as_slice(),
-                    [Diagnostic::AmbiguousContract { matches, .. }] if matches.len() == 2
-                ),
-                "{diagnostics:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_pinned_node_never_binds_a_hashless_contract() {
-        let graph = Graph::builder("t")
-            .add_component(cref("source"))
-            .add_node("s", {
-                let mut pinned = cref("source");
-                pinned.content_hash = Some("bb".into());
-                pinned
-            })
-            .build();
-        let diagnostics = diags(graph.compile(&vec![source()]));
-        assert!(
-            matches!(
-                diagnostics.as_slice(),
-                [Diagnostic::UnknownComponent { .. }]
-            ),
-            "{diagnostics:?}"
-        );
-    }
-
-    #[test]
-    fn duplicated_or_missing_entries_add_no_ambiguity() {
-        // [ghost, ghost] with no contracts: one ContractNotFound, one
-        // DuplicateComponent, and no ambiguity.
-        let graph = Graph::builder("t")
-            .add_component(cref("ghost"))
-            .add_component(cref("ghost"))
-            .add_node("n", cref("ghost"))
-            .build();
-        assert_eq!(
-            diags(graph.compile(&[] as &[ComponentContract])),
-            vec![
-                Diagnostic::ContractNotFound(cref("ghost")),
-                Diagnostic::DuplicateComponent(cref("ghost")),
-            ]
-        );
-        // [src (resolves to #aa), src#aa]: one contract.
-        let mut aa = source();
-        aa.id.content_hash = Some("aa".into());
-        let graph = Graph::builder("t")
-            .add_component(cref("source"))
-            .add_component(aa.id.clone())
-            .add_node("n", cref("source"))
-            .build();
-        graph.compile(&vec![aa]).expect("one contract");
-    }
-
-    #[test]
-    fn hash_map_sources_resolve_deterministically() {
-        let mut source_map: HashMap<ComponentRef, ComponentContract> = HashMap::new();
-        for hash in ["dd", "aa", "cc", "bb"] {
-            let mut c = source();
-            c.id.content_hash = Some(hash.into());
-            source_map.insert(c.id.clone(), c);
-        }
-        let graph = Graph::builder("t")
-            .add_component(cref("source"))
-            .add_node("s", cref("source"))
-            .build();
-        let diagnostics = diags(graph.compile(&source_map));
-        let Some(Diagnostic::AmbiguousContract { matches, .. }) = diagnostics.first() else {
-            panic!("{diagnostics:?}");
-        };
-        let hashes: Vec<&str> = matches
-            .iter()
-            .filter_map(|m| m.content_hash.as_deref())
-            .collect();
-        assert_eq!(hashes, ["aa", "bb", "cc", "dd"]);
     }
 
     #[test]
@@ -3151,7 +2627,13 @@ mod tests {
         let compiled = graph.compile().expect("valid graph");
         let nodes: Vec<(usize, &str, &str)> = compiled
             .nodes()
-            .map(|n| (n.index, n.node.id.as_str(), n.contract.id.world.as_str()))
+            .map(|n| {
+                (
+                    n.index,
+                    n.node.id.as_str(),
+                    n.contract.id.world.world.as_str(),
+                )
+            })
             .collect();
         assert_eq!(
             nodes,
@@ -3185,26 +2667,6 @@ mod tests {
             (depth[&NodeId::from("s")], depth[&NodeId::from("d")]),
             (0, 2)
         );
-    }
-
-    #[test]
-    fn arrays_and_indexes_are_contract_sources() {
-        let graph = || {
-            Graph::builder("t")
-                .add_component(cref("source"))
-                .add_node("s", cref("source"))
-                .build()
-        };
-        graph().compile(&[source()]).expect("an array is a source");
-        let index: ContractIndex = [source(), sink()].into_iter().collect();
-        graph().compile(&index).expect("an index is a source");
-        let mut other = source();
-        other.id.content_hash = Some("x".into());
-        let index = ContractIndex::new([source(), other]);
-        assert!(matches!(
-            diags(graph().compile(&index)).as_slice(),
-            [Diagnostic::AmbiguousContract { .. }, ..]
-        ));
     }
 
     #[test]
@@ -3271,42 +2733,6 @@ mod tests {
     }
 
     #[test]
-    fn many_revisions_of_one_world_compile_in_linear_time() {
-        // n pinned revisions of one world (no contracts: every entry is
-        // missing), and n nodes on the unhashed reference: one ambiguity,
-        // reported once, whatever n.
-        let compile = |n: usize| {
-            let mut builder = Graph::builder("revisions");
-            for i in 0..n {
-                let mut id = cref("w");
-                id.content_hash = Some(format!("{i:08x}"));
-                builder = builder.add_component(id);
-            }
-            for i in 0..n {
-                builder = builder.add_node(format!("n{i}").as_str(), cref("w"));
-            }
-            let started = std::time::Instant::now();
-            let diagnostics = diags(builder.build().compile(&[] as &[ComponentContract]));
-            let elapsed = started.elapsed();
-            let ambiguous: Vec<_> = diagnostics
-                .iter()
-                .filter(|d| matches!(d, Diagnostic::AmbiguousComponent { .. }))
-                .collect();
-            assert_eq!(ambiguous.len(), 1);
-            elapsed
-        };
-        compile(500);
-        let small = compile(4_000);
-        let large = compile(8_000);
-        // Quadratic work would take about four times as long; allow a wide
-        // margin for timing noise.
-        assert!(
-            large < small * 3 + std::time::Duration::from_millis(200),
-            "{small:?} for 4k, {large:?} for 8k"
-        );
-    }
-
-    #[test]
     fn a_large_table_compiles_in_linear_time() {
         // 10k distinct components, one node each, through an index: every
         // lookup and match is per world, so this stays fast.
@@ -3327,7 +2753,8 @@ mod tests {
                 .add_component(c)
                 .add_node(format!("n{i}").as_str(), c.id.clone());
         }
-        let index = ContractIndex::new(contracts);
+        let index: HashMap<ContractId, ComponentContract> =
+            contracts.into_iter().map(|c| (c.id.clone(), c)).collect();
         let started = std::time::Instant::now();
         builder.build().compile(&index).expect("valid graph");
         assert!(started.elapsed() < std::time::Duration::from_secs(30));

@@ -1,17 +1,19 @@
 #![cfg(test)]
 #![allow(missing_docs)]
 
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use test_components::ECHO;
+use test_components::{ECHO, RELAY};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use witgraph_ir::{ComponentRef, Graph};
+use witgraph_ir::{ComponentName, ContractId, ContractSource, Graph};
 use witgraph_runtime::{Perf, RunningGraph, RuntimeConfig, RuntimeGraph, TickResult, Val};
-use witgraph_source::{ComponentSource, Digest, Location, Resolver, SourceError};
+use witgraph_source::{
+    Digest, Location, MANIFEST_MEDIA_TYPE, Resolver, SourceError, WASM_LAYER_MEDIA_TYPES,
+};
 
 /// A fresh directory under the test target directory.
 fn scratch(name: &str) -> PathBuf {
@@ -21,8 +23,53 @@ fn scratch(name: &str) -> PathBuf {
     dir
 }
 
-fn echo() -> ComponentRef {
-    "test:echo/echo@0.1.0".parse().unwrap()
+fn echo() -> ComponentName {
+    "echo".parse().unwrap()
+}
+
+const ECHO_WORLD: &str = "test:echo/echo@0.1.0";
+
+/// A node manifest for `echo`, its bytes and WIT at the locations given.
+fn manifest(component: &str, wit: &str, worlds: &[&str]) -> String {
+    serde_json::json!({
+        "wit": "test:echo@0.1.0",
+        "wit_source": wit,
+        "worlds": worlds,
+        "component": component,
+        "viewers": { ECHO_WORLD: { "out": "series" } },
+    })
+    .to_string()
+}
+
+fn copy_dir(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
+/// A project holding `echo`: its bytes (`bytes`), WIT and node manifest
+/// (`echo.node.json`).
+fn project(name: &str, bytes: &[u8], worlds: &[&str]) -> PathBuf {
+    let dir = scratch(name);
+    std::fs::write(dir.join("echo.wasm"), bytes).unwrap();
+    copy_dir(Path::new(ECHO.wit), &dir.join("wit"));
+    std::fs::write(
+        dir.join("echo.node.json"),
+        manifest("echo.wasm", "wit", worlds),
+    )
+    .unwrap();
+    dir
+}
+
+fn table(location: &str) -> BTreeMap<ComponentName, String> {
+    BTreeMap::from([(echo(), location.to_string())])
 }
 
 /// A read-only OCI registry holding artifacts in memory, counting the
@@ -39,8 +86,10 @@ struct Registry {
 const MANIFEST_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
 
 impl Registry {
-    /// Adds an artifact holding `layers` (media type and bytes).
-    fn artifact(&mut self, name: &str, layers: &[(&str, &[u8])]) {
+    /// Adds an artifact holding `layers` (media type and bytes), under the
+    /// tag `name` (`repository:tag`) and under its digest; returns the
+    /// digest.
+    fn artifact(&mut self, name: &str, layers: &[(&str, &[u8])]) -> String {
         let mut blob = |bytes: &[u8]| {
             let digest = Digest::of(bytes).to_string();
             self.blobs.insert(digest.clone(), bytes.to_vec());
@@ -67,8 +116,13 @@ impl Registry {
             },
             "layers": layers,
         });
+        let manifest = manifest.to_string();
+        let digest = Digest::of(manifest.as_bytes()).to_string();
+        let (repository, _) = name.split_once(':').unwrap();
         self.manifests
-            .insert(name.to_string(), manifest.to_string());
+            .insert(format!("{repository}:{digest}"), manifest.clone());
+        self.manifests.insert(name.to_string(), manifest);
+        digest
     }
 
     /// The response to `GET path`: content type and body.
@@ -87,8 +141,13 @@ impl Registry {
 
     /// Serves the registry on a local port, returning `host:port`.
     async fn serve(self) -> (String, Arc<Registry>) {
+        self.serve_at("127.0.0.1:0").await
+    }
+
+    /// Serves the registry at `address`, returning `host:port`.
+    async fn serve_at(self, address: &str) -> (String, Arc<Registry>) {
         let registry = Arc::new(self);
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = TcpListener::bind(address).await.unwrap();
         let host = listener.local_addr().unwrap().to_string();
         let served = registry.clone();
         tokio::spawn(async move {
@@ -128,11 +187,31 @@ impl Registry {
     }
 }
 
-/// A registry holding the `echo` guest as `test/echo:1.0`.
-async fn echo_registry() -> (String, Arc<Registry>) {
+/// A registry holding `echo`: its bytes as `test/echo:1.0`, its WIT as
+/// `test/echo-wit:1.0`, and its node manifest, naming those, as
+/// `test/echo-node:1.0`. Returns the digests of the three artifacts too.
+async fn echo_registry() -> (String, Arc<Registry>, [String; 3]) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let host = listener.local_addr().unwrap().to_string();
+    drop(listener);
     let mut registry = Registry::default();
-    registry.artifact("test/echo:1.0", &[("application/wasm", ECHO.wasm)]);
-    registry.serve().await
+    let wit = witgraph_wit::load::encode(&ECHO.wit_source()).unwrap();
+    let bytes = registry.artifact("test/echo:1.0", &[("application/wasm", ECHO.wasm)]);
+    let wit = registry.artifact("test/echo-wit:1.0", &[("application/wasm", &wit)]);
+    let pinned =
+        |repository: &str, digest: &str| format!("oci://{host}/test/{repository}@{digest}");
+    let node = manifest(
+        &pinned("echo", &bytes),
+        &pinned("echo-wit", &wit),
+        &[ECHO_WORLD],
+    );
+    let node = registry.artifact(
+        "test/echo-node:1.0",
+        &[(MANIFEST_MEDIA_TYPE, node.as_bytes())],
+    );
+    let (served, registry) = registry.serve_at(&host).await;
+    assert_eq!(served, host);
+    (host, registry, [bytes, wit, node])
 }
 
 fn resolver(host: &str) -> Resolver {
@@ -140,90 +219,94 @@ fn resolver(host: &str) -> Resolver {
 }
 
 #[tokio::test]
-async fn a_file_source_resolves_relative_to_the_base() {
-    let dir = scratch("file-source");
-    std::fs::write(dir.join("echo.wasm"), ECHO.wasm).unwrap();
-    let sources = [ComponentSource::file(echo(), "echo.wasm")];
-    let components = Resolver::new().base(&dir).resolve(&sources).await.unwrap();
-    let resolved = components.get(&echo()).unwrap();
-    assert_eq!(*resolved.bytes, *ECHO.wasm);
-    assert_eq!(resolved.digest, Digest::of(ECHO.wasm));
+async fn a_component_resolves_from_its_node_manifest() {
+    let dir = project("file-manifest", ECHO.wasm, &[ECHO_WORLD]);
+    let components = Resolver::new()
+        .base(&dir)
+        .resolve(&table("echo.node.json"))
+        .await
+        .unwrap();
+    let echo_component = components.get(&echo()).unwrap();
+    assert_eq!(*echo_component.bytes, *ECHO.wasm);
+    assert_eq!(echo_component.digest, Digest::of(ECHO.wasm));
+    let id: ContractId = format!("echo/{ECHO_WORLD}").parse().unwrap();
+    let contract = components.contract(&id).expect("its node world's contract");
+    assert_eq!(contract.outputs[0].viewer.as_deref(), Some("series"));
+    assert!(contract.docs.is_some(), "docs come from the WIT");
     assert_eq!(components.len(), 1);
 
-    let missing = [ComponentSource::file(echo(), "absent.wasm")];
-    let err = Resolver::new().base(&dir).resolve(&missing).await.err();
-    assert!(matches!(err, Some(SourceError::Read { .. })), "{err:?}");
-}
-
-#[tokio::test]
-async fn a_pinned_digest_is_checked() {
-    let dir = scratch("pinned");
-    std::fs::write(dir.join("echo.wasm"), ECHO.wasm).unwrap();
-    let pinned = |digest: Digest| [ComponentSource::file(echo(), "echo.wasm").pinned(digest)];
-    let resolver = Resolver::new().base(&dir);
-    resolver
-        .resolve(&pinned(Digest::of(ECHO.wasm)))
+    let err = Resolver::new()
+        .base(&dir)
+        .resolve(&table("absent.node.json"))
         .await
-        .expect("the pinned bytes");
-    let err = resolver
-        .resolve(&pinned(Digest::of(b"other")))
-        .await
-        .expect_err("other bytes are pinned");
-    match &err {
-        SourceError::DigestMismatch {
-            expected,
-            found,
-            location,
-            ..
-        } => {
-            assert_eq!(*expected, Digest::of(b"other"));
-            assert_eq!(*found, Digest::of(ECHO.wasm));
-            assert_eq!(*location, Location::File("echo.wasm".into()));
-        }
-        other => panic!("expected a digest mismatch, got {other}"),
-    }
-}
-
-#[tokio::test]
-async fn a_component_has_one_source() {
-    let sources = [
-        ComponentSource::file(echo(), "a.wasm"),
-        ComponentSource::file(echo(), "b.wasm"),
-    ];
-    let err = Resolver::new().resolve(&sources).await.err();
+        .err();
     assert!(
-        matches!(err, Some(SourceError::Duplicate { .. })),
+        matches!(&err, Some(SourceError::In { error, .. }) if matches!(**error, SourceError::Read { .. })),
         "{err:?}"
     );
 }
 
 #[tokio::test]
-async fn an_oci_source_pulls_the_component_layer() {
-    let (host, registry) = echo_registry().await;
-    let sources = [ComponentSource::oci(
-        echo(),
-        format!("{host}/test/echo:1.0"),
-    )];
-    let components = resolver(&host).resolve(&sources).await.unwrap();
+async fn a_manifest_says_what_its_bytes_are_and_is_held_to_it() {
+    let resolve = async |name: &str, bytes: &[u8], worlds: &[&str]| {
+        let dir = project(name, bytes, worlds);
+        Resolver::new()
+            .base(&dir)
+            .component(&echo(), "echo.node.json")
+            .await
+            .err()
+    };
+    // A world of another package.
+    let err = resolve("other-package", ECHO.wasm, &["test:relay/relay@0.1.0"]).await;
+    assert!(matches!(err, Some(SourceError::World { .. })), "{err:?}");
+    // A world its WIT does not have.
+    let err = resolve("no-such-world", ECHO.wasm, &["test:echo/nope@0.1.0"]).await;
+    assert!(matches!(err, Some(SourceError::World { .. })), "{err:?}");
+    // Bytes that do not target the world.
+    let err = resolve("other-bytes", RELAY.wasm, &[ECHO_WORLD]).await;
+    assert!(matches!(err, Some(SourceError::Verify(_))), "{err:?}");
+    // A manifest naming another package than its WIT is.
+    let dir = project("other-wit", ECHO.wasm, &[ECHO_WORLD]);
+    let other = manifest("echo.wasm", "wit", &[ECHO_WORLD]).replace(
+        "\"wit\":\"test:echo@0.1.0\"",
+        "\"wit\":\"test:other@0.1.0\"",
+    );
+    std::fs::write(dir.join("other.node.json"), other).unwrap();
+    let err = Resolver::new()
+        .base(&dir)
+        .component(&echo(), "other.node.json")
+        .await
+        .err();
+    assert!(matches!(err, Some(SourceError::Wit { .. })), "{err:?}");
+    // Not a manifest.
+    std::fs::write(dir.join("bad.node.json"), b"{\"wit\": 1}").unwrap();
+    let err = Resolver::new()
+        .base(&dir)
+        .component(&echo(), "bad.node.json")
+        .await
+        .err();
+    assert!(matches!(err, Some(SourceError::Manifest { .. })), "{err:?}");
+}
+
+#[tokio::test]
+async fn an_oci_component_pulls_its_manifest_wit_and_bytes() {
+    let (host, registry, _) = echo_registry().await;
+    let components = resolver(&host)
+        .resolve(&table(&format!("oci://{host}/test/echo-node:1.0")))
+        .await
+        .unwrap();
     assert_eq!(*components.get(&echo()).unwrap().bytes, *ECHO.wasm);
     assert!(registry.requests.load(Ordering::SeqCst) > 0);
 
-    let wrong = [sources[0].clone().pinned(Digest::of(b"other"))];
-    let err = resolver(&host).resolve(&wrong).await.err();
-    assert!(
-        matches!(err, Some(SourceError::DigestMismatch { .. })),
-        "{err:?}"
-    );
-
-    let absent = [ComponentSource::oci(
-        echo(),
-        format!("{host}/test/absent:1.0"),
-    )];
-    let err = resolver(&host).resolve(&absent).await.err();
+    let err = resolver(&host)
+        .component(&echo(), &format!("oci://{host}/test/absent:1.0"))
+        .await
+        .err();
     assert!(matches!(err, Some(SourceError::Pull { .. })), "{err:?}");
-
-    let malformed = [ComponentSource::oci(echo(), "Not A Reference")];
-    let err = resolver(&host).resolve(&malformed).await.err();
+    let err = resolver(&host)
+        .component(&echo(), "oci://Not A Reference")
+        .await
+        .err();
     assert!(
         matches!(err, Some(SourceError::Reference { .. })),
         "{err:?}"
@@ -231,44 +314,59 @@ async fn an_oci_source_pulls_the_component_layer() {
 }
 
 #[tokio::test]
-async fn a_pinned_artifact_in_the_cache_is_not_pulled_again() {
-    let (host, registry) = echo_registry().await;
+async fn a_manifest_pulled_over_oci_names_only_artifacts() {
+    let mut registry = Registry::default();
+    let node = manifest("echo.wasm", "wit", &[ECHO_WORLD]);
+    registry.artifact("test/loose:1.0", &[(MANIFEST_MEDIA_TYPE, node.as_bytes())]);
+    let (host, _registry) = registry.serve().await;
+    let err = resolver(&host)
+        .component(&echo(), &format!("oci://{host}/test/loose:1.0"))
+        .await
+        .err();
+    assert!(
+        matches!(err, Some(SourceError::FileFromOci { .. })),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_pinned_reference_in_the_cache_is_not_pulled_again() {
+    let (host, registry, [bytes, _, node]) = echo_registry().await;
     let cache = scratch("oci-cache");
     let resolver = resolver(&host).cache(&cache);
-    let unpinned = [ComponentSource::oci(
-        echo(),
-        format!("{host}/test/echo:1.0"),
-    )];
+    let pinned = format!("oci://{host}/test/echo-node@{node}");
 
-    // The first pull fills the cache.
-    let first = resolver.resolve(&unpinned).await.unwrap();
-    let digest = first.get(&echo()).unwrap().digest.clone();
+    // The first resolve fills the cache.
+    let first = resolver.component(&echo(), &pinned).await.unwrap();
     let pulled = registry.requests.load(Ordering::SeqCst);
     assert!(pulled > 0);
-    let file = cache.join("sha256").join(format!("{}.wasm", digest.hex()));
+    let file = cache
+        .join("sha256")
+        .join(format!("{}.wasm", first.digest.hex()));
     assert_eq!(std::fs::read(&file).unwrap(), ECHO.wasm);
 
-    // Pinned, it is read from the cache: the registry is not asked.
-    let pinned = [unpinned[0].clone().pinned(digest)];
-    let again = resolver.resolve(&pinned).await.unwrap();
-    assert_eq!(*again.get(&echo()).unwrap().bytes, *ECHO.wasm);
+    // Pinned, everything is read from the cache: the registry is not asked.
+    let again = resolver.component(&echo(), &pinned).await.unwrap();
+    assert_eq!(*again.bytes, *ECHO.wasm);
     assert_eq!(registry.requests.load(Ordering::SeqCst), pulled);
 
-    // Unpinned, the tag may have moved: it is pulled.
-    resolver.resolve(&unpinned).await.unwrap();
+    // A tag may have moved: it is pulled.
+    let tagged: Location = format!("oci://{host}/test/echo:1.0").parse().unwrap();
+    resolver.fetch(&tagged).await.unwrap();
     assert!(registry.requests.load(Ordering::SeqCst) > pulled);
 
     // A damaged cache file is not trusted.
     std::fs::write(&file, b"damaged").unwrap();
     let pulled = registry.requests.load(Ordering::SeqCst);
-    let repaired = resolver.resolve(&pinned).await.unwrap();
-    assert_eq!(*repaired.get(&echo()).unwrap().bytes, *ECHO.wasm);
+    let bytes_pinned: Location = format!("oci://{host}/test/echo@{bytes}").parse().unwrap();
+    let repaired = resolver.fetch(&bytes_pinned).await.unwrap();
+    assert_eq!(*repaired.bytes, *ECHO.wasm);
     assert!(registry.requests.load(Ordering::SeqCst) > pulled);
     assert_eq!(std::fs::read(&file).unwrap(), ECHO.wasm);
 }
 
 #[tokio::test]
-async fn an_artifact_holds_exactly_one_component_layer() {
+async fn an_artifact_holds_exactly_one_layer_of_its_kind() {
     let mut registry = Registry::default();
     registry.artifact(
         "test/two:1.0",
@@ -282,64 +380,46 @@ async fn an_artifact_holds_exactly_one_component_layer() {
         "test/signed:1.0",
         &[
             ("application/vnd.dev.sigstore.bundle+json", b"{}"),
-            ("application/wasm", ECHO.wasm),
+            (WASM_LAYER_MEDIA_TYPES[1], ECHO.wasm),
         ],
     );
     let (host, _registry) = registry.serve().await;
-    let resolve = async |name: &str| {
-        let sources = [ComponentSource::oci(
-            echo(),
-            format!("{host}/test/{name}:1.0"),
-        )];
-        resolver(&host).resolve(&sources).await.err()
+    let fetch = async |name: &str| {
+        let location: Location = format!("oci://{host}/test/{name}:1.0").parse().unwrap();
+        resolver(&host).fetch(&location).await
     };
-    let two = resolve("two").await;
+    let two = fetch("two").await.err();
     assert!(
         matches!(&two, Some(SourceError::Layers { found: 2, .. })),
         "{two:?}"
     );
-    let none = resolve("none").await;
+    let none = fetch("none").await.err();
     assert!(
         matches!(&none, Some(SourceError::Layers { found: 0, .. })),
         "{none:?}"
     );
     // A layer of another media type is not the component's.
-    let signed = [ComponentSource::oci(
-        echo(),
-        format!("{host}/test/signed:1.0"),
-    )];
-    let components = resolver(&host).resolve(&signed).await.unwrap();
-    assert_eq!(*components.get(&echo()).unwrap().bytes, *ECHO.wasm);
+    assert_eq!(*fetch("signed").await.unwrap().bytes, *ECHO.wasm);
 }
 
 #[tokio::test]
-async fn a_graph_loads_from_resolved_artifacts_alone() {
-    let (host, _registry) = echo_registry().await;
-    let sources = [ComponentSource::oci(
-        echo(),
-        format!("{host}/test/echo:1.0"),
-    )];
-    let components = resolver(&host).resolve(&sources).await.unwrap();
-
-    // The contract comes from the bytes: no WIT source is at hand.
-    let bytes = &components.get(&echo()).unwrap().bytes;
-    let contract = witgraph_wit::lower_component(bytes, &echo())
-        .unwrap()
-        .contract;
-    assert!(echo().matches(&contract.id));
-    assert!(contract.id.content_hash.is_some());
-    let graph = Graph::builder("from-artifacts")
-        .add_component(&contract)
-        .add_node("n", contract.id.clone())
+async fn a_graph_loads_from_resolved_components() {
+    let (host, _registry, _) = echo_registry().await;
+    let table = table(&format!("oci://{host}/test/echo-node:1.0"));
+    let components = resolver(&host).resolve(&table).await.unwrap();
+    let mut graph = Graph::builder("from-artifacts")
+        .add_node("n", format!("echo/{ECHO_WORLD}").parse().unwrap())
         .build();
-    let compiled = graph
-        .compile(std::slice::from_ref(&contract))
-        .expect("compiles");
-
-    // The bytes are keyed by the unhashed ref the source named.
-    let mut rt = RuntimeGraph::load(compiled, &components.wasm(), RuntimeConfig::default(), Perf)
-        .await
-        .expect("loads");
+    graph.components = table;
+    let compiled = graph.compile(&components).expect("compiles");
+    let mut rt = RuntimeGraph::load(
+        compiled,
+        &components.artifacts(),
+        RuntimeConfig::default(),
+        Perf,
+    )
+    .await
+    .expect("loads");
     rt.inject(&"n".into(), &"in".into(), Val::Float64(2.5))
         .await
         .unwrap();
@@ -355,104 +435,83 @@ async fn a_graph_loads_from_resolved_artifacts_alone() {
 }
 
 #[tokio::test]
-async fn sources_sharing_an_artifact_pull_it_once() {
-    let (host, registry) = echo_registry().await;
-    let cache = scratch("shared-artifact");
-    let reference = format!("{host}/test/echo:1.0");
-    let hashed: ComponentRef = format!("{:#}#{}", echo(), "ab".repeat(32)).parse().unwrap();
-    let sources = [
-        ComponentSource::oci(echo(), reference.clone()),
-        ComponentSource::oci(hashed.clone(), reference),
-    ];
-    // What one pull costs, on its own.
-    resolver(&host).resolve(&sources[..1]).await.unwrap();
-    let lone = registry.requests.load(Ordering::SeqCst);
-    let components = resolver(&host)
-        .cache(&cache)
-        .resolve(&sources)
-        .await
-        .unwrap();
-    assert_eq!(*components.get(&echo()).unwrap().bytes, *ECHO.wasm);
-    assert_eq!(*components.get(&hashed).unwrap().bytes, *ECHO.wasm);
-    assert_eq!(
-        registry.requests.load(Ordering::SeqCst),
-        2 * lone,
-        "one pull serves both"
-    );
-    let cached: Vec<_> = std::fs::read_dir(cache.join("sha256"))
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name())
-        .collect();
-    assert_eq!(cached.len(), 1, "no partial file is left: {cached:?}");
+async fn components_sharing_artifacts_resolve_alike() {
+    let (host, _registry, _) = echo_registry().await;
+    let location = format!("oci://{host}/test/echo-node:1.0");
+    let table = BTreeMap::from([
+        (echo(), location.clone()),
+        ("other".parse().unwrap(), location),
+    ]);
+    let components = resolver(&host).resolve(&table).await.unwrap();
+    assert_eq!(components.len(), 2);
+    let other: ContractId = format!("other/{ECHO_WORLD}").parse().unwrap();
+    assert!(components.contract(&other).is_some(), "named by the table");
 }
 
 #[tokio::test]
 async fn a_component_over_the_size_limit_is_refused() {
-    let dir = scratch("too-large");
-    std::fs::write(dir.join("echo.wasm"), ECHO.wasm).unwrap();
-    let file = [ComponentSource::file(echo(), "echo.wasm")];
+    let dir = project("too-large", ECHO.wasm, &[ECHO_WORLD]);
+    let file = Location::File("echo.wasm".into());
     let small = Resolver::new().base(&dir).max_component_bytes(16);
-    let err = small.resolve(&file).await.err();
+    let err = small.fetch(&file).await.err();
     assert!(
         matches!(err, Some(SourceError::TooLarge { limit: 16, .. })),
         "{err:?}"
     );
 
-    let (host, _registry) = echo_registry().await;
-    let oci = [ComponentSource::oci(
-        echo(),
-        format!("{host}/test/echo:1.0"),
-    )];
+    let (host, _registry, _) = echo_registry().await;
+    let oci: Location = format!("oci://{host}/test/echo:1.0").parse().unwrap();
     let err = resolver(&host)
         .max_component_bytes(16)
-        .resolve(&oci)
+        .fetch(&oci)
         .await
         .err();
     assert!(matches!(err, Some(SourceError::TooLarge { .. })), "{err:?}");
     let exact = ECHO.wasm.len() as u64;
     resolver(&host)
         .max_component_bytes(exact)
-        .resolve(&oci)
+        .fetch(&oci)
         .await
         .expect("a component of exactly the limit is fine");
 }
 
 #[tokio::test]
 async fn a_cache_that_cannot_be_written_does_not_fail_the_resolve() {
-    let (host, _registry) = echo_registry().await;
+    let (host, _registry, _) = echo_registry().await;
     // A file where the cache directory should be: nothing can be kept.
     let blocked = scratch("blocked-cache").join("not-a-dir");
     std::fs::write(&blocked, b"").unwrap();
-    let sources = [ComponentSource::oci(
-        echo(),
-        format!("{host}/test/echo:1.0"),
-    )];
     let components = resolver(&host)
         .cache(&blocked)
-        .resolve(&sources)
+        .resolve(&table(&format!("oci://{host}/test/echo-node:1.0")))
         .await
         .expect("the bytes were pulled and checked");
     assert_eq!(*components.get(&echo()).unwrap().bytes, *ECHO.wasm);
 }
 
 #[tokio::test]
-async fn a_file_source_stays_under_the_base() {
+async fn a_file_stays_under_the_base() {
     let root = scratch("outside-base");
     let base = root.join("project");
     std::fs::create_dir_all(&base).unwrap();
     std::fs::write(root.join("secret.wasm"), ECHO.wasm).unwrap();
     for path in ["../secret.wasm", root.join("secret.wasm").to_str().unwrap()] {
-        let sources = [ComponentSource::file(echo(), path)];
-        let err = Resolver::new().base(&base).resolve(&sources).await.err();
+        let err = Resolver::new()
+            .base(&base)
+            .fetch(&Location::File(path.into()))
+            .await
+            .err();
         assert!(
             matches!(err, Some(SourceError::OutsideBase { .. })),
             "{path}: {err:?}"
         );
     }
-    let sources = [ComponentSource::file(echo(), "../secret.wasm")];
     let trusted = Resolver::new().base(&base).allow_paths_outside_base();
-    let components = trusted.resolve(&sources).await.expect("a trusted list may");
-    assert_eq!(*components.get(&echo()).unwrap().bytes, *ECHO.wasm);
+    let fetched = trusted
+        .fetch(&Location::File("../secret.wasm".into()))
+        .await
+        .expect("a trusted table may");
+    assert_eq!(*fetched.bytes, *ECHO.wasm);
 }
 
 #[cfg(unix)]
@@ -463,8 +522,11 @@ async fn a_symbolic_link_out_of_the_base_is_refused() {
     std::fs::create_dir_all(&base).unwrap();
     std::fs::write(root.join("secret.wasm"), ECHO.wasm).unwrap();
     std::os::unix::fs::symlink(root.join("secret.wasm"), base.join("evil.wasm")).unwrap();
-    let sources = [ComponentSource::file(echo(), "evil.wasm")];
-    let err = Resolver::new().base(&base).resolve(&sources).await.err();
+    let err = Resolver::new()
+        .base(&base)
+        .fetch(&Location::File("evil.wasm".into()))
+        .await
+        .err();
     assert!(
         matches!(err, Some(SourceError::OutsideBase { .. })),
         "{err:?}"
@@ -472,19 +534,22 @@ async fn a_symbolic_link_out_of_the_base_is_refused() {
     // A link leading nowhere is not followed later, when something may
     // have appeared at its target: it fails now.
     std::os::unix::fs::symlink(root.join("later.wasm"), base.join("dangling.wasm")).unwrap();
-    let sources = [ComponentSource::file(echo(), "dangling.wasm")];
-    let err = Resolver::new().base(&base).resolve(&sources).await.err();
+    let err = Resolver::new()
+        .base(&base)
+        .fetch(&Location::File("dangling.wasm".into()))
+        .await
+        .err();
     assert!(matches!(err, Some(SourceError::Read { .. })), "{err:?}");
 }
 
 #[tokio::test]
-async fn a_malformed_reference_fails_even_when_its_digest_is_cached() {
-    let (host, _registry) = echo_registry().await;
+async fn a_malformed_reference_fails_even_when_its_artifact_is_cached() {
+    let (host, _registry, [bytes, _, _]) = echo_registry().await;
     let cache = scratch("cached-bad-reference");
     let resolver = resolver(&host).cache(&cache);
-    let good = ComponentSource::oci(echo(), format!("{host}/test/echo:1.0"));
-    let digest = resolver.fetch(&good).await.unwrap().digest;
-    let bad = ComponentSource::oci(echo(), "Not A Reference").pinned(digest);
+    let good: Location = format!("oci://{host}/test/echo@{bytes}").parse().unwrap();
+    resolver.fetch(&good).await.unwrap();
+    let bad: Location = format!("oci://Not A Reference@{bytes}").parse().unwrap();
     let err = resolver.fetch(&bad).await.err();
     assert!(
         matches!(err, Some(SourceError::Reference { .. })),
@@ -502,10 +567,11 @@ async fn a_fifo_is_not_a_component() {
         .status()
         .unwrap();
     assert!(made.success());
-    let source = ComponentSource::file(echo(), "pipe");
     let fetched = tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        Resolver::new().base(&dir).fetch(&source),
+        Resolver::new()
+            .base(&dir)
+            .fetch(&Location::File("pipe".into())),
     )
     .await
     .expect("does not wait for a writer");
@@ -521,7 +587,7 @@ async fn a_fifo_is_not_a_component() {
 #[cfg(unix)]
 #[tokio::test]
 async fn a_link_swapped_in_after_the_check_is_not_followed() {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::AtomicBool;
     let dir = scratch("swap");
     let base = dir.join("base");
     std::fs::create_dir_all(&base).unwrap();
@@ -543,12 +609,12 @@ async fn a_link_swapped_in_after_the_check_is_not_followed() {
         })
     };
     let resolver = Resolver::new().base(&base);
-    let source = ComponentSource::file(echo(), "c.wasm");
+    let location = Location::File("c.wasm".into());
     let (mut read, mut refused) = (0, 0);
     for _ in 0..2_000 {
-        match resolver.fetch(&source).await {
-            Ok(resolved) => {
-                assert_eq!(&*resolved.bytes, b"real", "read from outside the base");
+        match resolver.fetch(&location).await {
+            Ok(fetched) => {
+                assert_eq!(&*fetched.bytes, b"real", "read from outside the base");
                 read += 1;
             }
             Err(_) => refused += 1,

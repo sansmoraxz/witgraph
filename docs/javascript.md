@@ -11,7 +11,7 @@ they do on wasmtime, and snapshots have the same format.
 ```ts
 const session = await Session.load({
   graph, // the graph, as JSON
-  components, // [{ id: 'demo:graph/sensor@0.1.0', bytes, wit? }]
+  components, // [{ name: 'sensor', manifest, wit, bytes }]
   capabilities: (capability) =>
     capability.interface === 'demo:caps/clock@0.1.0' ? { now: () => 0n } : undefined,
   mocks: { sensor: () => ({ latest: { value: 1, timestamp: 0n } }) },
@@ -86,7 +86,7 @@ the TypeScript and let `init` fetch the module from beside the script.
   resolves to. With it, a future is read as soon as its node's run returns (its
   reader still gets the value).
 - **Contracts.** `session.contracts` has each node's ports. An output whose
-  component previews it in its `witgraph-viewer` section has a `viewer`
+  component's node manifest names a viewer for has a `viewer`
   ([Previewing outputs](components.md#previewing-outputs)). A handle port
   has a `handle`, the resource it carries.
 - **Simulation.** `mocks` replaces a node with a function: it is left out of the

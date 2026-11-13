@@ -94,13 +94,50 @@ interface Observation {
 /** The most edits undo goes back over. */
 const MAX_UNDO = 50;
 
+/** The version of the bundles {@link EditorController.downloadBundle} writes. */
+const BUNDLE_VERSION = 2;
+
+/** An entry of the catalog: a world, as a component provides it. */
+export interface CatalogEntry {
+  /** `component/namespace:name/world@version`. */
+  id: string;
+  /** Its place in {@link EditorController.componentSources}. */
+  index: number;
+  /** The component, by its name in the graph's component table. */
+  component: string;
+  /** The world, `namespace:name/world@version`. */
+  world: string;
+  /** What its world's doc comment says of it. */
+  docs?: string;
+  inputs: PortVisual[];
+  outputs: PortVisual[];
+}
+
+function toBase64(bytes: Uint8Array): string {
+  let binary = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  }
+  return btoa(binary);
+}
+
+function fromBase64(text: string): Uint8Array {
+  const binary = atob(text);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
 /**
  * How a graph attached to is edited: by the program that runs it. Each edit is handed to it,
  * which loads the graph edited in place of its own (or refuses it, saying why), and the editor
  * attaches to that. Nothing runs in the page.
  */
 export interface AttachedEditing {
-  /** The program's components, in the order of the graph's component table, for the catalog. */
+  /**
+   * The program's components, for the catalog and to check edits: each its name, node manifest
+   * and WIT. No bytes are needed: nothing runs in the page.
+   */
   components: ComponentSource[];
   /**
    * Loads `graph` in place of the graph attached to, stopped as that is (it is edited only
@@ -238,7 +275,7 @@ export class EditorController extends EventTarget {
    */
   #checked: ConnectionChecks | null = null;
   #tickRate = 0;
-  #componentContracts = new Map<number, Contract>();
+  #componentContracts = new Map<string, Contract[]>();
 
   // -- Mock & capability state ------------------------------------------------
   #capabilityInfo = new Map<string, CapabilityInfo[]>();
@@ -505,110 +542,53 @@ export class EditorController extends EventTarget {
     this.#dispatch('output-changed');
   }
 
-  get componentSources(): readonly {
-    id: string;
-    index: number;
-    /** What its world's doc comment says of it. */
-    docs?: string;
-    inputs: PortVisual[];
-    outputs: PortVisual[];
-  }[] {
-    if (!this.#session) return [];
-    const result: {
-      id: string;
-      index: number;
-      docs?: string;
-      inputs: PortVisual[];
-      outputs: PortVisual[];
-    }[] = [];
-    const seen = new Set<number>();
-
-    for (const [nodeId, visual] of this.#nodes) {
-      const graphNode = this.#graphJson?.nodes.find((n) => n.id === nodeId);
-      if (!graphNode) continue;
-      const compIdx = this.#graphJson?.components.findIndex((c) => {
-        const ref = graphNode.component as Record<string, unknown>;
-        const candidate = c as Record<string, unknown>;
-        return (
-          EditorController.#deepEqual(candidate, ref) ||
-          EditorController.#deepEqual(candidate, ref, new Set(['content_hash']))
-        );
-      });
-      if (compIdx === undefined || compIdx < 0 || seen.has(compIdx)) continue;
-      seen.add(compIdx);
-      // An attached graph's components are the program's: their contracts say what they are,
-      // named as a page's own are, without their content hash.
-      const id =
-        this.#components()?.[compIdx]?.id ?? this.#session.contracts.get(nodeId)?.id.split('#')[0];
-      if (!id) continue;
-      result.push({
-        id,
-        index: compIdx,
-        docs: this.#session.contracts.get(nodeId)?.docs,
-        inputs: visual.inputs,
-        outputs: visual.outputs,
-      });
-    }
-
-    // Also include components not yet used by any node — derive ports
-    // from the component's WIT contract so the catalog and paste show them.
+  /**
+   * What the catalog offers: each world a component provides, as a node of it runs it,
+   * described from the component's manifest and WIT. `index` is its place in this list.
+   */
+  get componentSources(): readonly CatalogEntry[] {
     const components = this.#components();
-    if (!components) return result;
-    for (let i = 0; i < components.length; i++) {
-      if (seen.has(i)) continue;
-      const comp = components[i];
-      let contract = this.#componentContracts.get(i);
-      if (!contract) {
+    if (!components) return [];
+    const result: CatalogEntry[] = [];
+    for (const component of components) {
+      let contracts = this.#componentContracts.get(component.name);
+      if (!contracts) {
         try {
-          contract = describeComponent(comp.id, comp.bytes);
-          this.#componentContracts.set(i, contract);
+          contracts = describeComponent(component.name, component.manifest, component.wit);
         } catch {
-          /* component bytes may be invalid */
+          /* a component whose manifest or WIT does not describe */
+          contracts = [];
         }
+        this.#componentContracts.set(component.name, contracts);
       }
-      result.push({
-        id: comp.id,
-        index: i,
-        docs: contract?.docs,
-        inputs: (contract?.inputs ?? []).map(portVisual),
-        outputs: (contract?.outputs ?? []).map(portVisual),
-      });
+      for (const contract of contracts) {
+        result.push({
+          id: contract.id,
+          index: result.length,
+          component: contract.component,
+          world: contract.world,
+          docs: contract.docs,
+          inputs: contract.inputs.map(portVisual),
+          outputs: contract.outputs.map(portVisual),
+        });
+      }
     }
-
     return result;
-  }
-
-  static #deepEqual(a: unknown, b: unknown, ignore: Set<string> = new Set()): boolean {
-    if (a === b) return true;
-    if (a == null || b == null) return false;
-    if (typeof a !== 'object' || typeof b !== 'object') return false;
-    const objA = a as Record<string, unknown>;
-    const objB = b as Record<string, unknown>;
-    const keysA = Object.keys(objA).filter((k) => !ignore.has(k));
-    const keysB = Object.keys(objB).filter((k) => !ignore.has(k));
-    if (keysA.length !== keysB.length) return false;
-    return keysA.every((k) => EditorController.#deepEqual(objA[k], objB[k]));
   }
 
   addNodeFromCatalog(componentIndex: number, x: number, y: number): void {
     if (this.#locked()) return;
-    const components = this.#components();
-    if (!this.#graphJson || !components) throw new Error('no graph loaded');
-    const comp = components[componentIndex];
-    if (!comp) throw new Error(`no component at index ${componentIndex}`);
-    const compRef = this.#graphJson.components[componentIndex];
-    if (!compRef) throw new Error(`no component ref at index ${componentIndex}`);
-    const id = `node-${Date.now().toString(36)}`;
-
-    // Get port info from the catalog source (derived from existing nodes using this component)
-    const source = this.componentSources.find((s) => s.index === componentIndex);
-    const inputs = source?.inputs ?? [];
-    const outputs = source?.outputs ?? [];
-
     if (!this.#graphJson) throw new Error('no graph loaded');
+    const source = this.componentSources[componentIndex];
+    if (!source) throw new Error(`no catalog entry at index ${componentIndex}`);
+    const id = `node-${Date.now().toString(36)}`;
+    const { inputs, outputs } = source;
+    // A component the table does not have yet is entered under its name.
+    this.#graphJson.components[source.component] ??= source.component;
     const node: GraphJsonNode = {
       id,
-      component: compRef,
+      component: source.component,
+      world: source.world,
       attrs: { 'editor.x': String(x), 'editor.y': String(y) },
     };
     this.#graphJson.nodes.push(node);
@@ -1160,14 +1140,24 @@ export class EditorController extends EventTarget {
     const bundle = JSON.parse(json) as {
       version: number;
       graph: GraphJson;
-      components: { id: string; wit?: string; bytes: string }[];
+      components: {
+        name: string;
+        manifest: import('witgraph-loader').NodeManifest;
+        wit: string;
+        bytes?: string;
+      }[];
     };
-    const components = bundle.components.map((c) => {
-      const binary = atob(c.bytes);
-      const bytes = new Uint8Array(binary.length);
-      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-      return { id: c.id, bytes, wit: c.wit } as import('witgraph-loader').ComponentSource;
-    });
+    if (bundle.version !== BUNDLE_VERSION) {
+      throw new Error(`a bundle of version ${bundle.version}; this editor reads ${BUNDLE_VERSION}`);
+    }
+    const components = bundle.components.map(
+      (c): ComponentSource => ({
+        name: c.name,
+        manifest: c.manifest,
+        wit: fromBase64(c.wit),
+        ...(c.bytes ? { bytes: fromBase64(c.bytes) } : {}),
+      }),
+    );
     this.dispose();
     await this.load({
       graph: bundle.graph,
@@ -1350,7 +1340,7 @@ export class EditorController extends EventTarget {
         name: this.#graphJson?.metadata.name ?? 'untitled',
         description: this.#graphJson?.metadata.description,
       },
-      components: this.#graphJson?.components ?? [],
+      components: this.#graphJson?.components ?? {},
       nodes: [],
       connections: [],
     };
@@ -2225,15 +2215,9 @@ export class EditorController extends EventTarget {
     const suffix = `-${Date.now().toString(36)}`;
     for (const node of this.#clipboard.nodes) {
       const newId = `${node.id}${suffix}`;
-      const compRef = node.component;
-      const source = this.componentSources.find((s) => {
-        const graphComp = this.#graphJson!.components[s.index] as
-          | Record<string, unknown>
-          | undefined;
-        return (
-          graphComp && EditorController.#deepEqual(graphComp, compRef as Record<string, unknown>)
-        );
-      });
+      const source = this.componentSources.find(
+        (s) => s.component === node.component && s.world === node.world,
+      );
       if (!source) continue;
       // Prefer ports from the catalog source; fall back to ports saved in clipboard
       const savedPorts = this.#clipboard.ports.get(node.id);
@@ -2507,12 +2491,15 @@ export class EditorController extends EventTarget {
     }
   }
 
-  addNode(id: string, componentRef: object, x: number, y: number): void {
+  /** Adds a node running `world` of `component` (by its name in the graph's table). */
+  addNode(id: string, component: string, world: string, x: number, y: number): void {
     if (this.#locked()) return;
     if (!this.#graphJson) throw new Error('no graph loaded');
+    this.#graphJson.components[component] ??= component;
     const node: GraphJsonNode = {
       id,
-      component: componentRef,
+      component,
+      world,
       attrs: { 'editor.x': String(x), 'editor.y': String(y) },
     };
     this.#graphJson.nodes.push(node);
@@ -2658,11 +2645,12 @@ export class EditorController extends EventTarget {
     if (!this.#originalOptions) throw new Error('no graph loaded');
     const graph = JSON.parse(this.exportGraph());
     const components = this.#originalOptions.components.map((c) => ({
-      id: c.id,
-      wit: c.wit,
-      bytes: btoa(Array.from(new Uint8Array(c.bytes), (b) => String.fromCharCode(b)).join('')),
+      name: c.name,
+      manifest: c.manifest,
+      wit: toBase64(c.wit),
+      ...(c.bytes ? { bytes: toBase64(c.bytes) } : {}),
     }));
-    const bundle = JSON.stringify({ version: 1, graph, components }, null, 2);
+    const bundle = JSON.stringify({ version: BUNDLE_VERSION, graph, components }, null, 2);
     const blob = new Blob([bundle], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');

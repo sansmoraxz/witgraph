@@ -17,6 +17,7 @@ use wasmtime::component::{
 use wasmtime::{Engine, Store};
 use witgraph_ir::{CompiledGraph, ComponentContract, Graph, PortRef};
 use witgraph_wit::hub::{self, HubMember};
+use witgraph_wit::load::WitSource;
 
 #[derive(ComponentType, Lift, Lower, Debug, Clone, Default, PartialEq, Eq)]
 #[component(record)]
@@ -40,20 +41,29 @@ fn engine() -> Engine {
 }
 
 fn contract(guest: Guest) -> ComponentContract {
-    witgraph_wit::load_components(guest.wit).unwrap().remove(0)
+    guest.contract()
 }
 
 fn compose(compiled: &CompiledGraph, guests: &[(&str, Guest)]) -> Vec<u8> {
-    let nodes: Vec<(witgraph_ir::NodeId, &[u8])> = guests
+    let nodes: Vec<(witgraph_ir::NodeId, &[u8], WitSource, witgraph_ir::WorldRef)> = guests
         .iter()
-        .map(|(node, guest)| (witgraph_ir::NodeId::from(*node), guest.wasm))
+        .map(|(node, guest)| {
+            (
+                witgraph_ir::NodeId::from(*node),
+                guest.wasm,
+                guest.wit_source(),
+                guest.id().world,
+            )
+        })
         .collect();
     let members: Vec<HubMember<'_>> = nodes
         .iter()
-        .map(|(node, bytes)| HubMember {
+        .map(|(node, bytes, wit, world)| HubMember {
             node,
             bytes,
             export: "node",
+            wit,
+            world,
             mocked: false,
         })
         .collect();

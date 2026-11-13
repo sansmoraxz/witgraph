@@ -388,8 +388,9 @@ fn write_wit_def(out: &mut String, resolve: &Resolve, id: TypeId) {
     }
 }
 
-/// Sha-256 (hex) over the canonical encoding of the lowered contract. Any
-/// `content_hash` already present on the contract's id is ignored.
+/// Sha-256 (hex) over the canonical encoding of the lowered contract: its
+/// structural identity, which leaves out its id. A fingerprint for
+/// runtimes, never written in a graph.
 pub fn content_hash(contract: &ComponentContract) -> String {
     hex::encode(Sha256::digest(canonical(contract).as_bytes()))
 }
@@ -400,7 +401,7 @@ mod tests {
 
     fn contract(port_name: &str) -> ComponentContract {
         ComponentContract {
-            id: "demo:test/w@0.1.0".parse().unwrap(),
+            id: "w/demo:test/w@0.1.0".parse().unwrap(),
             inputs: vec![PortDef::value(port_name, Type::F64)],
             outputs: vec![],
             capabilities: vec![],
@@ -488,7 +489,7 @@ mod tests {
     fn identity_is_structural_not_nominal() {
         let a = contract("in");
         let mut b = contract("in");
-        b.id = "other:pkg/x@2.0.0".parse().unwrap();
+        b.id = "x/other:pkg/x@2.0.0".parse().unwrap();
         assert_eq!(content_hash(&a), content_hash(&b));
     }
 

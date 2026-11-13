@@ -39,22 +39,24 @@ const wasm = await readFile(
   new URL('../../witgraph-loader/pkg/witgraph_web_bg.wasm', import.meta.url),
 );
 const components: ComponentSource[] = await Promise.all(
-  ['blob-source', 'blob-relay', 'blob-sink'].map(async (name) => ({
-    id: `test:${name}/${name}@0.1.0`,
-    bytes: new Uint8Array(await readFile(new URL(`${name}.wasm`, guests))),
-  })),
+  ['blob-source', 'blob-relay', 'blob-sink'].map(async (name) => {
+    const read = async (file: string) => new Uint8Array(await readFile(new URL(file, guests)));
+    return {
+      name,
+      manifest: JSON.parse(await readFile(new URL(`${name}.node.json`, guests), 'utf8')),
+      wit: await read(`${name}.wit.wasm`),
+      bytes: await read(`${name}.wasm`),
+    };
+  }),
 );
-const ref = (name: string) => ({
-  package: { namespace: 'test', name, version: '0.1.0' },
-  world: name,
-});
+const ref = (name: string) => ({ component: name, world: `test:${name}/${name}@0.1.0` });
 
 /** The chain, each node's bytes previewed or not. */
 function graph(size: number, previews: boolean): GraphJson {
   const preview = previews ? { 'editor.preview': 'blob' } : {};
   const node = (id: string, name: string, attrs: Record<string, string> = {}) => ({
     id,
-    component: ref(name),
+    ...ref(name),
     attrs: { ...attrs, ...(name === 'blob-sink' ? {} : preview) },
   });
   const edge = (from: string, to: string) => ({
@@ -64,7 +66,9 @@ function graph(size: number, previews: boolean): GraphJson {
   });
   return {
     metadata: { name: 'transfer' },
-    components: ['blob-source', 'blob-relay', 'blob-sink'].map(ref),
+    components: Object.fromEntries(
+      ['blob-source', 'blob-relay', 'blob-sink'].map((name) => [name, name]),
+    ),
     nodes: [
       node('source', 'blob-source', { 'inject.size': String(size) }),
       node('a', 'blob-relay'),

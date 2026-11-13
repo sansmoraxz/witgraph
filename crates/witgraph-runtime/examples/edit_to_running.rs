@@ -6,12 +6,11 @@
 //! cargo run --release -p witgraph-runtime --example edit_to_running [nodes...]
 //! ```
 
-use std::collections::HashMap;
 use std::error::Error;
 use std::time::Instant;
 
 use test_components::{BLOB_RELAY, BLOB_SINK, BLOB_SOURCE};
-use witgraph_ir::{CompiledGraph, ComponentContract, ComponentRef, Graph, PortRef};
+use witgraph_ir::{CompiledGraph, ComponentContract, Graph, PortRef};
 use witgraph_runtime::{NoCapabilities, Perf, PreparedGraph, RuntimeConfig, RuntimeGraph};
 
 fn chain(nodes: usize, contracts: &[ComponentContract]) -> Result<CompiledGraph, Box<dyn Error>> {
@@ -49,15 +48,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         sizes
     };
     let guests = [BLOB_SOURCE, BLOB_RELAY, BLOB_SINK];
+    let kit = test_components::Kit::new(&guests);
     let contracts: Vec<ComponentContract> = guests
         .iter()
-        .map(|guest| Ok(witgraph_wit::load_components(guest.wit)?.remove(0)))
-        .collect::<Result<_, Box<dyn Error>>>()?;
-    let wasm: HashMap<ComponentRef, &[u8]> = contracts
-        .iter()
-        .zip(&guests)
-        .map(|(contract, guest)| (contract.id.clone(), guest.wasm))
+        .map(|g| kit.contract(&kit.get(*g)).clone())
         .collect();
+    let wasm = kit.artifacts();
     println!("nodes  prepare    instantiate");
     for nodes in sizes {
         let engine = RuntimeConfig::default().new_engine()?;

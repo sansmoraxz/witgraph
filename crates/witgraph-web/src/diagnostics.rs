@@ -1,13 +1,12 @@
 //! What is wrong with a graph, as data a JavaScript host can act on: each diagnostic
 //! with a stable code, and the place in the graph it points at.
 
-use js_sys::{Array, Object, Reflect, Uint8Array};
+use js_sys::{Array, Object, Reflect};
 use miette::Diagnostic as _;
-use sha2::{Digest, Sha256};
 use wasm_bindgen::prelude::*;
 use witgraph_ir::{CompilationFailure, ComponentContract, Diagnostic, Graph, Location};
 
-use crate::graph::{contract, error, text};
+use crate::graph::{error, text};
 use crate::value::set;
 
 /// `names`, as an array of text.
@@ -98,28 +97,6 @@ pub(crate) fn compile_error(failure: &CompilationFailure) -> JsValue {
     thrown.into()
 }
 
-/// A component `load` would be given, as parts: its id, its bytes, its WIT source.
-pub(crate) fn component_entry(
-    entry: &JsValue,
-) -> Result<(String, Vec<u8>, Option<String>), JsError> {
-    let id = Reflect::get(entry, &text("id"))
-        .ok()
-        .and_then(|id| id.as_string())
-        .ok_or_else(|| error("a component needs an `id`"))?;
-    // `isView` sees through no proxy: what passes copies out without calling back
-    // into JavaScript.
-    let bytes = Reflect::get(entry, &text("bytes"))
-        .ok()
-        .filter(js_sys::ArrayBuffer::is_view)
-        .and_then(|bytes| bytes.dyn_into::<Uint8Array>().ok())
-        .ok_or_else(|| error(format!("component `{id}` needs `bytes`")))?
-        .to_vec();
-    let wit = Reflect::get(entry, &text("wit"))
-        .ok()
-        .and_then(|wit| wit.as_string());
-    Ok((id, bytes, wit))
-}
-
 /// Compiles graphs against a set of components, with nothing loaded: what an editor
 /// asks of a graph it has not made yet, by the rules a load goes by.
 #[wasm_bindgen]
@@ -129,16 +106,15 @@ pub struct GraphChecker {
 
 #[wasm_bindgen]
 impl GraphChecker {
-    /// `components` as `WebGraph.load` takes them. One with no contract (a provider,
-    /// say, which no node runs) is left out: a graph with a node of it says so.
+    /// `components` as `WebGraph.load` takes them, bytes or none: their contracts
+    /// are their manifests' and WIT's. One that does not describe is left out: a
+    /// graph with a node of it says so.
     #[wasm_bindgen(constructor)]
     pub fn new(components: Array) -> Result<GraphChecker, JsError> {
         let mut contracts = Vec::new();
         for entry in components.iter() {
-            let (id, bytes, wit) = component_entry(&entry)?;
-            let digest: [u8; 32] = Sha256::digest(&bytes).into();
-            if let Ok(lowered) = contract(&id, &bytes, digest, wit.as_deref()) {
-                contracts.push(lowered.contract);
+            if let Ok(entry) = crate::component::entry(&entry) {
+                contracts.extend(entry.described.worlds.iter().map(|w| w.contract.clone()));
             }
         }
         Ok(Self { contracts })

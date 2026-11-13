@@ -2,18 +2,38 @@
 
 A graph is plain, serializable data:
 
-- the components it uses, each by name, version and content hash;
-- nodes, each an instance of one of those components;
+- its component table: each component it uses, by a name, with where that
+  component's [node manifest](components.md#node-manifests) is (a path, or an
+  `oci://` reference);
+- nodes, each running one world of one of those components;
 - connections from an output port to an input port;
 - links, which supply a node's imports from another component.
 
-A graph doesn't store contracts. Contracts always come from WIT.
+```json
+{
+  "metadata": { "name": "demo" },
+  "components": { "sensor": "oci://ghcr.io/demo/sensor.node:0.1.0" },
+  "nodes": [{ "id": "s", "component": "sensor", "world": "demo:graph/sensor@0.1.0" }],
+  "connections": []
+}
+```
+
+A WIT package (`demo:graph@0.1.0`) and a world in it
+(`demo:graph/sensor@0.1.0`) are written as WIT writes them. A world is a
+contract: two components may provide the same one, and a graph may run both,
+each under its own name.
+
+A graph doesn't store contracts. Contracts always come from WIT: a node's is
+its world's, as its component's WIT has it, never read out of the component's
+bytes.
 
 ## Getting contracts
 
-`witgraph_wit::load_components(path)` reads a `.wit` file, a directory or an
-encoded WIT package and returns a contract for each component world in it.
-`lower_component(bytes, &id)` does the same from a compiled component.
+`witgraph_wit::load_components(path, &name)` reads a `.wit` file, a directory
+or an encoded WIT package and returns a contract for each component world in
+it, as the component `name` provides it. `witgraph_wit::lower_world(&source,
+&id)` lowers the one world a `ContractId` (component and world) names.
+`witgraph-source` does this for a whole graph, from its node manifests.
 
 ## Compiling
 
@@ -47,8 +67,9 @@ component instead:
 ```rust
 let graph = Graph::builder("g")
     .add_component(&calc)
+    .add_component(ComponentEntry::new(math.clone(), "math.node.json"))
     .add_node("n", calc.id.clone())
-    .link("l", "n", "test:math/ops@0.1.0", math_ref, "test:math/ops@0.1.0")
+    .link("l", "n", "test:math/ops@0.1.0", math, "test:math/ops@0.1.0")
     .build();
 ```
 
@@ -57,8 +78,9 @@ into the node, so the node calls it directly. Each node gets its own provider
 instance. This works the same in a browser or Node.js: the loader gets the
 composed component and runs that. The `compose` feature of `witgraph-wit` does
 the composition, and `witgraph-runtime` and `witgraph-web` turn it on.
-Providers are listed in `components` like any other component, and are not
-nodes.
+Providers are listed in the component table like any other component, by
+name, and need not be nodes: a provider's node manifest lists the world it
+exports, and what that world imports is asked of the host.
 
 ## Editor catalog
 

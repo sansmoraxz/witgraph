@@ -13,14 +13,18 @@ use witgraph_wit::{load_components, load_lowered, metadata};
 
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/demo");
 
+fn demo() -> witgraph_wit::ir::ComponentName {
+    "demo".parse().unwrap()
+}
+
 fn fixtures() -> Vec<ComponentContract> {
-    load_components(FIXTURES).expect("fixtures load and lower")
+    load_components(FIXTURES, &demo()).expect("fixtures load and lower")
 }
 
 fn contract<'a>(contracts: &'a [ComponentContract], world: &str) -> &'a ComponentContract {
     contracts
         .iter()
-        .find(|c| c.id.world == world)
+        .find(|c| c.id.world.world == world)
         .unwrap_or_else(|| panic!("no `{world}` contract"))
 }
 
@@ -110,11 +114,6 @@ fn fixtures_lower_with_every_port_kind() {
     assert_eq!(accumulator.shape(), NodeShape::Reactive);
     let collector = contract(&contracts, "collector");
     assert_eq!(collector.shape(), NodeShape::Streaming);
-
-    for c in &contracts {
-        let hash = c.id.content_hash.as_deref().expect("every contract hashed");
-        assert_eq!(hash.len(), 64);
-    }
 }
 
 #[test]
@@ -315,16 +314,17 @@ fn serialized_graph_holds_refs_and_recompiles_against_rederived_contracts() {
     let graph = demo_graph(&contracts);
 
     let json = serde_json::to_value(&graph).unwrap();
-    for entry in json["components"].as_array().unwrap() {
-        let entry = entry.as_object().unwrap();
+    assert_eq!(
+        json["components"],
+        serde_json::json!({ "demo": "demo" }),
+        "the table names components, never contract data"
+    );
+    for node in json["nodes"].as_array().unwrap() {
         assert!(
-            entry.contains_key("content_hash"),
-            "refs are pinned: {entry:?}"
+            node["world"].as_str().unwrap().starts_with("demo:graph/"),
+            "{node}"
         );
-        assert!(
-            !entry.contains_key("inputs") && !entry.contains_key("outputs"),
-            "no contract data is serialized: {entry:?}"
-        );
+        assert!(node.get("inputs").is_none(), "{node}");
     }
 
     let restored: Graph = serde_json::from_value(json).unwrap();
@@ -335,18 +335,19 @@ fn serialized_graph_holds_refs_and_recompiles_against_rederived_contracts() {
 }
 
 #[test]
-fn edited_component_no_longer_satisfies_a_pinned_graph() {
+fn a_world_the_component_no_longer_provides_is_diagnosed() {
     let contracts = fixtures();
     let graph = demo_graph(&contracts);
-    let mut edited = contracts.clone();
-    let alarm = edited.iter_mut().find(|c| c.id.world == "alarm").unwrap();
-    alarm.id.content_hash = Some("0".repeat(64));
+    let edited: Vec<ComponentContract> = contracts
+        .into_iter()
+        .filter(|c| c.id.world.world != "alarm")
+        .collect();
 
     let diags = diagnostics(graph, &edited);
     assert!(
         diags.iter().any(|d| matches!(
             d,
-            Diagnostic::ContractNotFound(id) if id.world == "alarm"
+            Diagnostic::ContractNotFound(id) if id.world.world == "alarm"
         )),
         "{diags:?}"
     );
@@ -354,7 +355,7 @@ fn edited_component_no_longer_satisfies_a_pinned_graph() {
 
 #[test]
 fn catalog_matches_committed_golden() {
-    let catalog = metadata::generate_catalog(&load_lowered(FIXTURES).unwrap());
+    let catalog = metadata::generate_catalog(&load_lowered(FIXTURES, &demo()).unwrap());
     let json = metadata::to_json(&catalog).unwrap();
     let golden_path = concat!(
         env!("CARGO_MANIFEST_DIR"),

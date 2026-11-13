@@ -56,8 +56,10 @@ data over time. See [docs/components.md](docs/components.md) for the full rules.
 
 ## A graph
 
-A graph lists the nodes and the connections between their ports. It is plain
-serializable data and holds no contracts. Compiling it looks the contracts up
+A graph lists the components it uses, by name with where each one's node
+manifest is, the nodes (each runs one world of one component), and the
+connections between their ports. It is plain serializable data and holds no
+contracts. Compiling it looks the contracts up
 and reports every problem it finds: mismatched types, unconnected required
 inputs, cycles without a feedback edge, and so on.
 
@@ -65,13 +67,15 @@ inputs, cycles without a feedback edge, and so on.
 let compiled = graph.compile(&contracts)?;
 ```
 
-`witgraph-wit` produces the contracts from `.wit` files or from compiled
-components. See [docs/graphs.md](docs/graphs.md).
+`witgraph-wit` lowers the contracts from WIT: a component's node manifest names
+its WIT package and the worlds it provides, and its bytes are only checked to
+target them. See [docs/graphs.md](docs/graphs.md) and
+[docs/components.md](docs/components.md#node-manifests).
 
 ## Running it
 
 ```rust
-let mut rt = RuntimeGraph::load(compiled, &wasm, RuntimeConfig::default(), Perf).await?;
+let mut rt = RuntimeGraph::load(compiled, &artifacts, RuntimeConfig::default(), Perf).await?;
 rt.inject(&"scale".into(), &"value".into(), Val::Float64(21.0)).await?;
 if let TickResult::Faulted(report) = rt.tick().await {
     return Err(report.fault.into());
@@ -79,8 +83,8 @@ if let TickResult::Faulted(report) = rt.tick().await {
 let out = rt.read_output(&"scale".into(), &"out".into()).await?;
 ```
 
-`wasm` maps each component to its bytes. `witgraph-source` can fetch them from
-files or an OCI registry. A `tick` runs every node that has new input, and
+`artifacts` maps each component to its bytes and WIT. `witgraph-source`
+resolves a graph's component table into them, from files or OCI registries. A `tick` runs every node that has new input, and
 repeats until nothing more can run. Nodes that need host features (a clock, a
 key-value store) get them through capability plugins. See
 [docs/running.md](docs/running.md).

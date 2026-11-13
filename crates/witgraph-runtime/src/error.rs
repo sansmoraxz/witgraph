@@ -1,7 +1,7 @@
 //! What loading a graph's components can fail with ([`LoadError`]),
 //! besides the scheduler's [`RuntimeError`].
 
-use witgraph_ir::{ComponentRef, NodeId, PortName};
+use witgraph_ir::{ComponentName, ContractId, NodeId, PortName};
 use witgraph_sched::RuntimeError;
 
 /// Why a graph could not be loaded: its components, their links and
@@ -9,49 +9,30 @@ use witgraph_sched::RuntimeError;
 /// invalid config, say).
 #[derive(Debug, Clone, thiserror::Error, miette::Diagnostic)]
 pub enum LoadError {
-    /// A link names its provider without a content hash, and several
-    /// pinned keys of the WASM map match it: which bytes to compose in is
-    /// not known.
-    #[error(
-        "provider `{provider}` matches several components: {}; pin it, or key one without a hash",
-        candidates.iter().map(|c| format!("`{c:#}`")).collect::<Vec<_>>().join(", ")
-    )]
-    #[diagnostic(code(witgraph::load::ambiguous_provider))]
-    AmbiguousProvider {
-        /// The provider as the link names it.
-        provider: Box<ComponentRef>,
-        /// The keys that match it.
-        candidates: Vec<ComponentRef>,
-    },
-    /// A component has no corresponding WASM bytes.
-    #[error(
-        "no WASM component provided for `{component}`{}",
-        component.content_hash.as_ref().map(|h| format!(" (content hash {h})")).unwrap_or_default()
-    )]
+    /// A component the graph names was not given.
+    #[error("no component `{component}` was given")]
     #[diagnostic(code(witgraph::load::missing_wasm))]
     MissingWasm {
-        /// The component missing its bytes.
-        component: Box<ComponentRef>,
+        /// The component, by its name in the graph's table.
+        component: ComponentName,
     },
-    /// A component's bytes are not a valid component, embed WIT that could
-    /// not be decoded or lowered into exactly one node contract, or failed
-    /// to compile on the engine.
+    /// A component's bytes are not a valid component, its WIT does not
+    /// lower, or it failed to compile on the engine.
     #[error("component `{component}` does not describe a witgraph node: {message}")]
     #[diagnostic(code(witgraph::load::bad_component))]
     BadComponent {
         /// The component whose bytes were rejected.
-        component: Box<ComponentRef>,
+        component: Box<ContractId>,
         /// What went wrong.
         message: String,
     },
-    /// A component's bytes implement a different contract than the one the
-    /// graph was compiled against: other ports or `run` kind, or an import
-    /// the contract does not declare as a capability.
+    /// A component's bytes do not target the world the graph runs of it:
+    /// other ports or `run` kind, or an import the world does not declare.
     #[error("component `{component}` does not match its contract: {message}")]
     #[diagnostic(code(witgraph::load::contract_mismatch))]
     ContractMismatch {
         /// The component whose bytes were rejected.
-        component: Box<ComponentRef>,
+        component: Box<ContractId>,
         /// The first difference found.
         message: String,
     },
@@ -62,7 +43,7 @@ pub enum LoadError {
     #[diagnostic(code(witgraph::load::bad_link))]
     BadLink {
         /// The node's component.
-        component: Box<ComponentRef>,
+        component: Box<ContractId>,
         /// The import the link satisfies.
         import: String,
         /// What went wrong.

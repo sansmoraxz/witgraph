@@ -7,7 +7,6 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, missing_docs)]
 
-use std::collections::HashMap;
 use std::hash::{BuildHasher, RandomState};
 use std::io::Write as _;
 use std::time::Duration;
@@ -22,13 +21,13 @@ async fn main() -> anyhow::Result<()> {
     let addr = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "127.0.0.1:0".into());
-    let mut contracts = Vec::new();
-    let mut wasm = HashMap::new();
-    for guest in [RELAY, LINE_WALK, C_WALK, ZIG_WALK] {
-        let contract = witgraph_wit::load_components(guest.wit)?.remove(0);
-        wasm.insert(contract.id.clone(), guest.wasm);
-        contracts.push(contract);
-    }
+    let guests = [RELAY, LINE_WALK, C_WALK, ZIG_WALK];
+    let kit = test_components::Kit::new(&guests);
+    let contracts: Vec<_> = guests
+        .iter()
+        .map(|g| kit.contract(&kit.get(*g)).clone())
+        .collect();
+    let wasm = kit.artifacts();
     let graph = Graph::builder("attached")
         .add_component(&contracts[0])
         .add_component(&contracts[1])

@@ -14,8 +14,9 @@ use wasmtime::component::{Component, Func, Instance, Linker, Val};
 use wasmtime::{Engine, Store};
 use wit_component::{ComponentEncoder, StringEncoding};
 use wit_parser::{LiftLowerAbi, ManglingAndAbi, Resolve};
-use witgraph_ir::{CompiledGraph, ComponentRef, Graph, PortRef, PortTable};
+use witgraph_ir::{CompiledGraph, ContractId, Graph, PortRef, PortTable};
 use witgraph_wit::hub::{self, HubMember};
+use witgraph_wit::load::WitSource;
 
 /// A small generator, so a seed means the same on every machine.
 struct Rng(u64);
@@ -432,10 +433,17 @@ struct Case {
     given: Arc<Mutex<Vec<Val>>>,
 }
 
-fn compile(ty: &Ty) -> (CompiledGraph, Vec<u8>, Vec<u8>) {
+/// A member of the graph: its bytes, its WIT, and what it runs.
+struct Member {
+    bytes: Vec<u8>,
+    wit: WitSource,
+    id: ContractId,
+}
+
+fn compile(ty: &Ty) -> (CompiledGraph, Member, Member) {
     let (head_wit, tail_wit) = (world(ty), tail_world(ty));
-    let head_id: ComponentRef = "test:node/head@0.1.0".parse().unwrap();
-    let tail_id: ComponentRef = "test:tail/tail@0.1.0".parse().unwrap();
+    let head_id: ContractId = "head/test:node/head@0.1.0".parse().unwrap();
+    let tail_id: ContractId = "tail/test:tail/tail@0.1.0".parse().unwrap();
     let head = witgraph_wit::contract_from_str("head.wit", &head_wit, &head_id).unwrap();
     let tail = witgraph_wit::contract_from_str("tail.wit", &tail_wit, &tail_id).unwrap();
     let compiled = Graph::builder("random")
@@ -447,10 +455,15 @@ fn compile(ty: &Ty) -> (CompiledGraph, Vec<u8>, Vec<u8>) {
         .build()
         .compile(&[head, tail])
         .unwrap();
+    let member = |wit: &str, world: &str, id: ContractId| Member {
+        bytes: component(wit, world),
+        wit: witgraph_wit::load::load_str("member.wit", wit).unwrap(),
+        id,
+    };
     (
         compiled,
-        component(&head_wit, "head"),
-        component(&tail_wit, "tail"),
+        member(&head_wit, "head", head_id),
+        member(&tail_wit, "tail", tail_id),
     )
 }
 
@@ -475,14 +488,18 @@ async fn build(engine: &Engine, ty: &Ty) -> Case {
     let members = [
         HubMember {
             node: &a,
-            bytes: &head,
+            bytes: &head.bytes,
             export: "node",
+            wit: &head.wit,
+            world: &head.id.world,
             mocked: true,
         },
         HubMember {
             node: &b,
-            bytes: &tail,
+            bytes: &tail.bytes,
             export: "node",
+            wit: &tail.wit,
+            world: &tail.id.world,
             mocked: true,
         },
     ];

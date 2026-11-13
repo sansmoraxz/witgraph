@@ -2,7 +2,7 @@
 //! compiler, and in the plain terms the rules are written in, so that the rules do not
 //! lean on the compiler's own idea of what fits what.
 
-use witgraph_ir::{Carried, ComponentContract, ComponentRef, HandleType, PortDef, Type};
+use witgraph_ir::{Carried, ComponentContract, ContractId, HandleType, PortDef, Type};
 
 /// A port's kind, as the rules see it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,8 +181,8 @@ pub const COMPONENTS: &[Component] = &[
 
 impl Component {
     /// What a graph calls it.
-    pub fn reference(&self) -> ComponentRef {
-        format!("fuzz:nodes/{}@0.1.0", self.world)
+    pub fn reference(&self) -> ContractId {
+        format!("{0}/fuzz:nodes/{0}@0.1.0", self.world)
             .parse()
             .expect("a catalog world is a valid reference")
     }

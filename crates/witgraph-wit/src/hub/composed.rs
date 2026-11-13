@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use wac_graph::types::Package;
 use wac_graph::{CompositionGraph, EncodeOptions, NodeId as WacNode};
-use witgraph_ir::{CompiledGraph, NodeId};
+use witgraph_ir::{CompiledGraph, NodeId, WorldRef};
 
 use super::{CONTROL_INTERFACE, PORTS_INTERFACE, generate, host_import};
 use crate::lower::HOST_INTERFACE;
@@ -18,9 +18,13 @@ pub struct HubMember<'a> {
     pub bytes: &'a [u8],
     /// The name its `node` interface is exported under.
     pub export: &'a str,
+    /// The WIT its node manifest names: what its `node` interface is.
+    pub wit: &'a crate::load::WitSource,
+    /// The world of it the node runs.
+    pub world: &'a WorldRef,
     /// Leaves the node out: the composite imports its `node` interface as
     /// [`member_import`](super::member_import), for the host to implement, and
-    /// nothing else of it. Its bytes only say what its ports are.
+    /// nothing else of it. Its bytes are not used.
     pub mocked: bool,
 }
 

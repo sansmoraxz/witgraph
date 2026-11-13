@@ -21,13 +21,15 @@ use tokio::time::sleep;
 use wasmtime::Engine;
 use wasmtime::component::{Linker, ResourceDynamic, Val};
 use witgraph_ir::{
-    Capability, CompiledGraph, ComponentContract, ComponentRef, Graph, NodeId, PortName,
+    Capability, CompiledGraph, ComponentContract, ComponentEntry, ComponentName, Graph, NodeId,
+    PortName,
 };
+use witgraph_runtime::Artifact;
 use witgraph_runtime::{
     CapabilityPlugin, OutputReader, Perf, PluginData, Plugins, PortVersion, PreparedGraph,
     RunningGraph, RuntimeConfig, RuntimeGraph, StoreData, TickResult, Val as _, ValReader, shared,
 };
-use witgraph_source::{ComponentSource, Digest, Resolver};
+use witgraph_source::{Digest, Resolver};
 
 /// A capability, for the snippet that adds some.
 struct Clock;

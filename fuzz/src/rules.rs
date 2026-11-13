@@ -31,22 +31,15 @@ impl<'g> Model<'g> {
         if !graph.links.is_empty() {
             return None;
         }
-        let known = |r: &witgraph_ir::ComponentRef| COMPONENTS.iter().find(|c| c.reference() == *r);
-        let mut listed = BTreeSet::new();
-        for reference in &graph.components {
-            known(reference)?;
-            if !listed.insert(reference.to_string()) {
-                return None;
-            }
-        }
+        let known = |r: &witgraph_ir::ContractId| COMPONENTS.iter().find(|c| c.reference() == *r);
         let mut nodes = BTreeMap::new();
         for (at, node) in graph.nodes.iter().enumerate() {
-            if !graph.components.contains(&node.component) {
+            if !graph.components.contains_key(&node.component) {
                 return None;
             }
             nodes
                 .entry(node.id.as_str())
-                .or_insert((at, known(&node.component)?));
+                .or_insert((at, known(&node.contract_id())?));
         }
         Some(Self { graph, nodes })
     }

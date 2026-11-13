@@ -9,8 +9,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use futures::FutureExt;
 use futures::executor::block_on;
 use witgraph_ir::{
-    CompiledGraph, ComponentContract, ComponentRef, Graph, HandleType, NodeId, PortDef,
-    PortDirection, PortName, PortRef, Type,
+    CompiledGraph, ComponentContract, Graph, HandleType, NodeId, PortDef, PortDirection, PortName,
+    PortRef, Type,
 };
 
 use witgraph_traits::{BoxFuture, NodeFault, NodePhase, Outcome, Perf, TickResult, boxed};
@@ -92,10 +92,7 @@ impl Executor for Adders {
 /// `in: option<u32>`, `add: option<u32>` → `out: u32`.
 fn adder() -> ComponentContract {
     ComponentContract {
-        id: ComponentRef {
-            content_hash: Some("aa".into()),
-            ..("test:nodes/adder@0.1.0".parse().unwrap())
-        },
+        id: "adder/test:nodes/adder@0.1.0".parse().unwrap(),
         inputs: vec![
             PortDef::value("in", Type::U32).optional(),
             PortDef::value("add", Type::U32).optional(),
@@ -366,10 +363,7 @@ fn tensor() -> HandleType {
 /// adders' `u32`s stand in for handles.
 fn load_handles() -> Scheduler<Perf, Adders> {
     let contract = |world: &str, inputs, outputs| ComponentContract {
-        id: ComponentRef {
-            content_hash: Some("bb".into()),
-            ..(format!("test:nodes/{world}@0.1.0").parse().unwrap())
-        },
+        id: format!("{world}/test:nodes/{world}@0.1.0").parse().unwrap(),
         inputs,
         outputs,
         capabilities: vec![],

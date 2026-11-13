@@ -6,7 +6,6 @@ use std::fmt::Write as _;
 use wasm_encoder::{Instruction as I, ValType};
 use wit_component::{ComponentEncoder, StringEncoding, embed_component_metadata};
 use wit_parser::abi::{AbiVariant, WasmSignature, WasmType};
-use wit_parser::decoding::{DecodedWasm, decode};
 use wit_parser::{
     Function, FutureIntrinsic, Int, LiftLowerAbi, Mangling, ManglingAndAbi, Resolve,
     ResourceIntrinsic, StreamIntrinsic, Type, TypeDefKind, TypeId, WasmExport, WasmExportKind,
@@ -54,21 +53,20 @@ pub(super) struct Generated<'a> {
     pub(super) order: Vec<HubMember<'a>>,
 }
 
-/// A member's WIT, as its component declares it.
-struct Decoded {
-    resolve: Resolve,
+/// A member's WIT, as its node manifest's WIT declares its world.
+struct Decoded<'a> {
+    resolve: &'a Resolve,
     run: Function,
 }
 
-fn read_member(member: &HubMember<'_>) -> Result<Decoded, HubError> {
+fn read_member<'a>(member: &HubMember<'a>) -> Result<Decoded<'a>, HubError> {
     let failed = |message: String| HubError::Member {
         node: member.node.clone(),
         message,
     };
-    let decoded = decode(member.bytes).map_err(|e| failed(format!("{e:#}")))?;
-    let DecodedWasm::Component(resolve, world) = decoded else {
-        return Err(failed("the bytes are a WIT package".into()));
-    };
+    let world = crate::lower::find_world(member.wit, member.world)
+        .ok_or_else(|| failed(format!("its WIT has no world `{}`", member.world)))?;
+    let resolve = &member.wit.resolve;
     let run = resolve.worlds[world]
         .exports
         .iter()
@@ -150,12 +148,12 @@ fn world_text(
     compiled: &CompiledGraph,
     ports: &PortTable,
     order: &[HubMember<'_>],
-    decoded: &[Decoded],
+    decoded: &[Decoded<'_>],
 ) -> Result<String, HubError> {
     let mut resources = Resources::default();
     // Once to find every resource's newest version, then for real.
     for member in decoded {
-        Printer::new("", &member.resolve, &mut resources).run(&member.run)?;
+        Printer::new("", member.resolve, &mut resources).run(&member.run)?;
     }
 
     let mut imports = String::new();

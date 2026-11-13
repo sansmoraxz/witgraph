@@ -19,8 +19,7 @@ use futures::FutureExt;
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
 use futures::channel::oneshot;
 use witgraph_ir::{
-    ComponentContract, ComponentRef, FeedbackIdx, Graph, InputIdx, NodeIdx, PortDef, PortRef,
-    ResourceClaim, Type,
+    ComponentContract, FeedbackIdx, Graph, InputIdx, NodeIdx, PortDef, PortRef, ResourceClaim, Type,
 };
 
 use crate::control::SchedulerCore;
@@ -135,10 +134,7 @@ impl Plane {
 
 fn contract(world: &str, inputs: Vec<PortDef>, outputs: Vec<PortDef>) -> ComponentContract {
     ComponentContract {
-        id: ComponentRef {
-            content_hash: Some("cc".into()),
-            ..(format!("test:nodes/{world}@0.1.0").parse().unwrap())
-        },
+        id: format!("{world}/test:nodes/{world}@0.1.0").parse().unwrap(),
         inputs,
         outputs,
         capabilities: vec![],

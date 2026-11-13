@@ -9,32 +9,30 @@ use witgraph_ir::{ComponentContract, HandleType, PortDef, PortKind};
 use crate::lower::Lowered;
 
 /// The catalog format version this crate emits.
-pub const SCHEMA_VERSION: u32 = 5;
+pub const SCHEMA_VERSION: u32 = 6;
 
 /// The full set of components available to an editor.
 #[derive(Debug, Clone, Serialize)]
 pub struct Catalog {
     /// Always [`SCHEMA_VERSION`].
     pub schema_version: u32,
-    /// One entry per component, sorted by id.
+    /// One entry per contract (a world, as a component provides it), sorted
+    /// by component and world.
     pub components: Vec<ComponentMeta>,
 }
 
 /// Editor-facing view of one component contract.
 #[derive(Debug, Clone, Serialize)]
 pub struct ComponentMeta {
-    /// The pinned component reference, content hash included
-    /// (`demo:graph/sensor@0.1.0#<hash>`): unique per entry, even for two
-    /// revisions of one world, and parsed back by
-    /// [`ComponentRef`](witgraph_ir::ComponentRef)'s `FromStr`.
+    /// The contract's id, `component/world` (`sensor/demo:graph/sensor@0.1.0`),
+    /// parsed back by [`ContractId`](witgraph_ir::ContractId)'s `FromStr`.
     pub id: String,
-    /// The WIT package, e.g. `demo:graph@0.1.0`.
-    pub package: String,
-    /// The world's name within the package.
+    /// The component, by its name in the graph's component table.
+    pub component: String,
+    /// The world, e.g. `demo:graph/sensor@0.1.0`.
     pub world: String,
-    /// sha-256 hex of the lowered contract.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub content_hash: Option<String>,
+    /// The world's WIT package, e.g. `demo:graph@0.1.0`.
+    pub package: String,
     /// Doc comment from the WIT world, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub docs: Option<String>,
@@ -104,8 +102,8 @@ pub struct PortMeta {
     /// Doc comment from the WIT field, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub docs: Option<String>,
-    /// Output ports only: the viewer the component's `witgraph-viewer`
-    /// section names for it, if any.
+    /// Output ports only: the viewer the component's node manifest names
+    /// for it, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub viewer: Option<String>,
 }
@@ -127,10 +125,10 @@ impl ComponentMeta {
     /// lowered world has; see [`generate_catalog`]).
     pub fn of(contract: &ComponentContract) -> Self {
         Self {
-            id: format!("{:#}", contract.id),
-            package: contract.id.package.to_string(),
-            world: contract.id.world.clone(),
-            content_hash: contract.id.content_hash.clone(),
+            id: contract.id.to_string(),
+            component: contract.id.component.to_string(),
+            world: contract.id.world.to_string(),
+            package: contract.id.world.package.to_string(),
             docs: contract.docs.clone(),
             inputs: contract.inputs.iter().map(port_meta).collect(),
             outputs: contract.outputs.iter().map(port_meta).collect(),
@@ -148,10 +146,10 @@ impl ComponentMeta {
     }
 }
 
-/// Build a catalog from lowered worlds. Components are sorted by their
-/// structured reference — not the rendered id string — so versions order
-/// numerically (`0.2.0` before `0.10.0`) and the output is stable
-/// regardless of load order.
+/// Build a catalog from lowered worlds. Entries are sorted by their
+/// structured id, not the rendered string, so versions order numerically
+/// (`0.2.0` before `0.10.0`) and the output is stable regardless of load
+/// order.
 pub fn generate_catalog(lowered: &[Lowered]) -> Catalog {
     let mut sorted: Vec<&Lowered> = lowered.iter().collect();
     sorted.sort_by(|a, b| a.contract.id.cmp(&b.contract.id));
@@ -197,6 +195,10 @@ mod tests {
     use crate::load::load_str;
     use crate::lower::lower;
 
+    fn c() -> witgraph_ir::ComponentName {
+        "c".parse().unwrap()
+    }
+
     #[test]
     fn catalog_is_sorted_and_versioned() {
         let source = load_str(
@@ -218,7 +220,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        let catalog = generate_catalog(&lower(&source).unwrap());
+        let catalog = generate_catalog(&lower(&source, &c()).unwrap());
 
         assert_eq!(catalog.schema_version, SCHEMA_VERSION);
         let ids: Vec<&str> = catalog
@@ -226,11 +228,12 @@ mod tests {
             .iter()
             .map(|c| c.id.split('#').next().unwrap_or_default())
             .collect();
-        assert_eq!(ids, ["demo:test/alpha@0.1.0", "demo:test/zeta@0.1.0"]);
+        assert_eq!(ids, ["c/demo:test/alpha@0.1.0", "c/demo:test/zeta@0.1.0"]);
 
         let alpha = &catalog.components[0];
         assert_eq!(alpha.package, "demo:test@0.1.0");
-        assert_eq!(alpha.world, "alpha");
+        assert_eq!(alpha.component, "c");
+        assert_eq!(alpha.world, "demo:test/alpha@0.1.0");
         assert_eq!(alpha.inputs[0].kind, PortKind::Value);
         assert_eq!(alpha.inputs[0].type_display, "u32");
         assert!(alpha.inputs[0].optional);
@@ -243,32 +246,6 @@ mod tests {
             !json.contains("\"type\""),
             "no structured types in the catalog: {json}"
         );
-    }
-
-    #[test]
-    fn two_revisions_of_one_world_get_distinct_ids() {
-        let wit = |out: &str| {
-            format!(
-                r#"
-                package demo:test@0.1.0;
-                world w {{
-                    export node: interface {{
-                        record outputs {{ {out}: u32 }}
-                        run: async func() -> outputs;
-                    }}
-                }}
-                "#
-            )
-        };
-        let mut lowered = lower(&load_str("a.wit", &wit("a")).unwrap()).unwrap();
-        lowered.extend(lower(&load_str("b.wit", &wit("b")).unwrap()).unwrap());
-        let catalog = generate_catalog(&lowered);
-        let ids: Vec<&str> = catalog.components.iter().map(|c| c.id.as_str()).collect();
-        assert_ne!(ids[0], ids[1]);
-        for (id, entry) in ids.iter().zip(&catalog.components) {
-            let parsed: witgraph_ir::ComponentRef = id.parse().unwrap();
-            assert_eq!(parsed.content_hash, entry.content_hash, "the id is pinned");
-        }
     }
 
     #[test]
@@ -286,15 +263,15 @@ mod tests {
                 "#
             )
         };
-        let mut contracts = lower(&load_str("a.wit", &wit("0.10.0")).unwrap()).unwrap();
-        contracts.extend(lower(&load_str("b.wit", &wit("0.2.0")).unwrap()).unwrap());
+        let mut contracts = lower(&load_str("a.wit", &wit("0.10.0")).unwrap(), &c()).unwrap();
+        contracts.extend(lower(&load_str("b.wit", &wit("0.2.0")).unwrap(), &c()).unwrap());
         let catalog = generate_catalog(&contracts);
         let ids: Vec<&str> = catalog
             .components
             .iter()
             .map(|c| c.id.split('#').next().unwrap_or_default())
             .collect();
-        assert_eq!(ids, ["demo:test/w@0.2.0", "demo:test/w@0.10.0"]);
+        assert_eq!(ids, ["c/demo:test/w@0.2.0", "c/demo:test/w@0.10.0"]);
     }
 
     #[test]
@@ -313,7 +290,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        let catalog = generate_catalog(&lower(&source).unwrap());
+        let catalog = generate_catalog(&lower(&source, &c()).unwrap());
         let types = &catalog.components[0].types;
         assert_eq!(types.len(), 1);
         assert_eq!(types[0].name, "reading");
@@ -334,7 +311,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        let json = to_json(&generate_catalog(&lower(&bare).unwrap())).unwrap();
+        let json = to_json(&generate_catalog(&lower(&bare, &c()).unwrap())).unwrap();
         assert!(!json.contains("\"types\""), "{json}");
     }
 }

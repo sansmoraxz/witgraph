@@ -1,15 +1,19 @@
 //! The graph IR: nodes, connections, metadata, and the builder.
 //!
-//! A [`Graph`] references the components its nodes instantiate by
-//! [`ComponentRef`] (content hash included) and never embeds their
-//! contracts: contracts are always re-derived from WIT and supplied to
+//! A [`Graph`] names the components its nodes instantiate in a table, each
+//! by a [`ComponentName`] and where its node manifest is, and each node the
+//! world it runs of one of them. It never embeds their contracts: contracts
+//! are always lowered from the components' WIT and supplied to
 //! [`Graph::compile`] through a [`ContractSource`](crate::ContractSource). A
 //! serialized graph therefore carries no type information that could drift
 //! from the components it names.
 
 use std::collections::BTreeMap;
 
-use crate::id::{ComponentRef, ConnectionId, LinkId, NodeId, PortRef, ResourceId};
+use crate::component::ComponentContract;
+use crate::id::{
+    ComponentName, ConnectionId, ContractId, LinkId, NodeId, PortRef, ResourceId, WorldRef,
+};
 
 /// How much of a named resource a node claims while active: positive and finite.
 ///
@@ -156,8 +160,11 @@ pub struct GraphMetadata {
 pub struct Node {
     /// The node's graph-unique id.
     pub id: NodeId,
-    /// The component this node instantiates.
-    pub component: ComponentRef,
+    /// The component this node instantiates, by its name in the graph's
+    /// component table.
+    pub component: ComponentName,
+    /// The world of that component the node runs.
+    pub world: WorldRef,
     /// Display label, if it differs from the id.
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub label: Option<String>,
@@ -177,6 +184,13 @@ pub struct Node {
         serde(default, skip_serializing_if = "BTreeMap::is_empty")
     )]
     pub attrs: BTreeMap<String, String>,
+}
+
+impl Node {
+    /// The contract the node runs: its world, as its component provides it.
+    pub fn contract_id(&self) -> ContractId {
+        ContractId::new(self.component.clone(), self.world.clone())
+    }
 }
 
 /// A directed edge from an output port to an input port.
@@ -232,11 +246,60 @@ pub struct Link {
     /// ([`Capability::interface`](crate::Capability::interface)): an
     /// interface id, an inline interface's import name, or a label.
     pub import: String,
-    /// The component providing it.
-    pub provider: ComponentRef,
+    /// The component providing it, by its name in the graph's component
+    /// table.
+    pub provider: ComponentName,
     /// The provider's export that satisfies the import
     /// (`namespace:name/interface@version`).
     pub export: String,
+}
+
+/// An entry of a graph's component table: a component's name, and where
+/// its node manifest is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComponentEntry {
+    /// The component's name in the table.
+    pub name: ComponentName,
+    /// Where its node manifest is: a path, or an `oci://` reference.
+    pub location: String,
+}
+
+impl ComponentEntry {
+    /// `name`, described by the node manifest at `location`.
+    pub fn new(name: ComponentName, location: impl Into<String>) -> Self {
+        Self {
+            name,
+            location: location.into(),
+        }
+    }
+}
+
+impl From<&ContractId> for ComponentEntry {
+    fn from(id: &ContractId) -> Self {
+        let name = id.component.clone();
+        Self {
+            location: name.to_string(),
+            name,
+        }
+    }
+}
+
+impl From<ContractId> for ComponentEntry {
+    fn from(id: ContractId) -> Self {
+        Self::from(&id)
+    }
+}
+
+impl From<&ComponentContract> for ComponentEntry {
+    fn from(contract: &ComponentContract) -> Self {
+        Self::from(&contract.id)
+    }
+}
+
+impl From<ComponentContract> for ComponentEntry {
+    fn from(contract: ComponentContract) -> Self {
+        Self::from(&contract.id)
+    }
 }
 
 /// The serializable data stage of the typestate chain: a complete but not
@@ -247,11 +310,11 @@ pub struct Link {
 pub struct Graph {
     /// Human-facing information about the graph.
     pub metadata: GraphMetadata,
-    /// The component table: every component the nodes may reference,
-    /// normally pinned by content hash. A node's [`ComponentRef`] resolves
-    /// against this table (an unhashed node reference matches a hashed
-    /// entry); each entry resolves to a contract at compile time.
-    pub components: Vec<ComponentRef>,
+    /// The component table: every component the nodes and links may name,
+    /// by name, with where its node manifest is (a path, or an `oci://`
+    /// reference). The location is not read here: whoever supplies the
+    /// contracts and the components resolves it.
+    pub components: BTreeMap<ComponentName, String>,
     /// The graph's nodes.
     pub nodes: Vec<Node>,
     /// The graph's connections.
@@ -314,18 +377,22 @@ pub struct GraphBuilder {
 }
 
 impl GraphBuilder {
-    /// Adds a component to the graph's component table. Accepts a
-    /// [`ComponentRef`] or a contract (`&contract`), whose id is recorded.
-    pub fn add_component(mut self, component: impl Into<ComponentRef>) -> Self {
-        self.graph.components.push(component.into());
+    /// Adds a component to the graph's component table: a
+    /// [`ComponentEntry`], or a contract (`&contract`), whose component is
+    /// entered under its name, at a location of that name.
+    pub fn add_component(mut self, entry: impl Into<ComponentEntry>) -> Self {
+        let entry = entry.into();
+        self.graph.components.insert(entry.name, entry.location);
         self
     }
 
-    /// Adds a node instantiating the given component.
-    pub fn add_node(mut self, id: impl Into<NodeId>, component: ComponentRef) -> Self {
+    /// Adds a node running the given contract: a world, as a component of
+    /// the table provides it.
+    pub fn add_node(mut self, id: impl Into<NodeId>, contract: ContractId) -> Self {
         self.graph.nodes.push(Node {
             id: id.into(),
-            component,
+            component: contract.component,
+            world: contract.world,
             label: None,
             resources: BTreeMap::new(),
             attrs: BTreeMap::new(),
@@ -399,7 +466,7 @@ impl GraphBuilder {
         id: impl Into<LinkId>,
         node: impl Into<NodeId>,
         import: impl Into<String>,
-        provider: ComponentRef,
+        provider: ComponentName,
         export: impl Into<String>,
     ) -> Self {
         self.graph.links.push(Link {
@@ -423,22 +490,12 @@ impl GraphBuilder {
 mod tests {
     use super::*;
     use crate::Type;
-    use crate::component::ComponentContract;
-    use crate::id::PackageRef;
     use crate::port::PortDef;
 
     #[test]
     fn serde_round_trip_preserves_ids() {
         let component = ComponentContract {
-            id: ComponentRef {
-                package: PackageRef {
-                    namespace: "demo".into(),
-                    name: "graph".into(),
-                    version: Some(semver::Version::new(0, 1, 0)),
-                },
-                world: "echo".into(),
-                content_hash: Some("aa".into()),
-            },
+            id: "echo/demo:graph/echo@0.1.0".parse().unwrap(),
             inputs: vec![PortDef::value("in", Type::STRING)],
             outputs: vec![PortDef::value("out", Type::STRING)],
             capabilities: vec![],
@@ -459,23 +516,23 @@ mod tests {
     }
 
     #[test]
-    fn serialized_graph_holds_only_component_refs() {
-        let id: ComponentRef = "demo:graph/echo@0.1.0".parse().unwrap();
-        let mut pinned = id.clone();
-        pinned.content_hash = Some("aa".into());
+    fn serialized_graph_holds_only_references() {
+        let id: ContractId = "echo/demo:graph/echo@0.1.0".parse().unwrap();
         let graph = Graph::builder("refs")
-            .add_component(pinned)
+            .add_component(ComponentEntry::new(
+                id.component.clone(),
+                "oci://example.com/echo:0.1.0",
+            ))
             .add_node("n", id)
             .build();
         let json = serde_json::to_value(&graph).unwrap();
-        let entry = json["components"][0].as_object().unwrap();
-        let mut keys: Vec<&str> = entry.keys().map(String::as_str).collect();
-        keys.sort_unstable();
         assert_eq!(
-            keys,
-            ["content_hash", "package", "world"],
-            "the table stores refs, never ports or types: {entry:?}"
+            json["components"],
+            serde_json::json!({ "echo": "oci://example.com/echo:0.1.0" }),
+            "the table maps names to node manifests, never ports or types"
         );
+        assert_eq!(json["nodes"][0]["component"], "echo");
+        assert_eq!(json["nodes"][0]["world"], "demo:graph/echo@0.1.0");
     }
 
     #[test]
@@ -503,15 +560,8 @@ mod tests {
 
         let node = Node {
             id: "n".into(),
-            component: ComponentRef {
-                package: PackageRef {
-                    namespace: "x".into(),
-                    name: "y".into(),
-                    version: None,
-                },
-                world: "w".into(),
-                content_hash: None,
-            },
+            component: "c".parse().unwrap(),
+            world: "x:y/w".parse().unwrap(),
             label: None,
             resources: BTreeMap::new(),
             attrs: BTreeMap::new(),
@@ -530,24 +580,24 @@ mod tests {
 
     #[test]
     fn unknown_fields_are_rejected() {
-        let misspelled = r#"{"package":{"namespace":"d","name":"g","version":null},"world":"w","contentHash":"aa"}"#;
-        assert!(
-            serde_json::from_str::<ComponentRef>(misspelled).is_err(),
-            "a misspelled key must not silently drop the pin"
-        );
         let conn = r#"{"id":"c","from":{"node":"a","port":"o"},"to":{"node":"b","port":"i"},"feedbak":true}"#;
         assert!(serde_json::from_str::<Connection>(conn).is_err());
-        let node = r#"{"id":"n","component":{"package":{"namespace":"d","name":"g","version":null},"world":"w"},"resource":{}}"#;
+        let node = r#"{"id":"n","component":"c","world":"d:g/w","resource":{}}"#;
         assert!(serde_json::from_str::<Node>(node).is_err());
     }
 
     #[test]
-    fn component_refs_are_validated_on_deserialize() {
-        let bad = r#"{"package":{"namespace":"Demo X","name":"g","version":null},"world":"w"}"#;
-        assert!(serde_json::from_str::<ComponentRef>(bad).is_err());
-        let good =
-            r#"{"package":{"namespace":"demo","name":"g","version":null},"world":"stage-2"}"#;
-        assert!(serde_json::from_str::<ComponentRef>(good).is_ok());
+    fn references_are_validated_on_deserialize() {
+        let node = |component: &str, world: &str| {
+            serde_json::from_str::<Node>(&format!(
+                r#"{{"id":"n","component":"{component}","world":"{world}"}}"#
+            ))
+        };
+        assert!(node("c", "demo:g/stage-2").is_ok());
+        assert!(node("c", "Demo X:g/w").is_err());
+        assert!(node("C D", "demo:g/w").is_err());
+        let table = r#"{"metadata":{"name":"t"},"components":{"Not A Name":"x"},"nodes":[],"connections":[]}"#;
+        assert!(serde_json::from_str::<Graph>(table).is_err());
     }
 
     #[test]
@@ -563,7 +613,7 @@ mod tests {
     fn capacities_are_read_from_a_graph_and_left_out_when_none_are_declared() {
         let graph = |resources: &str| {
             serde_json::from_str::<Graph>(&format!(
-                r#"{{"metadata":{{"name":"t"}},"components":[],"nodes":[],"connections":[],
+                r#"{{"metadata":{{"name":"t"}},"components":{{}},"nodes":[],"connections":[],
                     "resources":{resources}}}"#
             ))
         };

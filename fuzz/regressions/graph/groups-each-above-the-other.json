@@ -2,78 +2,24 @@
   "metadata": {
     "name": "fuzz"
   },
-  "components": [
-    {
-      "package": {
-        "namespace": "fuzz",
-        "name": "nodes",
-        "version": "0.1.0"
-      },
-      "world": "stream-tee"
-    },
-    {
-      "package": {
-        "namespace": "fuzz",
-        "name": "nodes",
-        "version": "0.1.0"
-      },
-      "world": "future-source"
-    },
-    {
-      "package": {
-        "namespace": "fuzz",
-        "name": "nodes",
-        "version": "0.1.0"
-      },
-      "world": "stream-waits"
-    },
-    {
-      "package": {
-        "namespace": "fuzz",
-        "name": "nodes",
-        "version": "0.1.0"
-      },
-      "world": "stream-pass"
-    },
-    {
-      "package": {
-        "namespace": "fuzz",
-        "name": "nodes",
-        "version": "0.1.0"
-      },
-      "world": "relay"
-    },
-    {
-      "package": {
-        "namespace": "fuzz",
-        "name": "nodes",
-        "version": "0.1.0"
-      },
-      "world": "stream-sink"
-    }
-  ],
+  "components": {
+    "stream-tee": "stream-tee",
+    "future-source": "future-source",
+    "stream-waits": "stream-waits",
+    "stream-pass": "stream-pass",
+    "relay": "relay",
+    "stream-sink": "stream-sink"
+  },
   "nodes": [
     {
       "id": "n0",
-      "component": {
-        "package": {
-          "namespace": "fuzz",
-          "name": "nodes",
-          "version": "0.1.0"
-        },
-        "world": "stream-tee"
-      }
+      "component": "stream-tee",
+      "world": "fuzz:nodes/stream-tee@0.1.0"
     },
     {
       "id": "n1",
-      "component": {
-        "package": {
-          "namespace": "fuzz",
-          "name": "nodes",
-          "version": "0.1.0"
-        },
-        "world": "future-source"
-      },
+      "component": "future-source",
+      "world": "fuzz:nodes/future-source@0.1.0",
       "resources": {
         "gpu": {
           "amount": 1.0
@@ -82,36 +28,18 @@
     },
     {
       "id": "n2",
-      "component": {
-        "package": {
-          "namespace": "fuzz",
-          "name": "nodes",
-          "version": "0.1.0"
-        },
-        "world": "stream-waits"
-      }
+      "component": "stream-waits",
+      "world": "fuzz:nodes/stream-waits@0.1.0"
     },
     {
       "id": "n3",
-      "component": {
-        "package": {
-          "namespace": "fuzz",
-          "name": "nodes",
-          "version": "0.1.0"
-        },
-        "world": "stream-tee"
-      }
+      "component": "stream-tee",
+      "world": "fuzz:nodes/stream-tee@0.1.0"
     },
     {
       "id": "n4",
-      "component": {
-        "package": {
-          "namespace": "fuzz",
-          "name": "nodes",
-          "version": "0.1.0"
-        },
-        "world": "stream-pass"
-      },
+      "component": "stream-pass",
+      "world": "fuzz:nodes/stream-pass@0.1.0",
       "resources": {
         "gpu": {
           "amount": 0.25
@@ -120,14 +48,8 @@
     },
     {
       "id": "n5",
-      "component": {
-        "package": {
-          "namespace": "fuzz",
-          "name": "nodes",
-          "version": "0.1.0"
-        },
-        "world": "future-source"
-      },
+      "component": "future-source",
+      "world": "fuzz:nodes/future-source@0.1.0",
       "resources": {
         "gpu": {
           "amount": 1.0
@@ -136,25 +58,13 @@
     },
     {
       "id": "n6",
-      "component": {
-        "package": {
-          "namespace": "fuzz",
-          "name": "nodes",
-          "version": "0.1.0"
-        },
-        "world": "relay"
-      }
+      "component": "relay",
+      "world": "fuzz:nodes/relay@0.1.0"
     },
     {
       "id": "n7",
-      "component": {
-        "package": {
-          "namespace": "fuzz",
-          "name": "nodes",
-          "version": "0.1.0"
-        },
-        "world": "stream-sink"
-      }
+      "component": "stream-sink",
+      "world": "fuzz:nodes/stream-sink@0.1.0"
     }
   ],
   "connections": [

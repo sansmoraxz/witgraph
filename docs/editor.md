@@ -164,8 +164,7 @@ say, is let go at once.
 
 A node shows one of its outputs in a region below its ports: the frames of a
 video stream as they arrive, say. Which output, and how, is up to the
-component: its `witgraph-viewer` custom section names a viewer for its
-outputs ([Previewing outputs](components.md#previewing-outputs)), and the
+component: its node manifest names a viewer for its outputs ([Previewing outputs](components.md#previewing-outputs)), and the
 node previews the first one it names.
 
 - **Choosing.** _Preview_ in the inspector picks another output, or none. An
@@ -239,7 +238,8 @@ is bounded (120 values, about 8 MiB).
 ## Saving and loading
 
 _Load_ opens a graph from a JSON file, and _JSON_ downloads the current one.
-_Bundle_ downloads the graph together with its component bytes, so it can be
+_Bundle_ downloads the graph together with its components (their manifests,
+WIT and bytes), so it can be
 opened without anything else. Graph and node attributes (`attrs`) are kept in
 the JSON.
 
@@ -269,14 +269,14 @@ The graph runs in a worker `worker` makes, so a node that spins leaves the edito
 in a new one on the inputs it was given, so its nodes' outputs and state are gone, and the
 timeline says so. The worker calls `serveSession` from [the loader](javascript.md#in-a-worker),
 with a `capabilities` callback for anything the graph imports, which is asked each time the
-graph is instantiated. `load` takes the graph as JSON, the component bytes and the
+graph is instantiated. `load` takes the graph as JSON, the components and the
 scheduler's `wasm`. The controller emits
 `state-changed`, `trace-event`, `fault` and `output-changed` events, so you can
 show your own status or react to edits. `output-changed` fires at most once a
 frame while streams carry items.
 
-The catalog describes each component with the description it carries, a
-`witgraph-docs` section of its bytes
+The catalog lists each world a component provides, described by its world's
+doc comment
 ([Describing a component](components.md#describing-a-component)).
 
 ## Styling

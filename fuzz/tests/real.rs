@@ -17,7 +17,7 @@ use test_components::{
     FUTURE_READER, FUTURE_WRITER, Guest, MAYBE, RELAY, STREAM_CONSUMER, STREAM_PRODUCER,
     STREAM_RELAY,
 };
-use witgraph_ir::{ComponentContract, ComponentRef, Graph, PortRef, ResourceClaim};
+use witgraph_ir::{ComponentContract, ContractId, Graph, PortRef, ResourceClaim};
 use witgraph_runtime::{Perf, RunningGraph, RuntimeConfig, RuntimeGraph, TickResult, Val};
 
 struct Rng(u64);
@@ -69,24 +69,24 @@ const GUESTS: [(Kind, Guest); 7] = [
 ];
 
 fn contract(guest: Guest) -> ComponentContract {
-    witgraph_wit::load_components(guest.wit).unwrap().remove(0)
+    guest.contract()
 }
 
 struct Kit {
     contracts: Vec<ComponentContract>,
-    wasm: HashMap<ComponentRef, &'static [u8]>,
-    refs: HashMap<&'static str, ComponentRef>,
+    wasm: test_components::Kit,
+    refs: HashMap<&'static str, ContractId>,
 }
 
 fn kit() -> Kit {
     let mut kit = Kit {
         contracts: vec![],
-        wasm: HashMap::new(),
+        wasm: test_components::Kit::default(),
         refs: HashMap::new(),
     };
     for (kind, guest) in GUESTS {
         let contract = contract(guest);
-        kit.wasm.insert(contract.id.clone(), guest.wasm);
+        kit.wasm.add(guest);
         kit.refs.insert(name_of(kind), contract.id.clone());
         kit.contracts.push(contract);
     }
@@ -464,7 +464,7 @@ async fn case(seed: u64, kit: &Kit, config: RuntimeConfig) {
         Ok(compiled) => compiled,
         Err(failure) => panic!("seed {seed}: does not compile: {failure}\n{json}"),
     };
-    let mut rt = RuntimeGraph::load(compiled, &kit.wasm, config, Perf)
+    let mut rt = RuntimeGraph::load(compiled, &kit.wasm.artifacts(), config, Perf)
         .await
         .unwrap_or_else(|error| panic!("seed {seed}: does not load: {error}\n{json}"));
 

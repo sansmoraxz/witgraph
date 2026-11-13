@@ -13,8 +13,8 @@ export interface ViewerInstance {
 }
 
 /**
- * How a node previews one of its outputs. A component names its viewer in
- * its `witgraph-viewer` custom section (`output.frames=image`); the editor
+ * How a node previews one of its outputs. A component's node manifest names
+ * its viewer (`"viewers": { "<world>": { "frames": "image" } }`); the editor
  * looks the name up among the registered viewers.
  */
 export interface PortViewer {

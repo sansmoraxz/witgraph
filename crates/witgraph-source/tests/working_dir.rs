@@ -5,8 +5,7 @@
 
 use std::path::PathBuf;
 
-use witgraph_ir::ComponentRef;
-use witgraph_source::{ComponentSource, Resolver, SourceError};
+use witgraph_source::{Location, Resolver, SourceError};
 
 #[tokio::test]
 async fn a_symbolic_link_out_of_the_working_directory_is_refused() {
@@ -19,16 +18,15 @@ async fn a_symbolic_link_out_of_the_working_directory_is_refused() {
     std::os::unix::fs::symlink(root.join("secret.wasm"), project.join("evil.wasm")).unwrap();
     std::env::set_current_dir(&project).unwrap();
 
-    let echo: ComponentRef = "test:echo/echo@0.1.0".parse().unwrap();
     // No base: relative paths are the working directory's.
     let resolver = Resolver::new();
-    let evil = ComponentSource::file(echo.clone(), "evil.wasm");
+    let evil = Location::File("evil.wasm".into());
     let err = resolver.fetch(&evil).await.err();
     assert!(
         matches!(err, Some(SourceError::OutsideBase { .. })),
         "{err:?}"
     );
-    let inside = ComponentSource::file(echo, "inside.wasm");
+    let inside = Location::File("inside.wasm".into());
     let inside = resolver
         .fetch(&inside)
         .await

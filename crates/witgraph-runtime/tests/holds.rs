@@ -3,20 +3,20 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, missing_docs)]
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::time::Duration;
 
 use test_components::ECHO;
-use witgraph_ir::{ComponentRef, Graph, NodeId, PortName, PortRef};
+use witgraph_ir::{Graph, NodeId, PortName, PortRef};
 use witgraph_runtime::{
     HoldAt, NodeHolds, OutputReader, Perf, RunningGraph, RuntimeConfig, RuntimeGraph, TickResult,
 };
 
 /// `a` feeding `b`, both `echo`.
 async fn a_feeds_b() -> RuntimeGraph<Perf> {
-    let contract = witgraph_wit::load_components(ECHO.wit).unwrap().remove(0);
-    let id: ComponentRef = contract.id.clone();
+    let contract = ECHO.contract();
+    let id = contract.id.clone();
     let graph = Graph::builder("holds")
         .add_component(&contract)
         .add_node("a", id.clone())
@@ -24,8 +24,8 @@ async fn a_feeds_b() -> RuntimeGraph<Perf> {
         .connect("ab", PortRef::new("a", "out"), PortRef::new("b", "in"))
         .build();
     let compiled = graph.compile(&[contract]).expect("graph compiles");
-    let wasm = HashMap::from([(id, ECHO.wasm)]);
-    RuntimeGraph::load(compiled, &wasm, RuntimeConfig::default(), Perf)
+    let kit = test_components::Kit::new(&[ECHO]);
+    RuntimeGraph::load(compiled, &kit.artifacts(), RuntimeConfig::default(), Perf)
         .await
         .expect("graph loads")
 }

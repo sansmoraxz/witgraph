@@ -20,18 +20,18 @@ mod topo;
 pub mod wave;
 
 pub use compile::{
-    CompilationFailure, CompiledConnection, CompiledGraph, CompiledNode, ContractIndex,
-    ContractSource, LinkKey, RequiredCapability, Resolution, resolve_contract,
+    CompilationFailure, CompiledConnection, CompiledGraph, CompiledNode, ContractSource, LinkKey,
+    RequiredCapability,
 };
 pub use component::{Capability, ComponentContract};
 pub use diagnostics::{Diagnostic, Diagnostics, Location, Severity};
 pub use graph::{
-    Amount, Capacity, Connection, Graph, GraphBuilder, GraphMetadata, Link, Node, ResourceClaim,
-    ResourceDecl, UnknownNodeError,
+    Amount, Capacity, ComponentEntry, Connection, Graph, GraphBuilder, GraphMetadata, Link, Node,
+    ResourceClaim, ResourceDecl, UnknownNodeError,
 };
 pub use id::{
-    ComponentRef, ConnectionId, LinkId, NodeId, PackageRef, ParseComponentRefError, PortName,
-    PortRef, ResourceId,
+    ComponentName, ConnectionId, ContractId, LinkId, NodeId, ParseRefError, PortName, PortRef,
+    ResourceId, WitRef, WorldRef,
 };
 pub use index::{
     FeedbackEntry, FeedbackIdx, Idx, IndexVec, InputIdx, NodeIdx, OutputIdx, PortEntry, PortSet,

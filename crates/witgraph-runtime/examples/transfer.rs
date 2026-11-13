@@ -5,7 +5,6 @@
 //! cargo run --release -p witgraph-runtime --example transfer [MiB...]
 //! ```
 
-use std::collections::HashMap;
 use std::error::Error;
 use std::time::{Duration, Instant};
 use witgraph_runtime::RunningGraph;
@@ -27,18 +26,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
 
     let guests = [BLOB_SOURCE, BLOB_RELAY, BLOB_SINK];
-    let contract = |guest: Guest| -> Result<_, witgraph_wit::Error> {
-        Ok(witgraph_wit::load_components(guest.wit)?.remove(0))
-    };
-    let contracts = guests
-        .map(contract)
-        .into_iter()
-        .collect::<Result<Vec<_>, _>>()?;
-    let wasm: HashMap<_, &[u8]> = guests
+    let kit = test_components::Kit::new(&guests);
+    let contracts: Vec<_> = guests
         .iter()
-        .zip(&contracts)
-        .map(|(g, c)| (c.id.clone(), g.wasm))
+        .map(|g: &Guest| kit.contract(&kit.get(*g)).clone())
         .collect();
+    let wasm = kit.artifacts();
     let [source, relay, sink] = [0, 1, 2].map(|i| contracts[i].id.clone());
     let port = |node: &str| PortRef::new(node, "blob");
     let graph = contracts

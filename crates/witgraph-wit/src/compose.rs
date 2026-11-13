@@ -11,16 +11,15 @@
 //! also checks that an export fits the import it is given, and turns every
 //! import nothing satisfies (the node's unlinked ones, and the providers'
 //! own) into an import of the outer component: the capabilities the host
-//! still has to provide.
+//! still has to provide, as the node's and the providers' WIT declare them.
 
 use std::borrow::Cow;
 
 use wac_graph::types::Package;
 use wac_graph::{CompositionGraph, EncodeOptions, NodeId};
-use witgraph_ir::{Capability, ComponentContract, ComponentRef, LinkKey};
+use witgraph_ir::{Capability, ComponentContract, ComponentName, LinkKey};
 
-use crate::lower::Lowered;
-use crate::lower_component;
+use crate::verify::Imports;
 
 /// Whether two components are the same bytes: the same slice, or equal.
 fn same_bytes(a: &[u8], b: &[u8]) -> bool {
@@ -33,74 +32,40 @@ pub struct LinkedProvider<'a> {
     /// The node's import the link satisfies, as its contract names it.
     pub import: &'a str,
     /// The component providing it.
-    pub provider: &'a ComponentRef,
+    pub provider: &'a ComponentName,
     /// The provider's encoded component.
     pub bytes: &'a [u8],
     /// The provider's export that satisfies the import.
     pub export: &'a str,
+    /// What the provider imports, as its WIT declares it: what composing it
+    /// in asks the host for.
+    pub capabilities: &'a [Capability],
 }
 
-/// Why no bytes could be found for a link's provider.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ProviderError {
-    /// None of the components given fits it.
-    Missing,
-    /// Several do, sorted.
-    Ambiguous(Vec<ComponentRef>),
-}
+/// A provider, as a node's links find it: its bytes, and what it imports.
+pub type Provider<'a> = (&'a [u8], &'a [Capability]);
 
-/// The bytes of the component a link names as its provider, among `components`. A
-/// provider has no contract for a content hash to name, so a pinned ref takes only
-/// the component with that very ref. An unpinned one takes the component with its
-/// own ref, else the one pinned component of its world.
-pub fn find_provider<'a, 'i>(
-    components: impl IntoIterator<Item = (&'i ComponentRef, &'a [u8])>,
-    provider: &ComponentRef,
-) -> Result<&'a [u8], ProviderError> {
-    let mut fits = Vec::new();
-    for (id, bytes) in components {
-        if id == provider {
-            return Ok(bytes);
-        }
-        if id.matches(provider) {
-            fits.push((id, bytes));
-        }
-    }
-    if provider.content_hash.is_some() {
-        return Err(ProviderError::Missing);
-    }
-    match fits.as_slice() {
-        [] => Err(ProviderError::Missing),
-        [(_, bytes)] => Ok(bytes),
-        several => {
-            let mut candidates: Vec<ComponentRef> =
-                several.iter().map(|(id, _)| (*id).clone()).collect();
-            candidates.sort();
-            Err(ProviderError::Ambiguous(candidates))
-        }
-    }
-}
-
-/// A node's links with their providers' bytes, which `bytes` finds. A link whose
-/// import the node's bytes never use is left with none, so its provider need not
-/// be there.
+/// A node's links with their providers, which `find` finds. A link whose
+/// import the node's bytes (which import `imports`) never use is left with
+/// none, so its provider need not be there.
 pub fn linked_providers<'a, E>(
-    lowered: &Lowered,
+    imports: &Imports,
     links: &'a [LinkKey],
-    mut bytes: impl FnMut(&ComponentRef) -> Result<&'a [u8], E>,
+    mut find: impl FnMut(&ComponentName) -> Result<Provider<'a>, E>,
 ) -> Result<Vec<LinkedProvider<'a>>, E> {
     links
         .iter()
         .map(|(import, provider, export)| {
-            let found = match imported_as(lowered, import) {
-                Some(_) => bytes(provider)?,
-                None => &[][..],
+            let (bytes, capabilities) = match imports.imported_as(import) {
+                Some(_) => find(provider)?,
+                None => (&[][..], &[][..]),
             };
             Ok(LinkedProvider {
                 import,
                 provider,
-                bytes: found,
+                bytes,
                 export,
+                capabilities,
             })
         })
         .collect()
@@ -135,7 +100,7 @@ struct Composed {
 /// semver-compatible version wit-component merged it to). `node_export` is
 /// the name the node exports its `node` interface under; the composed
 /// component exports it under the same name. Links naming the same
-/// provider (refs that [match](ComponentRef::matches)) with the same bytes
+/// provider with the same bytes
 /// share one instance of it; any other link gets an instance of its own,
 /// so a link never runs on bytes resolved for another.
 fn compose(
@@ -158,14 +123,14 @@ fn compose(
     };
     let consumer = instantiate(&mut graph, "witgraph:node", node).map_err(whole)?;
 
-    let mut providers: Vec<(&ComponentRef, &[u8], NodeId)> = Vec::new();
+    let mut providers: Vec<(&ComponentName, &[u8], NodeId)> = Vec::new();
     for (link, argument) in links {
         let at = |message: String| (link.import.to_string(), message);
-        // Bytes are compared only for matching refs, and only when they
-        // are not the same slice: a byte-by-byte comparison is the rare
-        // case of one provider loaded twice.
-        let same = |(id, bytes, _): &&(&ComponentRef, &[u8], NodeId)| {
-            id.matches(link.provider) && same_bytes(bytes, link.bytes)
+        // Bytes are compared only for one name, and only when they are
+        // not the same slice: a byte-by-byte comparison is the rare case of
+        // one provider loaded twice.
+        let same = |(name, bytes, _): &&(&ComponentName, &[u8], NodeId)| {
+            *name == link.provider && same_bytes(bytes, link.bytes)
         };
         let provider = match providers.iter().find(same) {
             Some((_, _, instance)) => *instance,
@@ -237,55 +202,8 @@ pub struct LinkedNode<'a> {
     pub components: usize,
 }
 
-/// The name component bytes (as `lowered` from them) import a contract's
-/// `import` under: itself, or the newer semver-compatible version
-/// wit-component merged it into. `None` when the bytes never import it.
-pub fn imported_as<'l>(lowered: &'l Lowered, import: &str) -> Option<&'l str> {
-    witgraph_ir::interface::resolve_import(&lowered.contract.capabilities, import)
-        .filter(|c| c.is_interface())
-        .map(|c| c.interface.as_str())
-}
-
-/// What the host is asked for and links: each capability in `imported`,
-/// named as `contract` declares it when the node's own bytes (`lowered`)
-/// import it under a newer semver-compatible version (wit-component
-/// merges a dependency's newer pin into one import). Verification proved
-/// every item the bytes use is in the declared version, so whatever serves
-/// it serves them, and the linker resolves the newer import to it. What
-/// only a composed provider imports is asked for as the provider imports
-/// it.
-fn as_declared(
-    contract: &ComponentContract,
-    lowered: &Lowered,
-    imported: &[Capability],
-) -> Vec<Capability> {
-    let own = |name: &str| {
-        lowered
-            .contract
-            .capabilities
-            .iter()
-            .any(|c| c.interface == name)
-    };
-    imported
-        .iter()
-        .map(|capability| {
-            own(&capability.interface)
-                .then(|| {
-                    witgraph_ir::interface::resolve_import(
-                        &contract.capabilities,
-                        &capability.interface,
-                    )
-                })
-                .flatten()
-                .filter(|declared| declared.is_interface() == capability.is_interface())
-                .unwrap_or(capability)
-                .clone()
-        })
-        .collect()
-}
-
-/// Composes `links` into `bytes`, which implement `contract` as `lowered`
-/// (from [`lower_component`]) says.
+/// Composes `links` into `bytes`, which implement `contract`, export its
+/// `node` interface as `export`, and import `imports`.
 ///
 /// A link whose import the bytes do not have (their code never uses it)
 /// has nothing to satisfy and is left out; one the bytes import at a newer
@@ -294,7 +212,8 @@ fn as_declared(
 pub fn link_node<'a>(
     contract: &ComponentContract,
     bytes: &'a [u8],
-    lowered: &Lowered,
+    export: &str,
+    imports: &Imports,
     links: &[LinkedProvider<'_>],
 ) -> Result<LinkedNode<'a>, LinkError> {
     let bad_link = |import: &str, message: String| LinkError {
@@ -304,7 +223,7 @@ pub fn link_node<'a>(
     // Each link with the name the bytes import it under.
     let mut used: Vec<(&LinkedProvider<'_>, &str)> = Vec::with_capacity(links.len());
     for link in links {
-        let Some(argument) = imported_as(lowered, link.import) else {
+        let Some(argument) = imports.imported_as(link.import) else {
             continue;
         };
         // Two contract imports wit-component merged into one take one
@@ -324,94 +243,28 @@ pub fn link_node<'a>(
     if used.is_empty() {
         return Ok(LinkedNode {
             bytes: Cow::Borrowed(bytes),
-            export: lowered.export.clone(),
-            capabilities: as_declared(contract, lowered, &lowered.contract.capabilities),
+            export: export.to_string(),
+            capabilities: imports.used(&contract.capabilities),
             components: 1,
         });
     }
-    let export = lowered.export.clone();
     let composed =
-        compose(bytes, &export, &used).map_err(|(import, message)| bad_link(&import, message))?;
-    // The composed component's own view of its world: its ports are the
-    // node's, its imports what is left for the host. The node's own bytes
-    // lowered, so what fails now came with the providers (what they import).
+        compose(bytes, export, &used).map_err(|(import, message)| bad_link(&import, message))?;
+    // What the composed component imports: the node's unlinked imports, as
+    // its contract declares them, and its providers', as theirs do.
     let with_providers = |message: String| {
         let import = used.first().map_or("", |(link, _)| link.import);
         bad_link(import, format!("with its providers composed in: {message}"))
     };
-    let composed_view = lower_component(&composed.bytes, &contract.id)
-        .map_err(|e| with_providers(e.to_string()))?;
+    let left = Imports::of(&composed.bytes).map_err(|e| with_providers(e.to_string()))?;
+    let mut declared = contract.capabilities.clone();
+    for (link, _) in &used {
+        Capability::add_unique(&mut declared, link.capabilities);
+    }
     Ok(LinkedNode {
         bytes: Cow::Owned(composed.bytes),
-        export,
-        capabilities: as_declared(contract, lowered, &composed_view.contract.capabilities),
+        export: export.to_string(),
+        capabilities: left.used(&declared),
         components: 1 + composed.providers,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn id(text: &str) -> ComponentRef {
-        text.parse().unwrap()
-    }
-
-    fn pinned(text: &str, hash: &str) -> ComponentRef {
-        ComponentRef {
-            content_hash: Some(hash.into()),
-            ..id(text)
-        }
-    }
-
-    #[test]
-    fn a_provider_is_found_by_its_own_ref_first() {
-        let (plain, hashed) = (id("a:b/c@1.0.0"), pinned("a:b/c@1.0.0", "aa"));
-        let components = [(&hashed, &b"pinned"[..]), (&plain, &b"plain"[..])];
-        assert_eq!(find_provider(components, &plain), Ok(&b"plain"[..]));
-        assert_eq!(find_provider(components, &hashed), Ok(&b"pinned"[..]));
-    }
-
-    #[test]
-    fn an_unpinned_provider_takes_the_one_pinned_component_of_its_world() {
-        let (wanted, hashed) = (id("a:b/c@1.0.0"), pinned("a:b/c@1.0.0", "aa"));
-        assert_eq!(
-            find_provider([(&hashed, &b"pinned"[..])], &wanted),
-            Ok(&b"pinned"[..])
-        );
-    }
-
-    #[test]
-    fn a_pinned_provider_takes_nothing_else() {
-        let wanted = pinned("a:b/c@1.0.0", "bb");
-        let (plain, other) = (id("a:b/c@1.0.0"), pinned("a:b/c@1.0.0", "aa"));
-        let components = [(&plain, &b"plain"[..]), (&other, &b"other"[..])];
-        assert_eq!(
-            find_provider(components, &wanted),
-            Err(ProviderError::Missing)
-        );
-    }
-
-    #[test]
-    fn another_version_is_no_provider() {
-        let (wanted, other) = (id("a:b/c@1.0.0"), id("a:b/c@1.0.1"));
-        assert_eq!(
-            find_provider([(&other, &b"x"[..])], &wanted),
-            Err(ProviderError::Missing)
-        );
-    }
-
-    #[test]
-    fn several_pinned_components_are_ambiguous() {
-        let wanted = id("a:b/c@1.0.0");
-        let (first, second) = (pinned("a:b/c@1.0.0", "aa"), pinned("a:b/c@1.0.0", "bb"));
-        let components = [(&second, &b"2"[..]), (&first, &b"1"[..])];
-        assert_eq!(
-            find_provider(components, &wanted),
-            Err(ProviderError::Ambiguous(vec![
-                first.clone(),
-                second.clone()
-            ]))
-        );
-    }
 }

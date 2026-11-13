@@ -6,8 +6,7 @@ use std::sync::{Arc, Mutex};
 use futures::FutureExt;
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
 use witgraph_ir::{
-    ComponentContract, ComponentRef, FeedbackIdx, Graph, InputIdx, NodeId, NodeIdx, PortDef,
-    PortRef, Type,
+    ComponentContract, FeedbackIdx, Graph, InputIdx, NodeId, NodeIdx, PortDef, PortRef, Type,
 };
 
 use crate::control::SchedulerCore;
@@ -20,10 +19,7 @@ use crate::{NodePhase, Perf, TickResult};
 /// `in: option<u32>`, `add: option<u32>` → `out: u32`.
 fn adder() -> ComponentContract {
     ComponentContract {
-        id: ComponentRef {
-            content_hash: Some("aa".into()),
-            ..("test:nodes/adder@0.1.0".parse().unwrap())
-        },
+        id: "adder/test:nodes/adder@0.1.0".parse().unwrap(),
         inputs: vec![
             PortDef::value("in", Type::U32).optional(),
             PortDef::value("add", Type::U32).optional(),
@@ -107,10 +103,7 @@ fn stream_group_with(
     capacity: Option<f64>,
 ) -> (SchedulerCore<Scripted>, Scripted) {
     let contract = |world: &str, inputs, outputs| ComponentContract {
-        id: ComponentRef {
-            content_hash: Some("cc".into()),
-            ..(format!("test:nodes/{world}@0.1.0").parse().unwrap())
-        },
+        id: format!("{world}/test:nodes/{world}@0.1.0").parse().unwrap(),
         inputs,
         outputs,
         capabilities: vec![],
@@ -424,10 +417,7 @@ fn nothing_starts_until_every_command_is_answered() {
 /// plane: past its first run, with the latch of its feedback asked.
 fn with_a_latch_asked() -> (SchedulerCore<Scripted>, Scripted, InputIdx, FeedbackIdx) {
     let looped = ComponentContract {
-        id: ComponentRef {
-            content_hash: Some("cc".into()),
-            ..("test:nodes/looped@0.1.0".parse().unwrap())
-        },
+        id: "looped/test:nodes/looped@0.1.0".parse().unwrap(),
         inputs: vec![PortDef::value("in", Type::U32)],
         outputs: vec![PortDef::value("out", Type::U32)],
         capabilities: vec![],

@@ -37,15 +37,17 @@ const guests = await guestDir();
 const wasm = await readFile(
   new URL('../../witgraph-loader/pkg/witgraph_web_bg.wasm', import.meta.url),
 );
-const ref = (name: string) => ({
-  package: { namespace: 'test', name, version: '0.1.0' },
-  world: name,
-});
+const ref = (name: string) => ({ component: name, world: `test:${name}/${name}@0.1.0` });
 const components: ComponentSource[] = await Promise.all(
-  ['blob-source', 'blob-relay', 'blob-sink'].map(async (name) => ({
-    id: `test:${name}/${name}@0.1.0`,
-    bytes: new Uint8Array(await readFile(new URL(`${name}.wasm`, guests))),
-  })),
+  ['blob-source', 'blob-relay', 'blob-sink'].map(async (name) => {
+    const read = async (file: string) => new Uint8Array(await readFile(new URL(file, guests)));
+    return {
+      name,
+      manifest: JSON.parse(await readFile(new URL(`${name}.node.json`, guests), 'utf8')),
+      wit: await read(`${name}.wit.wasm`),
+      bytes: await read(`${name}.wasm`),
+    };
+  }),
 );
 
 const sizes = process.argv.slice(2).map(Number);
@@ -55,8 +57,10 @@ for (const nodes of sizes.length > 0 ? sizes : [4, 16, 32]) {
     ref(i === 0 ? 'blob-source' : i === nodes - 1 ? 'blob-sink' : 'blob-relay');
   const graph = {
     metadata: { name: `chain-${nodes}` },
-    components: ['blob-source', 'blob-relay', 'blob-sink'].map(ref),
-    nodes: Array.from({ length: nodes }, (_, i) => ({ id: `n${i}`, component: kind(i) })),
+    components: Object.fromEntries(
+      ['blob-source', 'blob-relay', 'blob-sink'].map((name) => [name, name]),
+    ),
+    nodes: Array.from({ length: nodes }, (_, i) => ({ id: `n${i}`, ...kind(i) })),
     connections: Array.from({ length: nodes - 1 }, (_, i) => ({
       id: `c${i}`,
       from: { node: `n${i}`, port: 'blob' },

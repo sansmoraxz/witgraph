@@ -21,8 +21,9 @@ use sha2::{Digest, Sha256};
 use wasmtime::Engine;
 use wasmtime::component::Component;
 #[cfg(feature = "compile")]
-use witgraph_ir::ComponentRef;
+use witgraph_ir::ComponentName;
 use witgraph_ir::{Capability, CompiledGraph, NodeId};
+use witgraph_wit::Artifact;
 
 use super::{Parts, PreparedGraph, fingerprint, validate_engine};
 use crate::error::LoadError;
@@ -128,7 +129,7 @@ impl PreparedGraph {
 #[cfg(feature = "compile")]
 impl PreparedGraph {
     /// Loads the graph saved at `path` if it is still good, and otherwise
-    /// prepares it from `wasm` and saves the result there.
+    /// prepares it from `components` and saves the result there.
     ///
     /// A file is still good if [`deserialize`](Self::deserialize) accepts it and
     /// it was prepared from these very bytes, which a changed component with the
@@ -149,11 +150,11 @@ impl PreparedGraph {
     pub unsafe fn load_or_compile(
         engine: &Engine,
         compiled: &CompiledGraph,
-        wasm: &HashMap<ComponentRef, &[u8]>,
+        components: &HashMap<ComponentName, Artifact<'_>>,
         path: impl AsRef<Path>,
     ) -> Result<Self, LoadError> {
         let path = path.as_ref();
-        let source = source_hash(wasm);
+        let source = source_hash(components);
         if let Ok(saved) = fs::read(path) {
             // SAFETY: passed on to the caller.
             match unsafe { Self::deserialize(engine, compiled, &saved) } {
@@ -165,7 +166,7 @@ impl PreparedGraph {
                 Ok(_) | Err(_) => {}
             }
         }
-        let prepared = Self::new(engine, compiled, wasm)?;
+        let prepared = Self::new(engine, compiled, components)?;
         save(path, &prepared.serialize()?).map_err(|e| LoadError::GraphMismatch {
             message: format!("failed to save it to `{}`: {e}", path.display()),
         })?;
@@ -173,18 +174,19 @@ impl PreparedGraph {
     }
 }
 
-/// A hash of what a graph is prepared from: every component's key and bytes, in
-/// any order.
+/// A hash of what a graph is prepared from: every component's name and bytes, in
+/// any order. Its WIT is what the graph's contracts are, which the graph's
+/// fingerprint holds.
 #[cfg(feature = "compile")]
-pub(super) fn source_hash(wasm: &HashMap<ComponentRef, &[u8]>) -> String {
+pub(super) fn source_hash(components: &HashMap<ComponentName, Artifact<'_>>) -> String {
     let mut hash = Sha256::new();
     let mut field = |field: &[u8]| {
         hash.update((field.len() as u64).to_le_bytes());
         hash.update(field);
     };
-    let mut keys: Vec<(String, &[u8])> = wasm
+    let mut keys: Vec<(String, &[u8])> = components
         .iter()
-        .map(|(key, bytes)| (key.to_string(), *bytes))
+        .map(|(key, artifact)| (key.to_string(), artifact.bytes))
         .collect();
     keys.sort();
     for (key, bytes) in keys {

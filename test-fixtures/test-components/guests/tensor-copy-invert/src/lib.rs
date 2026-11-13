@@ -3,18 +3,6 @@ wit_bindgen::generate!({ path: "wit", world: "tensor-copy-invert", generate_all 
 use exports::node::{Guest, Inputs, Outputs};
 use test::data::tensor::Tensor;
 
-/// Declares how an editor previews this node's outputs (the
-/// `witgraph-viewer` custom section).
-macro_rules! viewer {
-    ($hints:literal) => {
-        #[used]
-        #[unsafe(link_section = "witgraph-viewer")]
-        static VIEWER: [u8; $hints.len()] = *$hints;
-    };
-}
-
-viewer!(b"output.tensor=tensor\n");
-
 struct CopyInvert;
 
 impl Guest for CopyInvert {

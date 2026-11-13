@@ -6,6 +6,7 @@ use wit_parser::{PackageId, PackageName, ParseError, Resolve, SourceMap, Unresol
 
 /// A resolved WIT source: the shared type arena plus the root packages that
 /// were pushed (dependencies are reachable through `resolve`).
+#[derive(Debug, Clone)]
 pub struct WitSource {
     /// The shared type arena for everything that was loaded.
     pub resolve: Resolve,
@@ -177,25 +178,33 @@ pub fn load_str(name: &str, wit: &str) -> Result<WitSource, LoadError> {
     Ok(WitSource { resolve, packages })
 }
 
-/// Load the WIT embedded in an encoded component: the world it was built
-/// from, with the packages it depends on. The component's own package is
-/// the root.
+/// Load a wasm-encoded WIT package (as `wasm-tools component wit --wasm`
+/// and `wkg` write one): the package, with the packages it depends on. The
+/// package is the root.
 ///
-/// What it loads is the component's view of its world, which can be
-/// narrower than the WIT source: a component imports only the functions
-/// and resources its code uses.
-pub fn load_component(bytes: &[u8]) -> Result<WitSource, LoadError> {
+/// Component bytes are refused: a component's WIT is never read from it.
+pub fn load_encoded(bytes: &[u8]) -> Result<WitSource, LoadError> {
     let failed = |message: String| LoadError::Resolve { message };
-    let decoded = wit_parser::decoding::decode(bytes).map_err(|e| failed(format!("{e:#}")))?;
-    let package = decoded.package();
-    let wit_parser::decoding::DecodedWasm::Component(resolve, _) = decoded else {
-        return Err(failed(
-            "the bytes are a WIT package, not a component".to_string(),
-        ));
-    };
-    Ok(WitSource {
-        resolve,
-        packages: vec![package],
+    match wit_parser::decoding::decode(bytes).map_err(|e| failed(format!("{e:#}")))? {
+        wit_parser::decoding::DecodedWasm::WitPackage(resolve, package) => Ok(WitSource {
+            resolve,
+            packages: vec![package],
+        }),
+        wit_parser::decoding::DecodedWasm::Component(..) => Err(failed(
+            "the bytes are a component, not a WIT package".to_string(),
+        )),
+    }
+}
+
+/// `source`'s main package, wasm-encoded with the packages it depends on:
+/// what [`load_encoded`] reads back. How a WIT source travels (to a
+/// browser, say) as one blob.
+pub fn encode(source: &WitSource) -> Result<Vec<u8>, LoadError> {
+    let package = *source.packages.first().ok_or_else(|| LoadError::Resolve {
+        message: "the source has no package".to_string(),
+    })?;
+    wit_component::encode(&source.resolve, package, false).map_err(|e| LoadError::Resolve {
+        message: format!("{e:#}"),
     })
 }
 
@@ -353,12 +362,12 @@ mod tests {
         .unwrap();
         let source = load_path(&*dir).expect("loads");
         assert_eq!(names(&source), ["demo:app@0.1.0"]);
-        let ids: Vec<String> = crate::load_components(&*dir)
+        let ids: Vec<String> = crate::load_components(&*dir, &"app".parse().unwrap())
             .expect("lowers")
             .iter()
             .map(|c| c.id.to_string())
             .collect();
-        assert_eq!(ids, ["demo:app/app@0.1.0"]);
+        assert_eq!(ids, ["app/demo:app/app@0.1.0"]);
     }
 
     #[test]

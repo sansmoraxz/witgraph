@@ -29,8 +29,8 @@ fn graph(contract: &ComponentContract) -> Result<CompiledGraph, Box<dyn Error>> 
 fn save(contract: &ComponentContract, path: &str) -> Result<(), Box<dyn Error>> {
     let engine = RuntimeConfig::default().new_engine()?;
     let start = Instant::now();
-    let wasm = [(contract.id.clone(), ECHO.wasm)].into_iter().collect();
-    let prepared = PreparedGraph::new(&engine, &graph(contract)?, &wasm)?;
+    let kit = test_components::Kit::new(&[ECHO]);
+    let prepared = PreparedGraph::new(&engine, &graph(contract)?, &kit.artifacts())?;
     println!("compiled in {:?}", start.elapsed());
     std::fs::write(path, prepared.serialize()?)?;
     Ok(())
@@ -72,7 +72,7 @@ async fn run(contract: &ComponentContract, path: &str) -> Result<(), Box<dyn Err
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let contract = witgraph_wit::load_components(ECHO.wit)?.remove(0);
+    let contract = ECHO.contract();
     match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
         ["save", path] => save(&contract, path),
         ["run", path] => run(&contract, path).await,

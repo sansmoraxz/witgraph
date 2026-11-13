@@ -4,16 +4,13 @@
 #![cfg(feature = "debug")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, missing_docs)]
 
-use std::collections::HashMap;
 use std::future::Future;
 use std::time::Duration;
 
 use test_components::{
     Guest, LINE_STREAM, LINE_STREAM_SINK, LINE_WALK, RELAY, STREAM_DRAIN, STREAM_PRODUCER,
 };
-use witgraph_ir::{
-    ComponentContract, ComponentRef, Graph, GraphBuilder, NodeId, PortName, PortRef,
-};
+use witgraph_ir::{ComponentContract, ContractId, Graph, GraphBuilder, NodeId, PortName, PortRef};
 use witgraph_runtime::{
     BreakpointScope, LineDebugger, LineStop, OwnLines, Perf, RunningGraph, RuntimeConfig,
     RuntimeGraph, RuntimeLines, StopReason, TickResult,
@@ -48,25 +45,24 @@ fn mark_in(source: &str, name: &str) -> u32 {
 
 struct Kit {
     contracts: Vec<ComponentContract>,
-    wasm: HashMap<ComponentRef, &'static [u8]>,
+    wasm: test_components::Kit,
 }
 
 impl Kit {
     fn new(guests: &[Guest]) -> Self {
         let mut kit = Kit {
             contracts: Vec::new(),
-            wasm: HashMap::new(),
+            wasm: test_components::Kit::default(),
         };
         for guest in guests {
-            let mut contracts = witgraph_wit::load_components(guest.wit).unwrap();
-            let contract = contracts.remove(0);
-            kit.wasm.insert(contract.id.clone(), guest.wasm);
+            let contract = guest.contract();
+            kit.wasm.add(*guest);
             kit.contracts.push(contract);
         }
         kit
     }
 
-    fn id(&self, at: usize) -> ComponentRef {
+    fn id(&self, at: usize) -> ContractId {
         self.contracts[at].id.clone()
     }
 
@@ -84,7 +80,7 @@ impl Kit {
             ..RuntimeConfig::default()
         };
         let compiled = graph.compile(&self.contracts).expect("graph compiles");
-        let rt = RuntimeGraph::load(compiled, &self.wasm, config, Perf)
+        let rt = RuntimeGraph::load(compiled, &self.wasm.artifacts(), config, Perf)
             .await
             .expect("graph loads");
         let lines = rt.lines().expect("loaded to debug");
@@ -717,7 +713,7 @@ async fn a_host_says_which_lines_are_its_own() {
         };
         let graph = kit.builder().add_node("a", kit.id(0)).build();
         let compiled = graph.compile(&kit.contracts).unwrap();
-        let rt = RuntimeGraph::load(compiled, &kit.wasm, config, Perf)
+        let rt = RuntimeGraph::load(compiled, &kit.wasm.artifacts(), config, Perf)
             .await
             .unwrap();
         rt.lines().unwrap().files()
@@ -766,7 +762,7 @@ async fn an_engine_not_made_to_debug_is_refused_and_a_graph_may_share_one_that_i
         ..RuntimeConfig::default()
     };
     let compiled = graph().compile(&kit.contracts).unwrap();
-    let refused = RuntimeGraph::load(compiled, &kit.wasm, config, Perf).await;
+    let refused = RuntimeGraph::load(compiled, &kit.wasm.artifacts(), config, Perf).await;
     let error = refused
         .err()
         .expect("it cannot stop on anything")
@@ -783,7 +779,7 @@ async fn an_engine_not_made_to_debug_is_refused_and_a_graph_may_share_one_that_i
         ..RuntimeConfig::default()
     };
     let compiled = graph().compile(&kit.contracts).unwrap();
-    let mut rt = RuntimeGraph::load(compiled, &kit.wasm, config, Perf)
+    let mut rt = RuntimeGraph::load(compiled, &kit.wasm.artifacts(), config, Perf)
         .await
         .unwrap();
     assert!(rt.lines().is_none());

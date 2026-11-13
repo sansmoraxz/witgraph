@@ -2,59 +2,18 @@
   "metadata": {
     "name": "fuzz"
   },
-  "components": [
-    {
-      "package": {
-        "namespace": "fuzz",
-        "name": "nodes",
-        "version": "0.1.0"
-      },
-      "world": "stream-source"
-    },
-    {
-      "package": {
-        "namespace": "fuzz",
-        "name": "nodes",
-        "version": "0.1.0"
-      },
-      "world": "future-source"
-    },
-    {
-      "package": {
-        "namespace": "fuzz",
-        "name": "nodes",
-        "version": "0.1.0"
-      },
-      "world": "future-sink"
-    },
-    {
-      "package": {
-        "namespace": "fuzz",
-        "name": "nodes",
-        "version": "0.1.0"
-      },
-      "world": "stream-sink"
-    },
-    {
-      "package": {
-        "namespace": "fuzz",
-        "name": "nodes",
-        "version": "0.1.0"
-      },
-      "world": "source"
-    }
-  ],
+  "components": {
+    "stream-source": "stream-source",
+    "future-source": "future-source",
+    "future-sink": "future-sink",
+    "stream-sink": "stream-sink",
+    "source": "source"
+  },
   "nodes": [
     {
       "id": "n0",
-      "component": {
-        "package": {
-          "namespace": "fuzz",
-          "name": "nodes",
-          "version": "0.1.0"
-        },
-        "world": "stream-source"
-      },
+      "component": "stream-source",
+      "world": "fuzz:nodes/stream-source@0.1.0",
       "resources": {
         "gpu": {
           "amount": 0.1
@@ -63,14 +22,8 @@
     },
     {
       "id": "n1",
-      "component": {
-        "package": {
-          "namespace": "fuzz",
-          "name": "nodes",
-          "version": "0.1.0"
-        },
-        "world": "stream-source"
-      },
+      "component": "stream-source",
+      "world": "fuzz:nodes/stream-source@0.1.0",
       "resources": {
         "gpu": {
           "amount": 0.25
@@ -79,36 +32,18 @@
     },
     {
       "id": "n2",
-      "component": {
-        "package": {
-          "namespace": "fuzz",
-          "name": "nodes",
-          "version": "0.1.0"
-        },
-        "world": "future-source"
-      }
+      "component": "future-source",
+      "world": "fuzz:nodes/future-source@0.1.0"
     },
     {
       "id": "n3",
-      "component": {
-        "package": {
-          "namespace": "fuzz",
-          "name": "nodes",
-          "version": "0.1.0"
-        },
-        "world": "stream-source"
-      }
+      "component": "stream-source",
+      "world": "fuzz:nodes/stream-source@0.1.0"
     },
     {
       "id": "n4",
-      "component": {
-        "package": {
-          "namespace": "fuzz",
-          "name": "nodes",
-          "version": "0.1.0"
-        },
-        "world": "future-sink"
-      },
+      "component": "future-sink",
+      "world": "fuzz:nodes/future-sink@0.1.0",
       "resources": {
         "gpu": {
           "amount": 0.1
@@ -117,14 +52,8 @@
     },
     {
       "id": "n5",
-      "component": {
-        "package": {
-          "namespace": "fuzz",
-          "name": "nodes",
-          "version": "0.1.0"
-        },
-        "world": "stream-sink"
-      },
+      "component": "stream-sink",
+      "world": "fuzz:nodes/stream-sink@0.1.0",
       "resources": {
         "gpu": {
           "amount": 0.3
@@ -133,14 +62,8 @@
     },
     {
       "id": "n6",
-      "component": {
-        "package": {
-          "namespace": "fuzz",
-          "name": "nodes",
-          "version": "0.1.0"
-        },
-        "world": "stream-sink"
-      },
+      "component": "stream-sink",
+      "world": "fuzz:nodes/stream-sink@0.1.0",
       "resources": {
         "gpu": {
           "amount": 0.3
@@ -149,14 +72,8 @@
     },
     {
       "id": "n7",
-      "component": {
-        "package": {
-          "namespace": "fuzz",
-          "name": "nodes",
-          "version": "0.1.0"
-        },
-        "world": "stream-sink"
-      },
+      "component": "stream-sink",
+      "world": "fuzz:nodes/stream-sink@0.1.0",
       "resources": {
         "disk": {
           "amount": 0.3
@@ -165,14 +82,8 @@
     },
     {
       "id": "n8",
-      "component": {
-        "package": {
-          "namespace": "fuzz",
-          "name": "nodes",
-          "version": "0.1.0"
-        },
-        "world": "source"
-      },
+      "component": "source",
+      "world": "fuzz:nodes/source@0.1.0",
       "resources": {
         "disk": {
           "amount": 0.3

@@ -54,8 +54,9 @@ interface Scenario {
   steps: Step[];
 }
 
-function componentRef(guest: string) {
-  return { package: { namespace: 'test', name: guest, version: '0.1.0' }, world: guest };
+/** The world of guest `guest`. */
+function worldOf(guest: string) {
+  return `test:${guest}/${guest}@0.1.0`;
 }
 
 function port(text: string) {
@@ -66,17 +67,23 @@ function port(text: string) {
 async function load(scenario: Scenario): Promise<Session> {
   const used = [...new Set(scenario.nodes.map((node) => node.guest))];
   const components: ComponentSource[] = await Promise.all(
-    used.map(async (guest) => ({
-      id: `test:${guest}/${guest}@0.1.0`,
-      bytes: new Uint8Array(await readFile(new URL(`${guest}.wasm`, guests))),
-    })),
+    used.map(async (guest) => {
+      const read = async (name: string) => new Uint8Array(await readFile(new URL(name, guests)));
+      return {
+        name: guest,
+        manifest: JSON.parse(await readFile(new URL(`${guest}.node.json`, guests), 'utf8')),
+        wit: await read(`${guest}.wit.wasm`),
+        bytes: await read(`${guest}.wasm`),
+      };
+    }),
   );
   const graph = {
     metadata: { name: 'scenario' },
-    components: used.map(componentRef),
+    components: Object.fromEntries(used.map((guest) => [guest, guest])),
     nodes: scenario.nodes.map(({ id, guest, resources }) => ({
       id,
-      component: componentRef(guest),
+      component: guest,
+      world: worldOf(guest),
       ...(resources
         ? {
             resources: Object.fromEntries(

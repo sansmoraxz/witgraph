@@ -82,7 +82,7 @@ use futures::channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use futures::future::Either;
 use futures::stream::StreamExt;
 use witgraph_ir::{
-    CompiledGraph, ComponentRef, Connection, ConnectionId, FeedbackIdx, Idx, IndexVec, InputIdx,
+    CompiledGraph, Connection, ConnectionId, ContractId, FeedbackIdx, Idx, IndexVec, InputIdx,
     Link, NodeId, NodeIdx, OutputIdx, PortKind, PortName, PortSet, PortTable, ResourceId,
 };
 use witgraph_traits::{
@@ -202,7 +202,7 @@ pub struct SchedulerCore<P: ?Sized> {
     /// The graph's connections, sorted by id: how snapshots name the wiring.
     connections: Vec<Connection>,
     /// Each node's resolved component: how snapshots name the nodes.
-    components: BTreeMap<NodeId, ComponentRef>,
+    components: BTreeMap<NodeId, ContractId>,
     /// The graph's links, sorted by id.
     links: Vec<Link>,
     /// The latest fault not yet taken.

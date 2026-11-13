@@ -82,43 +82,73 @@ const ZIG_GUESTS: [(&str, &str); 1] = [("zig-walk", "src/walk.zig")];
 /// Names guests, comma-separated, to build with debug info too, as `{name}.debug.wasm`.
 const DEBUG_GUESTS: &str = "WITGRAPH_DEBUG_GUESTS";
 
-/// The doc comment of the first world in `wit`, as the text WIT gives it.
-fn world_docs(wit: &str) -> Option<String> {
-    let lines: Vec<&str> = wit.lines().map(str::trim).collect();
-    let world = lines.iter().position(|line| line.starts_with("world "))?;
-    let mut docs: Vec<&str> = lines[..world]
-        .iter()
-        .rev()
-        .map_while(|line| line.strip_prefix("///"))
-        .map(|line| line.strip_prefix(' ').unwrap_or(line))
-        .collect();
-    docs.reverse();
-    (!docs.is_empty()).then(|| docs.join("\n"))
-}
-
-/// `component` with a custom section appended at the end of its root. The
-/// way a guest's author would declare its description is a static in the
-/// guest, but these are written once, in the WIT.
-fn with_section(mut component: Vec<u8>, name: &str, data: &[u8]) -> Vec<u8> {
-    fn leb(mut n: usize, out: &mut Vec<u8>) {
-        loop {
-            let byte = (n & 0x7f) as u8;
-            n >>= 7;
-            if n == 0 {
-                out.push(byte);
-                return;
-            }
-            out.push(byte | 0x80);
+/// A JSON string literal of `s`.
+fn json_string(s: &str) -> String {
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
         }
     }
-    let mut body = Vec::new();
-    leb(name.len(), &mut body);
-    body.extend_from_slice(name.as_bytes());
-    body.extend_from_slice(data);
-    component.push(0);
-    leb(body.len(), &mut component);
-    component.extend(body);
-    component
+    out.push('"');
+    out
+}
+
+/// The node manifest of guest `name`, built to `<name>.wasm` beside it, and its WIT,
+/// encoded, for `<name>.wit.wasm` beside it: its WIT package and every world in it, and
+/// the viewers its `viewers.json` names (output port to viewer, for its world).
+fn node_manifest(name: &str, guest_dir: &Path) -> (String, Vec<u8>) {
+    let wit = guest_dir.join(name).join("wit");
+    let mut resolve = wit_parser::Resolve {
+        all_features: true,
+        ..wit_parser::Resolve::default()
+    };
+    let (package_id, _) = resolve
+        .push_dir(&wit)
+        .unwrap_or_else(|e| panic!("failed to read the WIT of {name}: {e:#}"));
+    let encoded = wit_component::encode(&resolve, package_id, false)
+        .unwrap_or_else(|e| panic!("failed to encode the WIT of {name}: {e:#}"));
+    let package = &resolve.packages[package_id];
+    let version = package
+        .name
+        .version
+        .as_ref()
+        .map(|v| format!("@{v}"))
+        .unwrap_or_default();
+    let (namespace, pkg) = (&package.name.namespace, &package.name.name);
+    let worlds: Vec<String> = package
+        .worlds
+        .keys()
+        .map(|world| format!("{namespace}:{pkg}/{world}{version}"))
+        .collect();
+    let viewers = match fs::read_to_string(guest_dir.join(name).join("viewers.json")) {
+        Ok(hints) => {
+            let world = worlds
+                .first()
+                .unwrap_or_else(|| panic!("{name} has viewers but no world"));
+            format!(
+                ",\n  \"viewers\": {{ {}: {} }}",
+                json_string(world),
+                hints.trim()
+            )
+        }
+        Err(_) => String::new(),
+    };
+    let manifest = format!(
+        "{{\n  \"wit\": {},\n  \"wit_source\": {},\n  \"worlds\": [{}],\n  \"component\": {}{viewers}\n}}\n",
+        json_string(&format!("{namespace}:{pkg}{version}")),
+        json_string(&format!("{name}.wit.wasm")),
+        worlds
+            .iter()
+            .map(|w| json_string(w))
+            .collect::<Vec<_>>()
+            .join(", "),
+        json_string(&format!("{name}.wasm")),
+    );
+    (manifest, encoded)
 }
 
 fn main() {
@@ -148,6 +178,7 @@ fn main() {
         // Directories are scanned recursively, so `wit/deps` is covered.
         println!("cargo::rerun-if-changed=guests/{name}/src");
         println!("cargo::rerun-if-changed=guests/{name}/wit");
+        println!("cargo::rerun-if-changed=guests/{name}/viewers.json");
 
         let debug = WITH_DEBUG_INFO.contains(&name);
         let component = if C_GUESTS.contains(&name) {
@@ -170,6 +201,13 @@ fn main() {
         let wasm_dst = out_dir.join(format!("{name}.wasm"));
         fs::write(&wasm_dst, &component)
             .unwrap_or_else(|e| panic!("failed to write {}: {e}", wasm_dst.display()));
+        let (manifest, wit) = node_manifest(name, &guest_dir);
+        let manifest_dst = out_dir.join(format!("{name}.node.json"));
+        fs::write(&manifest_dst, manifest)
+            .unwrap_or_else(|e| panic!("failed to write {}: {e}", manifest_dst.display()));
+        let wit_dst = out_dir.join(format!("{name}.wit.wasm"));
+        fs::write(&wit_dst, wit)
+            .unwrap_or_else(|e| panic!("failed to write {}: {e}", wit_dst.display()));
 
         if debug_guests.contains(&name) {
             let component = if debug {
@@ -230,7 +268,7 @@ fn build_guest(name: &str, guest_dir: &Path, target_dir: &Path, debug: bool) -> 
         .join(format!("{lib_name}.wasm"));
     let module = fs::read(&core_wasm)
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", core_wasm.display()));
-    componentize(name, &crate_dir, &module)
+    componentize(name, &module)
 }
 
 /// Builds a guest written in C as a component, its own code with debug info and no
@@ -387,7 +425,7 @@ fn link_guest(name: &str, dir: &Path, work: &Path, objects: Vec<PathBuf>) -> Vec
         false,
     )
     .unwrap_or_else(|e| panic!("failed to embed the world of {name}: {e:#}"));
-    componentize(name, dir, &module)
+    componentize(name, &module)
 }
 
 /// The C files in `dir`, in order.
@@ -421,20 +459,11 @@ fn clang(name: &str, dir: &Path, args: Vec<OsString>) {
 }
 
 /// A guest's core module as a component, with its world's docs.
-fn componentize(name: &str, crate_dir: &Path, module: &[u8]) -> Vec<u8> {
-    let component = wit_component::ComponentEncoder::default()
+fn componentize(name: &str, module: &[u8]) -> Vec<u8> {
+    wit_component::ComponentEncoder::default()
         .validate(true)
         .module(module)
         .unwrap_or_else(|e| panic!("failed to encode {name} module: {e:#}"))
         .encode()
-        .unwrap_or_else(|e| panic!("failed to produce {name} component: {e:#}"));
-
-    // A component's bytes keep no doc comments: the world's go in the
-    // `witgraph-docs` section, for an editor to describe the node by.
-    let wit = fs::read_to_string(crate_dir.join("wit/world.wit"))
-        .unwrap_or_else(|e| panic!("failed to read the WIT of {name}: {e}"));
-    match world_docs(&wit) {
-        Some(docs) => with_section(component, "witgraph-docs", docs.as_bytes()),
-        None => component,
-    }
+        .unwrap_or_else(|e| panic!("failed to produce {name} component: {e:#}"))
 }

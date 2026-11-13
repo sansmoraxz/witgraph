@@ -3,18 +3,6 @@ wit_bindgen::generate!({ path: "wit", world: "video-source", generate_all });
 use exports::node::{Frame, Guest, Inputs, Outputs};
 use wasi::clocks::monotonic_clock;
 
-/// Declares how an editor previews this node's outputs (the
-/// `witgraph-viewer` custom section).
-macro_rules! viewer {
-    ($hints:literal) => {
-        #[used]
-        #[unsafe(link_section = "witgraph-viewer")]
-        static VIEWER: [u8; $hints.len()] = *$hints;
-    };
-}
-
-viewer!(b"output.frames=image\n");
-
 const WIDTH: u32 = 96;
 const HEIGHT: u32 = 64;
 const SQUARE: u32 = 16;

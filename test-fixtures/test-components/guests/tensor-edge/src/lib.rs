@@ -3,18 +3,6 @@ wit_bindgen::generate!({ path: "wit", world: "tensor-edge", generate_all });
 use exports::node::{Guest, Inputs, Outputs};
 use witgraph::runtime::host;
 
-/// Declares how an editor previews this node's outputs (the
-/// `witgraph-viewer` custom section).
-macro_rules! viewer {
-    ($hints:literal) => {
-        #[used]
-        #[unsafe(link_section = "witgraph-viewer")]
-        static VIEWER: [u8; $hints.len()] = *$hints;
-    };
-}
-
-viewer!(b"output.edges=tensor\n");
-
 /// A Laplacian: bright where the image changes, dark where it is flat.
 const KERNEL: [f32; 9] = [-1.0, -1.0, -1.0, -1.0, 8.0, -1.0, -1.0, -1.0, -1.0];
 

@@ -4,18 +4,6 @@ use exports::node::{Frame, Guest, Inputs, Outputs};
 use test::accel::cnn::{self, Conv, Layer, Tensor};
 use witgraph::runtime::host;
 
-/// Declares how an editor previews this node's outputs (the
-/// `witgraph-viewer` custom section).
-macro_rules! viewer {
-    ($hints:literal) => {
-        #[used]
-        #[unsafe(link_section = "witgraph-viewer")]
-        static VIEWER: [u8; $hints.len()] = *$hints;
-    };
-}
-
-viewer!(b"output.edges=image\noutput.backend=text\n");
-
 /// The Sobel kernel across `x`: right minus left.
 const SOBEL_X: [f32; 9] = [-1.0, 0.0, 1.0, -2.0, 0.0, 2.0, -1.0, 0.0, 1.0];
 /// The Sobel kernel across `y`: below minus above.

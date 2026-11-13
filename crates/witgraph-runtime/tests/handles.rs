@@ -4,7 +4,6 @@
 //! Handle ports: nodes passing tensors the host keeps (`test:data`), over
 //! a CPU-backed provider.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use witgraph_runtime::RunningGraph;
@@ -17,7 +16,7 @@ use test_components::{
 use wasmtime::StoreContextMut;
 use wasmtime::component::{ComponentType, Lift, Linker, Lower, ResourceDynamic};
 use witgraph_ir::{
-    Capability, ComponentContract, ComponentRef, Graph, GraphBuilder, NodeId, PortRef,
+    Capability, ComponentContract, ContractId, Graph, GraphBuilder, NodeId, PortRef,
 };
 use witgraph_runtime::shared::link_resource;
 use witgraph_runtime::{
@@ -226,20 +225,19 @@ impl CapabilityPlugin for Tensors {
 }
 
 fn contract(guest: Guest) -> ComponentContract {
-    let mut contracts = witgraph_wit::load_components(guest.wit).expect("guest WIT lowers");
-    contracts.remove(0)
+    guest.contract()
 }
 
 struct Kit {
     contracts: Vec<ComponentContract>,
-    wasm: HashMap<ComponentRef, &'static [u8]>,
+    wasm: test_components::Kit,
 }
 
 impl Kit {
     fn new() -> Self {
         let mut kit = Kit {
             contracts: Vec::new(),
-            wasm: HashMap::new(),
+            wasm: test_components::Kit::default(),
         };
         for guest in [
             TENSOR_SOURCE,
@@ -256,7 +254,7 @@ impl Kit {
             TENSOR_FUTURE_SINK,
         ] {
             let c = contract(guest);
-            kit.wasm.insert(c.id.clone(), guest.wasm);
+            kit.wasm.add(guest);
             kit.contracts.push(c);
         }
         kit
@@ -276,11 +274,11 @@ impl Kit {
     ) -> Result<RuntimeGraph<Perf, Plugins>, LoadError> {
         let compiled = graph.compile(&self.contracts).expect("graph compiles");
         let plugins = Plugins::new().with(Tensors { shares }).unwrap();
-        RuntimeGraph::load_with_host(compiled, &self.wasm, config, Perf, plugins).await
+        RuntimeGraph::load_with_host(compiled, &self.wasm.artifacts(), config, Perf, plugins).await
     }
 }
 
-fn of(guest: Guest) -> ComponentRef {
+fn of(guest: Guest) -> ContractId {
     contract(guest).id
 }
 

@@ -154,8 +154,7 @@ pub struct PortDef {
     /// Doc comment from the WIT field, if any.
     pub docs: Option<String>,
     /// Output ports only: how an editor should preview the port's values
-    /// (`image`, say), as the component's `witgraph-viewer` section
-    /// declares it. Opaque here; WIT text never sets it. Like `docs`, it is
+    /// (`image`, say), as the component's node manifest declares it. Opaque here; WIT text never sets it. Like `docs`, it is
     /// part of equality, so contracts compared with each other must come
     /// from the same source.
     pub viewer: Option<String>,

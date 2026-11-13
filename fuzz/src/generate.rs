@@ -96,9 +96,11 @@ pub fn graph(u: &mut Unstructured<'_>) -> Result<Graph> {
                 .expect("every claim here is an amount");
             resources.insert((*pick(u, &RESOURCES)?).into(), claim);
         }
+        let reference = component.reference();
         nodes.push(Node {
             id: format!("n{at}").into(),
-            component: component.reference(),
+            component: reference.component,
+            world: reference.world,
             label: None,
             resources,
             attrs: BTreeMap::new(),
@@ -107,13 +109,11 @@ pub fn graph(u: &mut Unstructured<'_>) -> Result<Graph> {
 
     let mut connections = wired(u, &picked)?;
 
-    // Components the table lists, in the order first used.
-    let mut components = Vec::new();
+    // Components the table lists.
+    let mut components = BTreeMap::new();
     for component in &picked {
-        let reference = component.reference();
-        if !components.contains(&reference) {
-            components.push(reference);
-        }
+        let name = component.reference().component;
+        components.insert(name.clone(), name.to_string());
     }
 
     let mut graph = Graph {
@@ -122,7 +122,7 @@ pub fn graph(u: &mut Unstructured<'_>) -> Result<Graph> {
             description: None,
             attrs: BTreeMap::new(),
         },
-        components: vec![],
+        components: BTreeMap::new(),
         nodes,
         connections: vec![],
         links: vec![],
@@ -141,13 +141,8 @@ pub fn graph(u: &mut Unstructured<'_>) -> Result<Graph> {
     damage(u, &mut connections, &mut graph, count)?;
     graph.connections = connections;
     graph.components = components;
-    if u.ratio(1, 64)?
-        && let Some(first) = graph.components.first().cloned()
-    {
-        graph.components.push(first);
-    }
     if u.ratio(1, 64)? {
-        graph.components.pop();
+        graph.components.pop_last();
     }
     Ok(graph)
 }

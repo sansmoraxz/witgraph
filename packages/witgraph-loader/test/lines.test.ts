@@ -63,10 +63,8 @@ const fixture = (path: string) =>
     'utf8',
   );
 
-const ref = (guest: string) => ({
-  package: { namespace: 'test', name: guest, version: '0.1.0' },
-  world: guest,
-});
+/** The world of guest `guest`. */
+const ref = (guest: string) => `test:${guest}/${guest}@0.1.0`;
 
 async function options(
   nodes: [string, string][],
@@ -81,8 +79,8 @@ async function options(
   return {
     graph: {
       metadata: { name: 'lines' },
-      components: used.map(ref),
-      nodes: nodes.map(([id, guest]) => ({ id, component: ref(guest) })),
+      components: Object.fromEntries(used.map((guest) => [guest, guest])),
+      nodes: nodes.map(([id, guest]) => ({ id, component: guest, world: ref(guest) })),
       connections: connections.map(([id, from, to, feedback]) => ({
         id,
         from: port(from),
@@ -91,10 +89,15 @@ async function options(
       })),
     },
     components: await Promise.all(
-      used.map(async (guest) => ({
-        id: `test:${guest}/${guest}@0.1.0`,
-        bytes: new Uint8Array(await readFile(new URL(`${guest}.wasm`, guests))),
-      })),
+      used.map(async (guest) => {
+        const read = async (name: string) => new Uint8Array(await readFile(new URL(name, guests)));
+        return {
+          name: guest,
+          manifest: JSON.parse(await readFile(new URL(`${guest}.node.json`, guests), 'utf8')),
+          wit: await read(`${guest}.wit.wasm`),
+          bytes: await read(`${guest}.wasm`),
+        };
+      }),
     ),
     wasm,
     ...more,

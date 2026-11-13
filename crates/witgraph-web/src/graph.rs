@@ -15,8 +15,8 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::{JsFuture, future_to_promise};
 use witgraph_ir::wasm_wave::value::Type;
 use witgraph_ir::{
-    Capability, CompiledGraph, ComponentContract, ComponentRef, Graph, IndexVec, InputIdx, NodeId,
-    OutputIdx, PortDirection, PortKind, PortName, PortTable,
+    Capability, CompiledGraph, ComponentName, Graph, IndexVec, InputIdx, NodeId, OutputIdx,
+    PortDirection, PortKind, PortName, PortTable,
 };
 use witgraph_probes::{
     Frame, ModuleDebug, ModuleOffset, OwnLines, OwnRules, PathPattern, Spill, Variable,
@@ -30,7 +30,8 @@ use witgraph_traits::{
     FaultReport, NodeState, OutputReader, PortVersion, RunningGraph, SnapshotError,
 };
 
-use crate::diagnostics::{compile_error, component_entry, diagnostic_array};
+use crate::component::{self, Entry};
+use crate::diagnostics::{compile_error, diagnostic_array};
 use crate::link::{self, Linked};
 use crate::live::{Live, LiveMode, LiveState};
 use crate::plane::{Callbacks, WebHub, WebPlane, stream_inputs};
@@ -309,30 +310,11 @@ impl RunningGraph for WebRuntime {
 /// ones are dropped.
 const TRACE_LIMIT: usize = 65_536;
 
-/// The most contracts kept for later loads ([`CONTRACTS`]).
-const CACHED: usize = 32;
-
 #[wasm_bindgen]
 extern "C" {
     // `Promise.resolve`, with its exception caught (see `value.rs`).
     #[wasm_bindgen(catch, js_namespace = Promise, js_name = resolve)]
     fn resolve(value: &JsValue) -> Result<Promise, JsValue>;
-}
-
-/// What a component's contract is made from: the SHA-256 of its bytes and
-/// of its WIT source, and its id as given.
-#[derive(PartialEq, Eq)]
-struct ContractKey {
-    bytes: [u8; 32],
-    wit: Option<[u8; 32]>,
-    id: String,
-}
-
-thread_local! {
-    /// The contracts the latest loads made, latest last: an editor that
-    /// reloads its graph on every edit lowers each component once.
-    static CONTRACTS: RefCell<Vec<(ContractKey, Lowered)>> =
-        const { RefCell::new(Vec::new()) };
 }
 
 pub(crate) fn error(message: impl std::fmt::Display) -> JsError {
@@ -399,101 +381,9 @@ fn describe(meta: &witgraph_wit::metadata::ComponentMeta) -> Result<JsValue, JsE
 }
 
 /// `value` as a JavaScript object, through its JSON form.
-fn json(value: &impl serde::Serialize) -> Result<JsValue, JsError> {
+pub(crate) fn json(value: &impl serde::Serialize) -> Result<JsValue, JsError> {
     let json = serde_json::to_string(value).map_err(error)?;
     js_sys::JSON::parse(&json).map_err(|_| error("a value did not convert from JSON"))
-}
-
-/// A component's contract, and what was wrong with it but did not stop it
-/// lowering (see [`witgraph_wit::lower::Lowered::warnings`]).
-#[derive(Clone)]
-pub(crate) struct Lowered {
-    pub(crate) contract: ComponentContract,
-    /// The name it exports its `node` interface under.
-    export: String,
-    warnings: Vec<String>,
-}
-
-/// The contract of component `id` with encoded `bytes` (whose SHA-256 is
-/// `digest`) and, if given, the WIT source it was built from: as a load
-/// made it before, else lowered now.
-pub(crate) fn contract(
-    id: &str,
-    bytes: &[u8],
-    digest: [u8; 32],
-    wit: Option<&str>,
-) -> Result<Lowered, JsError> {
-    let key = ContractKey {
-        bytes: digest,
-        wit: wit.map(|wit| Sha256::digest(wit).into()),
-        id: id.to_owned(),
-    };
-    let cached = CONTRACTS.with_borrow_mut(|contracts| {
-        let index = contracts.iter().position(|(k, _)| *k == key)?;
-        let entry = contracts.remove(index);
-        let contract = entry.1.clone();
-        contracts.push(entry);
-        Some(contract)
-    });
-    if let Some(contract) = cached {
-        return Ok(contract);
-    }
-    let contract = lower(id, bytes, wit)?;
-    CONTRACTS.with_borrow_mut(|contracts| {
-        contracts.push((key, contract.clone()));
-        if contracts.len() > CACHED {
-            contracts.remove(0);
-        }
-    });
-    Ok(contract)
-}
-
-/// The contract of component `id`: from its WIT source, against which the
-/// bytes are checked, or else lowered from the bytes. Either way its
-/// outputs' viewers are the bytes' (WIT text declares none).
-fn lower(id: &str, bytes: &[u8], wit: Option<&str>) -> Result<Lowered, JsError> {
-    let id: ComponentRef = id.parse().map_err(error)?;
-    match wit {
-        Some(wit) => {
-            let name = format!("{id}.wit");
-            let mut contract = witgraph_wit::contract_from_str(&name, wit, &id)
-                .map_err(|e| error(format!("the WIT of `{id}`: {e}")))?;
-            let found = witgraph_wit::verify::verify_component(&contract, bytes)
-                .map_err(|e| error(format!("component `{id}`: {e}")))?;
-            for port in &mut contract.outputs {
-                port.viewer = found
-                    .contract
-                    .outputs
-                    .iter()
-                    .find(|p| p.name == port.name)
-                    .and_then(|p| p.viewer.clone());
-            }
-            Ok(Lowered {
-                contract,
-                export: found.export,
-                warnings: found.warnings,
-            })
-        }
-        None => {
-            let lowered = witgraph_wit::lower_component(bytes, &id).map_err(error)?;
-            let contract = lowered.contract;
-            // Without WIT, the bytes' own hash is all there is: a pin
-            // naming another is other bytes than these.
-            if let (Some(pinned), Some(own)) = (&id.content_hash, &contract.id.content_hash)
-                && pinned != own
-            {
-                return Err(error(format!(
-                    "component `{id:#}`: the bytes hash to {own}; pass `wit` to check them \
-                     against the source the pin names"
-                )));
-            }
-            Ok(Lowered {
-                contract,
-                export: lowered.export,
-                warnings: lowered.warnings,
-            })
-        }
-    }
 }
 
 /// `bytes` as lower-case hex.
@@ -505,24 +395,6 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 /// names an import.
 fn unversioned(name: &str) -> &str {
     name.split_once('@').map_or(name, |(id, _)| id)
-}
-
-/// Lowers the WIT embedded in an encoded component and describes it as the
-/// editor catalog does (`{ id, package, world, content_hash, docs, inputs,
-/// outputs, capabilities, types }`, a port being `{ name, kind,
-/// type_display, handle?, optional, docs?, viewer? }`). `id` names the component
-/// (`namespace:name/world@version`); the result's `id` carries the content
-/// hash computed from the bytes.
-#[wasm_bindgen(js_name = describeComponent)]
-pub fn describe_component(id: &str, bytes: &[u8]) -> Result<JsValue, JsError> {
-    let id: ComponentRef = id.parse().map_err(error)?;
-    let lowered = witgraph_wit::lower_component(bytes, &id).map_err(error)?;
-    let catalog = witgraph_wit::metadata::generate_catalog(std::slice::from_ref(&lowered));
-    let meta = catalog
-        .components
-        .first()
-        .ok_or_else(|| error("the component did not describe"))?;
-    describe(meta)
 }
 
 /// The name jco gives a WIT record field or flag in JavaScript
@@ -832,51 +704,39 @@ impl WebGraph {
             .collect();
         let mut contracts = Vec::new();
         let mut warnings = Vec::new();
-        // Per contract, the `components` entry it came from.
-        let mut contract_entry = Vec::new();
-        let mut exports = Vec::new();
-        let mut entries: Vec<(ComponentRef, Vec<u8>)> = Vec::new();
-        for (index, entry) in components.iter().enumerate() {
-            let (id, bytes, wit) = component_entry(&entry).map_err(JsValue::from)?;
-            let digest: [u8; 32] = Sha256::digest(&bytes).into();
-            let component: ComponentRef = id.parse().map_err(error)?;
-            // A provider is not a node: it has no `node` export, so no
-            // contract. An entry that only links name is composed in, not
-            // lowered as a node.
-            let provider_only = graph.links.iter().any(|l| l.provider.matches(&component))
-                && !graph.components.iter().any(|c| c.matches(&component));
-            if !provider_only {
-                let lowered = contract(&id, &bytes, digest, wit.as_deref())?;
-                warnings.extend(
-                    lowered
-                        .warnings
-                        .into_iter()
-                        .map(|w| format!("component `{id}`: {w}")),
-                );
-                contracts.push(lowered.contract);
-                exports.push(lowered.export);
-                contract_entry.push(index);
+        let mut entries: Vec<Entry> = Vec::new();
+        for entry in components.iter() {
+            let entry = component::entry(&entry).map_err(JsValue::from)?;
+            if entries.iter().any(|e| e.name == entry.name) {
+                return Err(error(format!("component `{}` is given twice", entry.name)).into());
             }
-            entries.push((component, bytes));
+            warnings.extend(
+                entry
+                    .described
+                    .warnings
+                    .iter()
+                    .map(|w| format!("component `{}`: {w}", entry.name)),
+            );
+            contracts.extend(entry.described.worlds.iter().map(|w| w.contract.clone()));
+            entries.push(entry);
         }
         let compiled = graph
             .compile(&contracts)
             .map_err(|failure| compile_error(&failure))?;
-        // Among entries with one contract, compilation binds the first.
-        let mut first_of: HashMap<&ComponentRef, usize> = HashMap::new();
-        for (index, contract) in contracts.iter().enumerate() {
-            first_of.entry(&contract.id).or_insert(index);
-        }
+        let index_of: HashMap<&ComponentName, usize> = entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| (&entry.name, index))
+            .collect();
         let mut node_components = HashMap::new();
-        let mut node_exports = HashMap::new();
         for node in compiled.nodes() {
-            let contract_at = first_of
-                .get(&node.contract.id)
-                .copied()
+            let index = *index_of
+                .get(&node.contract.id.component)
                 .ok_or_else(|| error(format!("node `{}` has no component", node.node.id)))?;
-            let index = u32::try_from(contract_entry[contract_at]).map_err(error)?;
-            node_components.insert(node.node.id.clone(), index);
-            node_exports.insert(node.node.id.clone(), exports[contract_at].as_str());
+            if !mocked.contains(&node.node.id) {
+                component::check_targets(&entries[index], &node.contract.id.world)?;
+            }
+            node_components.insert(node.node.id.clone(), u32::try_from(index).map_err(error)?);
         }
         let linked = link::compose_links(&compiled, &entries, &node_components)?;
 
@@ -884,7 +744,6 @@ impl WebGraph {
             &compiled,
             &entries,
             &node_components,
-            &node_exports,
             &linked,
             &mocked,
             debug.unwrap_or(false),
@@ -1484,9 +1343,8 @@ fn value_type(
 /// in, but for the `mocked`. Returns it with what it imports.
 fn compose(
     compiled: &CompiledGraph,
-    entries: &[(ComponentRef, Vec<u8>)],
+    entries: &[Entry],
     of_node: &HashMap<NodeId, u32>,
-    exports: &HashMap<NodeId, &str>,
     linked: &Linked,
     mocked: &[NodeId],
     debug: bool,
@@ -1498,16 +1356,15 @@ fn compose(
         let contract = compiled.contract_for(&node.id).ok_or_else(unknown)?;
         let is_mocked = mocked.contains(&node.id);
         let composition = linked.of_node.get(&node.id).map(|at| &linked.composed[*at]);
+        let entry = of_node
+            .get(&node.id)
+            .and_then(|index| entries.get(*index as usize))
+            .ok_or_else(unknown)?;
+        let world = entry.world(&contract.id).ok_or_else(unknown)?;
         let (bytes, export, imports): (&[u8], &str, &[Capability]) = match composition {
             Some(linked) => (&linked.bytes, &linked.export, &linked.capabilities),
-            None => {
-                let (_, bytes) = of_node
-                    .get(&node.id)
-                    .and_then(|index| entries.get(*index as usize))
-                    .ok_or_else(unknown)?;
-                let export = exports.get(&node.id).ok_or_else(unknown)?;
-                (bytes, export, &contract.capabilities)
-            }
+            None if is_mocked => (&[], &world.export, &contract.capabilities),
+            None => (entry.bytes()?, &world.export, &contract.capabilities),
         };
         if !is_mocked {
             Capability::add_unique(&mut capabilities, imports);
@@ -1516,6 +1373,8 @@ fn compose(
             node: &node.id,
             bytes,
             export,
+            wit: &entry.described.wit,
+            world: &contract.id.world,
             mocked: is_mocked,
         });
     }

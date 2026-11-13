@@ -2,109 +2,46 @@
   "metadata": {
     "name": "fuzz"
   },
-  "components": [
-    {
-      "package": {
-        "namespace": "fuzz",
-        "name": "nodes",
-        "version": "0.1.0"
-      },
-      "world": "stream-source"
-    },
-    {
-      "package": {
-        "namespace": "fuzz",
-        "name": "nodes",
-        "version": "0.1.0"
-      },
-      "world": "stream-tee"
-    },
-    {
-      "package": {
-        "namespace": "fuzz",
-        "name": "nodes",
-        "version": "0.1.0"
-      },
-      "world": "stream-waits"
-    }
-  ],
+  "components": {
+    "stream-source": "stream-source",
+    "stream-tee": "stream-tee",
+    "stream-waits": "stream-waits"
+  },
   "nodes": [
     {
       "id": "n0",
-      "component": {
-        "package": {
-          "namespace": "fuzz",
-          "name": "nodes",
-          "version": "0.1.0"
-        },
-        "world": "stream-source"
-      }
+      "component": "stream-source",
+      "world": "fuzz:nodes/stream-source@0.1.0"
     },
     {
       "id": "n1",
-      "component": {
-        "package": {
-          "namespace": "fuzz",
-          "name": "nodes",
-          "version": "0.1.0"
-        },
-        "world": "stream-source"
-      }
+      "component": "stream-source",
+      "world": "fuzz:nodes/stream-source@0.1.0"
     },
     {
       "id": "n2",
-      "component": {
-        "package": {
-          "namespace": "fuzz",
-          "name": "nodes",
-          "version": "0.1.0"
-        },
-        "world": "stream-tee"
-      }
+      "component": "stream-tee",
+      "world": "fuzz:nodes/stream-tee@0.1.0"
     },
     {
       "id": "n3",
-      "component": {
-        "package": {
-          "namespace": "fuzz",
-          "name": "nodes",
-          "version": "0.1.0"
-        },
-        "world": "stream-tee"
-      }
+      "component": "stream-tee",
+      "world": "fuzz:nodes/stream-tee@0.1.0"
     },
     {
       "id": "n4",
-      "component": {
-        "package": {
-          "namespace": "fuzz",
-          "name": "nodes",
-          "version": "0.1.0"
-        },
-        "world": "stream-tee"
-      }
+      "component": "stream-tee",
+      "world": "fuzz:nodes/stream-tee@0.1.0"
     },
     {
       "id": "n5",
-      "component": {
-        "package": {
-          "namespace": "fuzz",
-          "name": "nodes",
-          "version": "0.1.0"
-        },
-        "world": "stream-tee"
-      }
+      "component": "stream-tee",
+      "world": "fuzz:nodes/stream-tee@0.1.0"
     },
     {
       "id": "n6",
-      "component": {
-        "package": {
-          "namespace": "fuzz",
-          "name": "nodes",
-          "version": "0.1.0"
-        },
-        "world": "stream-tee"
-      },
+      "component": "stream-tee",
+      "world": "fuzz:nodes/stream-tee@0.1.0",
       "resources": {
         "disk": {
           "amount": 0.3
@@ -113,14 +50,8 @@
     },
     {
       "id": "n7",
-      "component": {
-        "package": {
-          "namespace": "fuzz",
-          "name": "nodes",
-          "version": "0.1.0"
-        },
-        "world": "stream-waits"
-      },
+      "component": "stream-waits",
+      "world": "fuzz:nodes/stream-waits@0.1.0",
       "resources": {
         "disk": {
           "amount": 0.3
@@ -129,14 +60,8 @@
     },
     {
       "id": "n8",
-      "component": {
-        "package": {
-          "namespace": "fuzz",
-          "name": "nodes",
-          "version": "0.1.0"
-        },
-        "world": "stream-waits"
-      },
+      "component": "stream-waits",
+      "world": "fuzz:nodes/stream-waits@0.1.0",
       "resources": {
         "disk": {
           "amount": 0.3
@@ -145,14 +70,8 @@
     },
     {
       "id": "n9",
-      "component": {
-        "package": {
-          "namespace": "fuzz",
-          "name": "nodes",
-          "version": "0.1.0"
-        },
-        "world": "stream-waits"
-      },
+      "component": "stream-waits",
+      "world": "fuzz:nodes/stream-waits@0.1.0",
       "resources": {
         "disk": {
           "amount": 0.3
@@ -161,14 +80,8 @@
     },
     {
       "id": "n10",
-      "component": {
-        "package": {
-          "namespace": "fuzz",
-          "name": "nodes",
-          "version": "0.1.0"
-        },
-        "world": "stream-waits"
-      },
+      "component": "stream-waits",
+      "world": "fuzz:nodes/stream-waits@0.1.0",
       "resources": {
         "disk": {
           "amount": 0.3

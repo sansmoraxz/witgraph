@@ -3,18 +3,6 @@ wit_bindgen::generate!({ path: "wit", world: "mqtt-node", generate_all });
 use exports::node::{Guest, Outputs};
 use test::mqtt::source;
 
-/// Declares how an editor previews this node's outputs (the
-/// `witgraph-viewer` custom section).
-macro_rules! viewer {
-    ($hints:literal) => {
-        #[used]
-        #[unsafe(link_section = "witgraph-viewer")]
-        static VIEWER: [u8; $hints.len()] = *$hints;
-    };
-}
-
-viewer!(b"output.messages=text\n");
-
 struct MqttNode;
 
 impl Guest for MqttNode {

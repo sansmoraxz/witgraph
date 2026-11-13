@@ -5,18 +5,6 @@ use test::camera::camera;
 use test::data::tensor::Tensor;
 use witgraph::runtime::host;
 
-/// Declares how an editor previews this node's outputs (the
-/// `witgraph-viewer` custom section).
-macro_rules! viewer {
-    ($hints:literal) => {
-        #[used]
-        #[unsafe(link_section = "witgraph-viewer")]
-        static VIEWER: [u8; $hints.len()] = *$hints;
-    };
-}
-
-viewer!(b"output.tensors=tensor\n");
-
 struct Source;
 
 impl Guest for Source {

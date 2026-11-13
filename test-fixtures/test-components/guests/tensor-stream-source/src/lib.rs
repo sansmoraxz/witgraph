@@ -14,18 +14,6 @@ async fn make(width: u32, height: u32, fill: u8) -> Tensor {
         })
 }
 
-/// Declares how an editor previews this node's outputs (the
-/// `witgraph-viewer` custom section).
-macro_rules! viewer {
-    ($hints:literal) => {
-        #[used]
-        #[unsafe(link_section = "witgraph-viewer")]
-        static VIEWER: [u8; $hints.len()] = *$hints;
-    };
-}
-
-viewer!(b"output.tensors=tensor\n");
-
 struct Source;
 
 impl Guest for Source {

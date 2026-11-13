@@ -1,11 +1,11 @@
 {
-  "schema_version": 5,
+  "schema_version": 6,
   "components": [
     {
-      "id": "demo:graph/accumulator@0.1.0#94faeb0830cf0001362e34384e96a9944dfbce1a8a469a49a1f13ebe8af2e2bb",
+      "id": "demo/demo:graph/accumulator@0.1.0",
+      "component": "demo",
+      "world": "demo:graph/accumulator@0.1.0",
       "package": "demo:graph@0.1.0",
-      "world": "accumulator",
-      "content_hash": "94faeb0830cf0001362e34384e96a9944dfbce1a8a469a49a1f13ebe8af2e2bb",
       "docs": "Integrates deltas into a running total carried across iterations.",
       "inputs": [
         {
@@ -33,10 +33,10 @@
       "capabilities": []
     },
     {
-      "id": "demo:graph/alarm@0.1.0#36588419586af4113a0dc6ac20b6ce94b94b223f2ed34c4a903d712855cc0e59",
+      "id": "demo/demo:graph/alarm@0.1.0",
+      "component": "demo",
+      "world": "demo:graph/alarm@0.1.0",
       "package": "demo:graph@0.1.0",
-      "world": "alarm",
-      "content_hash": "36588419586af4113a0dc6ac20b6ce94b94b223f2ed34c4a903d712855cc0e59",
       "docs": "Reacts to threshold crossings.",
       "inputs": [
         {
@@ -50,10 +50,10 @@
       "capabilities": []
     },
     {
-      "id": "demo:graph/collector@0.1.0#8961eafdedca925bce1511c9149aa41cb97c56fb97ce05608b4e9d0a8149ff39",
+      "id": "demo/demo:graph/collector@0.1.0",
+      "component": "demo",
+      "world": "demo:graph/collector@0.1.0",
       "package": "demo:graph@0.1.0",
-      "world": "collector",
-      "content_hash": "8961eafdedca925bce1511c9149aa41cb97c56fb97ce05608b4e9d0a8149ff39",
       "docs": "Sums an entire stream of readings. The node collects the stream itself\n(reading it to end-of-stream) and resolves `summary` once it closes.",
       "inputs": [
         {
@@ -88,10 +88,10 @@
       ]
     },
     {
-      "id": "demo:graph/display@0.1.0#a391243d53c98bfc1b5b08f690b47abbfd51583a506b4a2506243f3e8eecbaf0",
+      "id": "demo/demo:graph/display@0.1.0",
+      "component": "demo",
+      "world": "demo:graph/display@0.1.0",
       "package": "demo:graph@0.1.0",
-      "world": "display",
-      "content_hash": "a391243d53c98bfc1b5b08f690b47abbfd51583a506b4a2506243f3e8eecbaf0",
       "docs": "Renders the filtered stream.",
       "inputs": [
         {
@@ -117,10 +117,10 @@
       ]
     },
     {
-      "id": "demo:graph/filter@0.1.0#f1c06171189ccd1a0a10deca4d88e55f55865d5d93ac6b8d32b54210d47ce6f2",
+      "id": "demo/demo:graph/filter@0.1.0",
+      "component": "demo",
+      "world": "demo:graph/filter@0.1.0",
       "package": "demo:graph@0.1.0",
-      "world": "filter",
-      "content_hash": "f1c06171189ccd1a0a10deca4d88e55f55865d5d93ac6b8d32b54210d47ce6f2",
       "docs": "Smooths a stream of readings.",
       "inputs": [
         {
@@ -158,10 +158,10 @@
       ]
     },
     {
-      "id": "demo:graph/sensor@0.1.0#c84e88838d1ac1760e8478045099d82b17135a82de753f3d544984ba0be91783",
+      "id": "demo/demo:graph/sensor@0.1.0",
+      "component": "demo",
+      "world": "demo:graph/sensor@0.1.0",
       "package": "demo:graph@0.1.0",
-      "world": "sensor",
-      "content_hash": "c84e88838d1ac1760e8478045099d82b17135a82de753f3d544984ba0be91783",
       "docs": "Periodically samples a sensor and publishes readings.",
       "inputs": [
         {

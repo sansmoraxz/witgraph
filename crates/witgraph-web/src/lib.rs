@@ -30,6 +30,8 @@
 //! thenable), which the loader may watch on its way to its reader.
 
 #[cfg(target_family = "wasm")]
+mod component;
+#[cfg(target_family = "wasm")]
 mod diagnostics;
 #[cfg(target_family = "wasm")]
 mod graph;
@@ -43,6 +45,8 @@ mod plane;
 mod value;
 
 #[cfg(target_family = "wasm")]
+pub use component::{describe_component, encode_wit};
+#[cfg(target_family = "wasm")]
 pub use diagnostics::GraphChecker;
 #[cfg(target_family = "wasm")]
-pub use graph::{WebGraph, describe_component, js_name};
+pub use graph::{WebGraph, js_name};

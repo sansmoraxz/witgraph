@@ -78,13 +78,10 @@
 //! host, so neither counts; importing anything else from `witgraph:runtime`
 //! is an error.
 //!
-//! The contract lowered from the WIT source and the one decoded from a
-//! component built from it agree on ports and `run`. Their capabilities
-//! (and so their content hashes) agree only when the component imports
-//! everything the world declares: a component imports only the items its
-//! code uses, so one that uses fewer decodes to fewer capabilities. Check a
-//! component against its source contract by ports, `run` and a subset of
-//! capabilities, not by hash.
+//! A contract is always lowered from WIT, never from a component's bytes: a
+//! component built from a world imports only the items its code uses, which
+//! can be fewer than the world declares. Its bytes are checked to target the
+//! world ([`crate::verify`]).
 
 use core::fmt;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -93,8 +90,8 @@ use wasm_wave::value::resolve_wit_type;
 use wit_parser as wp;
 use wit_parser::{Resolve, TypeId, WorldItem, WorldKey};
 use witgraph_ir::{
-    Capability, Carried, ComponentContract, ComponentRef, HandleType, PackageRef, PortDef,
-    PortDirection, PortType, Type,
+    Capability, Carried, ComponentContract, ComponentName, ContractId, HandleType, PortDef,
+    PortDirection, PortType, Type, WitRef, WorldRef,
 };
 
 use crate::hash;
@@ -162,9 +159,8 @@ impl std::error::Error for LowerFailures {}
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("world `{world}`: {kind}")]
 pub struct LowerError {
-    /// The failing world: its package (version included) and name, with no
-    /// content hash.
-    pub world: ComponentRef,
+    /// The failing world.
+    pub world: WorldRef,
     /// Why it failed.
     pub kind: LowerErrorKind,
 }
@@ -419,14 +415,15 @@ const MAX_FLAGS: usize = 32;
 /// The most parameters a function may have in a component.
 const MAX_PARAMS: usize = 1_000;
 
-/// Lower every witgraph component world in the source's root packages.
-/// Worlds that don't export a `node` interface are skipped. Every world is
-/// attempted; the error reports all failing worlds, not just the first, and
-/// discards the worlds that lowered. [`lower_each`] keeps them.
-pub fn lower(source: &WitSource) -> Result<Vec<Lowered>, LowerFailures> {
+/// Lower every witgraph component world in the source's root packages, as
+/// `component` provides it. Worlds that don't export a `node` interface are
+/// skipped. Every world is attempted; the error reports all failing worlds,
+/// not just the first, and discards the worlds that lowered. [`lower_each`]
+/// keeps them.
+pub fn lower(source: &WitSource, component: &ComponentName) -> Result<Vec<Lowered>, LowerFailures> {
     let mut contracts = Vec::new();
     let mut failures: Vec<LowerError> = Vec::new();
-    for result in lower_each(source) {
+    for result in lower_each(source, component) {
         match result {
             Ok(lowered) => contracts.push(lowered),
             Err(failure) => failures.push(failure),
@@ -441,43 +438,74 @@ pub fn lower(source: &WitSource) -> Result<Vec<Lowered>, LowerFailures> {
 
 /// Like [`lower`], but one result per component world, in package/world
 /// declaration order: a world that fails does not discard the others.
-pub fn lower_each(source: &WitSource) -> Vec<Result<Lowered, LowerError>> {
-    lower_matching(source, |_| true)
+pub fn lower_each(
+    source: &WitSource,
+    component: &ComponentName,
+) -> Vec<Result<Lowered, LowerError>> {
+    lower_matching(source, component, |_| true)
 }
 
-/// Like [`lower_each`], for only the worlds `wanted` picks (by the world's
-/// ref, without a content hash); the others are not lowered at all.
+/// Like [`lower_each`], for only the worlds `wanted` picks; the others are
+/// not lowered at all.
 pub fn lower_matching(
     source: &WitSource,
-    wanted: impl Fn(&ComponentRef) -> bool,
+    component: &ComponentName,
+    wanted: impl Fn(&WorldRef) -> bool,
 ) -> Vec<Result<Lowered, LowerError>> {
     let resolve = &source.resolve;
     let mut results = Vec::new();
+    for (world_ref, world_id) in root_worlds(source) {
+        if !wanted(&world_ref) {
+            continue;
+        }
+        let world = &resolve.worlds[world_id];
+        let id = ContractId::new(component.clone(), world_ref.clone());
+        match lower_world(resolve, world, id) {
+            Ok(Some(lowered)) => results.push(Ok(lowered)),
+            Ok(None) => {}
+            Err(kind) => results.push(Err(LowerError {
+                world: world_ref,
+                kind,
+            })),
+        }
+    }
+    results
+}
+
+/// The worlds of the source's root packages, in package/world declaration
+/// order.
+pub fn root_worlds(source: &WitSource) -> Vec<(WorldRef, wp::WorldId)> {
+    let resolve = &source.resolve;
+    let mut worlds = Vec::new();
     for &package_id in &source.packages {
         let package = &resolve.packages[package_id];
-        let package_ref = PackageRef {
+        let package_ref = WitRef {
             namespace: package.name.namespace.clone(),
             name: package.name.name.clone(),
             version: package.name.version.clone(),
         };
         for &world_id in package.worlds.values() {
             let world = &resolve.worlds[world_id];
-            let id = ComponentRef {
-                package: package_ref.clone(),
-                world: world.name.clone(),
-                content_hash: None,
-            };
-            if !wanted(&id) {
-                continue;
-            }
-            match lower_world(resolve, world, &package_ref) {
-                Ok(Some(lowered)) => results.push(Ok(lowered)),
-                Ok(None) => {}
-                Err(kind) => results.push(Err(LowerError { world: id, kind })),
-            }
+            worlds.push((
+                WorldRef::new(package_ref.clone(), world.name.clone()),
+                world_id,
+            ));
         }
     }
-    results
+    worlds
+}
+
+/// The world `world` names, among the source's root packages'.
+pub fn find_world(source: &WitSource, world: &WorldRef) -> Option<wp::WorldId> {
+    root_worlds(source)
+        .into_iter()
+        .find_map(|(found, id)| (&found == world).then_some(id))
+}
+
+/// What a world imports, as capabilities: what a component built to it may
+/// ask its host for. For a provider's world, which need not be a node's.
+pub fn world_capabilities(source: &WitSource, world: wp::WorldId) -> Vec<Capability> {
+    capabilities(&source.resolve, &source.resolve.worlds[world])
 }
 
 /// The world's `node` export: its interface and the name it is exported
@@ -611,7 +639,7 @@ const WELL_KNOWN: [(&str, PortDirection); 2] = [
 fn lower_world(
     resolve: &Resolve,
     world: &wp::World,
-    package: &PackageRef,
+    id: ContractId,
 ) -> Result<Option<Lowered>, LowerErrorKind> {
     let Some((node, export)) = find_node_export(resolve, world)? else {
         return Ok(None);
@@ -673,18 +701,13 @@ fn lower_world(
         }
     }
 
-    let mut contract = ComponentContract {
-        id: ComponentRef {
-            package: package.clone(),
-            world: world.name.clone(),
-            content_hash: None,
-        },
+    let contract = ComponentContract {
+        id,
         inputs,
         outputs,
         capabilities: capabilities(resolve, world),
         docs: world.docs.contents.clone(),
     };
-    contract.id.content_hash = Some(hash::content_hash(&contract));
     Ok(Some(Lowered {
         contract,
         warnings: Vec::new(),
@@ -1569,7 +1592,11 @@ mod tests {
     use witgraph_ir::{NodeShape, PortKind};
 
     fn lower_all(wit: &str) -> Result<Vec<Lowered>, crate::Error> {
-        Ok(lower(&load_str("test.wit", wit)?)?)
+        Ok(lower(&load_str("test.wit", wit)?, &component())?)
+    }
+
+    fn component() -> ComponentName {
+        "c".parse().unwrap()
     }
 
     fn lower_source(wit: &str) -> Result<Vec<ComponentContract>, crate::Error> {
@@ -1646,8 +1673,8 @@ mod tests {
             "#,
         );
 
-        assert_eq!(contract.id.to_string(), "demo:test/value-node@0.1.0");
-        assert_eq!(contract.id.content_hash.as_ref().unwrap().len(), 64);
+        assert_eq!(contract.id.to_string(), "c/demo:test/value-node@0.1.0");
+        assert_eq!(crate::hash::content_hash(&contract).len(), 64);
         assert_eq!(contract.docs.as_deref(), Some("Lowers everything."));
         assert_eq!(contract.shape(), NodeShape::Reactive);
 
@@ -2165,12 +2192,7 @@ mod tests {
 
     #[test]
     fn a_stream_of_handles_hashes_apart_from_a_handle_port() {
-        let hash = |fields: &str| {
-            lower_one(&handle_world(fields, ""))
-                .id
-                .content_hash
-                .unwrap()
-        };
+        let hash = |fields: &str| crate::hash::content_hash(&lower_one(&handle_world(fields, "")));
         let stream = hash("record inputs { a: u32 } record outputs { b: stream<tensor> }");
         assert_ne!(
             stream,
@@ -2194,7 +2216,7 @@ mod tests {
                 "",
             )
             .replace("@0.1.0", &format!("@{version}"));
-            lower_one(&wit).id.content_hash.unwrap()
+            crate::hash::content_hash(&lower_one(&wit))
         };
         assert_ne!(hash("0.1.0", "tensor"), hash("0.2.0", "tensor"));
         assert_ne!(hash("0.1.0", "tensor"), hash("0.1.0", "blob"));
@@ -2352,7 +2374,7 @@ mod tests {
             package demo:inner@0.2.0 {{ world w {{ {node} }} }}
             world w {{ {node} }}"
         );
-        let failures = lower(&load_str("test.wit", &wit).unwrap())
+        let failures = lower(&load_str("test.wit", &wit).unwrap(), &component())
             .unwrap_err()
             .failures;
         let mut worlds: Vec<String> = failures.iter().map(|f| f.world.to_string()).collect();
@@ -2699,7 +2721,8 @@ mod tests {
         );
         let elsewhere = lower_one(&wit("other:pkg@2.0.0", "renamed"));
         assert_eq!(
-            contract.id.content_hash, elsewhere.id.content_hash,
+            crate::hash::content_hash(&contract),
+            crate::hash::content_hash(&elsewhere),
             "the package, world and version stay out of the hash"
         );
     }
@@ -2726,7 +2749,8 @@ mod tests {
         assert_eq!(a.capabilities[1].items["blink"], r#"func("times":u8)"#);
         let b = lower_one(&wit("string"));
         assert_ne!(
-            a.id.content_hash, b.id.content_hash,
+            crate::hash::content_hash(&a),
+            crate::hash::content_hash(&b),
             "a capability signature change is a different contract"
         );
     }
@@ -2829,7 +2853,7 @@ mod tests {
                 "#
             )
         };
-        let hash = |import: &str| lower_one(&wit(import)).id.content_hash;
+        let hash = |import: &str| crate::hash::content_hash(&lower_one(&wit(import)));
         assert_ne!(hash("primary: clock"), hash("clock"));
         assert_ne!(hash("primary: clock"), hash("backup: clock"));
     }
@@ -2975,7 +2999,7 @@ mod tests {
             .stack_size(2 << 20)
             .spawn(move || {
                 let source = load_str("deep.wit", &wit).expect("wit-parser accepts it");
-                lower(&source).map(|l| l.len())
+                lower(&source, &component()).map(|l| l.len())
             })
             .unwrap()
             .join()
@@ -3003,7 +3027,7 @@ mod tests {
         );
         let source = load_str("aliases.wit", &wit).expect("wit-parser accepts it");
         let started = std::time::Instant::now();
-        let lowered = lower(&source).expect("lowers");
+        let lowered = lower(&source, &component()).expect("lowers");
         assert_eq!(lowered[0].types.len(), LAST + 1, "every alias is named");
         let took = started.elapsed();
         assert!(took.as_secs() < 60, "took {took:?}");
@@ -3028,7 +3052,7 @@ mod tests {
             .stack_size(2 << 20)
             .spawn(move || {
                 let source = load_str("aliases.wit", &wit).expect("wit-parser accepts it");
-                lower(&source).map(|l| l.len())
+                lower(&source, &component()).map(|l| l.len())
             })
             .unwrap()
             .join()
@@ -3180,19 +3204,21 @@ mod tests {
             "#,
         )
         .unwrap();
-        let results = lower_each(&source);
+        let results = lower_each(&source, &component());
         assert_eq!(results.len(), 2);
-        assert!(
-            results
-                .iter()
-                .any(|r| r.as_ref().is_ok_and(|l| l.contract.id.world == "good"))
-        );
+        assert!(results.iter().any(|r| {
+            r.as_ref()
+                .is_ok_and(|l| l.contract.id.world.world == "good")
+        }));
         assert!(
             results
                 .iter()
                 .any(|r| r.as_ref().is_err_and(|e| e.world.world == "bad"))
         );
-        assert!(lower(&source).is_err(), "`lower` still fails as a whole");
+        assert!(
+            lower(&source, &component()).is_err(),
+            "`lower` still fails as a whole"
+        );
     }
 
     #[test]
@@ -3267,7 +3293,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        let mut ids: Vec<String> = contracts.iter().map(|c| c.id.to_string()).collect();
+        let mut ids: Vec<String> = contracts.iter().map(|c| c.id.world.to_string()).collect();
         ids.sort();
         assert_eq!(
             ids,
@@ -3290,7 +3316,7 @@ mod tests {
             }
             "#,
         );
-        assert_eq!(contract.id.package.version, None);
+        assert_eq!(contract.id.world.package.version, None);
         assert_eq!(capability_names(&contract), ["config"]);
     }
 
@@ -3321,7 +3347,7 @@ mod tests {
         "#;
         let renamed = base.replace("out: f64", "output: f64");
 
-        let hash = |wit: &str| lower_one(wit).id.content_hash.unwrap();
+        let hash = |wit: &str| crate::hash::content_hash(&lower_one(wit));
         assert_eq!(hash(base), hash(commented));
         assert_ne!(hash(base), hash(&renamed));
     }

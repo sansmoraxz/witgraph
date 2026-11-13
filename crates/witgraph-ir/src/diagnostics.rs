@@ -8,7 +8,9 @@ use core::fmt;
 
 pub use miette::Severity;
 
-use crate::id::{ComponentRef, ConnectionId, LinkId, NodeId, PortName, PortRef, ResourceId};
+use crate::id::{
+    ComponentName, ConnectionId, ContractId, LinkId, NodeId, PortName, PortRef, ResourceId,
+};
 use crate::port::{PortDirection, PortKind};
 
 /// Where in the graph a diagnostic points.
@@ -18,8 +20,8 @@ use crate::port::{PortDirection, PortKind};
 pub enum Location {
     /// The graph as a whole.
     Graph,
-    /// One component contract in the graph's component table.
-    Component(ComponentRef),
+    /// One contract: a world, as one component of the table provides it.
+    Component(ContractId),
     /// One node.
     Node(NodeId),
     /// Several nodes, in declaration order.
@@ -66,16 +68,6 @@ fn join_unique<T: fmt::Display + Eq + core::hash::Hash>(items: &[T]) -> String {
 /// At most this many items of a long list are rendered.
 const LISTED: usize = 16;
 
-/// Component refs in their pinned form (`{:#}`, content hash included),
-/// the first [`LISTED`] of them.
-fn join_pinned(refs: &[ComponentRef]) -> String {
-    let mut out = join(refs.iter().take(LISTED).map(|r| format!("{r:#}")));
-    if refs.len() > LISTED {
-        out.push_str(&format!(" and {} more", refs.len() - LISTED));
-    }
-    out
-}
-
 /// Every defect graph validation can detect, as data. The `thiserror`
 /// message is the user-facing rendering; severity comes from the
 /// [`miette::Diagnostic`] derive (`None` = error, per miette convention).
@@ -83,90 +75,52 @@ fn join_pinned(refs: &[ComponentRef]) -> String {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 pub enum Diagnostic {
-    /// A node references a component missing from the graph's component
-    /// table, or one whose content hash differs from the contract the
-    /// matching table entry resolved to.
-    #[error("node `{node}` references unknown component `{component:#}`")]
+    /// A node names a component the graph's component table does not
+    /// have.
+    #[error("node `{node}` names component `{component}`, which is not in the component table")]
     #[diagnostic(
         code(witgraph::ir::unknown_component),
-        help(
-            "add it to the component table, or re-pin the node to the revision the table resolves to"
-        )
+        help("add it to the component table, with where its node manifest is")
     )]
     UnknownComponent {
-        /// The referencing node.
+        /// The node.
         node: NodeId,
-        /// The unresolved component reference.
-        component: ComponentRef,
+        /// The component it names.
+        component: ComponentName,
     },
-    /// A component table entry for which the [`ContractSource`] supplied no
-    /// contract — the component is unknown to it, or the source only has a
-    /// revision with a different content hash.
+    /// A link names a provider the graph's component table does not have.
+    #[error("link `{link}` names provider `{provider}`, which is not in the component table")]
+    #[diagnostic(
+        code(witgraph::ir::unknown_provider),
+        help("add it to the component table, with where its node manifest is")
+    )]
+    UnknownProvider {
+        /// The link.
+        link: LinkId,
+        /// The provider it names.
+        provider: ComponentName,
+    },
+    /// A world nodes run that the [`ContractSource`] has no contract of, as
+    /// the component they name provides it: the component does not provide
+    /// that world (its node manifest does not list it), or was not found.
     ///
     /// [`ContractSource`]: crate::ContractSource
-    #[error("no contract was supplied for component `{0:#}`")]
+    #[error("component `{}` provides no world `{}`", .0.component, .0.world)]
     #[diagnostic(
         code(witgraph::ir::contract_not_found),
-        help(
-            "re-derive the contract from the component's WIT, or re-pin the graph to the revision you have"
-        )
+        help("run one of the worlds the component's node manifest lists")
     )]
-    ContractNotFound(ComponentRef),
-    /// An unhashed component table entry that several contracts supplied by
-    /// the [`ContractSource`] fit: revisions with other content hashes, or
-    /// differing hashless contracts with the entry's id.
-    ///
-    /// [`ContractSource`]: crate::ContractSource
-    #[error(
-        "component `{component}` is ambiguous: {} contracts were supplied",
-        matches.len()
-    )]
-    #[diagnostic(
-        code(witgraph::ir::ambiguous_contract),
-        help("pin the entry to one of: {}", join_pinned(matches))
-    )]
-    AmbiguousContract {
-        /// The unhashed table entry.
-        component: ComponentRef,
-        /// Every revision that fits it.
-        matches: Vec<ComponentRef>,
-    },
-    /// Two entries in the graph's component table share an identity
-    /// (package, world, version, and content hash all equal).
-    #[error("component table contains duplicate component `{0}`")]
-    #[diagnostic(code(witgraph::ir::duplicate_component))]
-    DuplicateComponent(ComponentRef),
+    ContractNotFound(ContractId),
     /// A contract declares two ports with the same name on the same side.
     #[error("component `{component}` declares duplicate {direction} port `{port}`")]
     #[diagnostic(code(witgraph::ir::duplicate_port_name))]
     DuplicatePortName {
-        /// The component declaring the clashing ports.
-        component: ComponentRef,
+        /// The contract declaring the clashing ports.
+        component: ContractId,
         /// Which side of the contract the clash is on.
         direction: PortDirection,
         /// The repeated port name.
         port: PortName,
-    },
-    /// A component reference that matches more than one distinct entry in
-    /// the graph's component table (e.g. an unhashed reference amid several
-    /// hashed revisions of the same world). Reported once per reference,
-    /// with every node using it.
-    #[error(
-        "component reference `{component:#}` (used by {}) is ambiguous: it matches {} contracts",
-        join_nodes(nodes),
-        matches.len()
-    )]
-    #[diagnostic(
-        code(witgraph::ir::ambiguous_component),
-        help("matching contracts: {}", join_pinned(matches))
-    )]
-    AmbiguousComponent {
-        /// The nodes using the reference, in declaration order.
-        nodes: Vec<NodeId>,
-        /// The ambiguous component reference.
-        component: ComponentRef,
-        /// Every distinct contract id the reference matches, sorted.
-        matches: Vec<ComponentRef>,
     },
     /// Two nodes share an id.
     #[error("duplicate node id `{0}`")]
@@ -327,8 +281,8 @@ pub enum Diagnostic {
     )]
     #[diagnostic(code(witgraph::ir::optional_output))]
     OptionalOutput {
-        /// The component declaring the flagged output.
-        component: ComponentRef,
+        /// The contract declaring the flagged output.
+        component: ContractId,
         /// The flagged output port.
         port: PortName,
     },
@@ -426,7 +380,6 @@ impl Diagnostic {
     pub fn location(&self) -> Location {
         match self {
             Diagnostic::UnknownComponent { node, .. } => Location::Node(node.clone()),
-            Diagnostic::AmbiguousComponent { nodes, .. } => Location::Nodes(nodes.clone()),
             Diagnostic::DuplicateNodeId(node) => Location::Node(node.clone()),
             Diagnostic::NodeOverclaims { node, .. } => Location::Node(node.clone()),
             Diagnostic::DuplicateConnectionId(conn)
@@ -441,18 +394,15 @@ impl Diagnostic {
             | Diagnostic::UselessFeedback { conn } => Location::Connection(conn.clone()),
             Diagnostic::DuplicateLinkId(link)
             | Diagnostic::LinkUnknownNode { link, .. }
+            | Diagnostic::UnknownProvider { link, .. }
             | Diagnostic::UnknownImport { link, .. }
             | Diagnostic::ImportLinkedTwice { second: link, .. } => Location::Link(link.clone()),
             Diagnostic::MultipleWriters { port, .. }
             | Diagnostic::AsyncFanOut { port, .. }
             | Diagnostic::RequiredInputUnconnected { port }
             | Diagnostic::FeedbackOnlyInput { port, .. } => Location::Port(port.clone()),
-            Diagnostic::DuplicateComponent(component)
-            | Diagnostic::ContractNotFound(component)
-            | Diagnostic::AmbiguousContract { component, .. } => {
-                Location::Component(component.clone())
-            }
-            Diagnostic::DuplicatePortName { component, .. }
+            Diagnostic::ContractNotFound(component)
+            | Diagnostic::DuplicatePortName { component, .. }
             | Diagnostic::OptionalOutput { component, .. } => {
                 Location::Component(component.clone())
             }
@@ -529,18 +479,9 @@ impl fmt::Display for Diagnostics {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::id::PackageRef;
 
-    fn cref(hash: Option<&str>) -> ComponentRef {
-        ComponentRef {
-            package: PackageRef {
-                namespace: "demo".into(),
-                name: "graph".into(),
-                version: None,
-            },
-            world: "w".into(),
-            content_hash: hash.map(String::from),
-        }
+    fn contract() -> ContractId {
+        "c/demo:graph/w".parse().unwrap()
     }
 
     #[test]
@@ -549,21 +490,28 @@ mod tests {
             (
                 Diagnostic::UnknownComponent {
                     node: "n".into(),
-                    component: cref(None),
+                    component: "c".parse().unwrap(),
                 },
                 Location::Node("n".into()),
             ),
             (
-                Diagnostic::DuplicateComponent(cref(None)),
-                Location::Component(cref(None)),
+                Diagnostic::UnknownProvider {
+                    link: "l".into(),
+                    provider: "c".parse().unwrap(),
+                },
+                Location::Link("l".into()),
+            ),
+            (
+                Diagnostic::ContractNotFound(contract()),
+                Location::Component(contract()),
             ),
             (
                 Diagnostic::DuplicatePortName {
-                    component: cref(None),
+                    component: contract(),
                     direction: PortDirection::Input,
                     port: "p".into(),
                 },
-                Location::Component(cref(None)),
+                Location::Component(contract()),
             ),
             (
                 Diagnostic::KindMismatch {
@@ -633,38 +581,10 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_component_help_includes_hashes() {
-        use miette::Diagnostic as _;
-        let diagnostic = Diagnostic::AmbiguousComponent {
-            nodes: vec!["n".into(), "m".into()],
-            component: cref(None),
-            matches: vec![cref(Some("aa")), cref(Some("bb"))],
-        };
+    fn missing_contracts_name_the_component_and_world() {
         assert_eq!(
-            diagnostic.to_string(),
-            "component reference `demo:graph/w` (used by `n`, `m`) is ambiguous: it matches 2 contracts"
-        );
-        let help = diagnostic.help().expect("has help").to_string();
-        assert_eq!(help, "matching contracts: demo:graph/w#aa, demo:graph/w#bb");
-    }
-
-    #[test]
-    fn long_lists_are_cut_short() {
-        use miette::Diagnostic as _;
-        let matches: Vec<ComponentRef> = (0..20).map(|i| cref(Some(&format!("{i:02x}")))).collect();
-        let diagnostic = Diagnostic::AmbiguousContract {
-            component: cref(None),
-            matches,
-        };
-        let help = diagnostic.help().expect("has help").to_string();
-        assert!(help.ends_with("demo:graph/w#0f and 4 more"), "{help}");
-    }
-
-    #[test]
-    fn missing_contracts_name_their_hash() {
-        assert_eq!(
-            Diagnostic::ContractNotFound(cref(Some("ab"))).to_string(),
-            "no contract was supplied for component `demo:graph/w#ab`"
+            Diagnostic::ContractNotFound(contract()).to_string(),
+            "component `c` provides no world `demo:graph/w`"
         );
     }
 }

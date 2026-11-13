@@ -15,7 +15,7 @@ use witgraph_host_plane::{
     boxed,
 };
 use witgraph_ir::{
-    ComponentContract, ComponentRef, Graph, NodeId, PortDef, PortDirection, PortRef, Type,
+    ComponentContract, ContractId, Graph, NodeId, PortDef, PortDirection, PortRef, Type,
 };
 
 /// What a node computes: its inputs, by field, to its outputs, by name.
@@ -74,10 +74,7 @@ impl Executor for Closures {
 /// `in: option<u32>` → `out: u32`.
 fn contract(world: &str) -> ComponentContract {
     ComponentContract {
-        id: ComponentRef {
-            content_hash: Some("aa".into()),
-            ..format!("mock:nodes/{world}@0.1.0").parse().unwrap()
-        },
+        id: format!("{world}/mock:nodes/{world}@0.1.0").parse().unwrap(),
         inputs: vec![PortDef::value("in", Type::U32).optional()],
         outputs: vec![PortDef::value("out", Type::U32)],
         capabilities: vec![],
@@ -147,7 +144,7 @@ fn builder() -> witgraph_ir::GraphBuilder {
     Graph::builder("mock").add_component(inc())
 }
 
-fn inc() -> ComponentRef {
+fn inc() -> ContractId {
     contract("inc").id
 }
 

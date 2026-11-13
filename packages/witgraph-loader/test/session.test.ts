@@ -17,6 +17,7 @@ import {
   type Diagnostic,
   describeComponent,
   diagnosticsOf,
+  encodeWit,
   type FutureItem,
   GraphChecker,
   init,
@@ -58,6 +59,7 @@ async function guestDir(): Promise<URL> {
 
 const guests = await guestDir();
 const wasm = await readFile(new URL('../pkg/witgraph_web_bg.wasm', import.meta.url));
+await init(wasm);
 
 const ids: Record<string, string> = {
   echo: 'test:echo/echo@0.1.0',
@@ -95,8 +97,15 @@ const ids: Record<string, string> = {
   'tensor-keep': 'test:tensor-keep/tensor-keep@0.1.0',
 };
 
+/** A component written here: its world, its bytes (WAT, parsed) and its WIT text. */
+interface Inline {
+  id: string;
+  bytes: Uint8Array;
+  wit: string;
+}
+
 /** Components written in WAT here, by guest name, beside the built guests. */
-const inline: Record<string, ComponentSource> = {};
+const inline: Record<string, Inline> = {};
 
 /**
  * `values`: echoes nested options and a list, in the representation jco
@@ -245,9 +254,29 @@ inline['start-fatal'] = {
     }`,
 };
 
-function componentRef(id: string) {
-  const match = /^([^:]+):([^/]+)\/([^@]+)@(.+)$/.exec(id)!;
-  return { package: { namespace: match[1], name: match[2], version: match[4] }, world: match[3] };
+/** The guest whose world `world` is: a built one's, or one written here. */
+function guestOf(world: string): string {
+  const named = (table: Record<string, string>) =>
+    Object.entries(table).find(([, w]) => w === world)?.[0];
+  const guest =
+    named(ids) ?? named(Object.fromEntries(Object.entries(inline).map(([g, c]) => [g, c.id])));
+  if (!guest) throw new Error(`no guest of ${world}`);
+  return guest;
+}
+
+/** What a node of the guest whose world is `world` names: the guest, and the world. */
+function nodeRef(world: string) {
+  return { component: guestOf(world), world };
+}
+
+/** A graph's component table, naming the guests of `worlds`. */
+function table(worlds: string[]): Record<string, string> {
+  return Object.fromEntries(worlds.map((world) => [guestOf(world), guestOf(world)]));
+}
+
+/** The package `world` is in. */
+function packageOf(world: string): string {
+  return world.replace(/\/[^@]+/, '');
 }
 
 type Connection = [id: string, from: string, to: string, feedback?: boolean];
@@ -265,14 +294,24 @@ async function loaded(options: SessionOptions): Promise<Session> {
   return session;
 }
 
-/** A built guest, or one written in WAT here. */
+/** A built guest, from its node manifest beside its bytes, or one written in WAT here. */
 async function guestSource(guest: string): Promise<ComponentSource> {
-  return (
-    inline[guest] ?? {
-      id: ids[guest],
-      bytes: new Uint8Array(await readFile(new URL(`${guest}.wasm`, guests))),
-    }
-  );
+  const written = inline[guest];
+  if (written) {
+    return {
+      name: guest,
+      manifest: { wit: packageOf(written.id), worlds: [written.id] },
+      wit: encodeWit(`${guest}.wit`, written.wit),
+      bytes: written.bytes,
+    };
+  }
+  const read = async (name: string) => new Uint8Array(await readFile(new URL(name, guests)));
+  return {
+    name: guest,
+    manifest: JSON.parse(await readFile(new URL(`${guest}.node.json`, guests), 'utf8')),
+    wit: await read(`${guest}.wit.wasm`),
+    bytes: await read(`${guest}.wasm`),
+  };
 }
 
 /** A graph over the named guests: nodes are `[id, guest]`, ports are `node.port`. */
@@ -289,10 +328,10 @@ async function load(
   };
   const graph = {
     metadata: { name: 'test' },
-    components: components.map(({ id }) => componentRef(id)),
+    components: Object.fromEntries(components.map(({ name }) => [name, name])),
     nodes: nodes.map(([id, guest]) => ({
       id,
-      component: componentRef(inline[guest]?.id ?? ids[guest]),
+      ...nodeRef(inline[guest]?.id ?? ids[guest]),
     })),
     connections: connections.map(([id, from, to, feedback]) => ({
       id,
@@ -424,7 +463,7 @@ test('a stream of records reaches the tap one record a chunk, and outputs carry 
   const [cr, cg, cb] = rgb('source');
   assert.ok(cr !== cg || cg !== cb, `the source is in colour: ${[cr, cg, cb]}`);
 
-  // The bytes' `witgraph-viewer` section, on the contract.
+  // The node manifests' viewers, on the contract.
   const viewers = (node: string) =>
     session.contracts.get(node)!.outputs.map(({ name, viewer }) => [name, viewer]);
   assert.deepEqual(viewers('source'), [['frames', 'image']]);
@@ -432,40 +471,39 @@ test('a stream of records reaches the tap one record a chunk, and outputs carry 
   assert.ok(viewers('sink').every(([, viewer]) => viewer === undefined));
 });
 
-test('a contract from WIT text takes its viewers from the bytes', async () => {
-  const wit = await readFile(
-    new URL('test-fixtures/test-components/guests/frame-grayscale/wit/world.wit', root),
-    'utf8',
-  );
+test('viewers come from the node manifest', async () => {
   const source = await guestSource('video-source');
-  const { bytes } = await guestSource('frame-grayscale');
+  const gray = await guestSource('frame-grayscale');
   const graph = {
     metadata: { name: 'test' },
-    components: [componentRef(ids['video-source']), componentRef(ids['frame-grayscale'])],
+    components: table([ids['video-source'], ids['frame-grayscale']]),
     nodes: [
-      { id: 'source', component: componentRef(ids['video-source']) },
-      { id: 'gray', component: componentRef(ids['frame-grayscale']) },
+      { id: 'source', ...nodeRef(ids['video-source']) },
+      { id: 'gray', ...nodeRef(ids['frame-grayscale']) },
     ],
     connections: [
       { id: 'a', from: { node: 'source', port: 'frames' }, to: { node: 'gray', port: 'frames' } },
     ],
   };
+  const plain = { ...gray.manifest, viewers: {} };
   const session = await loaded({
     graph,
-    components: [source, { id: ids['frame-grayscale'], bytes, wit }],
+    components: [source, { ...gray, manifest: plain }],
     wasm,
     capabilities: clock,
   });
-  assert.equal(session.contracts.get('gray')!.outputs[0].viewer, 'image');
+  assert.equal(session.contracts.get('gray')!.outputs[0].viewer, undefined);
+  assert.equal(session.contracts.get('source')!.outputs[0].viewer, 'image');
 });
 
 test('a wrong viewer hint is a warning, not a failed load', async () => {
-  // `video-source` with a section at its root naming an output it lacks.
-  const { id, bytes } = await guestSource('video-source');
-  const name = new TextEncoder().encode('witgraph-viewer');
-  const hint = new TextEncoder().encode('output.frame=image\n');
-  const body = [name.length, ...name, ...hint];
-  const stale = Uint8Array.from([...bytes, 0, body.length, ...body]);
+  // `video-source` with a manifest naming an output it lacks.
+  const source = await guestSource('video-source');
+  const id = ids['video-source'];
+  const stale = {
+    ...source,
+    manifest: { ...source.manifest, viewers: { [id]: { frame: 'image' } } },
+  };
   const warned: unknown[] = [];
   const warn = console.warn;
   console.warn = (...args: unknown[]) => warned.push(args.join(' '));
@@ -473,11 +511,11 @@ test('a wrong viewer hint is a warning, not a failed load', async () => {
     const session = await loaded({
       graph: {
         metadata: { name: 'test' },
-        components: [componentRef(id)],
-        nodes: [{ id: 'source', component: componentRef(id) }],
+        components: table([id]),
+        nodes: [{ id: 'source', ...nodeRef(id) }],
         connections: [],
       },
-      components: [{ id, bytes: stale }],
+      components: [stale],
       wasm,
       capabilities: clock,
     });
@@ -776,38 +814,22 @@ test('a paused tick can be inspected', async () => {
   assert.equal(await session.graph.readInput('a', 'in'), 1);
 });
 
-test('with its WIT source, a component resolves against the source contract', async () => {
-  const wit = await readFile(
-    new URL('test-fixtures/test-components/guests/echo/wit/world.wit', root),
-    'utf8',
-  );
-  const bytes = new Uint8Array(await readFile(new URL('echo.wasm', guests)));
-  const plain = await load([['a', 'echo']]);
-  const hash = plain.contracts.get('a')!.id.split('#')[1];
-  const pinned = { ...componentRef(ids.echo), content_hash: hash };
+test('the bytes of a component must target the world its manifest names', async () => {
+  const echo = await guestSource('echo');
+  const relay = await guestSource('relay');
   const graph = {
-    metadata: { name: 'pinned' },
-    components: [pinned],
-    nodes: [{ id: 'a', component: pinned }],
+    metadata: { name: 'targets' },
+    components: table([ids.echo]),
+    nodes: [{ id: 'a', ...nodeRef(ids.echo) }],
     connections: [],
   };
-  // The component passed under the pinned id the graph's table uses.
-  const session = await loaded({
-    graph,
-    components: [{ id: `${ids.echo}#${hash}`, bytes, wit }],
-    wasm,
-  });
+  const session = await loaded({ graph, components: [echo], wasm });
   await session.graph.inject('a', 'in', 3);
   await session.settle();
   assert.equal(await session.graph.readOutput('a', 'out'), 3);
-
-  const relay = await readFile(
-    new URL('test-fixtures/test-components/guests/relay/wit/world.wit', root),
-    'utf8',
-  );
   await assert.rejects(
-    Session.load({ graph, components: [{ id: ids.echo, bytes, wit: relay }], wasm }),
-    /no component world/,
+    Session.load({ graph, components: [{ ...echo, bytes: relay.bytes }], wasm }),
+    /does not target `test:echo\/echo@0\.1\.0`/,
   );
 });
 
@@ -881,36 +903,24 @@ function gate(): { promise: Promise<void>; open: () => void } {
 
 const tick = () => new Promise((resolve) => setTimeout(resolve, 10));
 
-test('each node runs the component its contract was resolved from', async () => {
+test('each node runs the component it names, of two of one world', async () => {
   const echo = await guestSource('echo');
-  const maybe = await guestSource('maybe');
-  const plain = await load([['a', 'echo']]);
-  const hash = plain.contracts.get('a')!.id.split('#')[1];
-  const unpinned = componentRef(ids.echo);
-  const pinned = { ...unpinned, content_hash: hash };
+  const other = { ...echo, name: 'other' };
   const graph = {
-    metadata: { name: 'pinned' },
-    components: [pinned],
-    nodes: [{ id: 'n', component: unpinned }],
+    metadata: { name: 'two' },
+    components: { echo: 'echo', other: 'other' },
+    nodes: [
+      { id: 'a', component: 'echo', world: ids.echo },
+      { id: 'b', component: 'other', world: ids.echo },
+    ],
     connections: [],
   };
-  // Other bytes under the unpinned id: the table pins the echo's.
-  for (const components of [
-    [
-      { id: ids.echo, bytes: maybe.bytes },
-      { id: `${ids.echo}#${hash}`, bytes: echo.bytes },
-    ],
-    [
-      { id: `${ids.echo}#${hash}`, bytes: echo.bytes },
-      { id: ids.echo, bytes: maybe.bytes },
-    ],
-  ]) {
-    const session = await loaded({ graph, components, wasm });
-    await session.graph.inject('n', 'in', 4);
-    await session.settle();
-    assert.deepEqual(session.graph.takeFaults(), []);
-    assert.equal(await session.graph.readOutput('n', 'out'), 4);
-  }
+  const session = await loaded({ graph, components: [echo, other], wasm });
+  assert.equal(session.contracts.get('b')!.component, 'other');
+  await session.graph.inject('b', 'in', 4);
+  await session.settle();
+  assert.deepEqual(session.graph.takeFaults(), []);
+  assert.equal(await session.graph.readOutput('b', 'out'), 4);
 });
 
 test('nested options cross in the representation jco picks at each depth', async () => {
@@ -1149,15 +1159,15 @@ test('an instance dropped while it rebuilds is abandoned', async () => {
   const { bytes } = await guestSource('echo');
   const graph = {
     metadata: { name: 'rebuild' },
-    components: [componentRef(ids.echo)],
-    nodes: [{ id: 'a', component: componentRef(ids.echo) }],
+    components: table([ids.echo]),
+    nodes: [{ id: 'a', ...nodeRef(ids.echo) }],
     connections: [],
   };
   const rebuilding = gate();
   let abandoned = 0;
   const web = WebGraph.load(
     JSON.stringify(graph),
-    [{ id: ids.echo, bytes }],
+    [{ ...(await guestSource('echo')), bytes }],
     {
       run: () => ({
         outputsChanged: [],
@@ -1193,8 +1203,9 @@ test('an instance dropped while it rebuilds is abandoned', async () => {
   } finally {
     web.free();
   }
+  const echo = { ...(await guestSource('echo')), bytes };
   assert.throws(
-    () => WebGraph.load(JSON.stringify(graph), [{ id: ids.echo, bytes }], { run: () => ({}) }, []),
+    () => WebGraph.load(JSON.stringify(graph), [echo], { run: () => ({}) }, []),
     /`callbacks.rebuild` is required/,
   );
 });
@@ -1241,14 +1252,14 @@ test('mocks are own properties, called as methods, with an empty result as no ou
 
 test('hooks are called as methods, and a throwing stream observer does not reach the reader', async () => {
   const sources = await Promise.all(['stream-producer', 'stream-consumer'].map(guestSource));
-  const [prod, cons] = sources.map(({ id }) => componentRef(id));
+  const [prod, cons] = [ids['stream-producer'], ids['stream-consumer']].map(nodeRef);
   class Debugger implements SessionOptions {
     graph = {
       metadata: { name: 'debug' },
-      components: [prod, cons],
+      components: table([ids['stream-producer'], ids['stream-consumer']]),
       nodes: [
-        { id: 'prod', component: prod },
-        { id: 'cons', component: cons },
+        { id: 'prod', ...prod },
+        { id: 'cons', ...cons },
       ],
       connections: [
         { id: 's', from: { node: 'prod', port: 'items' }, to: { node: 'cons', port: 'items' } },
@@ -1537,14 +1548,14 @@ async function loadLinked(
   const ops = 'test:math/ops@0.1.0';
   const graph = {
     metadata: { name: 'test' },
-    components: [componentRef(ids.calc)],
-    nodes: nodes.map((id) => ({ id, component: componentRef(ids.calc) })),
+    components: table([ids.calc, ids.math]),
+    nodes: nodes.map((id) => ({ id, ...nodeRef(ids.calc) })),
     connections: [],
     links: nodes.map((id) => ({
       id: `link-${id}`,
       node: id,
       import: ops,
-      provider: componentRef(ids.math),
+      provider: 'math',
       export: ops,
     })),
   };
@@ -1582,7 +1593,7 @@ test('each node gets an instance of the provider of its own', async () => {
 });
 
 test('a link whose provider was not given fails the load by name', async () => {
-  await assert.rejects(loadLinked(['n'], { providers: [] }), /test:math\/math@0\.1\.0/);
+  await assert.rejects(loadLinked(['n'], { providers: [] }), /`math`/);
 });
 
 /**
@@ -1950,15 +1961,21 @@ test('a node importing a component is refused, and the next graph loads', async 
   assert.deepEqual(session.graph.takeFaults(), []);
 });
 
-test('imports sharing an instance type are decoded, not a crash', async () => {
-  // Two labels of one interface, as wit-parser used to panic on: no `node`, so no contract.
-  const bytes = await parse(`(component
-    (type $i (instance (type $t u32) (export "t" (type (eq $t)))))
-    (import "primary" (implements "a:b/store@0.1.0") (instance (type $i)))
-    (import "backup" (implements "a:b/store@0.1.0") (instance (type $i))))`);
+test('a component is described from its manifest and WIT, without bytes', async () => {
+  const { manifest, wit } = await guestSource('frame-grayscale');
+  const [contract, ...rest] = describeComponent('gray', manifest, wit);
+  assert.deepEqual(rest, []);
+  assert.equal(contract.id, `gray/${ids['frame-grayscale']}`);
+  assert.equal(contract.component, 'gray');
+  assert.equal(contract.world, ids['frame-grayscale']);
+  assert.equal(contract.outputs[0].viewer, 'image');
+  // A provider's world is no node's.
+  const math = await guestSource('math');
+  assert.deepEqual(describeComponent('math', math.manifest, math.wit), []);
   assert.throws(
-    () => describeComponent('a:b/c@0.1.0', bytes),
-    /exactly one node world in the component, found 0/,
+    () =>
+      describeComponent('bad', { ...manifest, worlds: ['test:frame-grayscale/nope@0.1.0'] }, wit),
+    /has no world/,
   );
 });
 
@@ -2083,8 +2100,8 @@ test('a capability import named like a mocked node reaches the host', async () =
 test('a hub setter throwing during a restore is a fault, with the restore in place', async () => {
   const graph = {
     metadata: { name: 'test' },
-    components: [componentRef(ids.echo)],
-    nodes: [{ id: 'e', component: componentRef(ids.echo) }],
+    components: table([ids.echo]),
+    nodes: [{ id: 'e', ...nodeRef(ids.echo) }],
     connections: [],
   };
   const bytes = new Uint8Array(await readFile(new URL('echo.wasm', guests)));
@@ -2099,7 +2116,7 @@ test('a hub setter throwing during a restore is a fault, with the restore in pla
   };
   const web = WebGraph.load(
     JSON.stringify(graph),
-    [{ id: ids.echo, bytes }],
+    [{ ...(await guestSource('echo')), bytes }],
     {
       run: () => ({
         outputsChanged: [],
@@ -2133,15 +2150,15 @@ test('a hub setter throwing during a restore is a fault, with the restore in pla
 test('a hub setter throwing during an inject is a fault, as on wasmtime', async () => {
   const graph = {
     metadata: { name: 'test' },
-    components: [componentRef(ids.echo)],
-    nodes: [{ id: 'e', component: componentRef(ids.echo) }],
+    components: table([ids.echo]),
+    nodes: [{ id: 'e', ...nodeRef(ids.echo) }],
     connections: [],
   };
   const bytes = new Uint8Array(await readFile(new URL('echo.wasm', guests)));
   let writes = 0;
   const web = WebGraph.load(
     JSON.stringify(graph),
-    [{ id: ids.echo, bytes }],
+    [{ ...(await guestSource('echo')), bytes }],
     {
       run: () => ({
         outputsChanged: [],
@@ -2189,14 +2206,14 @@ async function overStandIn(
 ) {
   const graph = {
     metadata: { name: 'test' },
-    components: [componentRef(ids.echo)],
-    nodes: [{ id: 'e', component: componentRef(ids.echo) }],
+    components: table([ids.echo]),
+    nodes: [{ id: 'e', ...nodeRef(ids.echo) }],
     connections,
   };
   const bytes = new Uint8Array(await readFile(new URL('echo.wasm', guests)));
   return WebGraph.load(
     JSON.stringify(graph),
-    [{ id: ids.echo, bytes }],
+    [{ ...(await guestSource('echo')), bytes }],
     {
       run: () => ({
         outputsChanged: [],
@@ -2286,8 +2303,8 @@ function jsonGraph(
   };
   return {
     metadata: { name: 'test' },
-    components: used.map((guest) => componentRef(ids[guest])),
-    nodes: nodes.map(([id, guest]) => ({ id, component: componentRef(ids[guest]) })),
+    components: table(used.map((guest) => ids[guest])),
+    nodes: nodes.map(([id, guest]) => ({ id, ...nodeRef(ids[guest]) })),
     connections: connections.map(([id, from, to, feedback]) => ({
       id,
       from: port(from),
@@ -2397,7 +2414,7 @@ async function groupBesideANode(capacity?: number): Promise<void> {
   const components = await Promise.all(used.map(guestSource));
   const node = (id: string, guest: string, resources = {}) => ({
     id,
-    component: componentRef(ids[guest]),
+    ...nodeRef(ids[guest]),
     resources,
   });
   const ends = (id: string, from: string, to: string) => {
@@ -2414,7 +2431,7 @@ async function groupBesideANode(capacity?: number): Promise<void> {
   const session = await loaded({
     graph: {
       metadata: { name: 'test' },
-      components: used.map((guest) => componentRef(ids[guest])),
+      components: table(used.map((guest) => ids[guest])),
       ...(capacity === undefined ? {} : { resources: { gpu: { capacity } } }),
       nodes: [
         node('prod', 'stream-producer', { gpu: { amount: 0.6 } }),
@@ -2455,7 +2472,7 @@ test('a stream group claiming more than there is runs all the same', async () =>
   const components = await Promise.all(used.map(guestSource));
   const node = (id: string, guest: string) => ({
     id,
-    component: componentRef(ids[guest]),
+    ...nodeRef(ids[guest]),
     resources: { gpu: { amount: 1 } },
   });
   const ends = (id: string, from: string, to: string) => {
@@ -2471,7 +2488,7 @@ test('a stream group claiming more than there is runs all the same', async () =>
   const session = await loaded({
     graph: {
       metadata: { name: 'test' },
-      components: used.map((guest) => componentRef(ids[guest])),
+      components: table(used.map((guest) => ids[guest])),
       nodes: [
         node('prod', 'stream-producer'),
         node('pass', 'stream-relay'),

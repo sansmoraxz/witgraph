@@ -9,6 +9,7 @@
 
 import {
   type Capability,
+  type ComponentSource,
   type Contract,
   type Diagnostic,
   type Port,
@@ -73,7 +74,7 @@ export interface HandleItem {
 /** What {@link RemoteSession.load} loads, and what it tells the page. */
 export interface RemoteSessionOptions {
   graph: object | string;
-  components: { id: string; bytes: Uint8Array; wit?: string }[];
+  components: ComponentSource[];
   /** The scheduler's module, for the worker. Only the first load on an endpoint sends it. */
   wasm?: Wasm;
   /** Called in the page, with inputs and outputs that can be cloned. */
@@ -256,7 +257,7 @@ class Served {
   async load(
     message: {
       graph: object | string;
-      components: { id: string; bytes: Uint8Array; wit?: string }[];
+      components: ComponentSource[];
       wasm?: Wasm | { url: string };
       mocked: string[];
       holds: readonly string[] | 'all';

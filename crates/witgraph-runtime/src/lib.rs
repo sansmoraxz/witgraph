@@ -77,4 +77,5 @@ pub use witgraph_traits::lines::{
     SourceLanguage, SourceVariable, StackFrame, StopReason,
 };
 pub use witgraph_traits::{OutputReader, RunningGraph, until};
+pub use witgraph_wit::Artifact;
 pub use {wasmtime, witgraph_ir, witgraph_sched, witgraph_traits};

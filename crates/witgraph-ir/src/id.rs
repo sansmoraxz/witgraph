@@ -1,4 +1,5 @@
-//! Stable identifiers for nodes, ports, connections, and components.
+//! Stable identifiers for nodes, ports, connections, and components, and
+//! the references to WIT packages and worlds.
 //!
 //! IDs are human-assigned string slugs: diffable, deterministic across
 //! editor sessions and serialization round-trips. Uniqueness within a graph
@@ -83,11 +84,15 @@ impl fmt::Display for PortRef {
     }
 }
 
-/// A WIT package name, mirroring `wit_parser::PackageName`.
+/// A WIT package, as `namespace:name@version` (the version optional): what
+/// a node manifest's `wit` names, and the package of every world it
+/// provides.
+///
+/// Written and read as that string.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
-pub struct PackageRef {
+#[cfg_attr(feature = "serde", serde(try_from = "String", into = "String"))]
+pub struct WitRef {
     /// The package namespace (`demo` in `demo:graph`).
     pub namespace: String,
     /// The package name (`graph` in `demo:graph`).
@@ -96,8 +101,7 @@ pub struct PackageRef {
     pub version: Option<semver::Version>,
 }
 
-/// Renders as `namespace:name@version` (version omitted when absent).
-impl fmt::Display for PackageRef {
+impl fmt::Display for WitRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}:{}", self.namespace, self.name)?;
         if let Some(version) = &self.version {
@@ -107,89 +111,51 @@ impl fmt::Display for PackageRef {
     }
 }
 
-/// Component version identity: which WIT world, from which package version,
-/// with an optional content hash of the lowered contract.
+impl FromStr for WitRef {
+    type Err = ParseRefError;
+
+    /// Parses `namespace:name[@version]`, namespace and name WIT
+    /// identifiers.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let err = || ParseRefError::new("WIT package", s);
+        let (s_ref, version) = split_version(s).ok_or_else(err)?;
+        let (namespace, name) = s_ref.split_once(':').ok_or_else(err)?;
+        if !is_kebab_ident(namespace) || !is_kebab_ident(name) {
+            return Err(err());
+        }
+        Ok(Self {
+            namespace: namespace.to_string(),
+            name: name.to_string(),
+            version,
+        })
+    }
+}
+
+/// A world, as `namespace:name/world@version` (the version optional): the
+/// contract a node fulfils, from the package `namespace:name@version`.
 ///
-/// Version compatibility is exact-match only.
-///
-/// Deserializing validates it as [`FromStr`] does: namespace, name and
-/// world must be WIT identifiers, and the content hash, when present,
-/// non-empty lowercase hex.
+/// Written and read as that string.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "serde", serde(try_from = "RawComponentRef"))]
-pub struct ComponentRef {
+#[cfg_attr(feature = "serde", serde(try_from = "String", into = "String"))]
+pub struct WorldRef {
     /// The WIT package the world lives in.
-    pub package: PackageRef,
+    pub package: WitRef,
     /// The world's name within the package.
     pub world: String,
-    /// sha-256 hex of the lowered contract, when known.
-    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
-    pub content_hash: Option<String>,
 }
 
-/// A [`ComponentRef`] as written, before validation.
-#[cfg(feature = "serde")]
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawComponentRef {
-    package: PackageRef,
-    world: String,
-    #[serde(default)]
-    content_hash: Option<String>,
-}
-
-#[cfg(feature = "serde")]
-impl TryFrom<RawComponentRef> for ComponentRef {
-    type Error = ParseComponentRefError;
-
-    fn try_from(raw: RawComponentRef) -> Result<Self, Self::Error> {
-        let id = ComponentRef {
-            package: raw.package,
-            world: raw.world,
-            content_hash: raw.content_hash,
-        };
-        if id.is_valid() {
-            Ok(id)
-        } else {
-            Err(ParseComponentRefError(format!("{id:#}")))
+impl WorldRef {
+    /// The world `world` of `package`.
+    pub fn new(package: WitRef, world: impl Into<String>) -> Self {
+        Self {
+            package,
+            world: world.into(),
         }
     }
 }
 
-impl ComponentRef {
-    /// Whether namespace, name and world are WIT identifiers and the
-    /// content hash, when present, is non-empty lowercase hex: what
-    /// [`FromStr`] accepts.
-    fn is_valid(&self) -> bool {
-        is_kebab_ident(&self.package.namespace)
-            && is_kebab_ident(&self.package.name)
-            && is_kebab_ident(&self.world)
-            && self.content_hash.as_deref().is_none_or(is_lower_hex)
-    }
-
-    /// Equality that ignores `content_hash` when either side lacks one.
-    /// Derived `Eq` stays strict.
-    ///
-    /// The asymmetry with versions is deliberate: a version (`None` included)
-    /// must match exactly, because it is always author-assigned; a hash is
-    /// derived and may simply not have been computed yet, so its absence is
-    /// treated as "unknown", not "different".
-    pub fn matches(&self, other: &ComponentRef) -> bool {
-        if self.package != other.package || self.world != other.world {
-            return false;
-        }
-        match (&self.content_hash, &other.content_hash) {
-            (Some(a), Some(b)) => a == b,
-            _ => true,
-        }
-    }
-}
-
-/// Renders as `namespace:name/world@version` (hash excluded); the
-/// alternate form (`{:#}`) appends the content hash as `#<hash>`, the
-/// pinned form [`FromStr`] parses back.
-impl fmt::Display for ComponentRef {
+impl fmt::Display for WorldRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
@@ -199,26 +165,169 @@ impl fmt::Display for ComponentRef {
         if let Some(version) = &self.package.version {
             write!(f, "@{version}")?;
         }
-        if f.alternate()
-            && let Some(hash) = &self.content_hash
-        {
-            write!(f, "#{hash}")?;
-        }
         Ok(())
     }
 }
 
-/// The rejected input of a failed [`ComponentRef`] parse.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ParseComponentRefError(String);
+impl FromStr for WorldRef {
+    type Err = ParseRefError;
 
-impl fmt::Display for ParseComponentRefError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "invalid component reference: {}", self.0)
+    /// Parses `namespace:name/world[@version]`, namespace, name and world
+    /// WIT identifiers.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let err = || ParseRefError::new("world", s);
+        let (s_ref, version) = split_version(s).ok_or_else(err)?;
+        let (namespace, rest) = s_ref.split_once(':').ok_or_else(err)?;
+        let (name, world) = rest.split_once('/').ok_or_else(err)?;
+        if !is_kebab_ident(namespace) || !is_kebab_ident(name) || !is_kebab_ident(world) {
+            return Err(err());
+        }
+        Ok(Self {
+            package: WitRef {
+                namespace: namespace.to_string(),
+                name: name.to_string(),
+                version,
+            },
+            world: world.to_string(),
+        })
     }
 }
 
-impl core::error::Error for ParseComponentRefError {}
+/// `s` split at its `@version`, the version parsed: `None` if it does not
+/// parse.
+fn split_version(s: &str) -> Option<(&str, Option<semver::Version>)> {
+    match s.split_once('@') {
+        Some((rest, version)) => Some((rest, Some(semver::Version::parse(version).ok()?))),
+        None => Some((s, None)),
+    }
+}
+
+/// A component's name in a graph's component table: a WIT identifier
+/// (kebab-case), naming the node manifest it is described by.
+///
+/// Written and read as that string.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(try_from = "String", into = "String"))]
+pub struct ComponentName(String);
+
+impl ComponentName {
+    /// The name, as written.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ComponentName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl FromStr for ComponentName {
+    type Err = ParseRefError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if is_kebab_ident(s) {
+            Ok(Self(s.to_string()))
+        } else {
+            Err(ParseRefError::new("component name", s))
+        }
+    }
+}
+
+impl core::borrow::Borrow<str> for ComponentName {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
+macro_rules! via_string {
+    ($($name:ident),*) => {$(
+        impl TryFrom<String> for $name {
+            type Error = ParseRefError;
+            fn try_from(s: String) -> Result<Self, Self::Error> {
+                s.parse()
+            }
+        }
+        impl TryFrom<&str> for $name {
+            type Error = ParseRefError;
+            fn try_from(s: &str) -> Result<Self, Self::Error> {
+                s.parse()
+            }
+        }
+        impl From<$name> for String {
+            fn from(id: $name) -> String {
+                id.to_string()
+            }
+        }
+    )*};
+}
+via_string!(WitRef, WorldRef, ComponentName);
+
+/// What a contract is the contract of: one world, as one component
+/// provides it. Shown as `component/world` (`adder/demo:math/adder@0.1.0`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
+pub struct ContractId {
+    /// The component, by its name in the graph's table.
+    pub component: ComponentName,
+    /// The world it provides.
+    pub world: WorldRef,
+}
+
+impl ContractId {
+    /// `world`, as `component` provides it.
+    pub fn new(component: ComponentName, world: WorldRef) -> Self {
+        Self { component, world }
+    }
+}
+
+impl fmt::Display for ContractId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}", self.component, self.world)
+    }
+}
+
+impl FromStr for ContractId {
+    type Err = ParseRefError;
+
+    /// Parses `component/namespace:name/world[@version]`.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (component, world) = s
+            .split_once('/')
+            .ok_or_else(|| ParseRefError::new("contract id", s))?;
+        Ok(Self {
+            component: component.parse()?,
+            world: world.parse()?,
+        })
+    }
+}
+
+/// A string that is not the reference it should be.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseRefError {
+    what: &'static str,
+    input: String,
+}
+
+impl ParseRefError {
+    fn new(what: &'static str, input: &str) -> Self {
+        Self {
+            what,
+            input: input.to_string(),
+        }
+    }
+}
+
+impl fmt::Display for ParseRefError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "invalid {}: {:?}", self.what, self.input)
+    }
+}
+
+impl core::error::Error for ParseRefError {}
 
 /// A WIT identifier, as wit-parser validates it: non-empty parts joined by
 /// single dashes, each part all lowercase or all uppercase (digits allowed
@@ -240,78 +349,26 @@ fn is_kebab_ident(s: &str) -> bool {
     })
 }
 
-/// Non-empty lowercase hex.
-fn is_lower_hex(s: &str) -> bool {
-    !s.is_empty()
-        && s.chars()
-            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
-}
-
-impl FromStr for ComponentRef {
-    type Err = ParseComponentRefError;
-
-    /// Parses `namespace:name/world[@version][#hash]`, where namespace,
-    /// name, and world must be WIT identifiers and the content hash, when
-    /// present, lowercase hex.
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let err = || ParseComponentRefError(s.to_string());
-        let (s_ref, content_hash) = match s.split_once('#') {
-            Some((r, hash)) => (r, Some(hash.to_string())),
-            None => (s, None),
-        };
-        let (namespace, rest) = s_ref.split_once(':').ok_or_else(err)?;
-        let (name, rest) = rest.split_once('/').ok_or_else(err)?;
-        let (world, version) = match rest.split_once('@') {
-            Some((world, ver)) => {
-                let version = semver::Version::parse(ver).map_err(|_| err())?;
-                (world, Some(version))
-            }
-            None => (rest, None),
-        };
-        let id = ComponentRef {
-            package: PackageRef {
-                namespace: namespace.to_string(),
-                name: name.to_string(),
-                version,
-            },
-            world: world.to_string(),
-            content_hash,
-        };
-        if id.is_valid() { Ok(id) } else { Err(err()) }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn component_ref(version: Option<&str>, hash: Option<&str>) -> ComponentRef {
-        ComponentRef {
-            package: PackageRef {
-                namespace: "demo".into(),
-                name: "graph".into(),
-                version: version.map(|v| semver::Version::parse(v).unwrap()),
-            },
-            world: "sensor".into(),
-            content_hash: hash.map(String::from),
+    #[test]
+    fn worlds_round_trip() {
+        for s in ["demo:graph/sensor@0.1.0", "demo:graph/sensor"] {
+            assert_eq!(s.parse::<WorldRef>().unwrap().to_string(), s);
         }
+        let world: WorldRef = "demo:graph/sensor@0.1.0".parse().unwrap();
+        assert_eq!(world.package.to_string(), "demo:graph@0.1.0");
+        assert_eq!(world.world, "sensor");
     }
 
     #[test]
-    fn display_and_parse_round_trip() {
-        let with_version = component_ref(Some("0.1.0"), None);
-        assert_eq!(with_version.to_string(), "demo:graph/sensor@0.1.0");
-        assert_eq!(
-            "demo:graph/sensor@0.1.0".parse::<ComponentRef>().unwrap(),
-            with_version
-        );
-
-        let without_version = component_ref(None, None);
-        assert_eq!(without_version.to_string(), "demo:graph/sensor");
-        assert_eq!(
-            "demo:graph/sensor".parse::<ComponentRef>().unwrap(),
-            without_version
-        );
+    fn packages_round_trip() {
+        for s in ["wasi:cli@0.3.0", "demo:graph"] {
+            assert_eq!(s.parse::<WitRef>().unwrap().to_string(), s);
+        }
+        assert!("wasi:cli/command@0.3.0".parse::<WitRef>().is_err());
     }
 
     #[test]
@@ -333,8 +390,9 @@ mod tests {
             "demo:graph/sen@sor@0.1.0",
             "demo:graph/Sensor",
             "demo:graph/sensor-Two",
+            "demo:graph/sensor#ab12",
         ] {
-            assert!(bad.parse::<ComponentRef>().is_err(), "accepted {bad:?}");
+            assert!(bad.parse::<WorldRef>().is_err(), "accepted {bad:?}");
         }
     }
 
@@ -347,72 +405,37 @@ mod tests {
             "demo:graph/HTTP-proxy",
             "demo:graph/sensor-4k",
         ] {
-            assert!(good.parse::<ComponentRef>().is_ok(), "rejected {good:?}");
+            assert!(good.parse::<WorldRef>().is_ok(), "rejected {good:?}");
         }
     }
 
     #[test]
-    fn pinned_refs_round_trip() {
-        let pinned = component_ref(Some("0.1.0"), Some("ab12"));
-        assert_eq!(format!("{pinned:#}"), "demo:graph/sensor@0.1.0#ab12");
-        assert_eq!(pinned.to_string(), "demo:graph/sensor@0.1.0");
-        assert_eq!(
-            "demo:graph/sensor@0.1.0#ab12"
-                .parse::<ComponentRef>()
-                .unwrap(),
-            pinned
-        );
-        for bad in [
-            "demo:graph/sensor#",
-            "demo:graph/sensor#XYZ",
-            "demo:graph/sensor#a b",
-        ] {
-            assert!(bad.parse::<ComponentRef>().is_err(), "accepted {bad:?}");
+    fn component_names_are_wit_identifiers() {
+        assert!("adder".parse::<ComponentName>().is_ok());
+        assert!("http-get-2".parse::<ComponentName>().is_ok());
+        for bad in ["", "Adder2x", "a/b", "a:b", "a_b"] {
+            assert!(bad.parse::<ComponentName>().is_err(), "accepted {bad:?}");
         }
+    }
+
+    #[test]
+    fn contract_ids_round_trip() {
+        let id: ContractId = "adder/demo:math/adder@0.1.0".parse().unwrap();
+        assert_eq!(id.component.as_str(), "adder");
+        assert_eq!(id.world.to_string(), "demo:math/adder@0.1.0");
+        assert_eq!(id.to_string(), "adder/demo:math/adder@0.1.0");
     }
 
     #[cfg(feature = "serde")]
     #[test]
-    fn deserializing_validates_the_content_hash() {
-        let json = |hash: &str| {
-            format!(
-                r#"{{"package":{{"namespace":"demo","name":"graph","version":null}},"world":"w","content_hash":"{hash}"}}"#
-            )
-        };
-        assert!(serde_json::from_str::<ComponentRef>(&json("ab12")).is_ok());
-        for bad in ["", "ABCDEF", "NOT HEX#"] {
-            assert!(
-                serde_json::from_str::<ComponentRef>(&json(bad)).is_err(),
-                "accepted {bad:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn package_ref_display() {
-        let package = component_ref(Some("0.1.0"), None).package;
-        assert_eq!(package.to_string(), "demo:graph@0.1.0");
-        let versionless = component_ref(None, None).package;
-        assert_eq!(versionless.to_string(), "demo:graph");
-    }
-
-    #[test]
-    fn matches_ignores_missing_hash() {
-        let unhashed = component_ref(Some("0.1.0"), None);
-        let hashed = component_ref(Some("0.1.0"), Some("abc"));
-        let other_hash = component_ref(Some("0.1.0"), Some("def"));
-
-        assert!(unhashed.matches(&hashed));
-        assert!(hashed.matches(&unhashed));
-        assert!(hashed.matches(&hashed));
-        assert!(!hashed.matches(&other_hash));
-        assert_ne!(unhashed, hashed);
-
-        let other_world = ComponentRef {
-            world: "filter".into(),
-            ..unhashed.clone()
-        };
-        assert!(!unhashed.matches(&other_world));
+    fn references_are_strings() {
+        let world: WorldRef = serde_json::from_str(r#""demo:graph/w@0.1.0""#).unwrap();
+        assert_eq!(
+            serde_json::to_string(&world).unwrap(),
+            r#""demo:graph/w@0.1.0""#
+        );
+        assert!(serde_json::from_str::<WorldRef>(r#"{"world":"w"}"#).is_err());
+        assert!(serde_json::from_str::<ComponentName>(r#""Not A Name""#).is_err());
     }
 
     #[test]

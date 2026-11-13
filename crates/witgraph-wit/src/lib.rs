@@ -1,14 +1,17 @@
 //! WIT loading and lowering into the witgraph IR.
+//!
+//! A node's contract is its WIT world's, as its node manifest names it:
+//! lowered from WIT (a directory, text, or a wasm-encoded package), never
+//! read out of the component's bytes. The bytes are only checked to target
+//! the world ([`verify`]).
 
 #[cfg(feature = "compose")]
 pub mod compose;
-pub mod docs;
 pub mod hash;
 pub mod hub;
 pub mod load;
 pub mod lower;
 pub mod metadata;
-mod section;
 pub mod verify;
 pub mod viewer;
 
@@ -16,10 +19,22 @@ pub use witgraph_ir as ir;
 
 use std::path::Path;
 
-use witgraph_ir::ComponentContract;
+use witgraph_ir::{Capability, ComponentContract, ComponentName, ContractId, WorldRef};
 
-/// Failure from [`load_components`]: loading the WIT source or lowering its
-/// worlds.
+/// A component as a runtime builds a graph from it: its bytes, with the WIT
+/// its node manifest names.
+#[derive(Debug, Clone, Copy)]
+pub struct Artifact<'a> {
+    /// The encoded component.
+    pub bytes: &'a [u8],
+    /// The WIT its worlds are in.
+    pub wit: &'a load::WitSource,
+    /// What every world it provides imports, as its WIT declares it: what
+    /// composing it in as a link's provider asks the host for.
+    pub capabilities: &'a [Capability],
+}
+
+/// Failure from loading WIT and lowering its worlds.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// Loading or resolving the WIT source failed.
@@ -28,37 +43,29 @@ pub enum Error {
     /// One or more worlds failed to lower.
     #[error(transparent)]
     Lower(#[from] lower::LowerFailures),
-    /// A component's embedded WIT does not describe exactly one node
-    /// world.
-    #[error("expected exactly one node world in the component, found {found}")]
-    NotOneNode {
-        /// How many node worlds it describes.
-        found: usize,
-    },
-    /// The WIT source has no component world the ref names.
-    #[error("the WIT source has no component world `{id}`")]
+    /// The WIT source has no such world.
+    #[error("the WIT has no world `{world}`")]
     NoWorld {
-        /// The ref looked for.
-        id: String,
+        /// The world looked for.
+        world: WorldRef,
     },
-    /// The WIT source has the world, but its contract hashes otherwise
-    /// than the ref pins: the source changed since the ref was taken.
-    #[error("the WIT source's world `{id}` has content hash {found}, not the {expected} pinned")]
-    HashMismatch {
-        /// The world, without a hash.
-        id: String,
-        /// The hash the ref pins.
-        expected: String,
-        /// The hash of the source's contract.
-        found: String,
+    /// The world exports no `node` interface: it is not a node's.
+    #[error("world `{world}` exports no `node` interface")]
+    NotANode {
+        /// The world.
+        world: WorldRef,
     },
 }
 
-/// Load a `.wit` file or directory and lower every witgraph component world
-/// found in it, keeping only the contracts. Fails if any component world
+/// Load a `.wit` file or directory (or a wasm-encoded WIT package) and
+/// lower every witgraph component world found in it, as `component`
+/// provides it, keeping only the contracts. Fails if any component world
 /// fails to lower (every failure is reported); see [`load_each`].
-pub fn load_components(path: impl AsRef<Path>) -> Result<Vec<ComponentContract>, Error> {
-    Ok(load_lowered(path)?
+pub fn load_components(
+    path: impl AsRef<Path>,
+    component: &ComponentName,
+) -> Result<Vec<ComponentContract>, Error> {
+    Ok(load_lowered(path, component)?
         .into_iter()
         .map(|lowered| lowered.contract)
         .collect())
@@ -66,11 +73,11 @@ pub fn load_components(path: impl AsRef<Path>) -> Result<Vec<ComponentContract>,
 
 /// Like [`load_components`], but keeps each world's named types alongside
 /// its contract (what [`metadata::generate_catalog`] needs).
-///
-/// Like [`load_components`], it fails if any component world fails to
-/// lower, discarding the others; [`load_each`] keeps them.
-pub fn load_lowered(path: impl AsRef<Path>) -> Result<Vec<lower::Lowered>, Error> {
-    Ok(lower::lower(&load::load_path(path)?)?)
+pub fn load_lowered(
+    path: impl AsRef<Path>,
+    component: &ComponentName,
+) -> Result<Vec<lower::Lowered>, Error> {
+    Ok(lower::lower(&load::load_path(path)?, component)?)
 }
 
 /// Load a `.wit` file or directory and lower each component world in it on
@@ -79,100 +86,39 @@ pub fn load_lowered(path: impl AsRef<Path>) -> Result<Vec<lower::Lowered>, Error
 /// itself does not load.
 pub fn load_each(
     path: impl AsRef<Path>,
+    component: &ComponentName,
 ) -> Result<Vec<Result<lower::Lowered, lower::LowerError>>, load::LoadError> {
-    Ok(lower::lower_each(&load::load_path(path)?))
+    Ok(lower::lower_each(&load::load_path(path)?, component))
+}
+
+/// Lower the world `id` names, of `source`'s root packages, as `id`'s
+/// component provides it.
+pub fn lower_world(source: &load::WitSource, id: &ContractId) -> Result<lower::Lowered, Error> {
+    if lower::find_world(source, &id.world).is_none() {
+        return Err(Error::NoWorld {
+            world: id.world.clone(),
+        });
+    }
+    match lower::lower_matching(source, &id.component, |world| world == &id.world).pop() {
+        Some(Ok(lowered)) => Ok(lowered),
+        Some(Err(failure)) => Err(Error::Lower(lower::LowerFailures {
+            failures: vec![failure],
+        })),
+        None => Err(Error::NotANode {
+            world: id.world.clone(),
+        }),
+    }
 }
 
 /// Lower WIT text (one document; `name` is its pseudo-path in errors) and
-/// return the contract of the component world `id` names: the contract a
-/// catalog lowered from the same source has, content hash included. For a
-/// host without a filesystem, to check component bytes against their
-/// source ([`verify::verify_component`]).
+/// return the contract of the world `id` names, as `id`'s component
+/// provides it: the contract a catalog lowered from the same source has.
 pub fn contract_from_str(
     name: &str,
     wit: &str,
-    id: &witgraph_ir::ComponentRef,
+    id: &ContractId,
 ) -> Result<ComponentContract, Error> {
-    let unpinned = witgraph_ir::ComponentRef {
-        content_hash: None,
-        ..id.clone()
-    };
-    let source = load::load_str(name, wit)?;
-    for lowered in lower::lower_matching(&source, |world| world.matches(&unpinned)) {
-        match lowered {
-            Ok(lowered) if lowered.contract.id.matches(&unpinned) => {
-                let found = &lowered.contract.id.content_hash;
-                return match (&id.content_hash, found) {
-                    (Some(expected), Some(found)) if expected != found => {
-                        Err(Error::HashMismatch {
-                            id: unpinned.to_string(),
-                            expected: expected.clone(),
-                            found: found.clone(),
-                        })
-                    }
-                    _ => Ok(lowered.contract),
-                };
-            }
-            // The world asked for, failing: its own error, not "no world".
-            Err(failure) if failure.world.matches(&unpinned) => {
-                return Err(Error::Lower(lower::LowerFailures {
-                    failures: vec![failure],
-                }));
-            }
-            _ => {}
-        }
-    }
-    Err(Error::NoWorld {
-        id: format!("{id:#}"),
-    })
-}
-
-/// Lower the WIT embedded in an encoded component into its contract, so a
-/// graph can be compiled from component artifacts alone, without their WIT
-/// source. The component must describe exactly one node world
-/// ([`Error::NotOneNode`]).
-///
-/// A component does not record the package and world it was built from
-/// (it decodes as `root:component/root`), so the contract takes them from
-/// `id`. Its content hash is computed from the bytes' own contract,
-/// whatever hash `id` carries.
-///
-/// The contract is the component's own view: its capabilities are the
-/// imports its code uses, which can be fewer than its WIT source declares,
-/// so its content hash can differ from the hash of the contract lowered
-/// from that source.
-///
-/// The outputs the component's `witgraph-viewer` section names get their
-/// [`viewer`](witgraph_ir::PortDef::viewer). A hint that is wrong (one
-/// naming an output the component does not have, say) is skipped, and
-/// noted in [`warnings`](lower::Lowered::warnings). Its `witgraph-docs`
-/// section is the contract's [`docs`](witgraph_ir::ComponentContract::docs).
-pub fn lower_component(
-    bytes: &[u8],
-    id: &witgraph_ir::ComponentRef,
-) -> Result<lower::Lowered, Error> {
-    let source = load::load_component(bytes)?;
-    let mut lowered = lower::lower(&source)?;
-    match lowered.len() {
-        1 => {
-            let mut lowered = lowered.remove(0);
-            let content_hash = lowered.contract.id.content_hash.take();
-            lowered.contract.id = witgraph_ir::ComponentRef {
-                content_hash,
-                ..id.clone()
-            };
-            let hints = viewer::read(bytes);
-            lowered.warnings = hints.problems;
-            lowered
-                .warnings
-                .extend(viewer::apply(&mut lowered.contract, &hints.hints));
-            let (docs, problems) = docs::read(bytes);
-            lowered.warnings.extend(problems);
-            lowered.contract.docs = lowered.contract.docs.take().or(docs);
-            Ok(lowered)
-        }
-        found => Err(Error::NotOneNode { found }),
-    }
+    Ok(lower_world(&load::load_str(name, wit)?, id)?.contract)
 }
 
 #[cfg(test)]
@@ -200,48 +146,59 @@ mod tests {
         world tripler {
             export node;
         }
+
+        world provider {
+            export clock;
+        }
     "#;
+
+    fn id(text: &str) -> ContractId {
+        text.parse().unwrap()
+    }
 
     #[test]
     fn a_world_is_found_by_its_ref() {
-        let lowered = lower::lower(&load::load_str("pair.wit", WIT).unwrap()).unwrap();
-        let catalog = |world: &str| {
-            lowered
-                .iter()
-                .find(|l| l.contract.id.world == world)
-                .map(|l| l.contract.clone())
-                .unwrap()
-        };
+        let component: ComponentName = "pair".parse().unwrap();
+        let lowered = lower::lower(&load::load_str("pair.wit", WIT).unwrap(), &component).unwrap();
         for world in ["doubler", "tripler"] {
-            let expected = catalog(world);
-            let unpinned: witgraph_ir::ComponentRef =
-                format!("demo:pair/{world}@0.1.0").parse().unwrap();
-            let found = contract_from_str("pair.wit", WIT, &unpinned).unwrap();
-            assert_eq!(found, expected, "the catalog's contract, hash included");
-            assert_eq!(
-                contract_from_str("pair.wit", WIT, &expected.id).unwrap(),
-                expected
-            );
+            let expected = lowered
+                .iter()
+                .find(|l| l.contract.id.world.world == world)
+                .map(|l| l.contract.clone())
+                .unwrap();
+            let found = contract_from_str(
+                "pair.wit",
+                WIT,
+                &id(&format!("pair/demo:pair/{world}@0.1.0")),
+            )
+            .unwrap();
+            assert_eq!(found, expected, "the catalog's contract");
         }
         let broken = format!("{WIT}\nworld broken {{ export node: func(); }}");
-        let id: witgraph_ir::ComponentRef = "demo:pair/broken@0.1.0".parse().unwrap();
-        let found = contract_from_str("pair.wit", &broken, &id);
+        let found = contract_from_str("pair.wit", &broken, &id("pair/demo:pair/broken@0.1.0"));
         assert!(
             matches!(found, Err(Error::Lower(_))),
             "a world that fails to lower reports why: {found:?}"
         );
-        let stale: witgraph_ir::ComponentRef =
-            format!("demo:pair/doubler@0.1.0#{}", "ab".repeat(32))
-                .parse()
-                .unwrap();
         assert!(matches!(
-            contract_from_str("pair.wit", WIT, &stale),
-            Err(Error::HashMismatch { .. })
-        ));
-        let other: witgraph_ir::ComponentRef = "demo:pair/doubler@0.2.0".parse().unwrap();
-        assert!(matches!(
-            contract_from_str("pair.wit", WIT, &other),
+            contract_from_str("pair.wit", WIT, &id("pair/demo:pair/doubler@0.2.0")),
             Err(Error::NoWorld { .. })
         ));
+        assert!(matches!(
+            contract_from_str("pair.wit", WIT, &id("pair/demo:pair/provider@0.1.0")),
+            Err(Error::NotANode { .. })
+        ));
+    }
+
+    #[test]
+    fn an_encoded_package_lowers_as_its_text_does() {
+        let source = load::load_str("pair.wit", WIT).unwrap();
+        let encoded = load::encode(&source).unwrap();
+        let decoded = load::load_encoded(&encoded).unwrap();
+        let wanted = id("pair/demo:pair/doubler@0.1.0");
+        assert_eq!(
+            lower_world(&decoded, &wanted).unwrap().contract,
+            lower_world(&source, &wanted).unwrap().contract
+        );
     }
 }

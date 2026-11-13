@@ -1,27 +1,183 @@
 //! Guest components used by the witgraph runtime tests.
 //!
 //! Every guest is a standalone crate under `guests/` whose `wit/` directory
-//! is its contract. The build script compiles each one for
-//! `wasm32-unknown-unknown` and encodes it as a component. Every node's
-//! `run` is an `async func`, as witgraph requires.
+//! is its contract, and whose `viewers.json`, if any, says how an editor
+//! previews its outputs. The build script compiles each one for
+//! `wasm32-unknown-unknown`, encodes it as a component, and writes its node
+//! manifest beside it. Every node's `run` is an `async func`, as witgraph
+//! requires.
 
-/// One test guest: its component bytes and the directory holding its WIT
-/// contract (lower it with `witgraph_wit::load_components`).
+use std::collections::HashMap;
+
+use witgraph_ir::{
+    Capability, ComponentContract, ComponentEntry, ComponentName, ContractId, Graph, GraphBuilder,
+};
+use witgraph_wit::Artifact;
+use witgraph_wit::load::WitSource;
+
+/// One test guest: its component bytes, the directory holding its WIT, and its
+/// node manifest (beside its bytes, in the build's output).
 #[derive(Debug, Clone, Copy)]
 pub struct Guest {
+    /// The guest's name: its directory's, and its component's in a graph.
+    pub name: &'static str,
     /// The encoded WASM component.
     pub wasm: &'static [u8],
     /// The guest's `wit/` directory.
     pub wit: &'static str,
+    /// The guest's node manifest.
+    pub manifest: &'static str,
 }
 
 macro_rules! guest {
     ($wasm:literal, $dir:literal) => {
         Guest {
+            name: $dir,
             wasm: include_bytes!(env!($wasm)),
             wit: concat!(env!("CARGO_MANIFEST_DIR"), "/guests/", $dir, "/wit"),
+            manifest: concat!(env!("OUT_DIR"), "/", $dir, ".node.json"),
         }
     };
+}
+
+impl Guest {
+    /// The guest's name, as a graph's component table has it.
+    pub fn component(&self) -> ComponentName {
+        self.name
+            .parse()
+            .expect("a guest's name is a component name")
+    }
+
+    /// Its WIT.
+    pub fn wit_source(&self) -> WitSource {
+        witgraph_wit::load::load_path(self.wit).expect("a guest's WIT loads")
+    }
+
+    /// The contracts of its node worlds, as a component of its name.
+    pub fn contracts(&self) -> Vec<ComponentContract> {
+        witgraph_wit::load_components(self.wit, &self.component()).expect("a guest's WIT lowers")
+    }
+
+    /// The contract of its one node world.
+    pub fn contract(&self) -> ComponentContract {
+        let mut contracts = self.contracts();
+        assert_eq!(contracts.len(), 1, "one node world per guest");
+        contracts.remove(0)
+    }
+
+    /// What a node runs of it: its one node world.
+    pub fn id(&self) -> ContractId {
+        self.contract().id
+    }
+}
+
+/// One component of a [`Kit`].
+#[derive(Debug, Clone)]
+struct Entry {
+    bytes: Vec<u8>,
+    wit: WitSource,
+    capabilities: Vec<Capability>,
+}
+
+/// Contracts and components for a set of guests: what a graph of them compiles
+/// against, and loads with.
+#[derive(Debug, Clone, Default)]
+pub struct Kit {
+    /// Every node world's contract, of every component.
+    pub contracts: Vec<ComponentContract>,
+    entries: HashMap<ComponentName, Entry>,
+}
+
+impl Kit {
+    /// A kit of `guests`.
+    pub fn new(guests: &[Guest]) -> Self {
+        let mut kit = Self::default();
+        for guest in guests {
+            kit.add(*guest);
+        }
+        kit
+    }
+
+    /// Adds `guest`, under its own name.
+    pub fn add(&mut self, guest: Guest) -> &mut Self {
+        self.add_as(guest.component(), guest.wasm.to_vec(), guest.wit_source())
+    }
+
+    /// Adds `bytes` as the component `name`, its WIT `wit`: another guest's bytes
+    /// under a name, say, or bytes changed.
+    pub fn add_as(&mut self, name: ComponentName, bytes: Vec<u8>, wit: WitSource) -> &mut Self {
+        let lowered = witgraph_wit::lower::lower(&wit, &name).expect("the WIT lowers");
+        let mut capabilities = Vec::new();
+        for (_, world) in witgraph_wit::lower::root_worlds(&wit) {
+            Capability::add_unique(
+                &mut capabilities,
+                &witgraph_wit::lower::world_capabilities(&wit, world),
+            );
+        }
+        self.contracts.retain(|c| c.id.component != name);
+        self.contracts
+            .extend(lowered.into_iter().map(|lowered| lowered.contract));
+        self.entries.insert(
+            name,
+            Entry {
+                bytes,
+                wit,
+                capabilities,
+            },
+        );
+        self
+    }
+
+    /// Leaves the component `name` out.
+    pub fn remove(&mut self, name: &ComponentName) -> &mut Self {
+        self.contracts.retain(|c| &c.id.component != name);
+        self.entries.remove(name);
+        self
+    }
+
+    /// What a node runs of `guest`: its one node world.
+    pub fn get(&self, guest: Guest) -> ContractId {
+        let name = guest.component();
+        let mut ids = self.contracts.iter().filter(|c| c.id.component == name);
+        match (ids.next(), ids.next()) {
+            (Some(contract), None) => contract.id.clone(),
+            _ => panic!("guest `{name}` is not in the kit with one node world"),
+        }
+    }
+
+    /// The contract of `id`.
+    pub fn contract(&self, id: &ContractId) -> &ComponentContract {
+        self.contracts
+            .iter()
+            .find(|c| &c.id == id)
+            .expect("the kit has the contract")
+    }
+
+    /// A builder with every kit component in its table.
+    pub fn builder(&self, name: &str) -> GraphBuilder {
+        let mut names: Vec<&ComponentName> = self.entries.keys().collect();
+        names.sort();
+        names.into_iter().fold(Graph::builder(name), |b, n| {
+            b.add_component(ComponentEntry::new(n.clone(), n.to_string()))
+        })
+    }
+
+    /// Every component's bytes with its WIT: what a runtime loads a graph with.
+    pub fn artifacts(&self) -> HashMap<ComponentName, Artifact<'_>> {
+        self.entries
+            .iter()
+            .map(|(name, entry)| {
+                (
+                    name.clone(),
+                    Artifact {
+                        bytes: &entry.bytes,
+                        wit: &entry.wit,
+                        capabilities: &entry.capabilities,
+                    },
+                )
+            })
+            .collect()
+    }
 }
 
 /// `in: option<f64>` → `out: f64`; absent input reads as 0.0.
@@ -132,8 +288,8 @@ pub const READING_CONSUMER: Guest = guest!("READING_CONSUMER_WASM", "reading-con
 /// `frames: option<u32>`, `fps: option<u32>` → `frames: stream<frame>`
 /// (a record `{ width, height, pixels: list<u8> }`, 96x64 RGBA): an
 /// animated gradient, `frames` of them (forever when absent), sleeping
-/// `1000 / fps` ms between two when `fps` is given. Its `witgraph-viewer`
-/// section previews `frames` as `image`.
+/// `1000 / fps` ms between two when `fps` is given. Its node manifest
+/// previews `frames` as `image`.
 pub const VIDEO_SOURCE: Guest = guest!("VIDEO_SOURCE_WASM", "video-source");
 
 /// `frames: stream<frame>` → `frames: stream<frame>`, each frame turned
@@ -260,10 +416,7 @@ pub const LINE_WALK: Guest = guest!("LINE_WALK_WASM", "line-walk");
 
 /// `line-walk` written in C: `in`, `kinds` and `scale`, each `option<u32>`, → `out: u32`, built with
 /// debug info and no optimizing for its own code, `src/walk.c` and `src/scale.c`, and none for its bindings.
-pub const C_WALK: Guest = Guest {
-    wasm: include_bytes!(env!("C_WALK_WASM")),
-    wit: concat!(env!("CARGO_MANIFEST_DIR"), "/guests/c-walk/wit"),
-};
+pub const C_WALK: Guest = guest!("C_WALK_WASM", "c-walk");
 
 /// `line-walk` written in Zig, as `c-walk` is in C: built with debug info and no optimizing for
 /// its own code, `src/walk.zig` and `src/scale.zig`, and none for its C bindings.

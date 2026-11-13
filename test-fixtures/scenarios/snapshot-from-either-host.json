@@ -55,24 +55,8 @@
           }
         },
         "nodes": {
-          "e": {
-            "content_hash": "26645bcda0d2e2cc6d87d9514b928ddc95b3d9207dd37e37fad2cef8db92efa5",
-            "package": {
-              "name": "echo",
-              "namespace": "test",
-              "version": "0.1.0"
-            },
-            "world": "echo"
-          },
-          "h": {
-            "content_hash": "26645bcda0d2e2cc6d87d9514b928ddc95b3d9207dd37e37fad2cef8db92efa5",
-            "package": {
-              "name": "echo",
-              "namespace": "test",
-              "version": "0.1.0"
-            },
-            "world": "echo"
-          }
+          "e": { "component": "echo", "world": "test:echo/echo@0.1.0" },
+          "h": { "component": "echo", "world": "test:echo/echo@0.1.0" }
         },
         "outputs": {
           "e": {
@@ -104,24 +88,8 @@
       "do": "snapshot",
       "expect": {
         "nodes": {
-          "e": {
-            "content_hash": "26645bcda0d2e2cc6d87d9514b928ddc95b3d9207dd37e37fad2cef8db92efa5",
-            "package": {
-              "name": "echo",
-              "namespace": "test",
-              "version": "0.1.0"
-            },
-            "world": "echo"
-          },
-          "h": {
-            "content_hash": "26645bcda0d2e2cc6d87d9514b928ddc95b3d9207dd37e37fad2cef8db92efa5",
-            "package": {
-              "name": "echo",
-              "namespace": "test",
-              "version": "0.1.0"
-            },
-            "world": "echo"
-          }
+          "e": { "component": "echo", "world": "test:echo/echo@0.1.0" },
+          "h": { "component": "echo", "world": "test:echo/echo@0.1.0" }
         },
         "host_written": {
           "h": ["in"]

@@ -122,8 +122,9 @@ struct Inner<M: RuntimeMode, H: Host> {
 
 /// The version of the debug protocol, `wit/debug.wit`, that this crate speaks. A debugger that
 /// speaks another refuses to attach, as calls the other side does not know would fail. It moves on
-/// with each change to the protocol, which a test makes sure of.
-pub const PROTOCOL: u32 = 3;
+/// with each change to the protocol, which a test makes sure of, and with each change to what its
+/// JSON says (the contracts' shape, say), which none can.
+pub const PROTOCOL: u32 = 4;
 
 /// A graph a debugger can attach to. Tick it through this, not the graph itself.
 pub struct Debuggee<M: RuntimeMode, H: Host> {
@@ -953,7 +954,7 @@ mod protocol_tests {
         let wit = include_str!("../wit/debug.wit");
         assert_eq!(
             (PROTOCOL, fnv1a(wit)),
-            (3, 0x73b9_6b16_538b_e724),
+            (4, 0x73b9_6b16_538b_e724),
             "`wit/debug.wit` changed: move `PROTOCOL` on, here and as `PROTOCOL` in \
              `packages/witgraph-loader/src/attach/session.ts`, and record the new hash here"
         );

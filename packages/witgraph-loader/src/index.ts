@@ -12,6 +12,7 @@
 import { $init, generate } from '@bytecodealliance/jco-transpile/component';
 import initModule, {
   describeComponent as describeRaw,
+  encodeWit as encodeWitRaw,
   GraphChecker,
   instrumentModule,
   jsName as jsNameRaw,
@@ -37,18 +38,25 @@ export interface Port {
   docs?: string;
   /**
    * Output ports only: how an editor should preview the port (`image`,
-   * say), as the component's `witgraph-viewer` custom section declares it.
+   * say), as the component's node manifest declares it.
    */
   viewer?: string;
 }
 
-/** A component's contract, as the editor catalog describes one. */
+/**
+ * A world, as a component provides it: the contract a node of it runs, as the
+ * editor catalog describes one.
+ */
 export interface Contract {
-  /** `namespace:name/world@version#<content hash>`. */
+  /** `component/namespace:name/world@version`. */
   id: string;
-  package: string;
+  /** The component, by its name in the graph's component table. */
+  component: string;
+  /** The world, `namespace:name/world@version`. */
   world: string;
-  content_hash?: string;
+  /** The world's WIT package, `namespace:name@version`. */
+  package: string;
+  /** The world's doc comment. */
   docs?: string;
   inputs: Port[];
   outputs: Port[];
@@ -57,10 +65,29 @@ export interface Contract {
   types?: { name: string; owner?: string; type_display: string; docs?: string }[];
   /**
    * What was wrong with the component but did not stop it loading (from
-   * `describeComponent` only): a viewer hint naming an output it does not
-   * have, say.
+   * `describeComponent` only): a viewer naming an output it does not have,
+   * say.
    */
   warnings?: string[];
+}
+
+/**
+ * What a component is: its node manifest. `wit_source` and `component` say
+ * where its WIT and bytes are, as paths (relative to the manifest) or
+ * `oci://` references; a browser is given those as they are, and needs only
+ * the rest.
+ */
+export interface NodeManifest {
+  /** The WIT package its worlds are in, `namespace:name@version`. */
+  wit: string;
+  /** Where that WIT is. */
+  wit_source?: string;
+  /** Every world of `wit` it provides, `namespace:name/world@version`. */
+  worlds: string[];
+  /** Where its bytes are. */
+  component?: string;
+  /** How an editor previews outputs: per world, output port to viewer. */
+  viewers?: Record<string, Record<string, string>>;
 }
 
 /**
@@ -79,19 +106,19 @@ export interface Capability {
   items?: Record<string, string>;
 }
 
-/** A component the graph is composed of. */
+/**
+ * A component the graph is composed of. What it is comes from its manifest
+ * and WIT alone; its bytes are checked to target the worlds nodes run of it.
+ */
 export interface ComponentSource {
-  /** `namespace:name/world@version`, as the graph's component table names it. */
-  id: string;
-  /** The encoded component. */
-  bytes: Uint8Array;
-  /**
-   * The WIT source text the component was built from (one document,
-   * dependencies nested in it). With it, the bytes are checked against
-   * their source and the graph may pin the content hashes a catalog lowered
-   * from that source has; without, the contract is lowered from the bytes.
-   */
-  wit?: string;
+  /** Its name in the graph's component table. */
+  name: string;
+  /** Its node manifest. */
+  manifest: NodeManifest;
+  /** Its WIT, as one wasm-encoded package (`wasm-tools component wit --wasm`). */
+  wit: Uint8Array;
+  /** The encoded component: what runs. Not needed to describe or check a graph. */
+  bytes?: Uint8Array;
 }
 
 /** The inputs or outputs of one `run`, keyed by port in `lowerCamelCase`. */
@@ -333,13 +360,28 @@ function initialisedOrThrow(): void {
 }
 
 /**
- * Lowers the WIT embedded in an encoded component and describes it as the
- * editor catalog does. `id` names the component
- * (`namespace:name/world@version`). Needs {@link init}.
+ * Describes a component as the editor catalog does, from its manifest and WIT
+ * (no bytes): one contract per node world it provides, its named types and
+ * warnings included. `name` is its name in the graph's component table. Needs
+ * {@link init}.
  */
-export function describeComponent(id: string, bytes: Uint8Array): Contract {
+export function describeComponent(
+  name: string,
+  manifest: NodeManifest,
+  wit: Uint8Array,
+): Contract[] {
   initialisedOrThrow();
-  return describeRaw(id, bytes) as Contract;
+  return describeRaw(name, manifest, wit) as Contract[];
+}
+
+/**
+ * WIT text (one document, the packages it uses nested in it) as one
+ * wasm-encoded package: what a {@link ComponentSource}'s `wit` is. `name` is
+ * its pseudo-path in errors. Needs {@link init}.
+ */
+export function encodeWit(name: string, wit: string): Uint8Array {
+  initialisedOrThrow();
+  return encodeWitRaw(name, wit);
 }
 
 /**

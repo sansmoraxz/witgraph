@@ -236,71 +236,73 @@ Zig's standard library is not the guest's own. Zig works out at compile time wha
 such a value is no variable once the guest runs: make it a `var` to see it. Zig 0.17 is what
 `test-fixtures/test-components/guests/zig-walk` is built with, by the fixtures' build script.
 
+## Node manifests
+
+A component's bytes say nothing about it that witgraph reads: what it is comes
+from its **node manifest**, a JSON file beside it (or an OCI artifact of its
+own):
+
+```json
+{
+  "wit": "demo:graph@0.1.0",
+  "wit_source": "wit",
+  "worlds": ["demo:graph/sensor@0.1.0"],
+  "component": "sensor.wasm",
+  "viewers": { "demo:graph/sensor@0.1.0": { "samples": "series" } }
+}
+```
+
+- `wit` is the WIT package its worlds are in, as WIT writes it.
+- `wit_source` is where that WIT is: a directory or `.wit` file (with its
+  `deps/`), or a wasm-encoded WIT package (`wasm-tools component wit --wasm`,
+  or what `wkg` publishes).
+- `worlds` lists every world of `wit` the component provides. A node runs one
+  of them. A link's provider lists the world it exports, which need not be a
+  node's.
+- `component` is where its bytes are.
+- `viewers` says how an editor previews outputs (see below).
+
+Locations are paths, relative to the manifest, or OCI artifacts, written
+explicitly: `oci://ghcr.io/demo/sensor:0.1.0`, or pinned,
+`oci://ghcr.io/demo/sensor@sha256:…`. A manifest pulled over OCI (a layer of
+media type `application/vnd.witgraph.node.v1+json`) may name only `oci://`
+artifacts. A graph's component table names each component's manifest
+([graphs](graphs.md)).
+
+The contracts are lowered from the WIT, and the bytes are checked to target
+each world listed, with wit-component's `targets`: the same check `wasm-tools
+component targets` makes. Nothing else is read out of the bytes, so nothing a
+guest embeds in them (a custom section, say) means anything to witgraph.
+
 ## Previewing outputs
 
 A component can tell an editor how to preview its outputs, the way an image
-node in a visual editor shows the image it made. The hints live in a custom
-section of the component called `witgraph-viewer`, as UTF-8 text with one
-line per output:
+node in a visual editor shows the image it made. Its node manifest's `viewers`
+names a viewer for each output that has one, per world:
 
-```text
-# comments and blank lines are ignored
-output.frames=image
+```json
+"viewers": { "demo:graph/camera@0.1.0": { "frames": "image" } }
 ```
 
 The viewer's name means nothing to witgraph itself. The
 [editor](editor.md#previews) knows `image`, `series` and `text`, and you can
-register others. A component can only name its own outputs, each one once.
-A hint is only a hint: a line that can't be parsed, or names an output the
-component doesn't have, is skipped and never stops the component from
-loading. What was skipped is in `Lowered::warnings` and the catalog's
-`warnings`; in JavaScript, in `session.warnings` and on the console, and the
-editor lists it in its timeline.
-
-In Rust, embed the section with a static. It ends up in the component's core
-module, which is where witgraph looks for it (a section inside a component
-composed into this one, such as a link's provider, belongs to that one):
-
-```rust
-macro_rules! viewer {
-    ($hints:literal) => {
-        #[used]
-        #[unsafe(link_section = "witgraph-viewer")]
-        static VIEWER: [u8; $hints.len()] = *$hints;
-    };
-}
-
-viewer!(b"output.frames=image\n");
-```
-
-The linker joins sections with the same name, so end every line, the last
-included, with a newline.
+register others. A hint is only a hint: one naming an output the world doesn't
+have, or no viewer, is skipped and never stops the component from loading.
+What was skipped is in the catalog's `warnings`; in JavaScript, in
+`session.warnings` and on the console, and the editor lists it in its
+timeline.
 
 ## Describing a component
 
-A component can say what it does, for an editor to show beside it, the way
-the catalog of the [editor](editor.md) does. Its bytes keep no doc comments,
-so the description lives in a custom section of the component called
-`witgraph-docs`: UTF-8 text, the description whole.
+A component's description, for an editor to show beside it, is its world's
+doc comment, from its WIT:
 
-```rust
-macro_rules! docs {
-    ($text:literal) => {
-        #[used]
-        #[unsafe(link_section = "witgraph-docs")]
-        static DOCS: [u8; $text.len()] = *$text;
-    };
-}
-
-docs!(b"Adds `add` to what it is given.");
+```wit
+/// Adds `add` to what it is given.
+world adder { /* ... */ }
 ```
 
-It is found where a `witgraph-viewer` section is, and several sections of the
-same name read as one. A section that can't be read (it is not text) is
-skipped and never stops the component from loading; what was skipped is in
-`Lowered::warnings`. In JavaScript the description is the `docs` of the
-contract `describeComponent` returns. When a contract is lowered from WIT
-source, the doc comment of its world is its description instead.
+In JavaScript it is the `docs` of each contract `describeComponent` returns.
 
 The `image` viewer shows either a record of raw pixels or the bytes of an
 encoded image:
@@ -327,4 +329,5 @@ printable, as hex when not.
 The video pipeline among the test components (`video-source`,
 `frame-grayscale`, `frame-invert` and `video-sink`) is a complete example;
 `relay`, `stream-producer`, `future-writer` and `mqtt-node` declare viewers
-for a Value, a stream of numbers, a future and a stream of bytes.
+for a Value, a stream of numbers, a future and a stream of bytes, each in the
+`viewers.json` its manifest is written from.

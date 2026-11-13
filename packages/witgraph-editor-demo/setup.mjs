@@ -1,5 +1,6 @@
 /**
- * Copies test components into components/ so the demo page can fetch them, and builds each
+ * Copies test components into components/ so the demo page can fetch them (each with its
+ * node manifest and encoded WIT), and builds each
  * with debug info too, into components/debug/, for the page's `?debug`. That takes a while the
  * first time. `--no-build` copies only what was built already, as CI has it from another job,
  * and `--list` names the guests.
@@ -132,5 +133,8 @@ mkdirSync(join('components', 'debug'), { recursive: true });
 
 for (const guest of GUESTS) {
   copyNewest(`${guest}.wasm`, join('components', `${guest}.wasm`));
+  // What it is: its node manifest, and its WIT, encoded.
+  copyNewest(`${guest}.node.json`, join('components', `${guest}.node.json`));
+  copyNewest(`${guest}.wit.wasm`, join('components', `${guest}.wit.wasm`));
   copyNewest(`${guest}.debug.wasm`, join('components', 'debug', `${guest}.wasm`));
 }

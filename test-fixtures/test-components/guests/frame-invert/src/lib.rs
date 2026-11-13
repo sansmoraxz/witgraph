@@ -2,18 +2,6 @@ wit_bindgen::generate!({ path: "wit", world: "frame-invert" });
 
 use exports::node::{Frame, Guest, Inputs, Outputs};
 
-/// Declares how an editor previews this node's outputs (the
-/// `witgraph-viewer` custom section).
-macro_rules! viewer {
-    ($hints:literal) => {
-        #[used]
-        #[unsafe(link_section = "witgraph-viewer")]
-        static VIEWER: [u8; $hints.len()] = *$hints;
-    };
-}
-
-viewer!(b"output.frames=image\n");
-
 struct Invert;
 
 impl Guest for Invert {

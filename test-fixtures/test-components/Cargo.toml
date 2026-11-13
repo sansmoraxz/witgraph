@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
+[dependencies]
+witgraph-ir = { workspace = true }
+witgraph-wit = { workspace = true }
+
 [build-dependencies]
 wit-component = { workspace = true }
 wit-parser = { workspace = true }

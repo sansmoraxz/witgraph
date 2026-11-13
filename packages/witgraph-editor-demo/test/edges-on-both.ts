@@ -4,10 +4,7 @@ import { type Capability, Session } from 'witgraph-loader';
 import { cpu } from '/src/accel/cnn.ts';
 import { webgpu } from '/src/accel/webgpu.ts';
 
-const ref = (name: string) => ({
-  package: { namespace: 'test', name, version: '0.1.0' },
-  world: name,
-});
+const ref = (name: string) => ({ component: name, world: `test:${name}/${name}@0.1.0` });
 
 const GUESTS = ['video-source', 'edge-detect', 'edge-detect-webgpu', 'video-sink'];
 
@@ -24,15 +21,21 @@ interface Frame {
 export async function edgesOnBoth(frames: number): Promise<number> {
   const seen: Record<string, Frame[]> = { cpu: [], gpu: [] };
   const components = await Promise.all(
-    GUESTS.map(async (guest) => ({
-      id: `test:${guest}/${guest}@0.1.0`,
-      bytes: new Uint8Array(await (await fetch(`/components/${guest}.wasm`)).arrayBuffer()),
-    })),
+    GUESTS.map(async (guest) => {
+      const bytes = async (file: string) =>
+        new Uint8Array(await (await fetch(`/components/${file}`)).arrayBuffer());
+      return {
+        name: guest,
+        manifest: await (await fetch(`/components/${guest}.node.json`)).json(),
+        wit: await bytes(`${guest}.wit.wasm`),
+        bytes: await bytes(`${guest}.wasm`),
+      };
+    }),
   );
   const chain = (id: string, edges: string) => [
-    { id: `${id}-source`, component: ref('video-source') },
-    { id, component: ref(edges) },
-    { id: `${id}-sink`, component: ref('video-sink') },
+    { id: `${id}-source`, ...ref('video-source') },
+    { id, ...ref(edges) },
+    { id: `${id}-sink`, ...ref('video-sink') },
   ];
   const wires = (id: string) => [
     {

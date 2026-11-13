@@ -15,8 +15,8 @@ use test_components::{
 use wasmtime::StoreContextMut;
 use wasmtime::component::{ComponentType, Lift, Lower, Resource, ResourceType};
 use witgraph_ir::{
-    Capability, CompiledGraph, ComponentContract, ComponentRef, Graph, GraphBuilder, NodeId,
-    PortDirection, PortRef, ResourceClaim,
+    Capability, CompiledGraph, ComponentContract, ComponentName, Graph, NodeId, PortDirection,
+    PortRef, ResourceClaim,
 };
 use witgraph_runtime::{
     CapabilityPlugin, FaultReport, Host, HostState, LoadError, NodeFault, NodePhase, PluginData,
@@ -28,46 +28,28 @@ use witgraph_runtime::{
 
 /// Lowers a guest's WIT into its contract.
 fn contract(guest: Guest) -> ComponentContract {
-    let mut contracts = witgraph_wit::load_components(guest.wit).expect("guest WIT lowers");
-    assert_eq!(contracts.len(), 1, "one node world per guest");
-    contracts.remove(0)
+    guest.contract()
 }
 
-/// Contracts and component bytes for a set of guests.
-struct Kit {
-    contracts: Vec<ComponentContract>,
-    wasm: HashMap<ComponentRef, &'static [u8]>,
+/// Contracts and components for a set of guests.
+struct Kit(test_components::Kit);
+
+impl std::ops::Deref for Kit {
+    type Target = test_components::Kit;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Kit {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
 }
 
 impl Kit {
     fn new(guests: &[Guest]) -> Self {
-        let mut kit = Kit {
-            contracts: Vec::new(),
-            wasm: HashMap::new(),
-        };
-        for guest in guests {
-            let c = contract(*guest);
-            kit.wasm.insert(c.id.clone(), guest.wasm);
-            kit.contracts.push(c);
-        }
-        kit
-    }
-
-    /// The contract lowered from `guest`.
-    fn get(&self, guest: Guest) -> ComponentRef {
-        let id = contract(guest).id;
-        assert!(
-            self.contracts.iter().any(|c| c.id == id),
-            "guest not in kit"
-        );
-        id
-    }
-
-    /// A builder with every kit component in its table.
-    fn builder(&self, name: &str) -> GraphBuilder {
-        self.contracts
-            .iter()
-            .fold(Graph::builder(name), |b, c| b.add_component(c))
+        Self(test_components::Kit::new(guests))
     }
 
     async fn load<M: RuntimeMode>(
@@ -77,7 +59,7 @@ impl Kit {
         mode: M,
     ) -> RuntimeGraph<M> {
         let compiled = graph.compile(&self.contracts).expect("graph compiles");
-        RuntimeGraph::load(compiled, &self.wasm, config, mode)
+        RuntimeGraph::load(compiled, &self.artifacts(), config, mode)
             .await
             .expect("graph loads")
     }
@@ -409,7 +391,7 @@ async fn zero_limits_are_invalid() {
     ] {
         let graph = kit.builder("zero").add_node("e", kit.get(ECHO)).build();
         let compiled = graph.compile(&kit.contracts).expect("compiles");
-        let err = RuntimeGraph::load(compiled, &kit.wasm, config, Perf)
+        let err = RuntimeGraph::load(compiled, &kit.artifacts(), config, Perf)
             .await
             .err()
             .expect("the limit is rejected");
@@ -441,11 +423,7 @@ async fn a_zero_memory_reservation_is_valid() {
 async fn two_versions_of_one_contract_run_side_by_side() {
     let kit = Kit::new(&[RELAY, RELAY_PLUS]);
     let (v1, v2) = (kit.get(RELAY), kit.get(RELAY_PLUS));
-    assert_eq!(
-        v1.content_hash, v2.content_hash,
-        "the same contract: the version is not part of the hash"
-    );
-    assert_ne!(v1, v2, "but two components");
+    assert_ne!(v1, v2, "two components");
     let graph = kit
         .builder("versions")
         .add_node("a", v1)
@@ -473,6 +451,7 @@ async fn two_versions_of_one_contract_run_side_by_side() {
     let snapshot = rt.snapshot().await.unwrap();
     let minor = |node: &str| {
         snapshot.nodes[&id(node)]
+            .world
             .package
             .version
             .as_ref()
@@ -483,15 +462,11 @@ async fn two_versions_of_one_contract_run_side_by_side() {
 }
 
 #[tokio::test]
-async fn two_revisions_of_one_world_are_told_apart_by_hash() {
+async fn two_components_of_one_world_are_told_apart_by_name() {
     let kit = Kit::new(&[RELAY, RELAY_WIDE]);
     let (narrow, wide) = (kit.get(RELAY), kit.get(RELAY_WIDE));
-    assert_eq!(
-        (&narrow.package, &narrow.world),
-        (&wide.package, &wide.world),
-        "one world id"
-    );
-    assert_ne!(narrow.content_hash, wide.content_hash, "two contracts");
+    assert_eq!(narrow.world, wide.world, "one world id");
+    assert_ne!(narrow.component, wide.component, "two components");
 
     let graph = kit
         .builder("revisions")
@@ -525,36 +500,29 @@ async fn two_revisions_of_one_world_are_told_apart_by_hash() {
         "the narrow one has no such port"
     );
 
-    // Unpinned, the reference matches both revisions.
-    let mut unpinned = narrow.clone();
-    unpinned.content_hash = None;
-    let ambiguous = kit
-        .builder("ambiguous")
-        .add_node("x", unpinned)
-        .build()
-        .compile(&kit.contracts)
-        .unwrap_err();
-    assert!(
-        ambiguous
-            .diagnostics
-            .iter()
-            .any(|d| matches!(d, witgraph_ir::Diagnostic::AmbiguousComponent { .. })),
-        "{}",
-        ambiguous.diagnostics
-    );
-
-    // The narrow bytes under the wide revision's key do not implement it.
+    // The narrow bytes under the wide component's name do not target its
+    // world as its WIT has it.
     let graph = kit
         .builder("swapped")
         .add_node("w", wide.clone())
         .connect_feedback("ww", port("w", "out"), port("w", "in"))
         .build();
     let compiled = graph.compile(&kit.contracts).expect("compiles");
-    let wasm = HashMap::from([(wide, RELAY.wasm), (narrow, RELAY.wasm)]);
-    let err = RuntimeGraph::load(compiled, &wasm, RuntimeConfig::default(), Perf)
-        .await
-        .err()
-        .expect("relay's bytes lack `doubled`");
+    let mut swapped = test_components::Kit::new(&[RELAY]);
+    swapped.add_as(
+        wide.component.clone(),
+        RELAY.wasm.to_vec(),
+        RELAY_WIDE.wit_source(),
+    );
+    let err = RuntimeGraph::load(
+        compiled,
+        &swapped.artifacts(),
+        RuntimeConfig::default(),
+        Perf,
+    )
+    .await
+    .err()
+    .expect("relay's bytes lack `doubled`");
     assert!(matches!(err, LoadError::ContractMismatch { .. }), "{err}");
 }
 
@@ -863,7 +831,7 @@ async fn capability_import_feeds_a_stream() {
     ])));
     let mut rt = RuntimeGraph::load_with_host(
         compiled,
-        &kit.wasm,
+        &kit.artifacts(),
         RuntimeConfig::default(),
         Perf,
         mqtt(feed.clone()),
@@ -933,10 +901,15 @@ async fn video(
         .connect("to-sink", port(from, "frames"), port("sink", "frames"))
         .build();
     let compiled = graph.compile(&kit.contracts).expect("compiles");
-    let mut rt =
-        RuntimeGraph::load_with_host(compiled, &kit.wasm, RuntimeConfig::default(), Perf, Clock)
-            .await
-            .expect("loads with the clock");
+    let mut rt = RuntimeGraph::load_with_host(
+        compiled,
+        &kit.artifacts(),
+        RuntimeConfig::default(),
+        Perf,
+        Clock,
+    )
+    .await
+    .expect("loads with the clock");
     inject(&mut rt, "source", "frames", Val::U32(frames)).await;
     if let Some(fps) = fps {
         inject(&mut rt, "source", "fps", Val::U32(fps)).await;
@@ -1146,10 +1119,15 @@ async fn edges(accel: Accel) -> RuntimeGraph<Perf, Accel> {
         .connect("b", port("edges", "edges"), port("sink", "frames"))
         .build();
     let compiled = graph.compile(&kit.contracts).expect("compiles");
-    let mut rt =
-        RuntimeGraph::load_with_host(compiled, &kit.wasm, RuntimeConfig::default(), Perf, accel)
-            .await
-            .expect("loads");
+    let mut rt = RuntimeGraph::load_with_host(
+        compiled,
+        &kit.artifacts(),
+        RuntimeConfig::default(),
+        Perf,
+        accel,
+    )
+    .await
+    .expect("loads");
     inject(&mut rt, "source", "frames", Val::U32(3)).await;
     rt
 }
@@ -1184,7 +1162,7 @@ async fn without_an_accelerator_edge_detection_faults_saying_why() {
 }
 
 #[test]
-fn a_component_declares_its_viewers_in_a_custom_section() {
+fn a_component_declares_its_viewers_in_its_node_manifest() {
     for (guest, viewer) in [
         (VIDEO_SOURCE, Some("image")),
         (FRAME_GRAYSCALE, Some("image")),
@@ -1194,48 +1172,27 @@ fn a_component_declares_its_viewers_in_a_custom_section() {
         (FUTURE_WRITER, Some("text")),
         (MQTT_NODE, Some("text")),
         (CONFIGURABLE, Some("series")),
+        (VIDEO_SINK, None),
     ] {
-        let declared = contract(guest);
-        let lowered = witgraph_wit::lower_component(guest.wasm, &declared.id)
-            .expect("lowers")
-            .contract;
+        let mut declared = contract(guest);
+        // WIT declares no viewer.
+        assert!(declared.outputs.iter().all(|p| p.viewer.is_none()));
+        let manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(guest.manifest).unwrap()).unwrap();
+        let hints: std::collections::BTreeMap<String, String> =
+            match manifest["viewers"].get(declared.id.world.to_string()) {
+                Some(hints) => serde_json::from_value(hints.clone()).unwrap(),
+                None => Default::default(),
+            };
+        let problems = witgraph_wit::viewer::apply(&mut declared, &hints);
+        assert_eq!(problems, Vec::<String>::new());
         assert_eq!(
-            lowered.outputs[0].viewer.as_deref(),
+            declared.outputs.first().and_then(|p| p.viewer.as_deref()),
             viewer,
             "{}",
             declared.id
         );
-        // WIT text declares no viewer.
-        assert_eq!(declared.outputs[0].viewer, None);
     }
-    let sink = contract(VIDEO_SINK);
-    let lowered = witgraph_wit::lower_component(VIDEO_SINK.wasm, &sink.id).unwrap();
-    assert!(lowered.contract.outputs.iter().all(|p| p.viewer.is_none()));
-    assert_eq!(lowered.warnings, Vec::<String>::new());
-}
-
-#[test]
-fn a_wrong_viewer_hint_is_skipped_not_fatal() {
-    // A second section at the root, after the module's `output.frames=image`:
-    // a stale output, and `frames` again.
-    let hints = b"output.frame=image\noutput.frames=text\n";
-    let name = witgraph_wit::viewer::SECTION.as_bytes();
-    let mut body = vec![u8::try_from(name.len()).unwrap()];
-    body.extend_from_slice(name);
-    body.extend_from_slice(hints);
-    let mut bytes = VIDEO_SOURCE.wasm.to_vec();
-    bytes.push(0);
-    bytes.push(u8::try_from(body.len()).unwrap());
-    bytes.extend(body);
-
-    let id = contract(VIDEO_SOURCE).id;
-    let lowered = witgraph_wit::lower_component(&bytes, &id).expect("still lowers");
-    assert_eq!(lowered.contract.outputs[0].viewer.as_deref(), Some("image"));
-    assert_eq!(lowered.warnings.len(), 2, "{:?}", lowered.warnings);
-    assert!(lowered.warnings.iter().any(|w| w.contains("`frame`")));
-    assert!(lowered.warnings.iter().any(|w| w.contains("named twice")));
-    // The bytes still verify against their contract.
-    witgraph_wit::verify::verify_component(&contract(VIDEO_SOURCE), &bytes).expect("verifies");
 }
 
 /// The interface `labelled` imports twice.
@@ -1307,7 +1264,14 @@ async fn load_labelled(plugins: Plugins) -> Result<RuntimeGraph<Perf, Plugins>, 
         .add_node("n", kit.get(LABELLED))
         .build();
     let compiled = graph.compile(&kit.contracts).expect("compiles");
-    RuntimeGraph::load_with_host(compiled, &kit.wasm, RuntimeConfig::default(), Perf, plugins).await
+    RuntimeGraph::load_with_host(
+        compiled,
+        &kit.artifacts(),
+        RuntimeConfig::default(),
+        Perf,
+        plugins,
+    )
+    .await
 }
 
 async fn read_string<M: RuntimeMode, H: Host>(
@@ -1394,8 +1358,8 @@ async fn a_label_between_two_plugins_it_does_not_name_is_ambiguous() {
 }
 
 /// The `math` provider, as links name it.
-fn math() -> ComponentRef {
-    "test:math/math@0.1.0".parse().unwrap()
+fn math() -> ComponentName {
+    MATH.component()
 }
 
 /// The interface `calc` imports and `math` exports.
@@ -1403,9 +1367,7 @@ const OPS: &str = "test:math/ops@0.1.0";
 
 /// `calc` and what links may compose into it.
 fn calc_kit() -> Kit {
-    let mut kit = Kit::new(&[CALC]);
-    kit.wasm.insert(math(), MATH.wasm);
-    kit
+    Kit::new(&[CALC, MATH])
 }
 
 #[tokio::test]
@@ -1424,7 +1386,7 @@ async fn a_link_satisfies_an_import_with_a_providers_export() {
         "the links leave the host nothing to provide"
     );
     // No host: the provider is all `calc` needs.
-    let mut rt = RuntimeGraph::load(compiled, &kit.wasm, RuntimeConfig::default(), Perf)
+    let mut rt = RuntimeGraph::load(compiled, &kit.artifacts(), RuntimeConfig::default(), Perf)
         .await
         .expect("the provider is composed in");
     inject(&mut rt, "a", "x", Val::U32(5)).await;
@@ -1464,25 +1426,6 @@ async fn a_link_satisfies_an_import_with_a_providers_export() {
     rt.restore(&snapshot).await.expect("the same links");
 }
 
-#[tokio::test]
-async fn an_unpinned_provider_is_found_under_its_one_pinned_key() {
-    let mut kit = Kit::new(&[CALC]);
-    let pinned: ComponentRef = format!("{}#{}", math(), "ab".repeat(32)).parse().unwrap();
-    kit.wasm.insert(pinned, MATH.wasm);
-    let graph = kit
-        .builder("pinned-provider")
-        .add_node("a", kit.get(CALC))
-        .link("la", "a", OPS, math(), OPS)
-        .build();
-    let compiled = graph.compile(&kit.contracts).expect("compiles");
-    let mut rt = RuntimeGraph::load(compiled, &kit.wasm, RuntimeConfig::default(), Perf)
-        .await
-        .expect("the provider is found under its pinned key");
-    inject(&mut rt, "a", "x", Val::U32(5)).await;
-    settle(&mut rt).await;
-    assert_eq!(read_u32(&mut rt, "a", "doubled").await, 10);
-}
-
 /// A provider of `ops` like `math`, whose every function traps.
 fn trapping_math() -> &'static [u8] {
     use wit_parser::{LiftLowerAbi, ManglingAndAbi, Resolve};
@@ -1510,19 +1453,22 @@ fn trapping_math() -> &'static [u8] {
 #[tokio::test]
 async fn each_node_runs_the_composition_built_for_its_links() {
     let mut kit = calc_kit();
-    let pinned: ComponentRef = format!("{}#{}", math(), "ab".repeat(32)).parse().unwrap();
-    kit.wasm.insert(pinned.clone(), trapping_math());
-    // `b` comes first and pins the trapping provider; `a` names `math`
-    // unpinned, which that pin also matches.
+    let trapping: ComponentName = "trapping-math".parse().unwrap();
+    kit.add_as(
+        trapping.clone(),
+        trapping_math().to_vec(),
+        MATH.wit_source(),
+    );
+    // `b` comes first and links the trapping provider; `a` links `math`.
     let graph = kit
         .builder("two-providers")
         .add_node("b", kit.get(CALC))
         .add_node("a", kit.get(CALC))
-        .link("lb", "b", OPS, pinned, OPS)
+        .link("lb", "b", OPS, trapping, OPS)
         .link("la", "a", OPS, math(), OPS)
         .build();
     let compiled = graph.compile(&kit.contracts).expect("compiles");
-    let mut rt = RuntimeGraph::load(compiled, &kit.wasm, RuntimeConfig::default(), Perf)
+    let mut rt = RuntimeGraph::load(compiled, &kit.artifacts(), RuntimeConfig::default(), Perf)
         .await
         .expect("loads");
     inject(&mut rt, "a", "x", Val::U32(5)).await;
@@ -1541,7 +1487,7 @@ async fn each_node_runs_the_composition_built_for_its_links() {
         .link("la", "a", OPS, math(), OPS)
         .build();
     let compiled = graph.compile(&kit.contracts).expect("compiles");
-    let mut rt = RuntimeGraph::load(compiled, &kit.wasm, RuntimeConfig::default(), Perf)
+    let mut rt = RuntimeGraph::load(compiled, &kit.artifacts(), RuntimeConfig::default(), Perf)
         .await
         .expect("loads");
     inject(&mut rt, "a", "x", Val::U32(5)).await;
@@ -1554,35 +1500,12 @@ async fn each_node_runs_the_composition_built_for_its_links() {
 }
 
 #[tokio::test]
-async fn an_unpinned_provider_matching_two_pinned_keys_is_ambiguous() {
-    let mut kit = Kit::new(&[CALC]);
-    for hash in ["ab", "cd"] {
-        let pinned: ComponentRef = format!("{}#{}", math(), hash.repeat(32)).parse().unwrap();
-        kit.wasm.insert(pinned, MATH.wasm);
-    }
-    let graph = kit
-        .builder("two-pins")
-        .add_node("a", kit.get(CALC))
-        .link("la", "a", OPS, math(), OPS)
-        .build();
-    let compiled = graph.compile(&kit.contracts).expect("compiles");
-    let err = RuntimeGraph::load(compiled, &kit.wasm, RuntimeConfig::default(), Perf)
-        .await
-        .err()
-        .expect("which bytes is not known");
-    assert!(
-        matches!(&err, LoadError::AmbiguousProvider { candidates, .. } if candidates.len() == 2),
-        "{err}"
-    );
-}
-
-#[tokio::test]
 async fn without_a_link_the_import_is_the_hosts() {
     let kit = calc_kit();
     let graph = || kit.builder("unlinked").add_node("n", kit.get(CALC)).build();
     let compiled = graph().compile(&kit.contracts).expect("compiles");
     assert_eq!(compiled.required_capabilities()[0].interface, OPS);
-    let err = RuntimeGraph::load(compiled, &kit.wasm, RuntimeConfig::default(), Perf)
+    let err = RuntimeGraph::load(compiled, &kit.artifacts(), RuntimeConfig::default(), Perf)
         .await
         .err()
         .expect("nothing provides `ops`");
@@ -1594,7 +1517,7 @@ async fn without_a_link_the_import_is_the_hosts() {
     let compiled = graph().compile(&kit.contracts).expect("compiles");
     let err = RuntimeGraph::load_with_host(
         compiled,
-        &kit.wasm,
+        &kit.artifacts(),
         RuntimeConfig::default(),
         Perf,
         Plugins::new(),
@@ -1610,16 +1533,19 @@ async fn without_a_link_the_import_is_the_hosts() {
 
 #[tokio::test]
 async fn a_link_that_cannot_be_made_fails_the_load() {
-    let mut kit = Kit::new(&[CALC, ECHO]);
-    kit.wasm.insert(math(), MATH.wasm);
-    let load = async |provider: ComponentRef, export: &str| {
+    let kit = Kit::new(&[CALC, ECHO, MATH]);
+    let load = async |provider: ComponentName, export: &str| {
         let graph = kit
             .builder("bad-link")
+            .add_component(witgraph_ir::ComponentEntry::new(
+                provider.clone(),
+                provider.to_string(),
+            ))
             .add_node("n", kit.get(CALC))
             .link("l", "n", OPS, provider, export)
             .build();
         let compiled = graph.compile(&kit.contracts).expect("compiles");
-        RuntimeGraph::load(compiled, &kit.wasm, RuntimeConfig::default(), Perf)
+        RuntimeGraph::load(compiled, &kit.artifacts(), RuntimeConfig::default(), Perf)
             .await
             .err()
             .expect("the link cannot be made")
@@ -1632,15 +1558,15 @@ async fn a_link_that_cannot_be_made_fails_the_load() {
         "{err}"
     );
     // `echo` exports only `node`, which is no `ops`.
-    let err = load(kit.get(ECHO), "node").await;
+    let err = load(ECHO.component(), "node").await;
     assert!(
         matches!(&err, LoadError::BadLink { message, .. } if message.contains("cannot take `node`")),
         "{err}"
     );
-    let absent: ComponentRef = "test:absent/absent@0.1.0".parse().unwrap();
+    let absent: ComponentName = "absent".parse().unwrap();
     let err = load(absent.clone(), OPS).await;
     assert!(
-        matches!(&err, LoadError::MissingWasm { component } if **component == absent),
+        matches!(&err, LoadError::MissingWasm { component } if *component == absent),
         "{err}"
     );
 }
@@ -1674,8 +1600,7 @@ async fn a_linked_node_is_prepared_with_its_links() {
         .await
     };
 
-    let mut wasm = kit.wasm.clone();
-    wasm.insert(math(), MATH.wasm);
+    let wasm = kit.artifacts();
     // Another graph: what it composes has no provider in it.
     let without = PreparedGraph::new(&engine, &bare, &wasm).unwrap();
     let err = load(without)
@@ -1733,7 +1658,7 @@ async fn wide_graph_full_flow() {
     ));
     let mut rt = RuntimeGraph::load_with_host(
         compiled,
-        &kit.wasm,
+        &kit.artifacts(),
         RuntimeConfig::default(),
         Trace::new(),
         mqtt(feed),
@@ -1911,7 +1836,7 @@ async fn an_engine_that_cannot_run_a_graph_is_rejected() {
         engine: Some(wasmtime::Engine::default()),
         ..RuntimeConfig::default()
     };
-    let err = RuntimeGraph::load(compiled, &kit.wasm, config, Perf)
+    let err = RuntimeGraph::load(compiled, &kit.artifacts(), config, Perf)
         .await
         .err()
         .expect("the default engine meters no fuel");
@@ -1922,16 +1847,18 @@ async fn an_engine_that_cannot_run_a_graph_is_rejected() {
 }
 
 #[tokio::test]
-async fn bytes_can_be_keyed_by_an_unhashed_ref() {
+async fn a_node_runs_through_its_phases_once() {
     let kit = Kit::new(&[ECHO]);
     let graph = kit.builder("e").add_node("e", kit.get(ECHO)).build();
     let compiled = graph.compile(&kit.contracts).expect("compiles");
-    let mut unhashed = kit.get(ECHO);
-    unhashed.content_hash = None;
-    let wasm = HashMap::from([(unhashed, ECHO.wasm)]);
-    let mut rt = RuntimeGraph::load(compiled, &wasm, RuntimeConfig::default(), Trace::new())
-        .await
-        .expect("the unhashed key matches by package and world");
+    let mut rt = RuntimeGraph::load(
+        compiled,
+        &kit.artifacts(),
+        RuntimeConfig::default(),
+        Trace::new(),
+    )
+    .await
+    .expect("loads");
     inject(&mut rt, "e", "in", Val::Float64(1.0)).await;
     settle(&mut rt).await;
     let phases: Vec<(NodePhase, NodePhase)> = rt
@@ -2259,7 +2186,7 @@ async fn an_group_over_its_memory_limit_fails_to_instantiate() {
         max_memory: Some(witgraph_runtime::ByteCount(4096)),
         ..RuntimeConfig::default()
     };
-    let err = RuntimeGraph::load(compiled, &kit.wasm, config, Perf)
+    let err = RuntimeGraph::load(compiled, &kit.artifacts(), config, Perf)
         .await
         .err()
         .expect("echo's memory is bigger than 4 KiB");
@@ -2311,7 +2238,8 @@ fn pipeline_and_busy(kit: &Kit) -> Graph {
     let mut graph = pipeline(kit);
     graph.nodes.push(witgraph_ir::Node {
         id: id("busy"),
-        component: kit.get(BUSY_LOOP),
+        component: BUSY_LOOP.component(),
+        world: kit.get(BUSY_LOOP).world,
         label: None,
         resources: Default::default(),
         attrs: Default::default(),
@@ -2378,10 +2306,10 @@ async fn a_prepared_graph_is_for_the_components_it_was_prepared_with() {
         .compile(&kit.contracts)
         .expect("compiles");
     let engine = RuntimeConfig::default().new_engine().unwrap();
-    let prepared = PreparedGraph::new(&engine, &prepared_for, &kit.wasm).unwrap();
+    let prepared = PreparedGraph::new(&engine, &prepared_for, &kit.artifacts()).unwrap();
     // The same ports, so the same contract hash, in another component.
     let mut other = contract(ECHO);
-    other.id = "test:echo/echo@0.2.0".parse().unwrap();
+    other.id = "echo/test:echo/echo@0.2.0".parse().unwrap();
     let another = Graph::builder("g")
         .add_component(&other)
         .add_node("n", other.id.clone())
@@ -2476,7 +2404,7 @@ async fn a_latch_does_not_pay_for_the_run_before_it() {
             .expect("compiles")
     };
     let engine = RuntimeConfig::default().new_engine().unwrap();
-    let prepared = PreparedGraph::new(&engine, &graph(), &kit.wasm).unwrap();
+    let prepared = PreparedGraph::new(&engine, &graph(), &kit.artifacts()).unwrap();
     let (mut low, mut high) = (1u64, 5_000_000u64);
     assert_eq!(
         tick_on_budget(&prepared, &graph, high).await,
@@ -2767,7 +2695,8 @@ async fn shutdown_cancels_everything() {
     let mut graph = pipeline(&kit);
     graph.nodes.push(witgraph_ir::Node {
         id: id("e"),
-        component: kit.get(ECHO),
+        component: ECHO.component(),
+        world: kit.get(ECHO).world,
         label: None,
         resources: Default::default(),
         attrs: Default::default(),
@@ -2798,7 +2727,7 @@ async fn rerun_restarts_an_group_the_host_cannot_feed() {
     let feed = Arc::new(Mutex::new(VecDeque::from([vec![1u8], vec![2u8]])));
     let mut rt = RuntimeGraph::load_with_host(
         compiled,
-        &kit.wasm,
+        &kit.artifacts(),
         RuntimeConfig::default(),
         Perf,
         mqtt(feed.clone()),
@@ -2888,7 +2817,7 @@ async fn the_host_creates_the_data_of_the_store() {
     let built = Arc::new(Mutex::new(Vec::new()));
     let mut rt = RuntimeGraph::load_with_host(
         compiled,
-        &kit.wasm,
+        &kit.artifacts(),
         RuntimeConfig::default(),
         Perf,
         Counting {
@@ -3103,7 +3032,7 @@ async fn every_stream_group_shares_one_store() {
     let built = Arc::new(Mutex::new(Vec::new()));
     let mut rt = RuntimeGraph::load_with_host(
         compiled,
-        &kit.wasm,
+        &kit.artifacts(),
         RuntimeConfig::default(),
         Trace::new(),
         Counting {
@@ -3211,7 +3140,7 @@ async fn dropping_a_graph_drops_its_store() {
     let compiled = pipeline(&kit).compile(&kit.contracts).expect("compiles");
     let mut rt = RuntimeGraph::load_with_host(
         compiled,
-        &kit.wasm,
+        &kit.artifacts(),
         RuntimeConfig::default(),
         Perf,
         Flagging(dropped.clone()),
@@ -3621,10 +3550,15 @@ async fn a_panic_making_group_data_on_a_rebuild_is_a_restart_fault() {
         made: Default::default(),
         panic_after: 1,
     };
-    let mut rt =
-        RuntimeGraph::load_with_host(compiled, &kit.wasm, RuntimeConfig::default(), Perf, host)
-            .await
-            .expect("loads");
+    let mut rt = RuntimeGraph::load_with_host(
+        compiled,
+        &kit.artifacts(),
+        RuntimeConfig::default(),
+        Perf,
+        host,
+    )
+    .await
+    .expect("loads");
     settle(&mut rt).await;
     rt.shutdown();
     rt.rerun(&id("e")).unwrap();
@@ -3657,7 +3591,8 @@ async fn a_revision_differing_only_in_its_docs_is_the_same_graph() {
             .compile(std::slice::from_ref(contract))
             .unwrap()
     };
-    let prepared = PreparedGraph::new(&engine, &graph(&kit.contracts[0]), &kit.wasm).unwrap();
+    let prepared =
+        PreparedGraph::new(&engine, &graph(&kit.contracts[0]), &kit.artifacts()).unwrap();
     RuntimeGraph::load_prepared(
         graph(&documented),
         &prepared,
@@ -3680,7 +3615,7 @@ async fn a_prepared_graph_loads_on_its_engine() {
             .unwrap()
     };
     let engine = RuntimeConfig::default().new_engine().unwrap();
-    let prepared = PreparedGraph::new(&engine, &graph(), &kit.wasm).unwrap();
+    let prepared = PreparedGraph::new(&engine, &graph(), &kit.artifacts()).unwrap();
 
     let mut rt = RuntimeGraph::load_prepared(
         graph(),
@@ -3737,7 +3672,7 @@ async fn a_graph_prepared_against_another_contract_is_rejected() {
             .compile(std::slice::from_ref(contract))
             .unwrap()
     };
-    let prepared = PreparedGraph::new(&engine, &compile(&real), &kit.wasm).unwrap();
+    let prepared = PreparedGraph::new(&engine, &compile(&real), &kit.artifacts()).unwrap();
     let err = RuntimeGraph::load_prepared(
         compile(&other),
         &prepared,
@@ -3764,7 +3699,7 @@ async fn an_engine_without_component_model_maps_is_rejected() {
     let graph = kit.builder("e").add_node("e", kit.get(ECHO)).build();
     let err = RuntimeGraph::load(
         graph.compile(&kit.contracts).unwrap(),
-        &kit.wasm,
+        &kit.artifacts(),
         RuntimeConfig {
             engine: Some(engine),
             ..RuntimeConfig::default()
@@ -3785,11 +3720,17 @@ async fn bytes_of_another_component_are_rejected() {
     let kit = Kit::new(&[ECHO]);
     let graph = kit.builder("mismatch").add_node("e", kit.get(ECHO)).build();
     let compiled = graph.compile(&kit.contracts).expect("compiles");
-    let wasm = HashMap::from([(kit.get(ECHO), RELAY.wasm)]);
-    let err = RuntimeGraph::load(compiled, &wasm, RuntimeConfig::default(), Perf)
-        .await
-        .err()
-        .expect("relay bytes do not implement echo");
+    let mut swapped = test_components::Kit::default();
+    swapped.add_as(ECHO.component(), RELAY.wasm.to_vec(), ECHO.wit_source());
+    let err = RuntimeGraph::load(
+        compiled,
+        &swapped.artifacts(),
+        RuntimeConfig::default(),
+        Perf,
+    )
+    .await
+    .err()
+    .expect("relay bytes do not implement echo");
     assert!(matches!(err, LoadError::ContractMismatch { .. }), "{err}");
 }
 
@@ -4144,7 +4085,7 @@ fn snapshot_round_trips_through_serde() {
         .collect()
     };
     let snapshot = Snapshot {
-        nodes: [(id("n"), "test:echo/echo@0.1.0".parse().unwrap())]
+        nodes: [(id("n"), "echo/test:echo/echo@0.1.0".parse().unwrap())]
             .into_iter()
             .collect(),
         connections: vec![witgraph_ir::Connection {
@@ -4604,7 +4545,7 @@ async fn a_node_waiting_on_its_host_holds_up_no_other_node_nor_a_feedback_loop()
     };
     let mut rt = RuntimeGraph::load_with_host(
         compiled,
-        &kit.wasm,
+        &kit.artifacts(),
         RuntimeConfig::default(),
         Perf,
         model.clone(),

@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use witgraph_ir::{ComponentRef, Connection, ConnectionId, Link, NodeId, PortName};
+use witgraph_ir::{Connection, ConnectionId, ContractId, Link, NodeId, PortName};
 
 use crate::node::NodePhase;
 
@@ -27,19 +27,17 @@ pub type PortValues = BTreeMap<NodeId, BTreeMap<PortName, String>>;
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Snapshot {
-    /// Each node's resolved component (id and content hash). A snapshot
-    /// restores only onto a graph with exactly these nodes and components.
-    pub nodes: BTreeMap<NodeId, ComponentRef>,
+    /// What each node runs: its world, as its component provides it. A
+    /// snapshot restores only onto a graph with exactly these nodes running
+    /// these. Components are named, not their bytes: keep the components
+    /// behind the names unchanged for a restore to replay the same code.
+    pub nodes: BTreeMap<NodeId, ContractId>,
     /// The graph's connections, sorted by id. A snapshot restores only onto
     /// a graph wired exactly the same way.
     pub connections: Vec<Connection>,
     /// The graph's links, sorted by id. A snapshot restores only onto a
-    /// graph whose nodes are linked to the same providers, by ref. Like
-    /// nodes, providers are named, not their bytes, and a provider's content
-    /// hash is not checked against its bytes (it has no contract to hash):
-    /// a pinned ref only selects the key its bytes are loaded under. Keep
-    /// the bytes behind a provider's key unchanged for a restore to replay
-    /// the same code.
+    /// graph whose nodes are linked to the same providers, by name. Like
+    /// nodes, providers are named, not their bytes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub links: Vec<Link>,
     /// Whether no `run` was in flight when the snapshot was taken.

@@ -2,13 +2,13 @@
 #![cfg(feature = "precompiled")]
 #![allow(clippy::unwrap_used)]
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use witgraph_runtime::RunningGraph;
 
+use test_components::Kit;
 use test_components::{CALC, ECHO, Guest, MATH};
-use witgraph_ir::{CompiledGraph, ComponentContract, ComponentRef, Graph};
+use witgraph_ir::{CompiledGraph, ComponentContract, ComponentEntry, ComponentName, Graph};
 use witgraph_runtime::{
     LoadError, NoCapabilities, Perf, PreparedGraph, RuntimeConfig, TickResult, Val,
 };
@@ -18,11 +18,11 @@ type RuntimeGraph = witgraph_runtime::RuntimeGraph<Perf>;
 const OPS: &str = "test:math/ops@0.1.0";
 
 fn contract(guest: Guest) -> ComponentContract {
-    witgraph_wit::load_components(guest.wit).unwrap().remove(0)
+    guest.contract()
 }
 
-fn math() -> ComponentRef {
-    "test:math/math@0.1.0".parse().unwrap()
+fn math() -> ComponentName {
+    MATH.component()
 }
 
 fn echo_graph() -> CompiledGraph {
@@ -39,6 +39,7 @@ fn calc_graph() -> CompiledGraph {
     let calc = contract(CALC);
     Graph::builder("saved")
         .add_component(&calc)
+        .add_component(ComponentEntry::new(math(), "math"))
         .add_node("n", calc.id.clone())
         .link("l", "n", OPS, math(), OPS)
         .build()
@@ -46,14 +47,16 @@ fn calc_graph() -> CompiledGraph {
         .unwrap()
 }
 
-fn echo_wasm(bytes: &[u8]) -> HashMap<ComponentRef, &[u8]> {
-    [(contract(ECHO).id, bytes)].into_iter().collect()
+fn echo_wasm(bytes: &[u8]) -> Kit {
+    let mut kit = Kit::default();
+    kit.add_as(ECHO.component(), bytes.to_vec(), ECHO.wit_source());
+    kit
 }
 
-fn calc_wasm(math_bytes: &[u8]) -> HashMap<ComponentRef, &[u8]> {
-    [(contract(CALC).id, CALC.wasm), (math(), math_bytes)]
-        .into_iter()
-        .collect()
+fn calc_wasm(math_bytes: &[u8]) -> Kit {
+    let mut kit = Kit::new(&[CALC]);
+    kit.add_as(math(), math_bytes.to_vec(), MATH.wit_source());
+    kit
 }
 
 /// Loads `bytes`, as another process would: on an engine of its own.
@@ -65,7 +68,7 @@ fn reload(compiled: &CompiledGraph, bytes: &[u8]) -> Result<PreparedGraph, LoadE
 
 fn saved_echo() -> Vec<u8> {
     let engine = RuntimeConfig::default().new_engine().unwrap();
-    PreparedGraph::new(&engine, &echo_graph(), &echo_wasm(ECHO.wasm))
+    PreparedGraph::new(&engine, &echo_graph(), &echo_wasm(ECHO.wasm).artifacts())
         .unwrap()
         .serialize()
         .unwrap()
@@ -101,7 +104,7 @@ async fn a_saved_graph_runs_on_a_new_engine() {
 #[tokio::test]
 async fn a_saved_graph_keeps_its_links() {
     let engine = RuntimeConfig::default().new_engine().unwrap();
-    let saved = PreparedGraph::new(&engine, &calc_graph(), &calc_wasm(MATH.wasm))
+    let saved = PreparedGraph::new(&engine, &calc_graph(), &calc_wasm(MATH.wasm).artifacts())
         .unwrap()
         .serialize()
         .unwrap();
@@ -235,12 +238,12 @@ fn rebuilt(wasm: &[u8]) -> Vec<u8> {
 fn load_or_compile(
     config: &RuntimeConfig,
     compiled: &CompiledGraph,
-    wasm: &HashMap<ComponentRef, &[u8]>,
+    wasm: &Kit,
     path: &Path,
 ) -> Result<PreparedGraph, LoadError> {
     let engine = config.new_engine().unwrap();
     // SAFETY: the file comes from `serialize`, or is refused unrun.
-    unsafe { PreparedGraph::load_or_compile(&engine, compiled, wasm, path) }
+    unsafe { PreparedGraph::load_or_compile(&engine, compiled, &wasm.artifacts(), path) }
 }
 
 #[test]
@@ -375,7 +378,7 @@ fn load_or_compile_reports_what_it_cannot_do() {
     let engine = wasmtime::Engine::default();
     let wasm = echo_wasm(ECHO.wasm);
     // SAFETY: refused before the file is run.
-    let err = unsafe { PreparedGraph::load_or_compile(&engine, &graph, &wasm, &path) }
+    let err = unsafe { PreparedGraph::load_or_compile(&engine, &graph, &wasm.artifacts(), &path) }
         .err()
         .expect("no fuel, no concurrency");
     assert!(matches!(err, LoadError::Runtime(_)), "{err}");

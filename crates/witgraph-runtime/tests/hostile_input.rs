@@ -16,8 +16,9 @@ use serde_json::Value;
 use test_components::{
     BUSY_LOOP, CORPUS_RELAY, ECHO, Guest, RELAY, STREAM_PRODUCER, TENSOR_SINK, TENSOR_SOURCE,
 };
-use witgraph_ir::{ComponentContract, ComponentRef, Graph};
+use witgraph_ir::{ComponentContract, ContractId, Graph};
 use witgraph_wit::hub::{self, HubMember};
+use witgraph_wit::load::WitSource;
 
 const GUESTS: [Guest; 7] = [
     ECHO,
@@ -130,7 +131,7 @@ const WIT_CHUNKS: [&[u8]; 16] = [
 const WASM_CHUNKS: [&[u8]; 4] = [
     b"\0asm",
     b"component-type",
-    b"witgraph-viewer",
+    b"component-import",
     b"\x00\x00\x00",
 ];
 
@@ -144,35 +145,47 @@ fn wit_case(seed: u64, rng: &mut Rng, source: &str) {
     no_panic(seed, "lowering WIT", &wit, || {
         if let Ok(source) = witgraph_wit::load::load_str("hostile.wit", &text) {
             count(&REACHED.wit_parsed);
-            if witgraph_wit::lower::lower(&source).is_ok() {
+            if witgraph_wit::lower::lower(&source, &"c".parse().unwrap()).is_ok() {
                 count(&REACHED.wit_lowered);
             }
         }
     });
 }
 
-fn wasm_case(seed: u64, rng: &mut Rng, guest: Guest, contract: &ComponentContract) {
+fn wasm_case(
+    seed: u64,
+    rng: &mut Rng,
+    guest: Guest,
+    wit: &WitSource,
+    contract: &ComponentContract,
+) {
     let bytes = mutated(rng, guest.wasm, &WASM_CHUNKS);
-    no_panic(seed, "lowering a component", &[], || {
-        let _ = witgraph_wit::lower_component(&bytes, &contract.id);
+    no_panic(seed, "reading a component's imports", &[], || {
+        let _ = witgraph_wit::verify::Imports::of(&bytes);
     });
     no_panic(seed, "verifying a component", &[], || {
-        let _ = witgraph_wit::verify::verify_component(contract, &bytes);
+        let _ = witgraph_wit::verify::verify_component(wit, &contract.id.world, &bytes);
     });
 }
 
-/// A component that still lowers goes on to be composed.
-fn compose_case(seed: u64, rng: &mut Rng, guest: Guest, contract: &ComponentContract) {
+/// A component that still targets its world goes on to be composed.
+fn compose_case(
+    seed: u64,
+    rng: &mut Rng,
+    guest: Guest,
+    wit: &WitSource,
+    contract: &ComponentContract,
+) {
     let bytes = mutated(rng, guest.wasm, &WASM_CHUNKS);
-    let Ok(lowered) = witgraph_wit::lower_component(&bytes, &contract.id) else {
+    if witgraph_wit::verify::verify_component(wit, &contract.id.world, &bytes).is_err() {
         return;
-    };
+    }
     count(&REACHED.component_lowered);
     let Ok(compiled) = Graph::builder("g")
-        .add_component(&lowered.contract)
-        .add_node("n", lowered.contract.id.clone())
+        .add_component(contract)
+        .add_node("n", contract.id.clone())
         .build()
-        .compile(std::slice::from_ref(&lowered.contract))
+        .compile(std::slice::from_ref(contract))
     else {
         return;
     };
@@ -180,7 +193,9 @@ fn compose_case(seed: u64, rng: &mut Rng, guest: Guest, contract: &ComponentCont
     let members = [HubMember {
         node: &node,
         bytes: &bytes,
-        export: &lowered.export,
+        export: "node",
+        wit,
+        world: &contract.id.world,
         mocked: false,
     }];
     no_panic(seed, "composing a hub", &[], || {
@@ -267,15 +282,13 @@ fn bad_input_is_an_error_not_a_panic() {
         Some(seed) => seed..seed + 1,
         None => 0..var("WITGRAPH_HOSTILE_CASES").unwrap_or(1000),
     };
-    let contracts: Vec<ComponentContract> = GUESTS
-        .iter()
-        .map(|guest| witgraph_wit::load_components(guest.wit).unwrap().remove(0))
-        .collect();
+    let contracts: Vec<ComponentContract> = GUESTS.iter().map(|guest| guest.contract()).collect();
+    let wits: Vec<WitSource> = GUESTS.iter().map(|guest| guest.wit_source()).collect();
     let sources: Vec<String> = GUESTS
         .iter()
         .map(|guest| std::fs::read_to_string(format!("{}/world.wit", guest.wit)).unwrap())
         .collect();
-    let refs: Vec<&ComponentRef> = contracts.iter().map(|c| &c.id).collect();
+    let refs: Vec<&ContractId> = contracts.iter().map(|c| &c.id).collect();
     let graph = Graph::builder("g")
         .add_component(&contracts[1])
         .add_node("a", refs[1].clone())
@@ -302,8 +315,8 @@ fn bad_input_is_an_error_not_a_panic() {
             let (guest, contract) = (GUESTS[at], &contracts[at]);
             match rng.below(4) {
                 0 => wit_case(seed, &mut rng, &sources[at]),
-                1 => wasm_case(seed, &mut rng, guest, contract),
-                2 => compose_case(seed, &mut rng, guest, contract),
+                1 => wasm_case(seed, &mut rng, guest, &wits[at], contract),
+                2 => compose_case(seed, &mut rng, guest, &wits[at], contract),
                 _ => graph_case(seed, &mut rng, &base, &contracts),
             }
         }

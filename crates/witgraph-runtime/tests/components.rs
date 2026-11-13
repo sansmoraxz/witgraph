@@ -14,11 +14,13 @@ use wasmtime::component::{Linker, ResourceType, Val};
 use wit_component::{ComponentEncoder, StringEncoding};
 use wit_parser::{LiftLowerAbi, ManglingAndAbi, Resolve};
 use witgraph_ir::NodeId;
-use witgraph_ir::{Capability, ComponentContract, ComponentRef, Graph};
+use witgraph_ir::{Capability, ComponentContract, ComponentEntry, ComponentName, Graph};
+use witgraph_runtime::Artifact;
 use witgraph_runtime::{
     Host, HostState, LoadError, NodeFault, NodePhase, RuntimeConfig, RuntimeError, RuntimeGraph,
     TickResult,
 };
+use witgraph_wit::load::WitSource;
 
 /// A component with `world`'s metadata whose core module imports only
 /// what `module_world` imports.
@@ -52,15 +54,60 @@ fn component(wit: &str, world: &str, module_world: &str) -> Vec<u8> {
         .unwrap()
 }
 
-/// The contract lowered from `world` in `wit`.
+thread_local! {
+    /// The WIT text of each contract [`contract`] lowered on this test's thread, for
+    /// [`artifact`] to give the runtime with its bytes.
+    static WIT: std::cell::RefCell<HashMap<witgraph_ir::ContractId, String>> =
+        Default::default();
+}
+
+/// The component a node runs, in these tests.
+fn node_name() -> ComponentName {
+    "c".parse().unwrap()
+}
+
+/// `wit`, loaded.
+fn source(wit: &str) -> WitSource {
+    witgraph_wit::load::load_str("test.wit", wit).unwrap()
+}
+
+/// The contract lowered from `world` in `wit`, as component `c` provides it.
 fn contract(wit: &str, world: &str) -> ComponentContract {
-    let source = witgraph_wit::load::load_str("test.wit", wit).unwrap();
-    witgraph_wit::lower::lower(&source)
+    let contract = witgraph_wit::lower::lower(&source(wit), &node_name())
         .unwrap()
         .into_iter()
         .map(|lowered| lowered.contract)
-        .find(|c| c.id.world == world)
-        .unwrap()
+        .find(|c| c.id.world.world == world)
+        .unwrap();
+    WIT.with(|w| w.borrow_mut().insert(contract.id.clone(), wit.to_string()));
+    contract
+}
+
+/// The WIT `contract` was lowered from, by [`contract`].
+fn wit_of(contract: &ComponentContract) -> WitSource {
+    source(&WIT.with(|w| w.borrow()[&contract.id].clone()))
+}
+
+/// What `world` of `source` imports.
+fn capabilities(source: &WitSource, world: &str) -> Vec<Capability> {
+    let (_, id) = witgraph_wit::lower::root_worlds(source)
+        .into_iter()
+        .find(|(w, _)| w.world == world)
+        .unwrap();
+    witgraph_wit::lower::world_capabilities(source, id)
+}
+
+/// `bytes` as a runtime is given them, with `wit`.
+fn artifact<'a>(
+    bytes: &'a [u8],
+    wit: &'a WitSource,
+    capabilities: &'a [Capability],
+) -> Artifact<'a> {
+    Artifact {
+        bytes,
+        wit,
+        capabilities,
+    }
 }
 
 /// A host that links every node's capabilities with one function.
@@ -101,7 +148,8 @@ where
     let compiled = graph
         .compile(std::slice::from_ref(contract))
         .expect("compiles");
-    let wasm: HashMap<ComponentRef, &[u8]> = HashMap::from([(contract.id.clone(), bytes)]);
+    let wit = wit_of(contract);
+    let wasm = HashMap::from([(node_name(), artifact(bytes, &wit, &[]))]);
     RuntimeGraph::load_with_host(
         compiled,
         &wasm,
@@ -241,7 +289,7 @@ async fn a_label_must_stand_for_the_contract_s_interface() {
     assert!(
         matches!(&err, LoadError::ContractMismatch { message, .. }
             if message.contains("`primary` for `demo:labels/timer@0.1.0`")
-                && message.contains("the contract for `demo:labels/clock@0.1.0`")),
+                && message.contains("the world for `demo:labels/clock@0.1.0`")),
         "{err}"
     );
 }
@@ -298,10 +346,11 @@ async fn a_providers_own_imports_become_the_nodes_capabilities() {
     assert_eq!(names(&contract), ["demo:linked/ops@0.1.0"]);
     let node = component(&wit, "w", "w");
     let provider = component(&wit, "provider", "provider");
-    let provider_id: ComponentRef = "demo:linked/provider@0.1.0".parse().unwrap();
+    let provider_id: ComponentName = "provider".parse().unwrap();
 
     let graph = Graph::builder("t")
         .add_component(&contract)
+        .add_component(ComponentEntry::new(provider_id.clone(), "provider"))
         .add_node("n", contract.id.clone())
         .link(
             "l",
@@ -318,9 +367,11 @@ async fn a_providers_own_imports_become_the_nodes_capabilities() {
         compiled.required_capabilities().is_empty(),
         "what the provider imports is not known before the load"
     );
-    let wasm: HashMap<ComponentRef, &[u8]> = HashMap::from([
-        (contract.id.clone(), node.as_slice()),
-        (provider_id, provider.as_slice()),
+    let wit = source(&wit);
+    let provided = capabilities(&wit, "provider");
+    let wasm = HashMap::from([
+        (node_name(), artifact(&node, &wit, &[])),
+        (provider_id, artifact(&provider, &wit, &provided)),
     ]);
     let asked = Arc::new(Mutex::new(Vec::new()));
     RuntimeGraph::load_with_host(
@@ -370,7 +421,8 @@ async fn imports_the_guest_does_not_use_are_not_required() {
     let compiled = graph
         .compile(std::slice::from_ref(&contract))
         .expect("compiles");
-    let wasm: HashMap<ComponentRef, &[u8]> = HashMap::from([(contract.id.clone(), &bytes[..])]);
+    let wit = wit_of(&contract);
+    let wasm = HashMap::from([(node_name(), artifact(&bytes, &wit, &[]))]);
     RuntimeGraph::load(
         compiled,
         &wasm,
@@ -656,7 +708,8 @@ async fn a_plugin_serving_the_declared_version_serves_a_merged_import() {
     let compiled = graph
         .compile(std::slice::from_ref(&contract))
         .expect("compiles");
-    let wasm: HashMap<ComponentRef, &[u8]> = HashMap::from([(contract.id.clone(), &bytes[..])]);
+    let wit = wit_of(&contract);
+    let wasm = HashMap::from([(node_name(), artifact(&bytes, &wit, &[]))]);
     let plugins = Plugins::new().with(Clock).unwrap();
     RuntimeGraph::load_with_host(
         compiled,
@@ -708,7 +761,10 @@ async fn bytes_wit_parser_cannot_decode_are_a_bad_component() {
         .await
         .err()
         .expect("not a node");
-    assert!(matches!(err, LoadError::BadComponent { .. }), "{err}");
+    assert!(
+        matches!(err, LoadError::ContractMismatch { .. }),
+        "it does not target its world: {err}"
+    );
 }
 
 #[tokio::test]
@@ -816,16 +872,17 @@ async fn two_links_on_imports_the_bytes_merged_are_refused() {
     let contract = contract(&wit, "w");
     let bytes = component(&wit, "newer", "newer");
     let provider_bytes = component(&wit, "provider", "provider");
-    let provider: ComponentRef = "demo:app/provider@0.1.0".parse().unwrap();
+    let provider: ComponentName = "provider".parse().unwrap();
     let links = ["demo:caps/clock@0.1.0", "demo:caps/clock@0.1.3"].map(|import| LinkedProvider {
         import,
         provider: &provider,
         bytes: &provider_bytes,
         export: "demo:caps/clock@0.1.3",
+        capabilities: &[],
     });
     // Even links that agree: a graph never has them (`ImportLinkedTwice`).
-    let lowered = witgraph_wit::verify::verify_component(&contract, &bytes).unwrap();
-    let linked = witgraph_wit::compose::link_node(&contract, &bytes, &lowered, &links);
+    let imports = witgraph_wit::verify::Imports::of(&bytes).unwrap();
+    let linked = witgraph_wit::compose::link_node(&contract, &bytes, "node", &imports, &links);
     match linked {
         Ok(_) => panic!("one import, two links"),
         Err(err) => assert!(err.message.contains("as one"), "{}", err.message),
@@ -897,7 +954,8 @@ async fn growing_memory_past_the_group_limit_faults() {
     let compiled = graph
         .compile(std::slice::from_ref(&contract))
         .expect("compiles");
-    let wasm: HashMap<ComponentRef, &[u8]> = HashMap::from([(contract.id.clone(), &bytes[..])]);
+    let wit = wit_of(&contract);
+    let wasm = HashMap::from([(node_name(), artifact(&bytes, &wit, &[]))]);
     let config = RuntimeConfig {
         max_memory: Some(witgraph_runtime::ByteCount(4 << 20)),
         ..RuntimeConfig::default()
@@ -942,7 +1000,10 @@ async fn bytes_importing_what_no_node_imports_are_a_bad_component() {
             .err()
             .expect(what);
         assert!(
-            matches!(err, LoadError::BadComponent { .. }),
+            matches!(
+                err,
+                LoadError::BadComponent { .. } | LoadError::ContractMismatch { .. }
+            ),
             "{what}: {err}"
         );
     }
@@ -970,7 +1031,7 @@ async fn bytes_without_one_node_world_are_a_bad_component() {
         .err()
         .expect("the bytes export no node");
     assert!(
-        matches!(err, LoadError::BadComponent { ref message, .. } if message.contains("exactly one node world")),
+        matches!(err, LoadError::ContractMismatch { ref message, .. } if message.contains("missing export named `node`")),
         "{err}"
     );
 }
@@ -1008,7 +1069,7 @@ async fn bytes_with_a_sync_run_are_a_bad_component() {
         .err()
         .expect("sync bytes");
     assert!(
-        matches!(err, LoadError::BadComponent { ref message, .. } if message.contains("async func")),
+        matches!(err, LoadError::ContractMismatch { ref message, .. } if message.contains("sync function")),
         "{err}"
     );
 }
@@ -1018,9 +1079,13 @@ async fn bytes_with_a_sync_run_are_a_bad_component() {
 /// fills its import shims only after a core module's start function ran.
 fn fails_on_start() -> (ComponentContract, Vec<u8>) {
     let wit = "package demo:startfatal@0.1.0;
+        package witgraph:runtime@0.1.0 {
+            interface host { fatal: func(message: string); }
+        }
         interface ctl { should-fail: func() -> bool; }
         world w {
             import ctl;
+            import witgraph:runtime/host@0.1.0;
             export node: interface {
                 record outputs { out: u32 }
                 run: async func() -> outputs;
@@ -1156,9 +1221,10 @@ async fn a_link_to_an_import_the_code_never_uses_satisfies_nothing() {
     let contract = contract(&wit, "w");
     // Built without `ops`: the code never calls it.
     let node = component(&wit, "w", "bare");
-    let provider_id: ComponentRef = "demo:idle/provider@0.1.0".parse().unwrap();
+    let provider_id: ComponentName = "provider".parse().unwrap();
     let graph = Graph::builder("t")
         .add_component(&contract)
+        .add_component(ComponentEntry::new(provider_id.clone(), "provider"))
         .add_node("n", contract.id.clone())
         .link(
             "l",
@@ -1172,8 +1238,8 @@ async fn a_link_to_an_import_the_code_never_uses_satisfies_nothing() {
         .compile(std::slice::from_ref(&contract))
         .expect("compiles");
     // The provider is not even needed: nothing would use it.
-    let wasm: HashMap<ComponentRef, &[u8]> =
-        HashMap::from([(contract.id.clone(), node.as_slice())]);
+    let wit = wit_of(&contract);
+    let wasm = HashMap::from([(node_name(), artifact(&node, &wit, &[]))]);
     RuntimeGraph::load(
         compiled,
         &wasm,
@@ -1229,19 +1295,17 @@ where
 
 #[tokio::test]
 async fn a_graph_runs_through_the_common_trait() {
-    let contract = witgraph_wit::load_components(test_components::ECHO.wit)
-        .unwrap()
-        .remove(0);
+    let contract = test_components::ECHO.contract();
     let compiled = witgraph_ir::Graph::builder("t")
         .add_component(&contract)
         .add_node("n", contract.id.clone())
         .build()
         .compile(std::slice::from_ref(&contract))
         .unwrap();
-    let wasm = std::collections::HashMap::from([(contract.id.clone(), test_components::ECHO.wasm)]);
+    let kit = test_components::Kit::new(&[test_components::ECHO]);
     let mut rt = RuntimeGraph::load(
         compiled,
-        &wasm,
+        &kit.artifacts(),
         RuntimeConfig::default(),
         witgraph_runtime::Perf,
     )

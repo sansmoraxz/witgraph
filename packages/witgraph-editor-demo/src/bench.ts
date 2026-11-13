@@ -10,9 +10,17 @@ const ids = (guest: string) => `test:${guest}/${guest}@0.1.0`;
 const ref = (guest: string) => `test:${guest}/${guest}@0.1.0`;
 
 async function component(guest: string): Promise<ComponentSource> {
-  const response = await fetch(`/components/${guest}.wasm`);
-  if (!response.ok) throw new Error(`no ${guest}`);
-  return { id: ids(guest), bytes: new Uint8Array(await response.arrayBuffer()) };
+  const fetched = async (file: string) => {
+    const response = await fetch(`/components/${file}`);
+    if (!response.ok) throw new Error(`no ${file}`);
+    return response;
+  };
+  return {
+    name: guest,
+    manifest: await (await fetched(`${guest}.node.json`)).json(),
+    wit: new Uint8Array(await (await fetched(`${guest}.wit.wasm`)).arrayBuffer()),
+    bytes: new Uint8Array(await (await fetched(`${guest}.wasm`)).arrayBuffer()),
+  };
 }
 
 async function session(
@@ -25,15 +33,12 @@ async function session(
     const [node, port] = text.split('.');
     return { node, port };
   };
-  const refOf = (guest: string) => {
-    const [, pkg, world] = ref(guest).match(/^test:([^/]+)\/([^@]+)@/) ?? [];
-    return { package: { namespace: 'test', name: pkg, version: '0.1.0' }, world };
-  };
+  const refOf = (guest: string) => ({ component: guest, world: ref(guest) });
   return Session.load({
     graph: {
       metadata: { name: 'bench' },
-      components: guests.map(refOf),
-      nodes: nodes.map(([id, guest]) => ({ id, component: refOf(guest) })),
+      components: Object.fromEntries(guests.map((guest) => [guest, guest])),
+      nodes: nodes.map(([id, guest]) => ({ id, ...refOf(guest) })),
       connections: edges.map(([from, to], i) => ({ id: `e${i}`, from: at(from), to: at(to) })),
     },
     components: await Promise.all(guests.map(component)),

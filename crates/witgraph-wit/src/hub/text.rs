@@ -1,8 +1,8 @@
 //! The hub's world, as WIT text.
 //!
-//! Decoded components can't be merged into one `Resolve` (every one is
-//! `root:component`), and a hub must import each member's `node` interface
-//! under a name of its own. So each interface is printed afresh, with its
+//! Members' WIT sources can't be merged into one `Resolve` (two may well
+//! declare one package otherwise), and a hub must import each member's
+//! `node` interface under a name of its own. So each interface is printed afresh, with its
 //! types copied, structurally: only the resources it names stay what they are,
 //! through a `use` of the interface declaring them.
 

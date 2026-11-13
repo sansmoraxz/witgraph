@@ -18,7 +18,7 @@ use witgraph_host_plane::{
     Scheduler, boxed,
 };
 use witgraph_ir::{
-    ComponentContract, ComponentRef, Graph, NodeId, PortDef, PortDirection, PortRef, Type,
+    ComponentContract, ContractId, Graph, NodeId, PortDef, PortDirection, PortRef, Type,
 };
 
 /// Every node is `out = in + add + 1`.
@@ -80,7 +80,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let ticks: u32 = args.next().map_or(Ok(20_000), |a| a.parse())?;
 
     let contract = ComponentContract {
-        id: "test:nodes/adder@0.1.0".parse::<ComponentRef>()?,
+        id: "adder/test:nodes/adder@0.1.0".parse::<ContractId>()?,
         inputs: vec![
             PortDef::value("in", Type::U32).optional(),
             PortDef::value("add", Type::U32).optional(),

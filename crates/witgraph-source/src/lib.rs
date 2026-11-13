@@ -1,45 +1,61 @@
-//! Resolving the component bytes a graph runs, from files and OCI
-//! registries.
+//! Resolving the components a graph runs: their node manifests, the WIT
+//! those name, and their bytes, from files and OCI registries.
 //!
-//! A graph names its components by [`ComponentRef`]; where their bytes come
-//! from is kept beside it, as a list of [`ComponentSource`]s (plain serde
-//! data). A [`Resolver`] turns that list into [`Components`]: the bytes of
-//! every component, keyed by its ref, which is what
-//! `witgraph_runtime::RuntimeGraph::load` takes.
+//! A graph's component table names each component and where its **node
+//! manifest** is: a path (relative to the graph), or an OCI artifact,
+//! written explicitly as `oci://registry/repository:tag` (or
+//! `@sha256:…`, pinned). A node manifest says what the component is:
 //!
 //! ```json
-//! [
-//!   { "component": { "package": { "namespace": "demo", "name": "graph", "version": "0.1.0" }, "world": "sensor" },
-//!     "oci": "ghcr.io/demo/sensor:0.1.0",
-//!     "digest": "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08" },
-//!   { "component": { "package": { "namespace": "demo", "name": "graph", "version": "0.1.0" }, "world": "alarm" },
-//!     "file": "components/alarm.wasm" }
-//! ]
+//! {
+//!   "wit": "demo:graph@0.1.0",
+//!   "wit_source": "wit",
+//!   "worlds": ["demo:graph/sensor@0.1.0"],
+//!   "component": "sensor.wasm",
+//!   "viewers": { "demo:graph/sensor@0.1.0": { "frames": "image" } }
+//! }
 //! ```
 //!
-//! # Digests
+//! - `wit`: the WIT package its worlds are in.
+//! - `wit_source`: where that WIT is: a directory or `.wit` file (with its
+//!   `deps/`), or a wasm-encoded WIT package, as a path or `oci://`.
+//! - `worlds`: every world of `wit` the component provides. A node runs one
+//!   of them; a link's provider need not export `node`.
+//! - `component`: the component's bytes, as a path or `oci://`.
+//! - `viewers`: how an editor previews outputs, per world.
 //!
-//! A source may pin a [`Digest`]: the sha-256 of the component's bytes
-//! (`sha256:<hex>`). Resolving checks it, whatever the source, and fails
-//! with [`SourceError::DigestMismatch`] on any other bytes. It is the
-//! digest of the component itself, the same for a file and for the layer
-//! of an OCI artifact, not the digest of an OCI manifest.
+//! A manifest's paths are relative to it. One pulled over OCI may name only
+//! `oci://` artifacts.
+//!
+//! A [`Resolver`] fetches all of it into [`Components`]: per component, its
+//! bytes, its WIT, and the contract of each node world it provides, lowered
+//! from the WIT, never read out of the bytes. The bytes are checked to
+//! target every world the manifest lists
+//! ([`verify_component`]).
+//!
+//! # Pinning
+//!
+//! An OCI reference with a digest (`oci://ghcr.io/demo/sensor@sha256:…`)
+//! names one artifact for good; the registry serves only that. A tag may
+//! move.
 //!
 //! # Cache
 //!
-//! With a cache directory ([`Resolver::cache`]), every component pulled
-//! from a registry is stored under its digest, and a pinned source whose
-//! digest is already there is read from disk without contacting the
-//! registry. Cached bytes are checked against their digest like any other.
+//! With a cache directory ([`Resolver::cache`]), every blob pulled from a
+//! registry is stored under its digest, and each pinned reference with the
+//! digest of what it held, so a pinned reference is read from disk without
+//! contacting the registry again. Cached bytes are checked against their
+//! digest.
 //!
 //! # OCI artifacts
 //!
-//! An OCI source is an image reference (`registry/repository:tag`, or
-//! `@sha256:…` for a manifest digest). The artifact must hold exactly one
-//! WebAssembly layer ([`WASM_LAYER_MEDIA_TYPES`]), as `wkg oci push` and
-//! `wash push` produce; layers of other media types are ignored.
+//! An artifact holds exactly one layer of the kind wanted: a component or
+//! an encoded WIT package in a WebAssembly layer
+//! ([`WASM_LAYER_MEDIA_TYPES`]), as `wkg oci push` and `wash push` produce
+//! them; a node manifest in a [`MANIFEST_MEDIA_TYPE`] layer. Layers of
+//! other media types are ignored.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use futures::{StreamExt, TryStreamExt};
 use std::fmt;
@@ -53,7 +69,17 @@ pub use oci_client::secrets::RegistryAuth;
 use oci_client::{Client, Reference};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use witgraph_ir::ComponentRef;
+use witgraph_ir::{
+    Capability, ComponentContract, ComponentName, ContractId, ContractSource, WitRef, WorldRef,
+};
+use witgraph_wit::load::WitSource;
+use witgraph_wit::verify::{Imports, verify_component};
+
+/// The media type of a node manifest's layer, in an OCI artifact.
+pub const MANIFEST_MEDIA_TYPE: &str = "application/vnd.witgraph.node.v1+json";
+
+/// The prefix of an OCI location.
+pub const OCI_SCHEME: &str = "oci://";
 
 /// The layer media types an OCI artifact may carry a component under.
 pub const WASM_LAYER_MEDIA_TYPES: [&str; 3] = [
@@ -121,127 +147,122 @@ impl From<Digest> for String {
     }
 }
 
-/// Where a component's bytes are.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+/// Where something a component is made of is: a file (or, for WIT, a
+/// directory), or an OCI artifact.
+///
+/// Written as a string: `oci://registry/repository:tag` (or `@sha256:…`)
+/// for an artifact, anything else a path.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
 pub enum Location {
-    /// A file holding the encoded component. A relative path is resolved
-    /// against [`Resolver::base`].
+    /// A path. A relative one is resolved against what names it: the
+    /// graph's directory ([`Resolver::base`]), or the node manifest's.
     File(PathBuf),
-    /// An OCI image reference (`registry/repository:tag`).
+    /// An OCI image reference (`registry/repository:tag`), without the
+    /// scheme.
     Oci(String),
+}
+
+impl Location {
+    /// Whether this is an OCI reference pinned by digest: one that names
+    /// the same artifact for good.
+    pub fn is_pinned(&self) -> bool {
+        matches!(self, Self::Oci(reference) if reference.contains("@sha256:"))
+    }
+
+    /// `relative`, as a node manifest at `self` names it: a path is
+    /// relative to the manifest's directory. A manifest pulled over OCI
+    /// has no directory: it may only name artifacts.
+    pub fn join(&self, relative: &Location) -> Result<Location, SourceError> {
+        match (self, relative) {
+            (_, Self::Oci(_)) => Ok(relative.clone()),
+            (Self::File(manifest), Self::File(path)) if path.is_relative() => Ok(Self::File(
+                manifest.parent().unwrap_or(Path::new("")).join(path),
+            )),
+            (Self::File(_), Self::File(_)) => Ok(relative.clone()),
+            (Self::Oci(manifest), Self::File(path)) => Err(SourceError::FileFromOci {
+                manifest: manifest.clone(),
+                path: path.clone(),
+            }),
+        }
+    }
 }
 
 impl fmt::Display for Location {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::File(path) => write!(f, "file `{}`", path.display()),
-            Self::Oci(reference) => write!(f, "OCI artifact `{reference}`"),
+            Self::File(path) => write!(f, "{}", path.display()),
+            Self::Oci(reference) => write!(f, "{OCI_SCHEME}{reference}"),
         }
     }
 }
 
-/// Where the bytes of one component come from.
-///
-/// In JSON, the location is a `file` or an `oci` key beside `component`
-/// and `digest`. Any other key is an error, so a misspelled `digest` cannot
-/// leave a source silently unpinned.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(try_from = "RawSource", into = "RawSource")]
-pub struct ComponentSource {
-    /// The component, as the graph's component table names it. With a
-    /// content hash it supplies that revision only; without, any revision
-    /// of the same package, version and world.
-    pub component: ComponentRef,
-    /// Where its bytes are.
-    pub location: Location,
-    /// The sha-256 the bytes must have, when pinned.
-    pub digest: Option<Digest>,
-}
+impl FromStr for Location {
+    type Err = String;
 
-/// A [`ComponentSource`] as JSON has it: `#[serde(flatten)]` cannot deny
-/// unknown fields, so the location's keys are spelled out.
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawSource {
-    component: ComponentRef,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    file: Option<PathBuf>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    oci: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    digest: Option<Digest>,
-}
-
-impl TryFrom<RawSource> for ComponentSource {
-    type Error = String;
-
-    fn try_from(raw: RawSource) -> Result<Self, Self::Error> {
-        let location = match (raw.file, raw.oci) {
-            (Some(path), None) => Location::File(path),
-            (None, Some(reference)) => Location::Oci(reference),
-            (None, None) => return Err("a source needs a `file` or an `oci` location".into()),
-            (Some(_), Some(_)) => return Err("a source has one location: `file` or `oci`".into()),
-        };
-        Ok(Self {
-            component: raw.component,
-            location,
-            digest: raw.digest,
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.is_empty() {
+            return Err("an empty location".into());
+        }
+        Ok(match s.strip_prefix(OCI_SCHEME) {
+            Some(reference) => Self::Oci(reference.to_string()),
+            None => Self::File(PathBuf::from(s)),
         })
     }
 }
 
-impl From<ComponentSource> for RawSource {
-    fn from(source: ComponentSource) -> Self {
-        let (file, oci) = match source.location {
-            Location::File(path) => (Some(path), None),
-            Location::Oci(reference) => (None, Some(reference)),
-        };
-        Self {
-            component: source.component,
-            file,
-            oci,
-            digest: source.digest,
-        }
+impl TryFrom<String> for Location {
+    type Error = String;
+
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        s.parse()
     }
 }
 
-impl ComponentSource {
-    /// `component`'s bytes are the file at `path`.
-    pub fn file(component: ComponentRef, path: impl Into<PathBuf>) -> Self {
-        Self {
-            component,
-            location: Location::File(path.into()),
-            digest: None,
-        }
-    }
-
-    /// `component`'s bytes are the OCI artifact `reference`.
-    pub fn oci(component: ComponentRef, reference: impl Into<String>) -> Self {
-        Self {
-            component,
-            location: Location::Oci(reference.into()),
-            digest: None,
-        }
-    }
-
-    /// Pins the bytes to `digest`.
-    pub fn pinned(mut self, digest: Digest) -> Self {
-        self.digest = Some(digest);
-        self
+impl From<Location> for String {
+    fn from(location: Location) -> Self {
+        location.to_string()
     }
 }
 
-/// Why component bytes could not be resolved.
+/// What a component is: a node manifest (see the [crate docs](crate)).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeManifest {
+    /// The WIT package the component's worlds are in.
+    pub wit: WitRef,
+    /// Where that WIT is: a directory or file, or an encoded WIT package.
+    pub wit_source: Location,
+    /// Every world of `wit` the component provides.
+    pub worlds: Vec<WorldRef>,
+    /// The component's bytes.
+    pub component: Location,
+    /// How an editor previews outputs: per world, output port to viewer.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub viewers: BTreeMap<WorldRef, BTreeMap<String, String>>,
+}
+
+/// Why a component could not be resolved.
 #[derive(Debug, thiserror::Error)]
 pub enum SourceError {
-    /// Two sources name the same component.
-    #[error("component `{component:#}` has more than one source")]
-    Duplicate {
-        /// The component named twice.
-        component: Box<ComponentRef>,
+    /// What went wrong resolving one component of a table.
+    #[error("component `{component}`: {error}")]
+    In {
+        /// The component.
+        component: ComponentName,
+        /// What went wrong.
+        #[source]
+        error: Box<SourceError>,
     },
-    /// A component file could not be read.
+    /// A location in the component table does not parse.
+    #[error("`{location}` is not a location: {message}")]
+    Location {
+        /// The location as written.
+        location: String,
+        /// Why.
+        message: String,
+    },
+    /// A file could not be read.
     #[error("failed to read `{}`", path.display())]
     Read {
         /// The file.
@@ -266,77 +287,151 @@ pub enum SourceError {
         /// The registry client's error.
         message: String,
     },
-    /// An OCI artifact holds no WebAssembly layer, or several. Layers of
-    /// other media types (a signature, say) are ignored.
-    #[error("`{reference}` holds {found} WebAssembly layers; a component artifact has one")]
+    /// An OCI artifact holds no layer of the kind wanted, or several.
+    #[error("`{reference}` holds {found} {what} layers; it should hold one")]
     Layers {
         /// The artifact.
         reference: String,
-        /// How many WebAssembly layers it holds.
+        /// What kind of layer was wanted.
+        what: &'static str,
+        /// How many it holds.
         found: usize,
     },
-    /// The bytes are not the ones the source pins.
-    #[error("{location} for `{component:#}` has digest {found}, but {expected} is pinned")]
-    DigestMismatch {
-        /// The component.
-        component: Box<ComponentRef>,
-        /// Where the bytes came from.
-        location: Location,
-        /// The pinned digest.
-        expected: Digest,
-        /// The digest of the bytes found.
-        found: Digest,
-    },
-    /// A file source names a path outside [`Resolver::base`]: absolute,
-    /// leaving it through `..`, or leading out of it through a symbolic
-    /// link (see [`Resolver::allow_paths_outside_base`]).
-    #[error("file source `{}` is outside the base directory", path.display())]
+    /// A path outside [`Resolver::base`]: absolute, leaving it through
+    /// `..`, or leading out of it through a symbolic link (see
+    /// [`Resolver::allow_paths_outside_base`]).
+    #[error("`{}` is outside the base directory", path.display())]
     OutsideBase {
-        /// The path as the source names it.
+        /// The path as named.
         path: PathBuf,
     },
-    /// A component is larger than [`Resolver::max_component_bytes`].
-    #[error("{location} for `{component:#}` is over the limit of {limit} bytes")]
+    /// A file or layer is larger than [`Resolver::max_component_bytes`].
+    #[error("`{location}` is over the limit of {limit} bytes")]
     TooLarge {
-        /// The component.
-        component: Box<ComponentRef>,
-        /// Where its bytes are.
+        /// Where it is.
         location: Location,
         /// The limit.
         limit: u64,
     },
+    /// A node manifest pulled over OCI names a path.
+    #[error("the node manifest `{OCI_SCHEME}{manifest}` names the path `{}`: one pulled over OCI may name only `{OCI_SCHEME}` artifacts", path.display())]
+    FileFromOci {
+        /// The manifest's reference.
+        manifest: String,
+        /// The path it names.
+        path: PathBuf,
+    },
+    /// A node manifest is not one.
+    #[error("`{location}` is not a node manifest: {message}")]
+    Manifest {
+        /// Where it is.
+        location: Location,
+        /// Why.
+        message: String,
+    },
+    /// The WIT a node manifest names does not load, or is not its `wit`
+    /// package.
+    #[error("the WIT at `{location}`: {message}")]
+    Wit {
+        /// Where it is.
+        location: Location,
+        /// What is wrong.
+        message: String,
+    },
+    /// A world a node manifest lists is not in its `wit` package, or does
+    /// not lower.
+    #[error("world `{world}`: {message}")]
+    World {
+        /// The world.
+        world: Box<WorldRef>,
+        /// What is wrong.
+        message: String,
+    },
+    /// The bytes do not target a world the manifest lists.
+    #[error("{0}")]
+    Verify(#[from] witgraph_wit::verify::VerifyError),
 }
 
-/// The bytes of one resolved component.
+impl SourceError {
+    fn of(self, component: &ComponentName) -> Self {
+        Self::In {
+            component: component.clone(),
+            error: Box::new(self),
+        }
+    }
+}
+
+/// Bytes fetched, with their digest.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Resolved {
-    /// The encoded component, shared by every source that names it.
+pub struct Fetched {
+    /// The bytes.
     pub bytes: Bytes,
-    /// The sha-256 of `bytes`: what to pin to get these bytes again.
+    /// Their sha-256.
     pub digest: Digest,
 }
 
-/// The bytes of every component a list of sources names.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Components(HashMap<ComponentRef, Resolved>);
+/// One component, resolved: what its node manifest says it is.
+#[derive(Debug, Clone)]
+pub struct Component {
+    /// Where its node manifest is.
+    pub location: Location,
+    /// Its node manifest.
+    pub manifest: NodeManifest,
+    /// The encoded component.
+    pub bytes: Bytes,
+    /// The sha-256 of `bytes`.
+    pub digest: Digest,
+    /// Its WIT.
+    pub wit: WitSource,
+    /// The names its bytes import.
+    pub imports: Imports,
+    /// The contract of every node world it provides, in manifest order,
+    /// its viewers applied.
+    pub contracts: Vec<ComponentContract>,
+    /// What every world it provides imports, as its WIT declares it.
+    pub capabilities: Vec<Capability>,
+    /// What was wrong but did not stop it resolving: viewers skipped.
+    pub warnings: Vec<String>,
+}
+
+impl Component {
+    /// Its WIT, as one wasm-encoded package: how it travels (to an editor
+    /// in a browser, say).
+    pub fn wit_encoded(&self) -> Result<Vec<u8>, witgraph_wit::load::LoadError> {
+        witgraph_wit::load::encode(&self.wit)
+    }
+
+    /// Its bytes with its WIT: what a runtime builds a graph from.
+    pub fn artifact(&self) -> witgraph_wit::Artifact<'_> {
+        witgraph_wit::Artifact {
+            bytes: &self.bytes,
+            wit: &self.wit,
+            capabilities: &self.capabilities,
+        }
+    }
+}
+
+/// Every component of a graph's table, resolved, by name.
+#[derive(Debug, Clone, Default)]
+pub struct Components(BTreeMap<ComponentName, Component>);
 
 impl Components {
-    /// The components' bytes by ref: what
+    /// Each component's bytes with its WIT, by name: what
     /// `witgraph_runtime::RuntimeGraph::load` takes.
-    pub fn wasm(&self) -> HashMap<ComponentRef, &[u8]> {
+    pub fn artifacts(&self) -> HashMap<ComponentName, witgraph_wit::Artifact<'_>> {
         self.0
             .iter()
-            .map(|(component, resolved)| (component.clone(), &*resolved.bytes))
+            .map(|(name, component)| (name.clone(), component.artifact()))
             .collect()
     }
 
-    /// The bytes and digest resolved for `component`.
-    pub fn get(&self, component: &ComponentRef) -> Option<&Resolved> {
-        self.0.get(component)
+    /// The component named `name`.
+    pub fn get(&self, name: &ComponentName) -> Option<&Component> {
+        self.0.get(name)
     }
 
-    /// Every resolved component.
-    pub fn iter(&self) -> impl Iterator<Item = (&ComponentRef, &Resolved)> {
+    /// Every component, by name.
+    pub fn iter(&self) -> impl Iterator<Item = (&ComponentName, &Component)> {
         self.0.iter()
     }
 
@@ -345,13 +440,59 @@ impl Components {
         self.0.len()
     }
 
-    /// Whether no component was resolved.
+    /// Whether none was.
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
+
+    /// Adds `component` under `name`, in place of any there.
+    pub fn insert(&mut self, name: ComponentName, component: Component) {
+        self.0.insert(name, component);
+    }
 }
 
-/// Fetches component bytes from their sources.
+impl FromIterator<(ComponentName, Component)> for Components {
+    fn from_iter<I: IntoIterator<Item = (ComponentName, Component)>>(iter: I) -> Self {
+        Self(iter.into_iter().collect())
+    }
+}
+
+impl ContractSource for Components {
+    fn contract(&self, id: &ContractId) -> Option<&ComponentContract> {
+        self.0
+            .get(&id.component)?
+            .contracts
+            .iter()
+            .find(|c| &c.id == id)
+    }
+}
+
+/// What kind of layer an artifact is pulled for.
+#[derive(Debug, Clone, Copy)]
+enum Layer {
+    /// A component, or an encoded WIT package.
+    Wasm,
+    /// A node manifest.
+    Manifest,
+}
+
+impl Layer {
+    fn accepts(self, media_type: &str) -> bool {
+        match self {
+            Self::Wasm => WASM_LAYER_MEDIA_TYPES.contains(&media_type),
+            Self::Manifest => media_type == MANIFEST_MEDIA_TYPE,
+        }
+    }
+
+    fn what(self) -> &'static str {
+        match self {
+            Self::Wasm => "WebAssembly",
+            Self::Manifest => "node manifest",
+        }
+    }
+}
+
+/// Fetches components: their node manifests, WIT, and bytes.
 pub struct Resolver {
     base: PathBuf,
     cache: Option<PathBuf>,
@@ -456,103 +597,255 @@ impl Resolver {
         self
     }
 
-    /// Resolves every source, several at once: reads the files, pulls the
-    /// artifacts (or reads them from the cache), and checks each pinned
-    /// digest. Sources with the same location and pin are fetched once.
-    /// Fails if any source cannot be resolved, with the error of the first
-    /// in list order (fetches not yet started then are not), and on a
-    /// component named twice.
-    pub async fn resolve(&self, sources: &[ComponentSource]) -> Result<Components, SourceError> {
-        // Before anything is fetched.
-        let mut named = std::collections::HashSet::with_capacity(sources.len());
-        if let Some(twice) = sources.iter().find(|s| !named.insert(&s.component)) {
-            return Err(SourceError::Duplicate {
-                component: Box::new(twice.component.clone()),
-            });
-        }
-        // One fetch per location and pin; the sources sharing it share its
-        // result (a mismatch names the first of them).
-        let mut fetches: Vec<&ComponentSource> = Vec::new();
-        let mut fetch_of: HashMap<(&Location, Option<&Digest>), usize> = HashMap::new();
-        let which: Vec<usize> = sources
-            .iter()
-            .map(|source| {
-                *fetch_of
-                    .entry((&source.location, source.digest.as_ref()))
-                    .or_insert_with(|| {
-                        fetches.push(source);
-                        fetches.len() - 1
-                    })
-            })
-            .collect();
-        // At most `FETCHES` at once; the first failure, in list order,
-        // ends the rest.
-        let fetched: Vec<Resolved> = futures::stream::iter(fetches.iter().map(|s| self.fetch(s)))
+    /// Resolves every component of a graph's component table (name to
+    /// node manifest location), several at once. Fails if any cannot be
+    /// resolved, with the error of the first by name.
+    pub async fn resolve(
+        &self,
+        table: &BTreeMap<ComponentName, String>,
+    ) -> Result<Components, SourceError> {
+        let resolved: Vec<(ComponentName, Component)> =
+            futures::stream::iter(table.iter().map(|(name, location)| async move {
+                let component = self
+                    .component(name, location)
+                    .await
+                    .map_err(|e| e.of(name))?;
+                Ok::<_, SourceError>((name.clone(), component))
+            }))
             .buffered(FETCHES)
             .try_collect()
             .await?;
-        // The bytes are shared (`Bytes`), so every source of a fetch holds
-        // the same ones.
-        let components = sources
-            .iter()
-            .zip(which)
-            .map(|(source, fetch)| (source.component.clone(), fetched[fetch].clone()))
-            .collect();
-        Ok(Components(components))
+        Ok(Components(resolved.into_iter().collect()))
     }
 
-    /// Resolves one source.
-    pub async fn fetch(&self, source: &ComponentSource) -> Result<Resolved, SourceError> {
-        let check = |(bytes, digest): (Vec<u8>, Digest)| match &source.digest {
-            Some(expected) if *expected != digest => Err(SourceError::DigestMismatch {
-                component: Box::new(source.component.clone()),
-                location: source.location.clone(),
-                expected: expected.clone(),
-                found: digest,
-            }),
-            _ => Ok(Resolved {
-                bytes: bytes.into(),
-                digest,
-            }),
+    /// Resolves one component, `name` in a graph's table, from the node
+    /// manifest at `location`.
+    pub async fn component(
+        &self,
+        name: &ComponentName,
+        location: &str,
+    ) -> Result<Component, SourceError> {
+        let location: Location = location.parse().map_err(|message| SourceError::Location {
+            location: location.to_string(),
+            message,
+        })?;
+        let fetched = self.fetch_layer(&location, Layer::Manifest).await?;
+        let manifest: NodeManifest =
+            serde_json::from_slice(&fetched.bytes).map_err(|e| SourceError::Manifest {
+                location: location.clone(),
+                message: e.to_string(),
+            })?;
+        let bytes_at = location.join(&manifest.component)?;
+        let wit_at = location.join(&manifest.wit_source)?;
+        let (fetched, wit) = futures::join!(self.fetch(&bytes_at), self.wit(&wit_at));
+        let (fetched, wit) = (fetched?, wit?);
+        let wit_error = |message: String| SourceError::Wit {
+            location: wit_at.clone(),
+            message,
         };
+        let roots: Vec<WitRef> = wit
+            .packages
+            .iter()
+            .map(|&id| {
+                let name = &wit.resolve.packages[id].name;
+                WitRef {
+                    namespace: name.namespace.clone(),
+                    name: name.name.clone(),
+                    version: name.version.clone(),
+                }
+            })
+            .collect();
+        if !roots.contains(&manifest.wit) {
+            return Err(wit_error(format!(
+                "it is not the package `{}` the manifest names",
+                manifest.wit
+            )));
+        }
+
+        let mut imports = Imports::default();
+        let mut contracts = Vec::new();
+        let mut capabilities = Vec::new();
+        let mut warnings = Vec::new();
+        for world in &manifest.worlds {
+            let world_error = |message: String| SourceError::World {
+                world: Box::new(world.clone()),
+                message,
+            };
+            if world.package != manifest.wit {
+                return Err(world_error(format!(
+                    "it is not in the package `{}`",
+                    manifest.wit
+                )));
+            }
+            let Some(id) = witgraph_wit::lower::find_world(&wit, world) else {
+                return Err(world_error("the WIT has no such world".into()));
+            };
+            imports = verify_component(&wit, world, &fetched.bytes)?;
+            Capability::add_unique(
+                &mut capabilities,
+                &witgraph_wit::lower::world_capabilities(&wit, id),
+            );
+            match witgraph_wit::lower_world(&wit, &ContractId::new(name.clone(), world.clone())) {
+                Ok(lowered) => {
+                    let mut contract = lowered.contract;
+                    if let Some(hints) = manifest.viewers.get(world) {
+                        warnings.extend(witgraph_wit::viewer::apply(&mut contract, hints));
+                    }
+                    contracts.push(contract);
+                }
+                // A provider's world.
+                Err(witgraph_wit::Error::NotANode { .. }) => {}
+                Err(e) => return Err(world_error(e.to_string())),
+            }
+        }
+        for world in manifest.viewers.keys() {
+            if !manifest.worlds.contains(world) {
+                warnings.push(format!(
+                    "viewers are given for `{world}`, which the component does not provide"
+                ));
+            }
+        }
+        Ok(Component {
+            location,
+            manifest,
+            bytes: fetched.bytes,
+            digest: fetched.digest,
+            wit,
+            imports,
+            contracts,
+            capabilities,
+            warnings,
+        })
+    }
+
+    /// Loads the WIT at `location`: a directory or file, or an encoded
+    /// package.
+    async fn wit(&self, location: &Location) -> Result<WitSource, SourceError> {
+        let failed = |message: String| SourceError::Wit {
+            location: location.clone(),
+            message,
+        };
+        match location {
+            Location::File(path) => {
+                let full = self.confined(path).await?;
+                let loaded = tokio::task::spawn_blocking(move || {
+                    witgraph_wit::load::load_path(full).map_err(|e| e.to_string())
+                })
+                .await
+                .map_err(|e| failed(e.to_string()))?;
+                loaded.map_err(failed)
+            }
+            Location::Oci(_) => {
+                let fetched = self.fetch(location).await?;
+                witgraph_wit::load::load_encoded(&fetched.bytes).map_err(|e| failed(e.to_string()))
+            }
+        }
+    }
+
+    /// Fetches the file, or the one WebAssembly layer of the artifact, at
+    /// `location`: a component, or an encoded WIT package.
+    pub async fn fetch(&self, location: &Location) -> Result<Fetched, SourceError> {
+        self.fetch_layer(location, Layer::Wasm).await
+    }
+
+    /// Fetches the file, or the one layer of the kind wanted of the
+    /// artifact, at `location`.
+    async fn fetch_layer(&self, location: &Location, layer: Layer) -> Result<Fetched, SourceError> {
         let too_large = || SourceError::TooLarge {
-            component: Box::new(source.component.clone()),
-            location: source.location.clone(),
+            location: location.clone(),
             limit: self.max_bytes,
         };
-        match &source.location {
+        match location {
             Location::File(path) => {
                 let full = self.confined(path).await?;
                 let file = open(&full).await?;
                 if !self.any_path {
                     self.still_confined(path, &full, &file).await?;
                 }
-                let bytes = read_file(file, &full, self.max_bytes).await?;
-                check(bytes.ok_or_else(too_large)?)
+                let (bytes, digest) = read_file(file, &full, self.max_bytes)
+                    .await?
+                    .ok_or_else(too_large)?;
+                Ok(Fetched {
+                    bytes: bytes.into(),
+                    digest,
+                })
             }
             Location::Oci(reference) => {
                 // Parsed first, so a malformed reference fails whether or
-                // not its digest is cached.
+                // not it is cached.
                 let parsed: Reference = reference.parse().map_err(|e| SourceError::Reference {
                     reference: reference.clone(),
                     message: format!("{e}"),
                 })?;
-                if let Some(resolved) = self.cached(source.digest.as_ref()).await {
-                    // Read under its pinned digest, and checked against it.
-                    return Ok(resolved);
+                let pinned = location.is_pinned();
+                if pinned && let Some(fetched) = self.cached_reference(reference).await {
+                    return Ok(fetched);
                 }
-                let bytes = self.pull(reference, &parsed).await?.ok_or_else(too_large)?;
-                // Only bytes that pass the check are cached. Caching is
-                // best effort: the bytes are verified and in hand whether
-                // or not they could be kept.
-                let resolved = check(bytes)?;
-                self.store(&resolved).await;
-                Ok(resolved)
+                let (bytes, digest) = self
+                    .pull(reference, &parsed, layer)
+                    .await?
+                    .ok_or_else(too_large)?;
+                let fetched = Fetched {
+                    bytes: bytes.into(),
+                    digest,
+                };
+                // Caching is best effort: the bytes are in hand whether or
+                // not they could be kept.
+                self.store(&fetched).await;
+                if pinned {
+                    self.store_reference(reference, &fetched.digest).await;
+                }
+                Ok(fetched)
             }
         }
     }
 
-    /// The path a file source's bytes are read from: `path` under the
+    /// The bytes cached for `digest`, if they are there and intact.
+    pub async fn cached(&self, digest: &Digest) -> Option<Fetched> {
+        let (bytes, found) = read(&self.cache_path(digest)?, self.max_bytes)
+            .await
+            .ok()??;
+        // A damaged cache file is pulled again rather than trusted.
+        (found == *digest).then(|| Fetched {
+            bytes: bytes.into(),
+            digest: found,
+        })
+    }
+
+    /// What a pinned reference held when it was last pulled, from the cache.
+    async fn cached_reference(&self, reference: &str) -> Option<Fetched> {
+        let text = tokio::fs::read_to_string(self.reference_path(reference)?)
+            .await
+            .ok()?;
+        self.cached(&text.trim().parse().ok()?).await
+    }
+
+    /// Notes in the cache what a pinned reference held.
+    async fn store_reference(&self, reference: &str, digest: &Digest) {
+        let Some(path) = self.reference_path(reference) else {
+            return;
+        };
+        let text = digest.to_string();
+        let write = move || {
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let _ = std::fs::write(path, text);
+        };
+        let _ = tokio::task::spawn_blocking(write).await;
+    }
+
+    /// Where the cache notes what `reference` held.
+    fn reference_path(&self, reference: &str) -> Option<PathBuf> {
+        Some(
+            self.cache
+                .as_ref()?
+                .join("references")
+                .join(Digest::of(reference.as_bytes()).hex()),
+        )
+    }
+
+    /// The path a file is read from: `path` under the
     /// base, refused unless it stays there once its symbolic links are
     /// followed (and then the path they lead to, so a link changed after
     /// this check is not followed). A file that is missing, or a link that
@@ -635,25 +928,12 @@ impl Resolver {
         )
     }
 
-    /// The cached bytes for a pinned digest, if they are there and intact.
-    async fn cached(&self, digest: Option<&Digest>) -> Option<Resolved> {
-        let digest = digest?;
-        let (bytes, found) = read(&self.cache_path(digest)?, self.max_bytes)
-            .await
-            .ok()??;
-        // A damaged cache file is pulled again rather than trusted.
-        (found == *digest).then(|| Resolved {
-            bytes: bytes.into(),
-            digest: found,
-        })
-    }
-
     /// Stores pulled bytes in the cache, under their digest.
     ///
     /// The write runs on a blocking task of its own, which finishes (file
     /// renamed into place, or removed) even when this resolve is dropped
     /// part way, as when another source fails or the caller times out.
-    async fn store(&self, resolved: &Resolved) {
+    async fn store(&self, resolved: &Fetched) {
         let Some(path) = self.cache_path(&resolved.digest) else {
             return;
         };
@@ -683,20 +963,21 @@ impl Resolver {
         let _ = tokio::task::spawn_blocking(write).await;
     }
 
-    /// Pulls the one WebAssembly layer of an OCI artifact, with its digest;
-    /// `None` when it is over the size limit (refused by its declared size,
-    /// or cut off while it arrives).
+    /// Pulls the one layer of the kind wanted of an OCI artifact, with its
+    /// digest; `None` when it is over the size limit (refused by its
+    /// declared size, or cut off while it arrives).
     async fn pull(
         &self,
         reference: &str,
         parsed: &Reference,
+        kind: Layer,
     ) -> Result<Option<(Vec<u8>, Digest)>, SourceError> {
         let failed = |e: oci_client::errors::OciDistributionError| SourceError::Pull {
             reference: reference.to_string(),
             message: format!("{e}"),
         };
         // The manifest first: an artifact may carry other layers (a
-        // signature, say) beside its component.
+        // signature, say) beside the one wanted.
         let (manifest, _) = self
             .client
             .pull_image_manifest(parsed, self.auth_for(parsed))
@@ -705,12 +986,13 @@ impl Resolver {
         let mut layers = manifest
             .layers
             .iter()
-            .filter(|layer| WASM_LAYER_MEDIA_TYPES.contains(&layer.media_type.as_str()));
+            .filter(|layer| kind.accepts(&layer.media_type));
         let layer = match (layers.next(), layers.count()) {
             (Some(layer), 0) => layer,
             (first, more) => {
                 return Err(SourceError::Layers {
                     reference: reference.to_string(),
+                    what: kind.what(),
                     found: usize::from(first.is_some()) + more,
                 });
             }
@@ -886,30 +1168,63 @@ mod tests {
     }
 
     #[test]
-    fn sources_round_trip_as_json() {
-        let component: ComponentRef = "demo:graph/sensor@0.1.0".parse().unwrap();
-        let sources = vec![
-            ComponentSource::oci(component.clone(), "ghcr.io/demo/sensor:0.1.0")
-                .pinned(EMPTY.parse().unwrap()),
-            ComponentSource::file(component, "components/sensor.wasm"),
-        ];
-        let json = serde_json::to_value(&sources).unwrap();
-        assert_eq!(json[0]["oci"], "ghcr.io/demo/sensor:0.1.0");
-        assert_eq!(json[0]["digest"], EMPTY);
-        assert_eq!(json[1]["file"], "components/sensor.wasm");
-        assert!(json[1].get("digest").is_none());
-        let back: Vec<ComponentSource> = serde_json::from_value(json).unwrap();
-        assert_eq!(back, sources);
+    fn locations_are_explicit_about_oci() {
+        let oci: Location = "oci://ghcr.io/demo/sensor:0.1.0".parse().unwrap();
+        assert_eq!(oci, Location::Oci("ghcr.io/demo/sensor:0.1.0".into()));
+        assert!(!oci.is_pinned());
+        assert!(
+            format!("oci://ghcr.io/demo/sensor@{EMPTY}")
+                .parse::<Location>()
+                .unwrap()
+                .is_pinned()
+        );
+        let file: Location = "ghcr.io/demo/sensor.wasm".parse().unwrap();
+        assert_eq!(file, Location::File("ghcr.io/demo/sensor.wasm".into()));
+        assert_eq!(oci.to_string(), "oci://ghcr.io/demo/sensor:0.1.0");
+        assert!("".parse::<Location>().is_err());
     }
 
     #[test]
-    fn a_source_with_a_malformed_digest_does_not_deserialize() {
-        let json = r#"{
-            "component": { "package": { "namespace": "demo", "name": "graph" }, "world": "w" },
-            "file": "w.wasm",
-            "digest": "md5:abc"
-        }"#;
-        assert!(serde_json::from_str::<ComponentSource>(json).is_err());
+    fn a_manifest_names_paths_relative_to_itself() {
+        let manifest: Location = "guests/adder.node.json".parse().unwrap();
+        let joined = manifest.join(&"out/adder.wasm".parse().unwrap()).unwrap();
+        assert_eq!(joined, Location::File("guests/out/adder.wasm".into()));
+        let pulled: Location = "oci://ghcr.io/demo/adder:1".parse().unwrap();
+        assert!(matches!(
+            pulled.join(&"adder.wasm".parse().unwrap()),
+            Err(SourceError::FileFromOci { .. })
+        ));
+        assert_eq!(
+            pulled
+                .join(&"oci://ghcr.io/demo/adder-wasm:1".parse().unwrap())
+                .unwrap(),
+            Location::Oci("ghcr.io/demo/adder-wasm:1".into())
+        );
+    }
+
+    #[test]
+    fn node_manifests_read_as_written() {
+        let manifest: NodeManifest = serde_json::from_str(
+            r#"{
+                "wit": "demo:graph@0.1.0",
+                "wit_source": "wit",
+                "worlds": ["demo:graph/sensor@0.1.0"],
+                "component": "oci://ghcr.io/demo/sensor:0.1.0",
+                "viewers": { "demo:graph/sensor@0.1.0": { "frames": "image" } }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(manifest.wit.to_string(), "demo:graph@0.1.0");
+        assert_eq!(
+            manifest.component,
+            Location::Oci("ghcr.io/demo/sensor:0.1.0".into())
+        );
+        let back: NodeManifest =
+            serde_json::from_value(serde_json::to_value(&manifest).unwrap()).unwrap();
+        assert_eq!(back, manifest);
+        let misspelled =
+            r#"{"wit":"d:g@0.1.0","wit_source":"w","worlds":[],"component":"c","viewer":{}}"#;
+        assert!(serde_json::from_str::<NodeManifest>(misspelled).is_err());
     }
 
     #[test]
@@ -920,18 +1235,5 @@ mod tests {
         let theirs: Reference = "evil.example/x:1".parse().unwrap();
         assert_eq!(resolver.auth_for(&mine), &basic);
         assert_eq!(resolver.auth_for(&theirs), &RegistryAuth::Anonymous);
-    }
-
-    #[test]
-    fn a_misspelled_or_missing_key_is_an_error() {
-        let source = |rest: &str| {
-            serde_json::from_str::<ComponentSource>(&format!(
-                r#"{{ "component": {{ "package": {{ "namespace": "demo", "name": "graph" }}, "world": "w" }}{rest} }}"#
-            ))
-        };
-        assert!(source(r#", "oci": "ghcr.io/demo/w:1", "digets": "sha256:00""#).is_err());
-        assert!(source("").is_err(), "no location");
-        assert!(source(r#", "file": "w.wasm", "oci": "ghcr.io/demo/w:1""#).is_err());
-        assert!(source(r#", "file": "w.wasm""#).is_ok());
     }
 }

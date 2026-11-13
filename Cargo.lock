@@ -2761,6 +2761,8 @@ version = "0.1.0"
 dependencies = [
  "wit-component",
  "wit-parser 0.263.0",
+ "witgraph-ir",
+ "witgraph-wit",
 ]
 
 [[package]]

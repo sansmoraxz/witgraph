@@ -228,7 +228,7 @@ mod tests {
         for node in nodes {
             builder = builder.add_node(
                 *node,
-                "demo:graph/test".parse().expect("valid component ref"),
+                "test/demo:graph/test".parse().expect("valid contract id"),
             );
         }
         for (i, (from, to, feedback)) in edges.iter().enumerate() {

@@ -4,12 +4,11 @@
 #![cfg(feature = "debug")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, missing_docs)]
 
-use std::collections::HashMap;
 use std::future::Future;
 use std::time::Duration;
 
 use test_components::{C_WALK, Guest, LINE_WALK};
-use witgraph_ir::{Graph, NodeId, PortName, PortRef};
+use witgraph_ir::{NodeId, PortName, PortRef};
 use witgraph_runtime::{
     BreakpointScope, LineDebugger, LineStop, OwnLines, OwnRules, PathPattern, Perf, RunningGraph,
     RuntimeConfig, RuntimeGraph, RuntimeLines, StopReason, TickResult,
@@ -56,20 +55,11 @@ async fn load_with(
     edges: &[(&str, &str)],
     own: OwnLines,
 ) -> (RuntimeGraph<Perf>, RuntimeLines) {
-    let mut contracts = Vec::new();
-    let mut wasm = HashMap::new();
-    let mut builder = Graph::builder("c");
-    for (_, guest) in nodes {
-        let contract = witgraph_wit::load_components(guest.wit).unwrap().remove(0);
-        if !wasm.contains_key(&contract.id) {
-            builder = builder.add_component(&contract);
-            wasm.insert(contract.id.clone(), guest.wasm);
-            contracts.push(contract);
-        }
-    }
+    let guests: Vec<Guest> = nodes.iter().map(|(_, guest)| *guest).collect();
+    let kit = test_components::Kit::new(&guests);
+    let mut builder = kit.builder("c");
     for (node, guest) in nodes {
-        let contract = witgraph_wit::load_components(guest.wit).unwrap().remove(0);
-        builder = builder.add_node(*node, contract.id);
+        builder = builder.add_node(*node, kit.get(*guest));
     }
     for (from, to) in edges {
         builder = builder.connect(
@@ -82,8 +72,11 @@ async fn load_with(
         debug_lines: Some(own),
         ..RuntimeConfig::default()
     };
-    let compiled = builder.build().compile(&contracts).expect("graph compiles");
-    let rt = RuntimeGraph::load(compiled, &wasm, config, Perf)
+    let compiled = builder
+        .build()
+        .compile(&kit.contracts)
+        .expect("graph compiles");
+    let rt = RuntimeGraph::load(compiled, &kit.artifacts(), config, Perf)
         .await
         .expect("graph loads");
     let lines = rt.lines().expect("loaded to debug");

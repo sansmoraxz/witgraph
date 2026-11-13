@@ -1,7 +1,7 @@
 # Running a graph
 
 ```rust
-let mut rt = RuntimeGraph::load(compiled, &wasm, RuntimeConfig::default(), Perf).await?;
+let mut rt = RuntimeGraph::load(compiled, &artifacts, RuntimeConfig::default(), Perf).await?;
 rt.inject(&"scale".into(), &"factor".into(), Val::U32(10)).await?;
 
 for _ in 0..100 {
@@ -21,21 +21,27 @@ through the hub, and sees a value only when it asks for one.
 
 ## Loading
 
-`RuntimeGraph::load` takes the compiled graph and a map from each component to
-its bytes. The bytes can come from anywhere. `witgraph-source` fetches them
-from files or OCI registries, optionally pinned to a digest and cached:
+`RuntimeGraph::load` takes the compiled graph and, by name, each component of
+its table: its bytes, with the WIT its node manifest names (an `Artifact`).
+They can come from anywhere. `witgraph-source` resolves a graph's component
+table: it fetches each node manifest, its WIT and its bytes, from files or
+OCI registries, and caches what it pulls:
 
 ```rust
-let sources = vec![
-    ComponentSource::oci(sensor, "ghcr.io/demo/sensor:0.1.0").pinned(digest),
-    ComponentSource::file(alarm, "components/alarm.wasm"),
-];
-let components = Resolver::new().base(dir).cache(cache_dir).resolve(&sources).await?;
-let rt = RuntimeGraph::load(compiled, &components.wasm(), config, Perf).await?;
+let components = Resolver::new()
+    .base(dir)
+    .cache(cache_dir)
+    .resolve(&graph.components)
+    .await?;
+let compiled = graph.compile(&components)?;
+let rt = RuntimeGraph::load(compiled, &components.artifacts(), config, Perf).await?;
 ```
 
-Loading checks each component against its contract and fails with a named
-error if something doesn't fit, then generates the hub, composes it with the
+An `oci://` reference with a digest (`oci://ghcr.io/demo/sensor@sha256:…`)
+names one artifact for good, and is read from the cache once pulled.
+
+Loading checks that each component's bytes target the world its nodes run
+(wit-component's `targets`), and fails with a named error if they don't, then generates the hub, composes it with the
 nodes, and compiles the result. That is slow enough to matter, so on a shared
 async executor prepare the graph first with `PreparedGraph::new` on a blocking
 thread, then call `load_prepared`. Any change to the graph's nodes, connections
@@ -48,7 +54,7 @@ compiling on every later load:
 
 ```rust
 // At build time.
-let prepared = PreparedGraph::new(&engine, &compiled, &wasm)?;
+let prepared = PreparedGraph::new(&engine, &compiled, &artifacts)?;
 std::fs::write("graph.bin", prepared.serialize()?)?;
 
 // At startup, possibly in a build with no compiler.
@@ -64,7 +70,7 @@ file if it's still good, and otherwise compiles the bytes and replaces it.
 ```rust
 // SAFETY: only we can write to this path.
 let prepared = unsafe {
-    PreparedGraph::load_or_compile(&engine, &compiled, &wasm, "graph.bin")
+    PreparedGraph::load_or_compile(&engine, &compiled, &artifacts, "graph.bin")
 }?;
 ```
 
@@ -110,7 +116,7 @@ Nodes that import capabilities load with `load_with_host`. The simplest host is
 
 ```rust
 let host = Plugins::new().with(Clock)?.with(Store("primary"))?.with(Store("backup"))?;
-let rt = RuntimeGraph::load_with_host(compiled, &wasm, config, Perf, host).await?;
+let rt = RuntimeGraph::load_with_host(compiled, &artifacts, config, Perf, host).await?;
 ```
 
 If a node imports a capability that no plugin provides, loading fails. If
@@ -423,7 +429,7 @@ it in a `Debuggee`, tick it through that, and serve it:
 ```rust
 use witgraph_remote::{Debuggee, Watched, serve};
 
-let rt = RuntimeGraph::load(compiled, &wasm, config, Watched::new(Perf)).await?;
+let rt = RuntimeGraph::load(compiled, &artifacts, config, Watched::new(Perf)).await?;
 let debuggee = Debuggee::new(rt)?;
 let served = serve(debuggee.clone(), "0.0.0.0:4433".parse()?, token).await?;
 println!("{} {:02x?}", served.url, served.certificate_hash);
@@ -456,7 +462,7 @@ on a line of its source, with `RuntimeGraph::lines`. This is the `LineDebugger` 
 
 ```rust,ignore
 let config = RuntimeConfig { debug_lines: Some(OwnLines::default()), ..RuntimeConfig::default() };
-let mut graph = RuntimeGraph::load(compiled, &wasm, config, Perf).await?;
+let mut graph = RuntimeGraph::load(compiled, &artifacts, config, Perf).await?;
 let lines = graph.lines().expect("loaded to debug");
 
 let file = lines.files_of(&NodeId::from("walker")).remove(0); // `files()` has every node's

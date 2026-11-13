@@ -195,7 +195,6 @@ fn same_in_any_order(
     let mut reversed = graph.clone();
     reversed.nodes.reverse();
     reversed.connections.reverse();
-    reversed.components.reverse();
     let other = reversed.clone().compile(contracts);
     match (result, &other) {
         (Ok(first), Ok(second)) => {

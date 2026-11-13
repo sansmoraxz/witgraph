@@ -180,8 +180,10 @@ export interface GraphJsonPortRef {
 /** A node in the serialized graph (`Node` in the IR). */
 export interface GraphJsonNode {
   id: string;
-  /** The `ComponentRef` this node instantiates (opaque to the editor). */
-  component: object;
+  /** The component it runs, by its name in the graph's component table. */
+  component: string;
+  /** The world of that component it runs, `namespace:name/world@version`. */
+  world: string;
   label?: string;
   /** How much of each named resource it holds while it runs. */
   resources?: Record<string, { amount: number }>;
@@ -202,7 +204,8 @@ export interface GraphJsonLink {
   id: string;
   node: string;
   import: string;
-  provider: object;
+  /** The component providing it, by its name in the graph's component table. */
+  provider: string;
   export: string;
 }
 
@@ -213,7 +216,8 @@ export interface GraphJson {
     description?: string;
     attrs?: Record<string, string>;
   };
-  components: object[];
+  /** The component table: each component's name, and where its node manifest is. */
+  components: Record<string, string>;
   nodes: GraphJsonNode[];
   connections: GraphJsonConnection[];
   links?: GraphJsonLink[];

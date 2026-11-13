@@ -3,7 +3,7 @@
 //! to one set of expectations.
 #![allow(missing_docs, clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use serde_json::{Value, json};
@@ -32,7 +32,7 @@ fn guest(name: &str) -> Guest {
 }
 
 fn contract(guest: Guest) -> ComponentContract {
-    witgraph_wit::load_components(guest.wit).unwrap().remove(0)
+    guest.contract()
 }
 
 /// `node.port`.
@@ -48,16 +48,14 @@ fn port_ref(text: &Value) -> PortRef {
 }
 
 async fn load(scenario: &Value) -> RuntimeGraph<Trace> {
-    let mut contracts: Vec<ComponentContract> = Vec::new();
-    let mut wasm = HashMap::new();
+    let mut kit = test_components::Kit::default();
     let mut builder = Graph::builder("scenario");
     for node in scenario["nodes"].as_array().unwrap() {
         let guest = guest(node["guest"].as_str().unwrap());
         let contract = contract(guest);
-        if !contracts.iter().any(|c| c.id == contract.id) {
+        if !kit.contracts.iter().any(|c| c.id == contract.id) {
             builder = builder.add_component(&contract);
-            wasm.insert(contract.id.clone(), guest.wasm);
-            contracts.push(contract.clone());
+            kit.add(guest);
         }
         let id = node["id"].as_str().unwrap();
         builder = builder.add_node(id, contract.id);
@@ -80,10 +78,15 @@ async fn load(scenario: &Value) -> RuntimeGraph<Trace> {
             builder.connect(id, from, to)
         };
     }
-    let compiled = builder.build().compile(&contracts).expect("compiles");
-    RuntimeGraph::load(compiled, &wasm, RuntimeConfig::default(), Trace::new())
-        .await
-        .expect("loads")
+    let compiled = builder.build().compile(&kit.contracts).expect("compiles");
+    RuntimeGraph::load(
+        compiled,
+        &kit.artifacts(),
+        RuntimeConfig::default(),
+        Trace::new(),
+    )
+    .await
+    .expect("loads")
 }
 
 fn tick_name(result: &TickResult) -> &'static str {

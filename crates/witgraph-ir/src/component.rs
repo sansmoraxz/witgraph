@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::id::ComponentRef;
+use crate::id::ContractId;
 use crate::port::{NodeShape, PortDef};
 
 /// A capability a component requires from its host.
@@ -112,12 +112,13 @@ impl Capability {
 
 /// The public contract of a WIT-defined component.
 ///
-/// Never serialized: a graph stores only [`ComponentRef`]s, and contracts are
-/// re-derived from WIT (see [`ContractSource`](crate::ContractSource)).
+/// Never serialized: a graph names only components and worlds, and
+/// contracts are lowered from WIT (see
+/// [`ContractSource`](crate::ContractSource)).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ComponentContract {
-    /// The component's version identity.
-    pub id: ComponentRef,
+    /// The world, and the component providing it.
+    pub id: ContractId,
     /// The component's input ports (fields of its `inputs` record).
     pub inputs: Vec<PortDef>,
     /// The component's output ports (fields of its `outputs` record).
@@ -126,18 +127,6 @@ pub struct ComponentContract {
     pub capabilities: Vec<Capability>,
     /// Doc comment from the WIT world, if any.
     pub docs: Option<String>,
-}
-
-impl From<&ComponentContract> for ComponentRef {
-    fn from(contract: &ComponentContract) -> Self {
-        contract.id.clone()
-    }
-}
-
-impl From<ComponentContract> for ComponentRef {
-    fn from(contract: ComponentContract) -> Self {
-        contract.id
-    }
 }
 
 impl ComponentContract {
@@ -162,7 +151,6 @@ impl ComponentContract {
 mod tests {
     use super::*;
     use crate::Type;
-    use crate::id::PackageRef;
 
     #[test]
     fn prefixed_names_are_bare_and_interface_ids_are_not() {
@@ -187,15 +175,7 @@ mod tests {
 
     fn contract(inputs: Vec<PortDef>, outputs: Vec<PortDef>) -> ComponentContract {
         ComponentContract {
-            id: ComponentRef {
-                package: PackageRef {
-                    namespace: "demo".into(),
-                    name: "graph".into(),
-                    version: None,
-                },
-                world: "test".into(),
-                content_hash: None,
-            },
+            id: "test/demo:graph/test".parse().unwrap(),
             inputs,
             outputs,
             capabilities: vec![],

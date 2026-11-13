@@ -9,24 +9,22 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::sync::Arc;
-#[cfg(feature = "compile")]
-use std::sync::OnceLock;
 
 use wasmtime::Engine;
 use wasmtime::component::Component;
 #[cfg(feature = "compile")]
 use witgraph_ir::ComponentContract;
-#[cfg(feature = "compile")]
-use witgraph_ir::PackageRef;
 use witgraph_ir::{Capability, CompiledGraph, IndexVec, NodeId, PortKind, PortTable};
 #[cfg(feature = "compile")]
-use witgraph_ir::{ComponentRef, LinkKey};
+use witgraph_ir::{ComponentName, ContractId, LinkKey};
 #[cfg(feature = "compile")]
-use witgraph_wit::compose::{ProviderError, find_provider, link_node, linked_providers};
+use witgraph_wit::Artifact;
+#[cfg(feature = "compile")]
+use witgraph_wit::compose::{link_node, linked_providers};
 #[cfg(feature = "compile")]
 use witgraph_wit::hub::{self, HubMember};
 #[cfg(feature = "compile")]
-use witgraph_wit::lower::Lowered;
+use witgraph_wit::verify::Imports;
 
 use super::{ByteCount, Fuel, GraphId, PortTypes, RuntimeConfig, RuntimeGraph};
 #[cfg(feature = "compile")]
@@ -41,8 +39,8 @@ use witgraph_sched::{RuntimeError, RuntimeMode, SchedulerCore};
 /// A graph composed into one component with its hub and compiled, ready for
 /// [`RuntimeGraph::load_prepared`].
 ///
-/// Preparing is the slow part of a load: it validates the bytes, decodes and
-/// checks their WIT, generates the hub, composes it with the nodes, and compiles
+/// Preparing is the slow part of a load: it checks the bytes target the worlds
+/// the graph runs of them, generates the hub, composes it with the nodes, and compiles
 /// the result with Cranelift, which can take seconds. It runs synchronously, so an
 /// embedder can run it off its async executor (`spawn_blocking`, say) and keep the
 /// result to load the same graph again without recompiling. A prepared graph
@@ -64,10 +62,10 @@ pub struct PreparedGraph {
 struct Parts {
     /// What tells the graph it was prepared for from any other.
     graph: String,
-    /// What each node imports, by its component's own view of its world (with
-    /// links composed in, what is left of the node's imports plus the
-    /// providers'): what the host is asked for. A component imports only what its
-    /// code uses, which can be fewer than its contract declares.
+    /// What each node imports (with links composed in, what is left of the
+    /// node's imports plus the providers'), as its WIT declares it: what the host
+    /// is asked for. A component imports only what its code uses, which can be
+    /// fewer than its world declares.
     capabilities: Vec<(NodeId, Vec<Capability>)>,
     /// How many components an instance holds: the hub, each node, and each
     /// provider composed in.
@@ -115,6 +113,9 @@ fn fingerprint(compiled: &CompiledGraph) -> String {
 #[cfg(feature = "compile")]
 struct CheckedNode<'a> {
     export: String,
+    /// The WIT of the node's component, and the world it runs.
+    wit: &'a witgraph_wit::load::WitSource,
+    world: &'a witgraph_ir::WorldRef,
     capabilities: Vec<Capability>,
     components: usize,
     /// The node's bytes, or the composed component's.
@@ -123,53 +124,47 @@ struct CheckedNode<'a> {
 
 #[cfg(feature = "compile")]
 impl PreparedGraph {
-    /// Checks `wasm` against `compiled`'s contracts, composes it, and compiles
-    /// it on `engine`.
+    /// Checks `components` against `compiled`'s contracts, composes them, and
+    /// compiles the result on `engine`.
     ///
-    /// `wasm` maps each component a node instantiates (by the [`ComponentRef`] of
-    /// its resolved contract, or the same ref without a content hash) to its
-    /// encoded component bytes, and each provider a link names to its bytes. A
-    /// provider has no contract for a content hash to name, so a link's provider
-    /// pinned with one must be a key of `wasm` exactly; an unpinned one takes its
-    /// own key, a key without a hash of its package, version and world, or the one
-    /// pinned key of them.
-    ///
-    /// The WIT embedded in the bytes is decoded and lowered, and must describe
-    /// the same ports as the contract, and import no capability item the contract
-    /// does not declare with the same signature ([`LoadError::ContractMismatch`]).
-    /// Bytes that are not a valid component, whose WIT cannot be decoded, or that
-    /// fail to compile on `engine` are a [`LoadError::BadComponent`]; a graph that
-    /// cannot be composed is a [`LoadError::Composition`]; an engine that cannot
-    /// run a graph is an `InvalidConfig` ([`LoadError::Runtime`]). What the bytes
-    /// import is what the host is asked for when the graph loads ([`Host::check`],
-    /// [`Host::link`]).
+    /// `components` maps each component the graph's table names (a node's, or a
+    /// link's provider) to its bytes and the WIT its node manifest names. The
+    /// bytes must target the world each node runs of them (wit-component's
+    /// `targets`, [`LoadError::ContractMismatch`]); nothing else is read from
+    /// them but the names they import. Bytes that are not a valid component, or
+    /// that fail to compile on `engine`, are a [`LoadError::BadComponent`]; a
+    /// graph that cannot be composed is a [`LoadError::Composition`]; an engine
+    /// that cannot run a graph is an `InvalidConfig` ([`LoadError::Runtime`]).
+    /// What the bytes import is what the host is asked for when the graph loads
+    /// ([`Host::check`], [`Host::link`]).
     pub fn new(
         engine: &Engine,
         compiled: &CompiledGraph,
-        wasm: &HashMap<ComponentRef, &[u8]>,
+        components: &HashMap<ComponentName, Artifact<'_>>,
     ) -> Result<Self, LoadError> {
-        Self::checked(engine, compiled, wasm, |_, _| Ok(()))
+        Self::checked(engine, compiled, components, |_, _| Ok(()))
     }
 
     /// As [`new`](Self::new), asking `check` about each node's imports before
     /// anything is composed or compiled.
-    fn checked(
+    fn checked<'a>(
         engine: &Engine,
-        compiled: &CompiledGraph,
-        wasm: &HashMap<ComponentRef, &[u8]>,
+        compiled: &'a CompiledGraph,
+        components: &'a HashMap<ComponentName, Artifact<'a>>,
         check: impl Fn(&NodeId, &[Capability]) -> Result<(), LoadError>,
     ) -> Result<Self, LoadError> {
         validate_engine(engine)?;
-        let index = WasmIndex::new(wasm);
-        let missing = |id: &ComponentRef| LoadError::MissingWasm {
-            component: Box::new(id.clone()),
+        let artifact = |name: &ComponentName| {
+            components.get(name).ok_or_else(|| LoadError::MissingWasm {
+                component: name.clone(),
+            })
         };
         // One component per contract and set of links: nodes of one component
         // with other links are other compositions. Each contract's bytes are
         // verified once, whatever their links.
         let mut checked: Vec<CheckedNode<'_>> = Vec::new();
-        let mut index_of: HashMap<(&ComponentRef, Vec<LinkKey>), usize> = HashMap::new();
-        let mut verified: HashMap<&ComponentRef, (&[u8], Lowered)> = HashMap::new();
+        let mut index_of: HashMap<(&ContractId, Vec<LinkKey>), usize> = HashMap::new();
+        let mut verified: HashMap<&ContractId, (Artifact<'a>, Imports, String)> = HashMap::new();
         let mut of_node = Vec::with_capacity(compiled.graph().nodes.len());
         for node in &compiled.graph().nodes {
             let contract = contract_of(compiled, &node.id)?;
@@ -178,24 +173,29 @@ impl PreparedGraph {
                 of_node.push((&node.id, at));
                 continue;
             }
-            let (bytes, lowered) = match verified.entry(&contract.id) {
+            let (found, imports, export) = match verified.entry(&contract.id) {
                 Entry::Occupied(entry) => entry.into_mut(),
                 Entry::Vacant(entry) => {
-                    let bytes = index
-                        .component(&contract.id)
-                        .ok_or_else(|| missing(&contract.id))?;
-                    entry.insert((bytes, verify(contract, bytes)?))
+                    let found = *artifact(&contract.id.component)?;
+                    let (imports, export) = verify(contract, found)?;
+                    entry.insert((found, imports, export))
                 }
             };
-            let links = linked_providers(lowered, &key.1, |provider| index.provider(provider))?;
+            let links = linked_providers(imports, &key.1, |provider| {
+                artifact(provider).map(|a| (a.bytes, a.capabilities))
+            })?;
             let linked =
-                link_node(contract, bytes, lowered, &links).map_err(|e| LoadError::BadLink {
-                    component: Box::new(contract.id.clone()),
-                    import: e.import,
-                    message: e.message,
+                link_node(contract, found.bytes, export, imports, &links).map_err(|e| {
+                    LoadError::BadLink {
+                        component: Box::new(contract.id.clone()),
+                        import: e.import,
+                        message: e.message,
+                    }
                 })?;
             checked.push(CheckedNode {
                 export: linked.export,
+                wit: found.wit,
+                world: &contract.id.world,
                 capabilities: linked.capabilities,
                 components: linked.components,
                 bytes: linked.bytes,
@@ -213,6 +213,8 @@ impl PreparedGraph {
                 node,
                 bytes: &checked[at].bytes,
                 export: &checked[at].export,
+                wit: checked[at].wit,
+                world: checked[at].world,
                 mocked: false,
             })
             .collect();
@@ -237,7 +239,7 @@ impl PreparedGraph {
                     .collect(),
                 components: composed.components + providers,
                 #[cfg(feature = "precompiled")]
-                source: Some(precompiled::source_hash(wasm)),
+                source: Some(precompiled::source_hash(components)),
             },
             component,
             #[cfg(feature = "debug")]
@@ -318,20 +320,20 @@ impl<M: RuntimeMode> RuntimeGraph<M, NoCapabilities> {
     /// [`load_with_host`](RuntimeGraph::load_with_host).
     pub async fn load(
         compiled: CompiledGraph,
-        wasm: &HashMap<ComponentRef, &[u8]>,
+        components: &HashMap<ComponentName, Artifact<'_>>,
         config: RuntimeConfig,
         mode: M,
     ) -> Result<Self, LoadError> {
-        Self::load_with_host(compiled, wasm, config, mode, NoCapabilities).await
+        Self::load_with_host(compiled, components, config, mode, NoCapabilities).await
     }
 }
 
 impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
-    /// Loads a compiled graph with WASM component bytes, with `host` providing
+    /// Loads a compiled graph with its components, with `host` providing
     /// capability imports and the Store's data.
     ///
-    /// The graph is prepared ([`PreparedGraph::new`], which says what `wasm`
-    /// holds) on [`RuntimeConfig::engine`] (or a new engine), then loaded as
+    /// The graph is prepared ([`PreparedGraph::new`], which says what
+    /// `components` holds) on [`RuntimeConfig::engine`] (or a new engine), then loaded as
     /// [`load_prepared`](Self::load_prepared) does. Every node's capabilities are
     /// checked ([`Host::check`]) before anything is compiled.
     ///
@@ -342,7 +344,7 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
     #[cfg(feature = "compile")]
     pub async fn load_with_host(
         compiled: CompiledGraph,
-        wasm: &HashMap<ComponentRef, &[u8]>,
+        components: &HashMap<ComponentName, Artifact<'_>>,
         config: RuntimeConfig,
         mode: M,
         host: H,
@@ -354,9 +356,10 @@ impl<M: RuntimeMode, H: Host> RuntimeGraph<M, H> {
         };
         validate_engine(&engine)?;
         check_shared(&host, &compiled)?;
-        let prepared = PreparedGraph::checked(&engine, &compiled, wasm, |node, capabilities| {
-            check_host(&host, node, capabilities)
-        })?;
+        let prepared =
+            PreparedGraph::checked(&engine, &compiled, components, |node, capabilities| {
+                check_host(&host, node, capabilities)
+            })?;
         Self::link_and_build(compiled, &prepared, config, engine, mode, host).await
     }
 
@@ -642,94 +645,37 @@ pub(super) fn contract_of<'a>(
         .ok_or_else(|| RuntimeError::UnknownNode { node: node.clone() })
 }
 
-/// The keys given for one world, with their bytes.
+/// Checks that `found` targets the world `contract` is of
+/// ([`witgraph_wit::verify::verify_component`]), and returns what it imports,
+/// and the name it exports its `node` interface under, as its WIT says.
 #[cfg(feature = "compile")]
-type World<'w, 'a> = Vec<(&'w ComponentRef, &'a [u8])>;
-
-/// The given bytes, looked up by exact key and, on a miss, by package
-/// (version included) and world: a miss costs the keys of that one world,
-/// not every key given. The index for misses is built on the first one.
-#[cfg(feature = "compile")]
-struct WasmIndex<'w, 'a> {
-    wasm: &'w HashMap<ComponentRef, &'a [u8]>,
-    by_world: OnceLock<HashMap<&'w PackageRef, HashMap<&'w str, World<'w, 'a>>>>,
-}
-
-#[cfg(feature = "compile")]
-impl<'w, 'a> WasmIndex<'w, 'a> {
-    fn new(wasm: &'w HashMap<ComponentRef, &'a [u8]>) -> Self {
-        Self {
-            wasm,
-            by_world: OnceLock::new(),
-        }
-    }
-
-    /// The keys of `id`'s world, with their bytes.
-    fn world(&self, id: &ComponentRef) -> &[(&'w ComponentRef, &'a [u8])] {
-        let wasm = self.wasm;
-        self.by_world
-            .get_or_init(|| {
-                let mut by_world: HashMap<_, HashMap<_, World<'w, 'a>>> = HashMap::new();
-                for (key, &bytes) in wasm {
-                    by_world
-                        .entry(&key.package)
-                        .or_default()
-                        .entry(key.world.as_str())
-                        .or_default()
-                        .push((key, bytes));
-                }
-                by_world
-            })
-            .get(&id.package)
-            .and_then(|worlds| worlds.get(id.world.as_str()))
-            .map_or(&[], Vec::as_slice)
-    }
-
-    /// The bytes keyed by exactly `id`.
-    fn get(&self, id: &ComponentRef) -> Option<&'a [u8]> {
-        self.wasm.get(id).copied()
-    }
-
-    /// The bytes for a component: keyed by its full ref, or by a ref
-    /// without a content hash that matches it (same package, version
-    /// included, and world).
-    fn component(&self, id: &ComponentRef) -> Option<&'a [u8]> {
-        self.get(id).or_else(|| {
-            self.world(id)
-                .iter()
-                .find(|(key, _)| key.content_hash.is_none())
-                .map(|(_, bytes)| *bytes)
-        })
-    }
-
-    /// The bytes of a link's provider ([`find_provider`]): several that fit are
-    /// [`LoadError::AmbiguousProvider`], none [`LoadError::MissingWasm`].
-    fn provider(&self, provider: &ComponentRef) -> Result<&'a [u8], LoadError> {
-        let components = self.wasm.iter().map(|(id, bytes)| (id, *bytes));
-        find_provider(components, provider).map_err(|e| match e {
-            ProviderError::Missing => LoadError::MissingWasm {
-                component: Box::new(provider.clone()),
-            },
-            ProviderError::Ambiguous(candidates) => LoadError::AmbiguousProvider {
-                provider: Box::new(provider.clone()),
-                candidates,
-            },
-        })
-    }
-}
-
-/// Checks that `bytes` implement `contract`
-/// ([`witgraph_wit::verify::verify_component`]), and returns the bytes' own
-/// view of their world.
-#[cfg(feature = "compile")]
-fn verify(contract: &ComponentContract, bytes: &[u8]) -> Result<Lowered, LoadError> {
+fn verify(
+    contract: &ComponentContract,
+    found: Artifact<'_>,
+) -> Result<(Imports, String), LoadError> {
     use witgraph_wit::verify::VerifyError;
-    let component = Box::new(contract.id.clone());
-    match witgraph_wit::verify::verify_component(contract, bytes) {
-        Ok(lowered) => Ok(lowered),
-        Err(VerifyError::Bad(message)) => Err(LoadError::BadComponent { component, message }),
-        Err(VerifyError::Mismatch(message)) => {
-            Err(LoadError::ContractMismatch { component, message })
+    let component = || Box::new(contract.id.clone());
+    let imports =
+        match witgraph_wit::verify::verify_component(found.wit, &contract.id.world, found.bytes) {
+            Ok(imports) => imports,
+            Err(VerifyError::Bad(message)) => {
+                return Err(LoadError::BadComponent {
+                    component: component(),
+                    message,
+                });
+            }
+            Err(e) => {
+                return Err(LoadError::ContractMismatch {
+                    component: component(),
+                    message: e.to_string(),
+                });
+            }
+        };
+    let lowered = witgraph_wit::lower_world(found.wit, &contract.id).map_err(|e| {
+        LoadError::BadComponent {
+            component: component(),
+            message: e.to_string(),
         }
-    }
+    })?;
+    Ok((imports, lowered.export))
 }

@@ -14,22 +14,23 @@ live.onclick = () => {
 
 const fetched = async (url: URL) => new Uint8Array(await (await fetch(url)).arrayBuffer());
 const stops: LineStop[] = [];
-const ref = {
-  package: { namespace: 'test', name: 'line-walk', version: '0.1.0' },
-  world: 'line-walk',
-};
+const ref = { component: 'line-walk', world: 'test:line-walk/line-walk@0.1.0' };
 const session = await RemoteSession.load(
   new Worker(new URL('./worker.ts', import.meta.url), { type: 'module' }),
   {
     graph: {
       metadata: { name: 'lines' },
-      components: [ref],
-      nodes: [{ id: 'walker', component: ref }],
+      components: { 'line-walk': 'line-walk' },
+      nodes: [{ id: 'walker', ...ref }],
       connections: [],
     },
     components: [
       {
-        id: 'test:line-walk/line-walk@0.1.0',
+        name: 'line-walk',
+        manifest: await (
+          await fetch(new URL('../../components/line-walk.node.json', import.meta.url))
+        ).json(),
+        wit: await fetched(new URL('../../components/line-walk.wit.wasm', import.meta.url)),
         bytes: await fetched(new URL('../../components/line-walk.wasm', import.meta.url)),
       },
     ],

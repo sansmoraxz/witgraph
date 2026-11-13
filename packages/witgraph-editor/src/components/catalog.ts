@@ -117,10 +117,16 @@ export class WitgraphCatalog extends HTMLElement {
         e.dataTransfer?.setData('witgraph/component-index', String(source.index));
       });
 
-      const worldMatch = source.id.match(/\/([^@#]+)/);
-      const worldName = worldMatch ? worldMatch[1] : source.id;
+      // `namespace:name/world@version`: the world's own name, then where it is from.
+      const worldName = source.world.replace(/^[^/]*\//, '').replace(/@.*$/, '');
       card.appendChild(this.#el('div', 'font-bold text-sm mb-0.5', worldName));
-      card.appendChild(this.#el('div', 'text-2xs text-wg-text-dim truncate mb-2', source.id));
+      const from = this.#el(
+        'div',
+        'text-2xs text-wg-text-dim truncate mb-2',
+        `${source.component} · ${source.world}`,
+      );
+      from.title = source.id;
+      card.appendChild(from);
       if (source.docs) {
         card.appendChild(this.#el('div', 'docs text-xs text-wg-text mb-2', source.docs));
       }

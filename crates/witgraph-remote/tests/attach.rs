@@ -2,11 +2,10 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, missing_docs)]
 
-use std::collections::HashMap;
 use std::time::Duration;
 
 use test_components::ECHO;
-use witgraph_ir::{ComponentRef, Graph, NodeId, PortName, PortRef};
+use witgraph_ir::{Graph, NodeId, PortName, PortRef};
 use witgraph_remote::{Debuggee, Served, Watched, serve};
 use witgraph_runtime::{Perf, RunningGraph, RuntimeConfig, RuntimeGraph};
 
@@ -23,8 +22,8 @@ use client::witgraph::debug::{graph, holds};
 
 /// `a` feeding `b`, both `echo`, served with a host ticking it.
 async fn attached() -> (Debuggee<Perf, witgraph_runtime::NoCapabilities>, Served) {
-    let contract = witgraph_wit::load_components(ECHO.wit).unwrap().remove(0);
-    let id: ComponentRef = contract.id.clone();
+    let contract = ECHO.contract();
+    let id = contract.id.clone();
     let graph = Graph::builder("attach")
         .add_component(&contract)
         .add_node("a", id.clone())
@@ -32,10 +31,10 @@ async fn attached() -> (Debuggee<Perf, witgraph_runtime::NoCapabilities>, Served
         .connect("ab", PortRef::new("a", "out"), PortRef::new("b", "in"))
         .build();
     let compiled = graph.compile(&[contract]).unwrap();
-    let wasm = HashMap::from([(id, ECHO.wasm)]);
+    let kit = test_components::Kit::new(&[ECHO]);
     let rt = RuntimeGraph::load(
         compiled,
-        &wasm,
+        &kit.artifacts(),
         RuntimeConfig::default(),
         Watched::new(Perf),
     )
@@ -186,13 +185,11 @@ async fn lines_attached() -> (Served, wrpc_webtransport::Client, String, u32) {
     use test_components::{LINE_WALK, RELAY};
     use witgraph_runtime::OwnLines;
 
-    let mut contracts = Vec::new();
-    let mut wasm = HashMap::new();
-    for guest in [RELAY, LINE_WALK] {
-        let contract = witgraph_wit::load_components(guest.wit).unwrap().remove(0);
-        wasm.insert(contract.id.clone(), guest.wasm);
-        contracts.push(contract);
-    }
+    let kit = test_components::Kit::new(&[RELAY, LINE_WALK]);
+    let contracts = vec![kit.get(RELAY), kit.get(LINE_WALK)]
+        .into_iter()
+        .map(|id| kit.contract(&id).clone())
+        .collect::<Vec<_>>();
     let graph = Graph::builder("lines")
         .add_component(&contracts[0])
         .add_component(&contracts[1])
@@ -215,7 +212,7 @@ async fn lines_attached() -> (Served, wrpc_webtransport::Client, String, u32) {
     };
     let mut rt = RuntimeGraph::load(
         graph.compile(&contracts).unwrap(),
-        &wasm,
+        &kit.artifacts(),
         config,
         Watched::new(Perf),
     )

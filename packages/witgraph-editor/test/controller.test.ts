@@ -78,15 +78,14 @@ const ids: Record<string, string> = {
   'tensor-future-sink': 'test:tensor-future-sink/tensor-future-sink@0.1.0',
 };
 
-function componentRef(id: string) {
-  const match = /^([^:]+):([^/]+)\/([^@]+)@(.+)$/.exec(id)!;
-  return { package: { namespace: match[1], name: match[2], version: match[4] }, world: match[3] };
-}
-
+/** A built guest, from its node manifest beside its bytes. */
 async function guestSource(guest: string): Promise<ComponentSource> {
+  const read = async (name: string) => new Uint8Array(await readFile(new URL(name, guests)));
   return {
-    id: ids[guest],
-    bytes: new Uint8Array(await readFile(new URL(`${guest}.wasm`, guests))),
+    name: guest,
+    manifest: JSON.parse(await readFile(new URL(`${guest}.node.json`, guests), 'utf8')),
+    wit: await read(`${guest}.wit.wasm`),
+    bytes: await read(`${guest}.wasm`),
   };
 }
 
@@ -128,8 +127,8 @@ async function loadController(
   };
   const graph: GraphJson = {
     metadata: { name: 'test' },
-    components: components.map(({ id }) => componentRef(id)),
-    nodes: nodes.map(([id, guest]) => ({ id, component: componentRef(ids[guest]) })),
+    components: Object.fromEntries(components.map(({ name }) => [name, name])),
+    nodes: nodes.map(([id, guest]) => ({ id, component: guest, world: ids[guest] })),
     connections: connections.map(([id, from, to, feedback]) => ({
       id,
       from: port(from),
@@ -168,14 +167,14 @@ test('load and dispose', async () => {
 });
 
 test('the catalog describes a component by the docs it carries', async () => {
-  // The description is in the component's bytes (a `witgraph-docs` section).
+  // The description is the world's doc comment, in its WIT.
   const components = await Promise.all(['relay', 'echo'].map(guestSource));
   const controller = await loadController([['a', 'relay']], [['c', 'a.out', 'a.in', true]], {
     components,
   });
 
   const docs = new Map(controller.componentSources.map((source) => [source.id, source.docs]));
-  assert.equal(docs.get(ids.relay), 'Passes a u32 through, adding `add` (default 0).');
+  assert.equal(docs.get(`relay/${ids.relay}`), 'Passes a u32 through, adding `add` (default 0).');
   // One no node uses is described the same.
   assert.equal(docs.size, 2);
   assert.ok(docs.get(ids.echo), 'echo has docs');
