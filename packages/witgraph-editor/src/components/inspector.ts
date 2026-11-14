@@ -3,8 +3,9 @@ import { type Diagnostic, fromWave } from 'witgraph-loader';
 import type { EditorController } from '../controller/editor-controller.ts';
 import type { NodeVisual, PortVisual } from '../controller/types.ts';
 import { defaultViewer } from '../controller/visual.ts';
-import { MAX_WAVE_BYTES, outputElement } from '../util/output-text.ts';
-import { READABLE_STYLES, readableLine } from '../util/readable.ts';
+import { MAX_WAVE_BYTES } from '../util/output-text.ts';
+import { readableLine } from '../util/readable.ts';
+import { BTN, WitgraphInjectField, WitgraphOutputValue } from './port-fields.ts';
 import { adoptStyles } from './shared-styles.ts';
 
 const PHASE_BG: Record<string, string> = {
@@ -21,9 +22,6 @@ const KIND_BG: Record<string, string> = {
   future: 'bg-wg-port-future',
   handle: 'bg-wg-port-handle',
 };
-
-const BTN =
-  'bg-wg-surface text-wg-text border border-wg-text-dim rounded px-2 py-1 cursor-pointer text-xs hover:bg-wg-surface-hover transition-all shadow-sm';
 
 const EXTRA_CSS = `
   :host { display: block; height: 100%; overflow-y: auto; overflow-x: hidden; background-color: var(--wg-bg);
@@ -59,7 +57,6 @@ const EXTRA_CSS = `
   .fault-bg { background: color-mix(in srgb, var(--wg-error) 8%, transparent); border-left: 2px solid var(--wg-error); }
   .bp-bg { background: color-mix(in srgb, var(--wg-warning) 8%, transparent); border-left: 2px solid var(--wg-warning); }
   .port-val { overflow-wrap: anywhere; }
-${READABLE_STYLES}
   .focus-ring:focus { border-color: var(--wg-primary); outline: none; box-shadow: 0 0 0 2px color-mix(in srgb, var(--wg-primary) 25%, transparent); }
   .section-accent { border-left: 2px solid var(--wg-primary); padding-left: 8px; }
   .section-accent-in { border-left-color: var(--wg-primary); }
@@ -87,9 +84,10 @@ function signature(root: Element): string {
   return [root.outerHTML, ...values].join('\u0000');
 }
 
-/** Whether `el` takes typing: a text field, a text area or a list. */
+/** Whether `el` takes typing: a text field, a text area or a list, in a field's own root too. */
 function isEditable(el: Element | null): boolean {
   if (!el) return false;
+  if (el.shadowRoot?.activeElement) return isEditable(el.shadowRoot.activeElement);
   const tag = el.tagName;
   return (
     tag === 'TEXTAREA' ||
@@ -100,8 +98,7 @@ function isEditable(el: Element | null): boolean {
 
 export class WitgraphInspector extends HTMLElement {
   #controller: EditorController | null = null;
-  // Not on `output-changed`: stream items are previewed in the node, and
-  // re-rendering for each would reset whatever is being typed here.
+  // Not on `output-changed`: values show in fields of their own, which follow them.
   #onStateChanged = () => this.render();
   /** What is shown: its {@link signature}, and what it inspects. */
   #shown: { signature: string; subject: string } | null = null;
@@ -215,16 +212,6 @@ export class WitgraphInspector extends HTMLElement {
     const nodeId = controller.selectedNode;
     const node = nodeId ? controller.nodes.get(nodeId) : undefined;
     return node ? this.#buildInspector(node) : this.#buildGraphProperties();
-  }
-
-  /** An output's value, as elements: `-` if it cannot be read. */
-  #outputValue(node: string, port: string): Node {
-    if (!this.#controller) return document.createTextNode('-');
-    try {
-      return outputElement(this.#controller, node, port);
-    } catch {
-      return document.createTextNode('-');
-    }
   }
 
   /** What compiling says of what is shown, if anything. */
@@ -1091,51 +1078,27 @@ export class WitgraphInspector extends HTMLElement {
     return wrap;
   }
 
+  /** An output's value, following it as it changes. */
+  #outputValue(node: string, port: string): HTMLElement {
+    const field = new WitgraphOutputValue();
+    field.node = node;
+    field.port = port;
+    // What tells one output's field from another's, as what is shown is compared.
+    field.dataset.node = node;
+    field.dataset.port = port;
+    if (this.#controller) field.controller = this.#controller;
+    return field;
+  }
+
   #buildInjectForm(node: NodeVisual, port: PortVisual): HTMLElement {
-    const currentValue = this.#controller?.getInjectedValue(node.id, port.name);
-    const wrap = this.#el('div', 'mt-1.5');
-
-    if (currentValue !== undefined) {
-      const valRow = this.#el('div', 'flex items-center gap-1.5 mb-1');
-      valRow.appendChild(this.#el('span', 'text-2xs text-wg-text-dim', 'Injected:'));
-      valRow.appendChild(this.#el('span', 'font-mono text-xs text-wg-success', currentValue));
-      wrap.appendChild(valRow);
-    }
-
-    const form = this.#el('div', 'flex gap-1.5 items-center');
-    const input = document.createElement('input');
-    input.type = 'text';
-    input.className =
-      'focus-ring flex-1 bg-wg-bg text-wg-text border border-wg-text-dim rounded px-2 py-1 font-mono text-xs';
-    input.style.minWidth = '0';
-    input.placeholder = 'WAVE value…';
-    if (currentValue !== undefined) input.value = currentValue;
-
-    const injectBtn = this.#el('button', BTN, 'Inject');
-    const clearBtn = this.#el('button', `${BTN} opacity-85`, '×');
-    (clearBtn as HTMLElement).title = 'Clear';
-    form.append(input, injectBtn, clearBtn);
-
-    injectBtn.addEventListener('click', async () => {
-      form.parentElement?.querySelector('.inject-error')?.remove();
-      try {
-        await this.#controller!.injectValue(node.id, port.name, input.value);
-      } catch (err: unknown) {
-        const errEl = this.#el(
-          'div',
-          'inject-error text-wg-error text-xs mt-1 p-1 bg-wg-error-10 rounded',
-          err instanceof Error ? err.message : String(err),
-        );
-        form.parentElement!.appendChild(errEl);
-      }
-    });
-
-    clearBtn.addEventListener('click', () => {
-      void this.#controller!.clearInput(node.id, port.name).catch(() => {});
-    });
-
-    wrap.appendChild(form);
-    return wrap;
+    const field = new WitgraphInjectField();
+    field.node = node.id;
+    field.port = port.name;
+    field.dataset.node = node.id;
+    field.dataset.port = port.name;
+    field.className = 'mt-1.5';
+    if (this.#controller) field.controller = this.#controller;
+    return field;
   }
 
   #buildEdgeInspector(edge: {

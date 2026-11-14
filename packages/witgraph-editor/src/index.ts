@@ -30,6 +30,7 @@ import { WitgraphCanvas } from './components/canvas.ts';
 import { WitgraphCatalog } from './components/catalog.ts';
 import { WitgraphControls } from './components/controls.ts';
 import { WitgraphInspector } from './components/inspector.ts';
+import { WitgraphInjectField, WitgraphOutputValue } from './components/port-fields.ts';
 import { WitgraphSource } from './components/source.ts';
 import { WitgraphTimeline } from './components/timeline.ts';
 
@@ -44,7 +45,9 @@ export {
   WitgraphCanvas,
   WitgraphCatalog,
   WitgraphControls,
+  WitgraphInjectField,
   WitgraphInspector,
+  WitgraphOutputValue,
   WitgraphSource,
   WitgraphTimeline,
 };
@@ -56,6 +59,8 @@ export function registerAll(): void {
   define('witgraph-canvas', WitgraphCanvas);
   define('witgraph-controls', WitgraphControls);
   define('witgraph-inspector', WitgraphInspector);
+  define('witgraph-output-value', WitgraphOutputValue);
+  define('witgraph-inject-field', WitgraphInjectField);
   define('witgraph-timeline', WitgraphTimeline);
   define('witgraph-source', WitgraphSource);
   define('witgraph-catalog', WitgraphCatalog);
