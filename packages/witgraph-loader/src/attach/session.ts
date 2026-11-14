@@ -118,7 +118,7 @@ export class AttachedSession implements DebugSession {
           .then(graph.takeStreamItems)
           .catch(() => []);
         for (const { node, port, items, count } of streams) {
-          const read = items.map((wave) => fromWave(wave) ?? wave);
+          const read = items.map((wave) => fromWave(wave));
           options.onStreamItem({ node, port, items: read, count: Number(count) });
         }
       }
@@ -409,7 +409,7 @@ function attachedGraph(
     readOutput: async (node, port) => {
       const wave = await ok(graph.readOutput(await open(), node, port));
       if (wave === undefined) return undefined;
-      return fromWave(wave) ?? wave;
+      return fromWave(wave);
     },
     readOutputWave: async (node, port) => ok(graph.readOutput(await open(), node, port)),
     readHandle: async (node, port) => ok(graph.readOutput(await open(), node, port)),

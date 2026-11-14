@@ -51,7 +51,7 @@ Put them anywhere on your page. They all share one `EditorController`.
   feedback loop or an endless stream runs until you stop it. On a graph that has finished,
   it runs it again.
 - **Next node** (F10) runs one node and pauses before the next, which is selected, with its
-  inputs in the inspector, as WAVE text as outputs are. It works from a stopped graph, a pause
+  inputs in the inspector, shown as outputs are. It works from a stopped graph, a pause
   or a breakpoint, and past the last node it starts over. A node that is left running, reading
   an endless stream say, goes on beside what you step through.
 - **Pause** (F6) holds each node from the next on: what is already running, streams
@@ -173,6 +173,11 @@ node previews the first one it names.
 - **Choosing.** _Preview_ in the inspector picks another output, or none. An
   output its component names no viewer for is plotted when it carries
   numbers and shown as text otherwise.
+- **Values as text.** A record shows its fields as rows, names in one column and values
+  in the other, a nested one indented under its field; a variant shows as its case, a
+  record's under it, or as `case(payload)` on a line; an absent option as `—`. The
+  inspector shows outputs so, a stream's latest item too, and a node's input field the
+  value it is fed on one line. Inject still takes WAVE text.
 - **How often.** A preview reads a Value output only when it has a new value,
   and by default as soon as it does. Set `previewIntervalMs` on the controller
   to read one output at most that often during a run: it is always read once

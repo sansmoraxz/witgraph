@@ -2,7 +2,7 @@
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { fromWave } from '../src/attach/wave.ts';
+import { fromWave, parseWave } from '../src/attach/wave.ts';
 
 test('WAVE text reads as the values jco lifts', () => {
   assert.equal(fromWave('3'), 3);
@@ -34,8 +34,10 @@ test('a record of a record of a variant reads whole, its fields camelCased', () 
   ]);
 });
 
-test('text that is not WAVE is undefined', () => {
+test('text that is not WAVE does not parse, and reads as itself', () => {
   for (const text of ['', '[1, 2', '{a: }', '"open', '1 2', "'ab'"]) {
-    assert.equal(fromWave(text), undefined, text);
+    assert.equal(parseWave(text), undefined, text);
+    assert.equal(fromWave(text), text, text);
   }
+  assert.deepEqual(parseWave('none'), { value: undefined }, '`none` parses');
 });

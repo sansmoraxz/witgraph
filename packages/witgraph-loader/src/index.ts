@@ -1077,6 +1077,7 @@ export function diagnosticsOf(error: unknown): Diagnostic[] | undefined {
 }
 
 export { AttachedSession, type AttachOptions } from './attach/session.ts';
+export { fromWave, parseWave } from './attach/wave.ts';
 export {
   type BreakpointScope,
   LineDebugger,

@@ -1,9 +1,10 @@
 import { createElement, History, Trash2 } from 'lucide';
-import type { Diagnostic } from 'witgraph-loader';
+import { type Diagnostic, fromWave } from 'witgraph-loader';
 import type { EditorController } from '../controller/editor-controller.ts';
 import type { NodeVisual, PortVisual } from '../controller/types.ts';
 import { defaultViewer } from '../controller/visual.ts';
-import { MAX_WAVE_BYTES, outputText } from '../util/output-text.ts';
+import { MAX_WAVE_BYTES, outputElement } from '../util/output-text.ts';
+import { READABLE_STYLES, readableLine } from '../util/readable.ts';
 import { adoptStyles } from './shared-styles.ts';
 
 const PHASE_BG: Record<string, string> = {
@@ -57,7 +58,8 @@ const EXTRA_CSS = `
   .warning-bg { background: color-mix(in srgb, var(--wg-warning) 8%, transparent); border-left: 2px solid var(--wg-warning); }
   .fault-bg { background: color-mix(in srgb, var(--wg-error) 8%, transparent); border-left: 2px solid var(--wg-error); }
   .bp-bg { background: color-mix(in srgb, var(--wg-warning) 8%, transparent); border-left: 2px solid var(--wg-warning); }
-  .port-val { white-space: pre-wrap; word-break: break-all; }
+  .port-val { overflow-wrap: anywhere; }
+${READABLE_STYLES}
   .focus-ring:focus { border-color: var(--wg-primary); outline: none; box-shadow: 0 0 0 2px color-mix(in srgb, var(--wg-primary) 25%, transparent); }
   .section-accent { border-left: 2px solid var(--wg-primary); padding-left: 8px; }
   .section-accent-in { border-left-color: var(--wg-primary); }
@@ -215,8 +217,14 @@ export class WitgraphInspector extends HTMLElement {
     return node ? this.#buildInspector(node) : this.#buildGraphProperties();
   }
 
-  #outputText(node: string, port: string): string {
-    return this.#controller ? outputText(this.#controller, node, port) : '-';
+  /** An output's value, as elements: `-` if it cannot be read. */
+  #outputValue(node: string, port: string): Node {
+    if (!this.#controller) return document.createTextNode('-');
+    try {
+      return outputElement(this.#controller, node, port);
+    } catch {
+      return document.createTextNode('-');
+    }
   }
 
   /** What compiling says of what is shown, if anything. */
@@ -727,13 +735,14 @@ export class WitgraphInspector extends HTMLElement {
       for (const [key, val] of Object.entries(bp.inputs)) {
         const entry = this.#el('div', 'flex items-center gap-2 font-mono text-xs py-0.5');
         entry.appendChild(this.#el('span', 'text-wg-text font-semibold', key));
-        // As an output with no value, or one too large, is shown.
+        // As an output with no value, or one too large, is shown; WAVE that does not read, as
+        // it is.
         const shown =
           val === undefined
             ? '-'
             : val.length > MAX_WAVE_BYTES
               ? `${val.slice(0, 80)}… (too large to show whole)`
-              : val;
+              : readableLine(fromWave(val));
         entry.appendChild(
           this.#el(
             'span',
@@ -969,16 +978,12 @@ export class WitgraphInspector extends HTMLElement {
       card.appendChild(topRow);
 
       if (direction === 'output') {
-        const pre = this.#el(
-          'pre',
+        const val = this.#el(
+          'div',
           'port-val font-mono text-xs mt-1.5 p-2 bg-wg-bg rounded-md text-wg-primary',
         );
-        try {
-          pre.textContent = this.#outputText(node.id, port.name);
-        } catch {
-          pre.textContent = '-';
-        }
-        card.appendChild(pre);
+        val.appendChild(this.#outputValue(node.id, port.name));
+        card.appendChild(val);
       }
 
       if (direction === 'input') {
@@ -1218,14 +1223,10 @@ export class WitgraphInspector extends HTMLElement {
     // Current value
     wrap.appendChild(this.#el('div', 'section-accent font-semibold text-sm', 'Current Value'));
     const valEl = this.#el(
-      'pre',
+      'div',
       'port-val font-mono text-xs p-2 bg-wg-surface rounded-md text-wg-primary shadow-sm',
     );
-    try {
-      valEl.textContent = this.#outputText(edge.fromNode, edge.fromPort);
-    } catch {
-      valEl.textContent = '-';
-    }
+    valEl.appendChild(this.#outputValue(edge.fromNode, edge.fromPort));
     wrap.appendChild(valEl);
 
     return wrap;

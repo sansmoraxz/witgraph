@@ -1,4 +1,5 @@
 import type { OutputView } from '../controller/types.ts';
+import { readable, readableLine } from '../util/readable.ts';
 import type { PortViewer } from './types.ts';
 
 /** The longest summary of one value the text viewer shows. */
@@ -32,22 +33,22 @@ export function summarize(value: unknown): string {
 }
 
 /**
- * What the text viewer shows for an output: a Value's value; a future's,
- * or that it is pending; a stream's item count and its latest items.
+ * What the text viewer shows for an output: a Value's value, as rows; a future's, or that it
+ * is pending; a stream's item count and its latest items, one a line.
  */
 export function describe(view: OutputView): string {
   switch (view.kind) {
     case 'future':
       if (view.pending)
-        return view.count > 0 ? `pending (was ${summarize(view.latest)})` : 'pending';
-      return summarize(view.latest);
+        return view.count > 0 ? `pending (was ${readableLine(view.latest)})` : 'pending';
+      return readable(view.latest);
     case 'stream': {
       if (view.count === 0) return 'no items yet';
-      const items = view.recent.slice(-MAX_ITEMS).map(summarize);
+      const items = view.recent.slice(-MAX_ITEMS).map(readableLine);
       return [`${view.count} item${view.count === 1 ? '' : 's'}`, ...items].join('\n');
     }
     default:
-      return summarize(view.latest);
+      return readable(view.latest);
   }
 }
 

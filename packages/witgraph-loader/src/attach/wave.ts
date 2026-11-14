@@ -10,16 +10,23 @@
  * - A case with a payload (`ok` and `err` too) is `{ tag, val }`; one without, an enum's say,
  *   is its name.
  *
- * Text that does not parse is `undefined`.
+ * The value is in `{ value }`, as `none` reads as `undefined` too; text that does not parse
+ * is `undefined`.
  */
-export function fromWave(text: string): unknown {
+export function parseWave(text: string): { value: unknown } | undefined {
   try {
     const parser = new Parser(text);
     const value = parser.value();
-    return parser.atEnd() ? value : undefined;
+    return parser.atEnd() ? { value } : undefined;
   } catch {
     return undefined;
   }
+}
+
+/** WAVE text as a value, as {@link parseWave} reads it; text that does not parse, as it is. */
+export function fromWave(text: string): unknown {
+  const parsed = parseWave(text);
+  return parsed ? parsed.value : text;
 }
 
 /** `observed-at` as jco names a field: `observedAt`. */
